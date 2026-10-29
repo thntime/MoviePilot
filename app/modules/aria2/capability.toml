@@ -1,0 +1,22 @@
+schema_version = 1
+id = "Aria2Module"
+kind = "host_module"
+entrypoint = "app.modules.aria2:Aria2Module"
+depends_on = []
+
+[metadata]
+name = "Aria2"
+type = "downloader"
+subtype = "Aria2"
+priority = 3
+
+[activation]
+policy = "when_configured"
+watch = ["Downloaders"]
+
+[activation.selector]
+kind = "system_config_item"
+key = "Downloaders"
+match_field = "type"
+match_value = "aria2"
+enabled_field = "enabled"

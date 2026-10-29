@@ -692,6 +692,8 @@ class DownloaderType(Enum):
     Transmission = "Transmission"
     # Rtorrent 下载器
     Rtorrent = "Rtorrent"
+    # Aria2 下载器
+    Aria2 = "Aria2"
 
 
 # 媒体服务器类型

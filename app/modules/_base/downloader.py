@@ -1,7 +1,7 @@
 """
 下载器模块业务样板基类。
 
-沉淀三个内置下载器模块（qbittorrent/transmission/rtorrent）逐字复制的样板：
+沉淀内置下载器模块（qbittorrent/transmission/rtorrent/aria2）共用的样板：
 连接测试、定时重连、种子信息读取与查询状态归一。差异化逻辑
 （任务添加、原始状态映射、任务列表构建）仍留在各模块。
 """

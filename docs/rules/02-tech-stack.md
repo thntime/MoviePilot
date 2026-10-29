@@ -65,6 +65,7 @@
 | qBittorrent | `app/modules/qbittorrent/` |
 | Transmission | `app/modules/transmission/` |
 | rTorrent | `app/modules/rtorrent/` |
+| aria2 | `app/modules/aria2/` |
 
 ### Media Servers
 | Module | Directory |

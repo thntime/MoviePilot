@@ -71,7 +71,7 @@ class DownloaderConf(BaseModel):
     """
 
     name: Optional[str] = Field(default=None, description="名称")
-    type: Optional[str] = Field(default=None, description="类型 qbittorrent/transmission/rtorrent")
+    type: Optional[str] = Field(default=None, description="类型 qbittorrent/transmission/rtorrent/aria2")
     default: Optional[bool] = Field(default=False, description="是否默认")
     config: Optional[dict[str, Any]] = Field(default_factory=dict, description="配置")
     enabled: Optional[bool] = Field(default=False, description="是否启用")
