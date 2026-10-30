@@ -29,6 +29,7 @@ class SchedulerServices:
     :param run_modules: 执行模块定时任务的入口
     :param get_wallpapers: 获取并缓存壁纸的任务入口
     :param refresh_site_data: 刷新站点资料的任务入口
+    :param refresh_netdisk_tokens: 刷新 CD 站点 CloudSaver 令牌的任务入口
     :param refresh_recommend: 刷新推荐资料的任务入口
     :param cache_subscribe_calendar: 缓存订阅日历的任务入口
     :param list_workflows: 返回当前可执行工作流快照的入口
@@ -51,6 +52,7 @@ class SchedulerServices:
     run_modules: JobCallable
     get_wallpapers: JobCallable
     refresh_site_data: JobCallable
+    refresh_netdisk_tokens: JobCallable
     refresh_recommend: JobCallable
     cache_subscribe_calendar: JobCallable
     list_workflows: Callable[[], Iterable[WorkflowSnapshot]]

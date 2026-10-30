@@ -410,6 +410,9 @@ class TorrentInfo(OptionalMediaIdentityMixin, BaseModel):
     category: Optional[str] = Field(default=None, description="种子分类 电影/电视剧/音乐")
     volume_factor: Optional[str] = Field(default=None, description="促销")
     freedate_diff: Optional[str] = Field(default=None, description="剩余免费时间")
+    download_type: str = Field(default="torrent", description="资源类型：torrent 种子资源，netdisk 网盘分享资源")
+    netdisk_platform: Optional[str] = Field(default=None, description="网盘平台标识，例如 quark/115/pan123")
+    share_password: Optional[str] = Field(default=None, description="网盘分享链接的提取码，无提取码时为空")
 
 
 class SubtitleInfo(BaseModel):

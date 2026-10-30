@@ -762,6 +762,70 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
             or []
         )
 
+    def search_netdisk_torrents(
+        self,
+        site: dict[str, Any],
+        keyword: str,
+        mtype: Optional[MediaType] = None,
+        page: Optional[int] = 0,
+    ) -> List[TorrentInfo]:
+        """
+        搜索一个 CD 站点的网盘分享资源。
+
+        :param site: CD 站点配置
+        :param keyword: 搜索关键词
+        :param mtype: 媒体类型
+        :param page: 页码
+        :return: 网盘候选列表；模块不可用时为空列表
+        """
+        return (
+            self._module_dispatcher.execute_system_modules(
+                "search_netdisk_torrents", None, site=site, keyword=keyword, mtype=mtype, page=page
+            )
+            or []
+        )
+
+    async def async_search_netdisk_torrents(
+        self,
+        site: dict[str, Any],
+        keyword: str,
+        mtype: Optional[MediaType] = None,
+        page: Optional[int] = 0,
+    ) -> List[TorrentInfo]:
+        """
+        异步搜索一个 CD 站点的网盘分享资源。
+
+        :param site: CD 站点配置
+        :param keyword: 搜索关键词
+        :param mtype: 媒体类型
+        :param page: 页码
+        :return: 网盘候选列表；模块不可用时为空列表
+        """
+        return (
+            await self._module_dispatcher.async_execute_system_modules(
+                "async_search_netdisk_torrents", None, site=site, keyword=keyword, mtype=mtype, page=page
+            )
+            or []
+        )
+
+    def test_netdisk_site(self, site: dict[str, Any]) -> Optional[Tuple[bool, str]]:
+        """
+        通过 CloudSaver 模块校验 CD 站点登录是否可用。
+
+        :param site: CD 站点配置
+        :return: 是否可用及失败原因；模块未处理时为空
+        """
+        return cast(Optional[Tuple[bool, str]], self.run_module("test_netdisk_site", site=site))
+
+    def refresh_netdisk_token(self, site: dict[str, Any]) -> Optional[bool]:
+        """
+        强制刷新一个 CD 站点的 CloudSaver 令牌。
+
+        :param site: CD 站点配置
+        :return: 刷新是否成功；模块未处理时为空
+        """
+        return cast(Optional[bool], self.run_module("refresh_netdisk_token", site=site))
+
     async def async_search_subtitles(
         self,
         site: dict[str, Any],

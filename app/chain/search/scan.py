@@ -31,6 +31,7 @@ from app.chain.base import ChainBase
 from app.chain.search.contract import _SearchOwnerBase
 from app.chain.search.execution import MediaSearchPlan
 from app.chain.search.provider import (
+    _is_netdisk_site,
     _site_keyword,
     _site_rate_limit_backoff,
     _site_request_interval,
@@ -173,9 +174,14 @@ class SearchSources:
         with capture_site_search_observation() as observation:
             deferral_seconds = 0.0
             try:
-                items = ([] if _wait_for_site_request(site) else
-                         self.owner.search_site_torrents(site=site, keyword=query["keyword"],
-                                                         mtype=media_type, page=page) or [])
+                if _wait_for_site_request(site):
+                    items = []
+                elif _is_netdisk_site(site):
+                    items = self.owner.search_netdisk_torrents(site=site, keyword=query["keyword"],
+                                                               mtype=media_type, page=page) or []
+                else:
+                    items = self.owner.search_site_torrents(site=site, keyword=query["keyword"],
+                                                            mtype=media_type, page=page) or []
                 if self.activity:
                     self.activity.site(int(query["site"]), name=str(site.get("name") or ""), candidates=len(items), status=observation.outcome, attempted=observation.attempted)
                 if observation.outcome == "deferred":

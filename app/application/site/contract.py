@@ -33,6 +33,11 @@ _SITE_MUTATION_FIELDS = frozenset(
         "is_active",
         "lst_mod_date",
         "downloader",
+        "kind",
+        "auth_type",
+        "username",
+        "password",
+        "auth_refresh_interval",
     }
 )
 
@@ -194,6 +199,11 @@ class SiteSnapshot:
     :param is_active: 是否启用该站点参与索引
     :param lst_mod_date: 站点配置最后修改时间文本
     :param downloader: 该站点指定的下载器配置名称
+    :param kind: 站点类型，pt 表示 PT 站，cd 表示网盘资源站
+    :param auth_type: 认证方式，cookie、api 或 auth
+    :param username: AUTH 认证使用的用户名
+    :param password: AUTH 认证使用的密码，仅用于链上登录，不得进入 API 响应
+    :param auth_refresh_interval: CD 站点认证令牌刷新间隔，单位为分钟
     """
 
     id: int
@@ -218,6 +228,11 @@ class SiteSnapshot:
     is_active: Optional[bool] = None
     lst_mod_date: Optional[str] = None
     downloader: Optional[str] = None
+    kind: Optional[str] = None
+    auth_type: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    auth_refresh_interval: Optional[int] = None
 
     def __post_init__(self) -> None:
         """

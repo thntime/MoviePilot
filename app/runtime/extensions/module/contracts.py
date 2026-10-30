@@ -504,6 +504,28 @@ _METHOD_CONTRACTS = {
         aggregation=ModuleResultAggregation.FIRST_NON_EMPTY,
         required_parameters=("site",),
     ),
+    "refresh_netdisk_token": ModuleMethodContract(
+        family="site",
+        input_contract="SiteTokenRefreshRequest",
+        result_contract="bool | None",
+        aggregation=ModuleResultAggregation.FIRST_NON_EMPTY,
+        required_parameters=("site",),
+    ),
+    "test_netdisk_site": ModuleMethodContract(
+        family="site",
+        input_contract="SiteTestRequest",
+        result_contract="tuple[bool, str] | None",
+        aggregation=ModuleResultAggregation.FIRST_NON_EMPTY,
+        required_parameters=("site",),
+    ),
+    "search_netdisk_torrents": ModuleMethodContract(
+        family="media-discovery",
+        input_contract="TorrentSearchRequest",
+        result_contract="list[TorrentInfo]",
+        result_shape=ModuleResultShape.LIST,
+        aggregation=ModuleResultAggregation.ORDERED_LIST_MERGE,
+        required_parameters=("site", "keyword", "mtype", "page"),
+    ),
     "site_subtitle_links": ModuleMethodContract(
         family="site",
         input_contract="SiteSubtitleLinksRequest",
@@ -1482,6 +1504,7 @@ _METHOD_CONTRACTS.update(
         "async_search_persons": _METHOD_CONTRACTS["search_persons"],
         "async_search_subtitles": _METHOD_CONTRACTS["search_subtitles"],
         "async_search_torrents": _METHOD_CONTRACTS["search_torrents"],
+        "async_search_netdisk_torrents": _METHOD_CONTRACTS["search_netdisk_torrents"],
         "async_tv_animation": _METHOD_CONTRACTS["tv_animation"],
         "async_tv_hot": _METHOD_CONTRACTS["tv_hot"],
         "async_tv_weekly_chinese": _METHOD_CONTRACTS["tv_weekly_chinese"],
@@ -1716,6 +1739,7 @@ _OBSERVED_HOST_METHODS = (
     "obtain_specific_image",
     "recognize_media",
     "recommend_name",
+    "refresh_netdisk_token",
     "refresh_torrents",
     "refresh_userdata",
     "register_commands",
@@ -1725,6 +1749,7 @@ _OBSERVED_HOST_METHODS = (
     "search_collections",
     "search_medias",
     "search_music",
+    "search_netdisk_torrents",
     "search_persons",
     "search_subtitles",
     "search_torrents",
@@ -1754,6 +1779,7 @@ _OBSERVED_HOST_METHODS = (
     "tmdb_tv_credits",
     "tmdb_tv_recommend",
     "tmdb_tv_similar",
+    "test_netdisk_site",
     "torrent_files",
     "transfer",
     "transfer_completed",
@@ -1893,6 +1919,7 @@ def _infer_observed_family(method: str) -> str:
             "search_medias",
             "search_persons",
             "search_subtitles",
+            "search_netdisk_torrents",
             "search_torrents",
             "tv_",
         )
@@ -1900,7 +1927,7 @@ def _infer_observed_family(method: str) -> str:
         return "media-discovery"
     if method == "clear_cache":
         return "category"
-    if method in {"get_search_page_size", "refresh_userdata", "site_subtitle_links"}:
+    if method in {"get_search_page_size", "refresh_netdisk_token", "refresh_userdata", "site_subtitle_links", "test_netdisk_site"}:
         return "site"
     if method == "user_authenticate":
         return "authentication"

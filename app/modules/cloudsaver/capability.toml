@@ -1,0 +1,15 @@
+schema_version = 1
+id = "CloudSaverModule"
+kind = "host_module"
+entrypoint = "app.modules.cloudsaver:CloudSaverModule"
+depends_on = []
+
+[metadata]
+name = "CloudSaver"
+type = "indexer"
+subtype = "CloudSaver"
+priority = 1
+
+[activation]
+policy = "bootstrap"
+watch = []

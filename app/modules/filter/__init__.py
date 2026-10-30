@@ -181,6 +181,16 @@ class FilterModule(_ModuleBase):
                 group.model_dump() if hasattr(group, "model_dump") else vars(group)
                 for group in groups
             ]
+            # 网盘候选没有做种与促销语义，Rust 快路径无法区分，混入网盘候选时回退 Python。
+            if any(
+                str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
+                for torrent in torrent_list
+            ):
+                return self.__filter_torrents_with_python(
+                    groups=group_defs,
+                    torrent_list=torrent_list,
+                    mediainfo=mediainfo,
+                )
             matched_orders = rust_accel.filter_torrents(
                 groups=group_defs,
                 torrent_list=torrent_list,
@@ -406,6 +416,8 @@ class FilterModule(_ModuleBase):
         seeders = rule.get("seeders")
         downloadvolumefactor = rule.get("downloadvolumefactor")
         pubdate = cast(str, rule.get("publish_time") or "")
+        # 网盘候选没有做种与促销语义，PT 专属条件不能参与淘汰。
+        is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
         if includes and not any(_regex_search(include, content) for include in includes):
             logger.debug(f"种子 {torrent.site_name} - {torrent.title} 不包含任何项 {includes}")
             return False
@@ -418,11 +430,11 @@ class FilterModule(_ModuleBase):
                 logger.debug(f"种子 {torrent.site_name} - {torrent.title} 大小 "
                              f"{size_tools.format_compact_size(torrent.size)} 不在范围 {size_range}MB")
                 return False
-        if seeders:
+        if seeders and not is_netdisk:
             if torrent.seeders < int(seeders):
                 logger.debug(f"种子 {torrent.site_name} - {torrent.title} 做种人数 {torrent.seeders} 小于 {seeders}")
                 return False
-        if downloadvolumefactor is not None:
+        if downloadvolumefactor is not None and not is_netdisk:
             if torrent.downloadvolumefactor != downloadvolumefactor:
                 logger.debug(
                     f"种子 {torrent.site_name} - {torrent.title} FREE值 {torrent.downloadvolumefactor} 不是 {downloadvolumefactor}")

@@ -16,6 +16,7 @@ from app.chain.media import MediaChain
 from app.chain.search.contract import _SearchOwnerBase
 from app.chain.search.execution import MediaSearchPlan, _candidate_contexts
 from app.chain.search.media import _build_missing_media_map
+from app.chain.search.provider import _is_netdisk_site
 from app.chain.search.result import SearchResultOwner
 from app.chain.search.scan import RESTART_AFTER_SECONDS, SearchSources
 from app.chain.search.title import SearchTitleOwner, _TitleSearchResolveRequest
@@ -146,7 +147,11 @@ async def _read_pages(
     """
     grouped: dict[str, list[str]] = {}
     for key in keys:
-        grouped.setdefault(manual.sources.queries[key]["site"], []).append(key)
+        site_id = manual.sources.queries[key]["site"]
+        site = manual.sources.sites.get(site_id) or {}
+        # 网盘站点的多个关键词互不共享流控语义，拆成独立分组后可同轮并发；PT 站点仍按轮次串行。
+        group_key = f"{site_id}::{key}" if _is_netdisk_site(site) else site_id
+        grouped.setdefault(group_key, []).append(key)
 
     async def read_source(site: dict[str, Any], requested_page: int) -> list[Any]:
         """

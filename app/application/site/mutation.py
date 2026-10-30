@@ -34,6 +34,48 @@ SiteEventPublisher = Callable[[dict[str, JsonData]], Awaitable[None]]
 DomainExtractor = Callable[[str], str]
 UrlNormalizer = Callable[[str], str]
 
+# tg 为前端 TG 频道沿用的历史类型值，行为与 PT 一致，仅用于保留既有创建流程。
+_SITE_KINDS = frozenset({"pt", "cd", "tg"})
+_SITE_AUTH_TYPES = frozenset({"cookie", "api", "auth"})
+_SITE_KIND_AUTH_TYPES = {
+    "pt": frozenset({"cookie", "api"}),
+    "cd": frozenset({"auth"}),
+    "tg": frozenset({"cookie", "api"}),
+}
+
+
+def _resolve_site_kind_auth(
+    values: Mapping[str, JsonData],
+    *,
+    default_kind: str = "pt",
+    default_auth_type: str = "cookie",
+) -> tuple[str, str, Optional[str]]:
+    """
+    解析站点类型与认证方式，返回解析值或中文校验失败原因。
+
+    :param values: 待写入的站点字段
+    :param default_kind: 未显式提供站点类型时采用的默认值
+    :param default_auth_type: 未显式提供认证方式且类型为 PT 时采用的默认值
+    :return: 站点类型、认证方式与失败原因；成功时原因为 None
+    """
+    raw_kind = values.get("kind")
+    kind = raw_kind if isinstance(raw_kind, str) and raw_kind else default_kind
+    raw_auth_type = values.get("auth_type")
+    if isinstance(raw_auth_type, str) and raw_auth_type:
+        auth_type = raw_auth_type
+    elif kind == "cd":
+        # CD 站点只有 AUTH 一种可用认证方式，未显式提供时直接推导。
+        auth_type = "auth"
+    else:
+        auth_type = default_auth_type
+    if kind not in _SITE_KINDS:
+        return "", "", f"站点类型不支持：{kind}，仅支持 pt/cd"
+    if auth_type not in _SITE_AUTH_TYPES:
+        return "", "", f"认证方式不支持：{auth_type}，仅支持 cookie/api/auth"
+    if auth_type not in _SITE_KIND_AUTH_TYPES[kind]:
+        return "", "", f"{kind} 站点不支持 {auth_type} 认证方式"
+    return kind, auth_type, None
+
 
 @dataclass(frozen=True, slots=True)
 class SiteReferenceMutation:
@@ -163,25 +205,55 @@ class SiteMutationCommand:
         raw_url = values.get("url")
         if not isinstance(raw_url, str) or not raw_url:
             return SiteMutationResult(False, "站点地址不能为空")
-        if self._auth_level_provider() < 2:
+        kind, auth_type, error = _resolve_site_kind_auth(values)
+        if error:
+            return SiteMutationResult(False, error)
+        # CD 站点不依赖官方站点资源包，不需要用户认证；PT 站点保持原有认证门槛。
+        if kind != "cd" and self._auth_level_provider() < 2:
             return SiteMutationResult(False, "用户未通过认证，无法使用站点功能！")
 
         domain = self._domain_extractor(raw_url)
-        site_info = await self._indexer_loader(domain)
-        if not site_info:
-            return SiteMutationResult(False, "该站点不支持，请检查站点域名是否正确")
-        if await self._repository.async_get_by_domain(domain):
-            return SiteMutationResult(False, f"{domain} 站点己存在")
+        if kind == "cd":
+            username = values.get("username")
+            password = values.get("password")
+            if not isinstance(username, str) or not username.strip():
+                return SiteMutationResult(False, "CD 站点必须填写用户名")
+            if not isinstance(password, str) or not password:
+                return SiteMutationResult(False, "CD 站点必须填写密码")
+            if await self._repository.async_get_by_domain(domain):
+                return SiteMutationResult(False, f"{domain} 站点己存在")
+            raw_name = values.get("name")
+            name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else domain
+            values.update(
+                {
+                    "domain": domain,
+                    "url": self._url_normalizer(raw_url),
+                    "name": name,
+                    "public": 0,
+                }
+            )
+            if values.get("timeout") is None:
+                values["timeout"] = 90
+            if values.get("auth_refresh_interval") is None:
+                values["auth_refresh_interval"] = 300
+        else:
+            site_info = await self._indexer_loader(domain)
+            if not site_info:
+                return SiteMutationResult(False, "该站点不支持，请检查站点域名是否正确")
+            if await self._repository.async_get_by_domain(domain):
+                return SiteMutationResult(False, f"{domain} 站点己存在")
+            values.update(
+                {
+                    "domain": domain,
+                    "url": self._url_normalizer(raw_url),
+                    "name": site_info.get("name"),
+                    "public": 1 if site_info.get("public") else 0,
+                }
+            )
 
         values.pop("id", None)
-        values.update(
-            {
-                "domain": domain,
-                "url": self._url_normalizer(raw_url),
-                "name": site_info.get("name"),
-                "public": 1 if site_info.get("public") else 0,
-            }
-        )
+        values["kind"] = kind
+        values["auth_type"] = auth_type
         try:
             await self._repository.stage_create(SiteMutation(values))
             await self._commit()
@@ -200,8 +272,23 @@ class SiteMutationCommand:
         """
         values = dict(payload)
         site_id = values.get("id")
-        if not isinstance(site_id, int) or not site_id or not await self._repository.get_by_id(site_id):
+        if not isinstance(site_id, int) or not site_id:
             return SiteMutationResult(False, "站点不存在")
+        site_info = await self._repository.get_by_id(site_id)
+        if not site_info:
+            return SiteMutationResult(False, "站点不存在")
+        kind, auth_type, error = _resolve_site_kind_auth(
+            values,
+            default_kind=getattr(site_info, "kind", None) or "pt",
+            default_auth_type=getattr(site_info, "auth_type", None) or "cookie",
+        )
+        if error:
+            return SiteMutationResult(False, error)
+        values["kind"] = kind
+        values["auth_type"] = auth_type
+        password = values.get("password")
+        if password is None or password == "":
+            values.pop("password", None)
 
         raw_url = values.get("url")
         normalized_url = self._url_normalizer(raw_url if isinstance(raw_url, str) else "")

@@ -1667,6 +1667,9 @@ class TorrentInfo:
     :param pri_order: 种子优先级
     :param category: 种子分类 电影/电视剧/音乐
     :param search_resource_id: 自动订阅分页搜索的内部候选标识，只用于提交结果与候选对应，不进入对外字典
+    :param download_type: 资源类型；torrent 表示种子资源，netdisk 表示网盘分享资源
+    :param netdisk_platform: 网盘平台标识，例如 quark/115/pan123
+    :param share_password: 网盘分享链接的提取码，无提取码时为空
     """
 
     site: Optional[int] = None
@@ -1696,6 +1699,9 @@ class TorrentInfo:
     pri_order: int = 0
     category: Optional[str] = None
     search_resource_id: Optional[str] = None
+    download_type: str = "torrent"
+    netdisk_platform: Optional[str] = None
+    share_password: Optional[str] = None
 
     def __post_init__(self) -> None:
         """

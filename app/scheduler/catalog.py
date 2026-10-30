@@ -251,6 +251,7 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
                 JobSpec("scheduler_job", "公共定时服务", services.run_modules, "module"),
                 *_wallpaper_job_specs(services, config.wallpaper),
                 JobSpec("sitedata_refresh", "站点数据刷新", services.refresh_site_data, "site"),
+                JobSpec("netdisk_token_refresh", "网盘站点令牌刷新", services.refresh_netdisk_tokens, "site"),
                 JobSpec("recommend_refresh", "推荐缓存", services.refresh_recommend, "recommend"),
                 JobSpec(
                     "plugin_market_refresh",
@@ -475,6 +476,16 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
                 minutes=config.sitedata_refresh_interval * 60,
                 kwargs={"job_id": "sitedata_refresh"},
             )
+
+        # 网盘站点令牌刷新：每 5 分钟检查一次，按站点配置的间隔决定是否重新登录
+        self._scheduler.add_job(
+            self.start,
+            "interval",
+            id="netdisk_token_refresh",
+            name="网盘站点令牌刷新",
+            minutes=5,
+            kwargs={"job_id": "netdisk_token_refresh"},
+        )
 
         # 推荐缓存
         self._scheduler.add_job(

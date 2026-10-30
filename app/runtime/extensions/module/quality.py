@@ -71,6 +71,7 @@ BASELINE_ASSESSED_MODULES = frozenset(
         "amll",
         "anilist",
         "aria2",
+        "cloudsaver",
         "discord",
         "douban",
         "emby",

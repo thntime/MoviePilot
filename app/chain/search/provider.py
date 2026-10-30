@@ -7,7 +7,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, wait
 from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Iterator, List, Optional
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Iterator, List, Optional, Set
 
 from app.application.configuration import get_configured_system_config
 from app.application.site.observation import (
@@ -41,6 +41,83 @@ from app.schemas.types import MediaType, ProgressKey, SystemConfigKey
 
 SiteIndexer = Dict[str, Any]
 SyncPending = dict[Future[Any], tuple[SiteIndexer, int, int]]
+
+def _is_netdisk_site(site: SiteIndexer) -> bool:
+    """
+    判断站点配置是否为 CD 网盘站点。
+
+    :param site: 站点索引配置
+    :return: 类型为 cd 时返回 True
+    """
+    return str(site.get("kind") or "pt") == "cd"
+
+
+def _netdisk_site_payload(snapshot: Any) -> SiteIndexer:
+    """
+    把 CD 站点快照投影为搜索链使用的站点配置字典。
+
+    :param snapshot: 站点配置快照
+    :return: 含类型、凭据与流控字段的站点字典
+    """
+    return {
+        "id": snapshot.id,
+        "name": snapshot.name,
+        "domain": snapshot.domain,
+        "url": snapshot.url,
+        "pri": snapshot.pri,
+        "kind": "cd",
+        "auth_type": snapshot.auth_type,
+        "username": snapshot.username,
+        "password": snapshot.password,
+        "auth_refresh_interval": snapshot.auth_refresh_interval,
+        "timeout": snapshot.timeout,
+        "downloader": snapshot.downloader,
+        "proxy": snapshot.proxy,
+        "limit_interval": snapshot.limit_interval,
+        "limit_count": snapshot.limit_count,
+        "limit_seconds": snapshot.limit_seconds,
+        "is_active": snapshot.is_active,
+    }
+
+
+def _apply_site_kinds(indexers: List[SiteIndexer], snapshots: List[Any]) -> List[SiteIndexer]:
+    """
+    用站点快照中的类型标注索引器配置，避免资源包未携带类型时把 CD 站点当成 PT 站点。
+
+    :param indexers: 资源包返回的站点索引配置
+    :param snapshots: 启用中的站点配置快照
+    :return: 原地标注后的站点索引配置
+    """
+    kind_by_id = {
+        getattr(snapshot, "id", None): str(getattr(snapshot, "kind", None) or "pt")
+        for snapshot in snapshots
+    }
+    for indexer in indexers:
+        indexer["kind"] = kind_by_id.get(indexer.get("id"), str(indexer.get("kind") or "pt"))
+    return indexers
+
+
+def _netdisk_indexers(
+    snapshots: List[Any],
+    selected_sites: List[int],
+    existing_ids: Set[Any],
+) -> List[SiteIndexer]:
+    """
+    把启用中的 CD 站点投影为本次搜索的网盘站点集合。
+
+    :param snapshots: 启用中的站点配置快照
+    :param selected_sites: 调用方指定或系统配置的站点 ID；为空表示不限制
+    :param existing_ids: 已由资源包目录提供的站点 ID，避免重复搜索
+    :return: CD 站点配置字典列表
+    """
+    return [
+        _netdisk_site_payload(snapshot)
+        for snapshot in snapshots
+        if str(getattr(snapshot, "kind", None) or "pt") == "cd"
+        and getattr(snapshot, "id", None) not in existing_ids
+        and (not selected_sites or getattr(snapshot, "id", None) in selected_sites)
+    ]
+
 
 def _site_keyword(site: SiteIndexer, keyword: str, mediainfo: Optional[MediaInfo]) -> str:
     """
@@ -171,6 +248,13 @@ def _search_site_page(
     """
     if _wait_for_site_request(site):
         return []
+    if _is_netdisk_site(site):
+        return owner.search_netdisk_torrents(
+            site=site,
+            keyword=keyword,
+            mtype=media_type,
+            page=page,
+        )
     return owner.search_site_torrents(
         site=site,
         keyword=keyword,
@@ -265,11 +349,23 @@ class _SearchProviderSyncOwner(_SearchOwnerBase):
         """
         从同步站点目录构造本次 provider 集合。
         """
-        return self._select_indexers(
+        selected_sites = self._selected_site_ids(sites)
+        indexers = self._select_indexers(
             SitesHelper().get_indexers(),
-            self._selected_site_ids(sites),
+            selected_sites,
             subtitles=subtitles,
         )
+        if subtitles:
+            return indexers
+        repository = getattr(self, "site_repository", None)
+        if repository is None:
+            return indexers
+        snapshots = repository.list_active()
+        indexers = _apply_site_kinds(indexers, snapshots)
+        return [
+            *indexers,
+            *_netdisk_indexers(snapshots, selected_sites, {indexer.get("id") for indexer in indexers}),
+        ]
 
     async def _async_indexers(
         self,
@@ -280,11 +376,24 @@ class _SearchProviderSyncOwner(_SearchOwnerBase):
         """
         从异步站点目录构造本次 provider 集合。
         """
-        return self._select_indexers(
+        selected_sites = self._selected_site_ids(sites)
+        indexers = self._select_indexers(
             await SitesHelper().async_get_indexers(),
-            self._selected_site_ids(sites),
+            selected_sites,
             subtitles=subtitles,
         )
+        if subtitles:
+            return indexers
+        repository = getattr(self, "site_repository", None)
+        if repository is None:
+            return indexers
+        snapshots = await repository.async_list_active()
+        indexers = _apply_site_kinds(indexers, snapshots)
+        return [
+            *indexers,
+            *_netdisk_indexers(snapshots, selected_sites, {indexer.get("id") for indexer in indexers}),
+        ]
+
 
     @staticmethod
     def _torrent_keyword(
@@ -930,6 +1039,13 @@ class SearchProviderOwner(_SearchProviderSyncOwner):
             """
             if await _async_wait_for_site_request(site):
                 return []
+            if _is_netdisk_site(site):
+                return await self.async_search_netdisk_torrents(
+                    site=site,
+                    keyword=_site_keyword(site, search_keyword, mediainfo),
+                    mtype=media_type,
+                    page=page_number,
+                )
             return await self.async_search_site_torrents(
                 site=site,
                 keyword=_site_keyword(site, search_keyword, mediainfo),

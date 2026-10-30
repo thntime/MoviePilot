@@ -61,6 +61,16 @@ class Site(Base):
     lst_mod_date: Mapped[Optional[str]] = mapped_column(String, default=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     # 下载器
     downloader: Mapped[Optional[str]] = mapped_column(String)
+    # 站点类型：pt 表示 PT 站，cd 表示 CloudSaver 网盘资源站
+    kind: Mapped[Optional[str]] = mapped_column(String, default="pt")
+    # 认证方式：cookie、api 或 auth，auth 表示用户名密码认证
+    auth_type: Mapped[Optional[str]] = mapped_column(String, default="cookie")
+    # AUTH 认证使用的用户名
+    username: Mapped[Optional[str]] = mapped_column(String)
+    # AUTH 认证使用的密码，仅写入不回显
+    password: Mapped[Optional[str]] = mapped_column(String)
+    # CD 站点认证令牌刷新间隔，单位为分钟
+    auth_refresh_interval: Mapped[Optional[int]] = mapped_column(Integer, default=300)
 
     @classmethod
     def get_by_domain(cls, db: Session, domain: str) -> Optional[Self]:

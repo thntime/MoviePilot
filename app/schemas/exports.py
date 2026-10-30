@@ -454,6 +454,7 @@ SCHEMA_EXPORTS = {
     'SiteCookieUpdate': ('app.schemas.site', 'SiteCookieUpdate'),
     'SiteEventData': ('app.schemas.event', 'SiteEventData'),
     'SiteIconData': ('app.schemas.site', 'SiteIconData'),
+    'SiteInput': ('app.schemas.site', 'SiteInput'),
     'SiteMappingData': ('app.schemas.site', 'SiteMappingData'),
     'SitePriorityUpdate': ('app.schemas.site', 'SitePriorityUpdate'),
     'SiteStatistic': ('app.schemas.site', 'SiteStatistic'),

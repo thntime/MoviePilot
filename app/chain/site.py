@@ -5,6 +5,7 @@
 import base64
 import re
 import threading
+import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -275,6 +276,38 @@ def _open_site_response(
     )
 
 
+# CD 站点令牌最近一次成功刷新时间，进程内共享，避免每次调度都重新登录。
+_netdisk_token_refreshed_at: Dict[int, float] = {}
+
+
+def _netdisk_site_dict(snapshot: SiteSnapshot) -> Dict[str, Any]:
+    """
+    把 CD 站点快照投影为模块调用使用的站点配置字典。
+
+    :param snapshot: 站点配置快照
+    :return: 含类型、凭据与流控字段的站点字典
+    """
+    return {
+        "id": snapshot.id,
+        "name": snapshot.name,
+        "domain": snapshot.domain,
+        "url": snapshot.url,
+        "pri": snapshot.pri,
+        "kind": "cd",
+        "auth_type": snapshot.auth_type,
+        "username": snapshot.username,
+        "password": snapshot.password,
+        "auth_refresh_interval": snapshot.auth_refresh_interval,
+        "timeout": snapshot.timeout,
+        "downloader": snapshot.downloader,
+        "proxy": snapshot.proxy,
+        "limit_interval": snapshot.limit_interval,
+        "limit_count": snapshot.limit_count,
+        "limit_seconds": snapshot.limit_seconds,
+        "is_active": snapshot.is_active,
+    }
+
+
 class SiteChain(InteractionChainMixin, ChainBase):
     """
     站点管理处理链
@@ -429,6 +462,42 @@ class SiteChain(InteractionChainMixin, ChainBase):
             progress_callback(value=100, text="站点数据刷新完成")
 
         return result
+
+    def refresh_netdisk_tokens(self) -> None:
+        """
+        按站点配置的刷新间隔重新获取 CD 站点的 CloudSaver 令牌。
+
+        调度器按固定节拍触发，只有到达各自间隔的站点才会重新登录；单个站点失败不影响其他站点。
+        """
+        try:
+            snapshots = self.site_repository.list_active()
+        except Exception as err:
+            logger.warn(f"读取 CD 站点配置失败：{err}")
+            return
+        now = time.time()
+        for snapshot in snapshots:
+            if str(getattr(snapshot, "kind", None) or "pt") != "cd":
+                continue
+            site_id = getattr(snapshot, "id", None)
+            if site_id is None:
+                continue
+            try:
+                interval = int(getattr(snapshot, "auth_refresh_interval", None) or 300) * 60
+            except (TypeError, ValueError):
+                interval = 300 * 60
+            last_refreshed = _netdisk_token_refreshed_at.get(site_id, 0.0)
+            if last_refreshed and now - last_refreshed < max(interval, 60):
+                continue
+            site = _netdisk_site_dict(snapshot)
+            try:
+                refreshed = self.refresh_netdisk_token(site)
+            except Exception as err:
+                logger.warn(f"CD 站点 {site.get('name')} 令牌刷新失败：{err}")
+                continue
+            if refreshed:
+                _netdisk_token_refreshed_at[site_id] = now
+            else:
+                logger.warn(f"CD 站点 {site.get('name')} 令牌刷新失败，保留上次结果等待下轮")
 
     def is_special_site(self, domain: str) -> bool:
         """
@@ -1080,24 +1149,45 @@ class SiteChain(InteractionChainMixin, ChainBase):
 
         try:
             start_time = datetime.now()
-            special_test = self.special_site_test.get(domain)
-            if special_test:
-                state, message = special_test(site_info)
-            else:
-                indexer = SitesHelper().get_indexer(domain) or {}
-                protocol_test = self.protocol_site_test.get(str(indexer.get("schema") or "")) \
-                    or self.protocol_site_test.get(str(indexer.get("parser") or ""))
-                if protocol_test:
-                    state, message = protocol_test(site_info)
+            if site_info.kind == "cd":
+                netdisk_result = self.run_module(
+                    "test_netdisk_site",
+                    site={
+                        "id": site_info.id,
+                        "name": site_info.name,
+                        "domain": site_info.domain,
+                        "url": site_info.url,
+                        "kind": site_info.kind,
+                        "auth_type": site_info.auth_type,
+                        "username": site_info.username,
+                        "password": site_info.password,
+                        "timeout": site_info.timeout,
+                        "auth_refresh_interval": site_info.auth_refresh_interval,
+                    },
+                )
+                if netdisk_result is None:
+                    state, message = False, "CloudSaver 模块不可用"
                 else:
-                    state, message = self.__test(
-                        replace(
-                            site_info,
-                            url=site_rules.resolve_page_url(
-                                site_info.url, indexer.get("login_path")
-                            ),
+                    state, message = netdisk_result
+            else:
+                special_test = self.special_site_test.get(domain)
+                if special_test:
+                    state, message = special_test(site_info)
+                else:
+                    indexer = SitesHelper().get_indexer(domain) or {}
+                    protocol_test = self.protocol_site_test.get(str(indexer.get("schema") or "")) \
+                        or self.protocol_site_test.get(str(indexer.get("parser") or ""))
+                    if protocol_test:
+                        state, message = protocol_test(site_info)
+                    else:
+                        state, message = self.__test(
+                            replace(
+                                site_info,
+                                url=site_rules.resolve_page_url(
+                                    site_info.url, indexer.get("login_path")
+                                ),
+                            )
                         )
-                    )
             seconds = (datetime.now() - start_time).seconds
             if state:
                 repository.success(domain=domain, seconds=seconds)

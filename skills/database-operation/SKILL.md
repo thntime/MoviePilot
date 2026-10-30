@@ -268,7 +268,7 @@ and pass the flag only for an explicitly authorized repair.
 - Purpose: Stores private-tracker URLs, RSS, credentials, rate limits, proxy state, and downloader binding.
 - Useful queries: Inspecting enablement, domain, rate limits, or downloader binding with minimal credential exposure.
 - Write boundary: Contains cookies, API keys, and tokens; manage it through the site API.
-- Columns: `id`, `name`, `domain`, `url`, `pri`, `rss`, `cookie`, `ua`, `apikey`, `token`, `proxy`, `filter`, `render`, `public`, `note`, `limit_interval`, `limit_count`, `limit_seconds`, `timeout`, `is_active`, `lst_mod_date`, `downloader`
+- Columns: `id`, `name`, `domain`, `url`, `pri`, `rss`, `cookie`, `ua`, `apikey`, `token`, `proxy`, `filter`, `render`, `public`, `note`, `limit_interval`, `limit_count`, `limit_seconds`, `timeout`, `is_active`, `lst_mod_date`, `downloader`, `kind`, `auth_type`, `username`, `password`, `auth_refresh_interval`
 
 ### `siteicon`
 - Purpose: Caches site names, domains, icon URLs, and Base64 icon content.

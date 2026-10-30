@@ -61,6 +61,11 @@ def _project_site(record: Site) -> SiteSnapshot:
         is_active=record.is_active,
         lst_mod_date=record.lst_mod_date,
         downloader=record.downloader,
+        kind=record.kind,
+        auth_type=record.auth_type,
+        username=record.username,
+        password=record.password,
+        auth_refresh_interval=record.auth_refresh_interval,
     )
 
 

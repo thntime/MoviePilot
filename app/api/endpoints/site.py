@@ -55,6 +55,7 @@ from app.schemas.site import SiteCategory as _SchemaSiteCategory
 from app.schemas.site import SiteCookieSet as _SchemaSiteCookieSet
 from app.schemas.site import SiteCookieUpdate as _SchemaSiteCookieUpdate
 from app.schemas.site import SiteIconData as _SchemaSiteIconData
+from app.schemas.site import SiteInput as _SchemaSiteInput
 from app.schemas.site import SiteMappingData as _SchemaSiteMappingData
 from app.schemas.site import SitePriorityUpdate as _SchemaSitePriorityUpdate
 from app.schemas.site import SiteStatistic as _SchemaSiteStatistic
@@ -63,6 +64,31 @@ from app.schemas.token import TokenPayload as _SchemaTokenPayload
 from app.schemas.types import MediaType, SystemConfigKey
 
 router = ResponseAPIRouter()
+
+
+def _is_cd_site(site: Any) -> bool:
+    """
+    判断站点是否为 CD 网盘资源站。
+
+    :param site: 站点快照或 API DTO
+    :return: 站点类型为 cd 时为 True
+    """
+    return getattr(site, "kind", None) == "cd"
+
+
+async def _netdisk_domains(query: SiteQueryService) -> set[str]:
+    """
+    读取全部 CD 站点域名，用于过滤 PT 专属数据。
+
+    :param query: 站点查询服务
+    :return: CD 站点域名集合
+    """
+    sites = await query.list_ordered()
+    domains: set[str] = set()
+    for site in sites:
+        if site.domain and _is_cd_site(site):
+            domains.add(site.domain)
+    return domains
 
 
 def _project_agent_site(site: Any, *, include_secrets: bool) -> dict[str, JsonData]:
@@ -294,21 +320,25 @@ async def read_sites_by_media_type(
 @router.post("/", summary="新增站点", response_model=_SchemaResponse[None])
 async def add_site(
     *,
-    site_in: _SchemaSite,
+    site_in: _SchemaSiteInput,
     command: SiteMutationCommand = Depends(get_site_mutation_command),
     _: ApiPrincipal = Depends(get_current_active_manage_user_async),
 ) -> Any:
     """
     新增站点
     """
-    result = await command.create(site_in.model_dump())
+    payload = site_in.model_dump()
+    if "timeout" not in site_in.model_fields_set:
+        # 未显式提供超时时交给用例决定默认值，避免 CD 站点误用 PT 的 15 秒默认值。
+        payload.pop("timeout", None)
+    result = await command.create(payload)
     return _SchemaResponse(success=result.success, message=result.message)
 
 
 @router.put("/", summary="更新站点", response_model=_SchemaResponse[None])
 async def update_site(
     *,
-    site_in: _SchemaSite,
+    site_in: _SchemaSiteInput,
     command: SiteMutationCommand = Depends(get_site_mutation_command),
     _: ApiPrincipal = Depends(get_current_active_manage_user_async),
 ) -> Any:
@@ -510,6 +540,8 @@ def refresh_userdata(
             status_code=404,
             detail=f"站点 {site_id} 不存在",
         )
+    if _is_cd_site(site):
+        return _SchemaResponse(success=False, message="CD 站点不支持该能力")
     if not site.domain:
         return _SchemaResponse(success=False, message="站点域名未配置")
     indexer = SitesHelper().get_indexer(site.domain)
@@ -549,7 +581,11 @@ async def read_userdata_latest(
         response.headers[COLLECTION_TOTAL_HEADER] = str(
             await query.count_userdata_latest()
         )
-    return await query.userdata_latest(page=page, count=count)
+    items = await query.userdata_latest(page=page, count=count)
+    cd_domains = await _netdisk_domains(query)
+    if not cd_domains:
+        return items
+    return [item for item in items if item.domain not in cd_domains]
 
 
 @router.get(
@@ -587,6 +623,8 @@ async def read_userdata(
             status_code=404,
             detail=f"站点 {site_id} 不存在",
         )
+    if _is_cd_site(site):
+        return _SchemaResponse(success=False, message="CD 站点不支持该能力", data=[])
     if not site.domain:
         raise HTTPException(
             status_code=409,
@@ -680,6 +718,8 @@ async def site_category(
             status_code=404,
             detail=f"站点 {site_id} 不存在",
         )
+    if _is_cd_site(site):
+        return []
     if not site.domain:
         raise HTTPException(status_code=400, detail="站点域名未配置")
     indexer = await SitesHelper().async_get_indexer(site.domain)
@@ -724,6 +764,8 @@ async def site_resource(
             status_code=404,
             detail=f"站点 {site_id} 不存在",
         )
+    if _is_cd_site(site):
+        return []
     if not site.domain:
         raise HTTPException(status_code=400, detail="站点域名未配置")
     torrents = await TorrentsChain().async_browse(
@@ -771,6 +813,9 @@ async def read_statistic_by_domain(
     通过域名获取站点统计信息
     """
     domain = site_rules.extract_domain(site_url)
+    site = await query.get_by_domain(domain)
+    if site and _is_cd_site(site):
+        return _SchemaSiteStatistic()
     return await query.statistic(domain)
 
 
@@ -795,7 +840,11 @@ async def read_statistics(
         response.headers[COLLECTION_TOTAL_HEADER] = str(
             await query.count_statistics()
         )
-    return await query.statistics(page=page, count=count)
+    statistics = await query.statistics(page=page, count=count)
+    cd_domains = await _netdisk_domains(query)
+    if not cd_domains:
+        return statistics
+    return [item for item in statistics if item.domain not in cd_domains]
 
 
 @router.get(
