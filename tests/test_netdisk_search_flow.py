@@ -353,3 +353,66 @@ def test_manual_page_groups_netdisk_keywords_per_round() -> None:
 
     assert collect(cd_sites, cd_queries) == [["k1", "k2"]]
     assert collect(pt_sites, pt_queries) == [["k1"], ["k2"]]
+
+
+def test_scan_sources_route_netdisk_site_to_netdisk_search() -> None:
+    """
+    渐进式搜索流对 CD 站点改走网盘搜索，PT 站点仍走索引器搜索。
+    """
+    from app.chain.search import scan as scan_module
+    from app.schemas.types import MediaType
+
+    class _Owner:
+        """
+        记录搜索入口调用，替代真实搜索链。
+        """
+
+        def __init__(self) -> None:
+            """
+            初始化调用记录。
+            """
+            self.calls: list[tuple[str, int]] = []
+
+        def search_netdisk_torrents(self, site=None, keyword=None, mtype=None, page=0):  # noqa: ARG002
+            """
+            记录网盘搜索调用并返回一条网盘候选。
+
+            :param site: 站点配置
+            :return: 网盘候选列表
+            """
+            self.calls.append(("netdisk", site["id"]))
+            return [TorrentInfo(title="网盘候选")]
+
+        def search_site_torrents(self, site=None, keyword=None, mtype=None, page=0):  # noqa: ARG002
+            """
+            记录索引器搜索调用并返回一条 PT 候选。
+
+            :param site: 站点配置
+            :return: PT 候选列表
+            """
+            self.calls.append(("torrent", site["id"]))
+            return [TorrentInfo(title="PT 候选")]
+
+    def fetch_for(kind: str):
+        """
+        构造只含单站点单查询的搜索来源并取一页。
+
+        :param kind: 站点类型
+        :return: 调用记录与页面结果
+        """
+        owner = _Owner()
+        sources = object.__new__(scan_module.SearchSources)
+        sources.owner = owner
+        sources.activity = None
+        sources.media = SimpleNamespace(type=MediaType.UNKNOWN)
+        sources.sites = {"1": {"id": 1, "kind": kind, "name": "站点"}}
+        sources.queries = {"1:k": {"site": "1", "keyword": "k"}}
+        return owner, sources.fetch("1:k", 0)
+
+    owner, page = fetch_for("cd")
+    assert owner.calls == [("netdisk", 1)]
+    assert [item.title for item in page.torrents] == ["网盘候选"]
+
+    owner, page = fetch_for("pt")
+    assert owner.calls == [("torrent", 1)]
+    assert [item.title for item in page.torrents] == ["PT 候选"]
