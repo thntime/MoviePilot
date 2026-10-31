@@ -3,10 +3,12 @@
 """
 
 import asyncio
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
+import app.modules.cloudsaver as netdisk_module
 from app.modules.cloudsaver import CloudSaverModule
 from app.modules.cloudsaver import cloudsaver as cloudsaver_module
 from app.modules.cloudsaver.cloudsaver import CloudSaverClient
@@ -73,6 +75,8 @@ class FakeCloudSaverServer:
         self.invalid_share_codes: set[str] = set()
         # 返回非 JSON 响应，模拟网络异常或超时导致无法判定的分享。
         self.undecidable_share_codes: set[str] = set()
+        # 指定分享的详情响应延迟，模拟超出检查预算的慢请求。
+        self.share_delay_seconds: Dict[str, float] = {}
         self._token_seq = 0
 
     def _issue_token(self) -> str:
@@ -111,6 +115,9 @@ class FakeCloudSaverServer:
             if token not in self.valid_tokens:
                 return FakeResponse({"message": "unauthorized"}, 401)
             share_code = str((params or {}).get("shareCode") or "")
+            delay = self.share_delay_seconds.get(share_code)
+            if delay:
+                time.sleep(delay)
             if share_code in self.invalid_share_codes:
                 return FakeResponse({"success": False, "message": "分享已失效"}, 500)
             if share_code in self.undecidable_share_codes:
@@ -618,3 +625,72 @@ def test_episode_token_prefers_range() -> None:
     assert CloudSaverModule._episode_token(["E05.mkv"]) == "S01E05"
     assert CloudSaverModule._episode_token(["01.mp4", "02.mp4"]) == "S01E01-E02"
     assert CloudSaverModule._episode_token(["花絮.mp4"]) is None
+
+
+def test_search_drops_candidates_over_check_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    分享有效性检查超出总预算时，未完成的候选按失效处理，已完成的候选照常返回。
+    """
+    server = FakeCloudSaverServer()
+    server.share_delay_seconds["slowshare"] = 0.2
+    server.search_results = [(200, make_payload([
+        {
+            "title": "慢响应资源",
+            "content": "简介",
+            "cloudType": "quark",
+            "cloudLinks": [{"link": "https://pan.quark.cn/s/slowshare", "cloudType": "quark"}],
+        },
+        {
+            "title": "快速响应资源",
+            "content": "简介",
+            "cloudType": "quark",
+            "cloudLinks": [{"link": "https://pan.quark.cn/s/fastshare", "cloudType": "quark"}],
+        },
+    ]))]
+    install_server(monkeypatch, server)
+    # 把 30 秒总预算压到毫秒级，避免用例等待真实超时。
+    monkeypatch.setattr(netdisk_module, "_ALIVE_BUDGET_SECONDS", 0.02)
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
+
+    assert results is not None
+    assert [item.title for item in results] == ["快速响应资源"]
+
+
+def test_search_limits_alive_checks_to_newest_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    单次搜索只检查最新的若干条候选，超出检查上限的候选不返回也不发起请求。
+    """
+    server = FakeCloudSaverServer()
+    server.search_results = [(200, make_payload([
+        {
+            "title": "最旧资源",
+            "content": "简介",
+            "pubDate": "2026-10-01",
+            "cloudType": "quark",
+            "cloudLinks": [{"link": "https://pan.quark.cn/s/shareold", "cloudType": "quark"}],
+        },
+        {
+            "title": "最新资源",
+            "content": "简介",
+            "pubDate": "2026-10-03",
+            "cloudType": "quark",
+            "cloudLinks": [{"link": "https://pan.quark.cn/s/sharenew", "cloudType": "quark"}],
+        },
+        {
+            "title": "次新资源",
+            "content": "简介",
+            "pubDate": "2026-10-02",
+            "cloudType": "quark",
+            "cloudLinks": [{"link": "https://pan.quark.cn/s/sharemiddle", "cloudType": "quark"}],
+        },
+    ]))]
+    install_server(monkeypatch, server)
+    # 把 200 条检查上限压到 2 条，验证截断按发布时间优先。
+    monkeypatch.setattr(netdisk_module, "_MAX_ALIVE_CHECKS", 2)
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
+
+    assert results is not None
+    assert [item.title for item in results] == ["最新资源", "次新资源"]
+    assert server.share_check_count == 2
