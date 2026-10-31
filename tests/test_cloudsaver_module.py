@@ -71,6 +71,8 @@ class FakeCloudSaverServer:
         self.share_check_count = 0
         self.share_file_names = ["资源文件.mp4"]
         self.invalid_share_codes: set[str] = set()
+        # 返回非 JSON 响应，模拟网络异常或超时导致无法判定的分享。
+        self.undecidable_share_codes: set[str] = set()
         self._token_seq = 0
 
     def _issue_token(self) -> str:
@@ -111,6 +113,9 @@ class FakeCloudSaverServer:
             share_code = str((params or {}).get("shareCode") or "")
             if share_code in self.invalid_share_codes:
                 return FakeResponse({"success": False, "message": "分享已失效"}, 500)
+            if share_code in self.undecidable_share_codes:
+                # 非 JSON 响应体，客户端无法判定有效性。
+                return FakeResponse(None, 200)
             return FakeResponse({
                 "success": True,
                 "data": {
@@ -500,6 +505,39 @@ def test_search_drops_invalid_shares(monkeypatch: pytest.MonkeyPatch) -> None:
     assert server.share_check_count == 2
 
 
+def test_search_drops_undecidable_shares(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    分享详情无法判定有效性时按失效处理，候选不进入结果。
+    """
+    server = FakeCloudSaverServer()
+    server.undecidable_share_codes.add("unknownshare")
+    server.search_results = [(200, make_payload([
+        {
+            "title": "无法判定资源",
+            "content": "简介",
+            "cloudType": "quark",
+            "cloudLinks": [{"link": "https://pan.quark.cn/s/unknownshare", "cloudType": "quark"}],
+        },
+        {
+            "title": "有效资源",
+            "content": "简介",
+            "cloudType": "quark",
+            "cloudLinks": [{"link": "https://pan.quark.cn/s/liveshare", "cloudType": "quark"}],
+        },
+    ]))]
+    install_server(monkeypatch, server)
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
+
+    assert results is not None
+    assert [item.title for item in results] == ["有效资源"]
+    assert server.share_check_count == 2
+    # 无法判定的分享不写入有效性缓存，下次搜索仍会重新检查。
+    from app.modules.cloudsaver import _alive_cache
+
+    assert not any("unknownshare" in key for key in _alive_cache)
+
+
 def test_search_dedupes_same_share_code_across_url_forms(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     同一分享码的不同链接形式只保留一条候选。
@@ -562,6 +600,14 @@ def test_search_fills_size_and_episode_from_share_detail(monkeypatch: pytest.Mon
     assert results is not None
     assert results[0].size == 1024 * 1024 * 500
     assert results[0].title == "仙逆 (2023) 4K S01E01-E12"
+    # 追加的集数标记必须能被媒体识别解析为季集展示文本，前端才有集数可显示。
+    from app.domain.metainfo import MetaInfo
+    from app.schemas.types import MediaType
+
+    meta = MetaInfo(title=results[0].title or "", subtitle=results[0].description, mtype=MediaType.TV)
+    assert meta.season == "S01"
+    assert meta.episode == "E01-E12"
+    assert meta.season_episode == "S01 E01-E12"
 
 
 def test_episode_token_prefers_range() -> None:
