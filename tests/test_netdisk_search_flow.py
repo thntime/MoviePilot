@@ -2,6 +2,7 @@
 CD 站点网盘搜索的路由、投影与过滤中性化测试。
 """
 
+import asyncio
 from types import SimpleNamespace
 
 from app.chain import site as site_module
@@ -272,3 +273,83 @@ def test_apply_site_kinds_defaults_unknown_site_to_pt() -> None:
     tagged = provider_module._apply_site_kinds(indexers, [])
 
     assert tagged[0]["kind"] == "pt"
+
+
+def test_manual_page_groups_netdisk_keywords_per_round() -> None:
+    """
+    CD 站点的多个关键词拆成独立分组后同轮并发，PT 站点仍按轮次串行。
+    """
+    from app.chain.search import manual as manual_module
+
+    class _Owner:
+        """
+        记录每轮提交的来源分组，替代真实站点分页调度器。
+        """
+
+        def __init__(self) -> None:
+            """
+            初始化来源分组记录。
+            """
+            self.calls: list[list[str]] = []
+
+        async def _iter_site_page_results(self, indexer_sites, search_pages, search_page,  # noqa: ARG002
+                                          should_continue, task_owner):  # noqa: ARG002
+            """
+            只记录本轮来源，不产出页面结果。
+
+            :param indexer_sites: 本轮提交的来源列表
+            """
+            self.calls.append([site["key"] for site in indexer_sites])
+            if False:
+                yield  # pragma: no cover
+
+    class _Manual:
+        """
+        提供 _read_pages 所需的最小单页搜索上下文。
+        """
+
+        def __init__(self, sites, queries, owner) -> None:
+            """
+            保存来源、查询与调度器替身。
+            """
+            self.sources = SimpleNamespace(sites=sites, queries=queries)
+            self.owner = owner
+
+        async def read(self, key: str, page: int):  # noqa: ARG002
+            """
+            返回固定的页事实与空候选。
+
+            :param key: 来源标识
+            :param page: 页码
+            :return: 页事实与候选列表
+            """
+            return {"key": key, "page": page}, []
+
+    def collect(sites, queries) -> list[list[str]]:
+        """
+        执行一次单页请求并返回每轮的来源分组。
+
+        :param sites: 站点配置映射
+        :param queries: 查询映射
+        :return: 每轮提交的来源标识列表
+        """
+        owner = _Owner()
+        manual = _Manual(sites, queries, owner)
+
+        async def run() -> None:
+            """
+            消费异步生成器，触发分组与提交。
+            """
+            async for _ in manual_module._read_pages(manual, ["k1", "k2"], 0):
+                pass
+
+        asyncio.run(run())
+        return owner.calls
+
+    cd_sites = {"1": {"id": 1, "kind": "cd", "name": "CD 站点"}}
+    pt_sites = {"2": {"id": 2, "kind": "pt", "name": "PT 站点"}}
+    cd_queries = {"k1": {"site": "1", "keyword": "仙逆"}, "k2": {"site": "1", "keyword": "仙逆 4K"}}
+    pt_queries = {"k1": {"site": "2", "keyword": "仙逆"}, "k2": {"site": "2", "keyword": "仙逆 4K"}}
+
+    assert collect(cd_sites, cd_queries) == [["k1", "k2"]]
+    assert collect(pt_sites, pt_queries) == [["k1"], ["k2"]]
