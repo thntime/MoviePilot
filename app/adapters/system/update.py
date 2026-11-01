@@ -66,7 +66,7 @@ class SystemUpdateManager(metaclass=SingletonClass):
 
     _BACKEND_RELEASES_API = "https://api.github.com/repos/jxxghp/MoviePilot/releases"
     _FRONTEND_RELEASE_API = (
-        "https://api.github.com/repos/thntime/MoviePilot-Frontend/releases/tags/{tag}"
+        "https://api.github.com/repos/thntime/MoviePilot/releases/tags/{tag}"
     )
     _BACKEND_ARCHIVE_URL = (
         "https://github.com/jxxghp/MoviePilot/archive/refs/tags/{tag}.zip"

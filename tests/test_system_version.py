@@ -76,7 +76,7 @@ def release_http(monkeypatch):
     ("getter", "owner", "repository"),
     [
         (SystemChain._SystemChain__get_server_release_version, "jxxghp", "MoviePilot"),
-        (SystemChain._SystemChain__get_front_release_version, "thntime", "MoviePilot-Frontend"),
+        (SystemChain._SystemChain__get_front_release_version, "thntime", "MoviePilot"),
     ],
 )
 @pytest.mark.parametrize(

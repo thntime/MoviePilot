@@ -89,16 +89,12 @@ jobs:
           path: frontend-src
           persist-credentials: false
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: yarn
-          cache-dependency-path: frontend-src/yarn.lock
-
       - name: Build frontend
         working-directory: frontend-src
         run: |
+          set -euo pipefail
+          node -v
+          node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 20 || (major === 20 && minor < 19)) { console.error("需要 Node >= 20.19"); process.exit(1); }'
           corepack enable
           corepack prepare yarn@1.22.22 --activate
           yarn install --frozen-lockfile --network-timeout 600000
@@ -162,3 +158,25 @@ jobs:
             MOVIEPILOT_PYTHON_VARIANT=standard
           cache-from: type=gha,scope=dockerhub-amd64
           cache-to: type=gha,scope=dockerhub-amd64,mode=max
+
+      - name: Package frontend dist
+        run: |
+          set -euo pipefail
+          (cd frontend-dist && zip -qr ../dist.zip .)
+          ls -lh dist.zip
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          tag="v${APP_VERSION}"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" dist.zip --clobber
+          else
+            gh release create "$tag" dist.zip \
+              --target "$(git rev-parse HEAD)" \
+              --title "$tag" \
+              --notes "自动构建发布 ${tag}：后端源码 + 自建前端 dist.zip（已打进 Docker 镜像）。"
+          fi
