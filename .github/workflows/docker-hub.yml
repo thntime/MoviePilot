@@ -89,6 +89,15 @@ jobs:
           path: frontend-src
           persist-credentials: false
 
+      - name: Align frontend version
+        working-directory: frontend-src
+        env:
+          APP_VERSION: ${{ needs.version.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.env.APP_VERSION;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+          node -e "console.log('frontend version =', require('./package.json').version)"
+
       - name: Build frontend
         working-directory: frontend-src
         run: |
