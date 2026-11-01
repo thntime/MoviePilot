@@ -5673,9 +5673,9 @@
       "statements": 984
     },
     "modules": {
-      "covered_lines": 22551,
-      "percent": 60.46,
-      "statements": 37298
+      "covered_lines": 22972,
+      "percent": 60.59,
+      "statements": 37913
     },
     "monitor": {
       "covered_lines": 1247,
@@ -5726,8 +5726,8 @@
     "root": "app"
   },
   "total": {
-    "covered_lines": 126886,
-    "percent": 77.68,
-    "statements": 163347
+    "covered_lines": 127307,
+    "percent": 77.64,
+    "statements": 163962
   }
 }
