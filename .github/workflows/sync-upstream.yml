@@ -99,9 +99,10 @@ jobs:
             body=$(printf '自动同步上游 `%s` 失败，存在合并冲突，未推送任何改动。\n\n- 仓库：`%s`\n- 上游提交：`%s`\n- 运行记录：%s\n\n**同步失败的文件：**\n\n%s\n' \
               "$UPSTREAM_REPO" "$GITHUB_REPOSITORY" "${UPSTREAM_HEAD:-unknown}" "$RUN_URL" "$files")
           fi
-          existing=$(gh issue list --state open --search "\"$ISSUE_TITLE\" in:title" --json number --jq '.[0].number // empty')
+          existing=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
+            --jq "[.[] | select(.title == \"${ISSUE_TITLE}\") | .number][0] // empty")
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body "$body"
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${existing}/comments" -f body="$body" > /dev/null
           else
-            gh issue create --title "$ISSUE_TITLE" --body "$body"
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues" -f title="$ISSUE_TITLE" -f body="$body" > /dev/null
           fi
