@@ -423,6 +423,24 @@
     },
     "target": "app.runtime.execution.run_in_threadpool"
   },
+  "app/modules/cloudsaver/__init__.py:asyncio.to_thread": {
+    "owners": {
+      "CloudSaverModule.async_search_netdisk_torrents": 1
+    },
+    "target": "asyncio.to_thread"
+  },
+  "app/modules/cloudsaver/__init__.py:concurrent.futures.Executor.submit": {
+    "owners": {
+      "CloudSaverModule._filter_alive_shares": 1
+    },
+    "target": "concurrent.futures.Executor.submit"
+  },
+  "app/modules/cloudsaver/__init__.py:concurrent.futures.ThreadPoolExecutor": {
+    "owners": {
+      "CloudSaverModule._filter_alive_shares": 1
+    },
+    "target": "concurrent.futures.ThreadPoolExecutor"
+  },
   "app/modules/discord/discord.py:app.runtime.execution.run_in_threadpool": {
     "owners": {
       "Discord._send_file": 1
@@ -468,6 +486,21 @@
   "app/modules/qqbot/qqbot.py:threading.Thread": {
     "owners": {
       "QQBot._start_gateway": 1
+    },
+    "target": "threading.Thread"
+  },
+  "app/modules/quark/__init__.py:threading.Thread": {
+    "owners": {
+      "QuarkModule.download": 1,
+      "QuarkModule.start_torrents": 1
+    },
+    "target": "threading.Thread"
+  },
+  "app/modules/quark/engine.py:threading.Thread": {
+    "owners": {
+      "ChunkedDownloader._run_elastic": 1,
+      "ChunkedDownloader._run_main": 1,
+      "ChunkedDownloader.run": 1
     },
     "target": "threading.Thread"
   },
