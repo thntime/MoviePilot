@@ -1,0 +1,108 @@
+name: Docker Hub Image
+
+# 手动触发或 v3 分支有提交时，构建包含前端的完整镜像并推送到 Docker Hub。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - v3
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-hub-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: thntime/moviepilot-v3
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v7
+
+      - name: Checkout frontend
+        uses: actions/checkout@v7
+        with:
+          repository: thntime/MoviePilot-Frontend
+          ref: v3
+          path: frontend-src
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: yarn
+          cache-dependency-path: frontend-src/yarn.lock
+
+      - name: Build frontend
+        working-directory: frontend-src
+        run: |
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
+          yarn install --frozen-lockfile --network-timeout 600000
+          yarn build
+
+      - name: Assemble frontend-dist
+        run: |
+          set -euo pipefail
+          test -f frontend-src/dist/index.html
+          rm -rf frontend-dist
+          mkdir -p frontend-dist
+          cp -a frontend-src/dist/. frontend-dist/
+          rm -f frontend-dist/.gitkeep
+          du -sh frontend-dist
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          app_version=$(sed -nE "s/^APP_VERSION[[:space:]]*=[[:space:]]*'v?([^']+)'[[:space:]]*$/\1/p" version.py)
+          test -n "$app_version"
+          echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.version.outputs.app_version }}
+            type=raw,value=sha-${{ steps.version.outputs.short_sha }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          pull: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MOVIEPILOT_FRONTEND_VERSION=${{ steps.version.outputs.app_version }}
+            MOVIEPILOT_PYTHON_VARIANT=standard
+          cache-from: type=gha,scope=dockerhub-amd64
+          cache-to: type=gha,scope=dockerhub-amd64,mode=max
