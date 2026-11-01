@@ -3635,6 +3635,16 @@
       "percent": 85.06,
       "statements": 261
     },
+    "app/modules/aria2/__init__.py": {
+      "covered_lines": 394,
+      "percent": 76.21,
+      "statements": 517
+    },
+    "app/modules/aria2/aria2.py": {
+      "covered_lines": 27,
+      "percent": 27.55,
+      "statements": 98
+    },
     "app/modules/bangumi/__init__.py": {
       "covered_lines": 184,
       "percent": 80.7,
