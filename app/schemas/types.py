@@ -462,6 +462,34 @@ class SystemConfigKey(Enum):
     NetdiskShortDramaMaxDuration = "NetdiskShortDramaMaxDuration"
     # 网盘短剧判定：平均每集大小上限（MB）
     NetdiskShortDramaMaxSize = "NetdiskShortDramaMaxSize"
+    # 网盘下载默认并发连接数
+    NetdiskDownloadThreads = "NetdiskDownloadThreads"
+    # 网盘单任务最大并发下载文件数
+    NetdiskMaxConcurrentDownloads = "NetdiskMaxConcurrentDownloads"
+    # 网盘全局限速（字节/秒，0 表示不限）
+    NetdiskDownloadSpeedLimit = "NetdiskDownloadSpeedLimit"
+    # 网盘分片重试次数
+    NetdiskDownloadRetries = "NetdiskDownloadRetries"
+    # 网盘下载读缓冲大小（字节）
+    NetdiskDownloadBufferSize = "NetdiskDownloadBufferSize"
+    # 网盘慢连接抢占开关
+    NetdiskSlowPreemptEnabled = "NetdiskSlowPreemptEnabled"
+    # 网盘慢连接判定阈值（字节/秒）
+    NetdiskSlowPreemptMinBps = "NetdiskSlowPreemptMinBps"
+    # 网盘慢连接判定时长（秒）
+    NetdiskSlowPreemptMinAge = "NetdiskSlowPreemptMinAge"
+    # 网盘多账号多源开关
+    NetdiskMultiSourceEnabled = "NetdiskMultiSourceEnabled"
+    # 网盘自动转存开关
+    NetdiskAutoTransferEnabled = "NetdiskAutoTransferEnabled"
+    # 网盘直链刷新节流（秒）
+    NetdiskLinkRefreshSeconds = "NetdiskLinkRefreshSeconds"
+    # 网盘有效性检查并发数
+    NetdiskProbeConcurrency = "NetdiskProbeConcurrency"
+    # 网盘有效性检查总预算（秒）
+    NetdiskProbeBudgetSeconds = "NetdiskProbeBudgetSeconds"
+    # 网盘单次搜索最多检查候选数
+    NetdiskProbeLimit = "NetdiskProbeLimit"
     # 订阅默认过滤规则组
     SubscribeFilterRuleGroups = "SubscribeFilterRuleGroups"
     # 补全搜索策略：smart 默认、full 全量、single_page 仅第一页；洗版始终全量
@@ -698,8 +726,10 @@ class DownloaderType(Enum):
     Rtorrent = "Rtorrent"
     # Aria2 下载器
     Aria2 = "Aria2"
-    # 夸克网盘下载器（并发 Range 分片）
+    # 夸克网盘下载器（历史类型，启动时迁移为 Netdisk）
     Quark = "Quark"
+    # 通用网盘下载器（并发 Range 分片，支持多平台）
+    Netdisk = "Netdisk"
 
 
 # 媒体服务器类型

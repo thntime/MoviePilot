@@ -32,8 +32,7 @@ _EPISODE_COVERAGE_THRESHOLD = 0.8
 _DEFAULT_SHORT_DRAMA_SECONDS = 300
 _DEFAULT_SHORT_DRAMA_MB = 150
 
-# 当前只展示夸克分享；其他平台既不支持转存，也没有有效性检查接口。
-_ALLOWED_PLATFORMS = frozenset({"quark"})
+# 网盘候选只保留已注册取链适配器的平台；未实现平台不进入候选。
 # 分享有效性检查的并发数、总预算与单次搜索最多检查的候选数。
 _ALIVE_WORKERS = 16
 _ALIVE_BUDGET_SECONDS = 30
@@ -43,6 +42,23 @@ _ALIVE_CACHE_TTL = 1800
 _ALIVE_CACHE_LIMIT = 2000
 _alive_cache: Dict[str, Tuple[float, bool, Optional[Dict[str, Any]]]] = {}
 _alive_lock = threading.Lock()
+
+
+def _platform_supported(platform: str) -> bool:
+    """
+    判断平台是否已注册取链适配器。
+
+    :param platform: 平台标识
+    :return: 已实现返回 True
+    """
+    from app.application.netdisk.registry import find_adapter, registered_platforms
+    from app.domain.netdisk import normalize_platform
+
+    if find_adapter(platform) is not None:
+        return True
+    if registered_platforms():
+        return False
+    return normalize_platform(platform) is not None
 
 
 class CloudSaverModule(_ModuleBase):
@@ -210,7 +226,7 @@ class CloudSaverModule(_ModuleBase):
                 if not url:
                     continue
                 platform = self._as_text(link.get("platform"))
-                if platform not in _ALLOWED_PLATFORMS:
+                if not _platform_supported(platform):
                     continue
                 # 同一分享可能以不同链接形式重复出现，按分享码去重，无法解析时退回链接本身。
                 share_code = parse_share_code(url)
@@ -404,6 +420,14 @@ class CloudSaverModule(_ModuleBase):
         file_size = int(detail.get("file_size") or 0)
         if file_size > 0:
             torrent.size = float(file_size)
+        token_value = str(detail.get("stoken") or "").strip()
+        if token_value:
+            torrent.netdisk_share_token = token_value
+        if detail.get("unverified"):
+            marker = "（未验证）"
+            description = str(torrent.description or "")
+            if marker not in description:
+                torrent.description = f"{description}{marker}" if description else marker
         token = CloudSaverModule._episode_token([str(entry.get("name") or "") for entry in files or []])
         if not token:
             return
@@ -431,7 +455,7 @@ class CloudSaverModule(_ModuleBase):
         torrent: TorrentInfo,
         share_code: str,
         detail: Dict[str, Any],
-        quark: QuarkShareClient,
+        quark: Optional[QuarkShareClient],
     ) -> bool:
         """
         判断候选是否通过质量检查：文件树完整、集数清晰、不是短剧。
@@ -444,7 +468,10 @@ class CloudSaverModule(_ModuleBase):
         :param quark: 夸克分享客户端
         :return: 通过返回 True
         """
-        files = self._share_files(quark, share_code, detail)
+        preloaded = detail.get("_files")
+        files = preloaded if isinstance(preloaded, list) else (
+            self._share_files(quark, share_code, detail) if quark is not None else None
+        )
         videos = self._video_files(files or [])
         if files is None or not self._is_episode_clear(videos):
             # 拿不到完整文件树或集数不清晰：丢弃，避免展示错误集数。
@@ -476,10 +503,62 @@ class CloudSaverModule(_ModuleBase):
         :param cached_detail: 缓存中已有的分享详情，可跳过详情请求
         :return: (分享详情, 是否通过质量检查)；无法判定时详情为 None
         """
+        platform = str(torrent.netdisk_platform or "").strip()
+        if platform and platform != "quark":
+            return self._inspect_remote_share(torrent, platform)
         detail = cached_detail or client.share_detail(share_code, torrent.share_password)
         if not detail or not detail.get("alive"):
             return detail, False
         return detail, self._passes_quality(torrent, share_code, detail, quark)
+
+    @staticmethod
+    def _mark_unverified(torrent: TorrentInfo) -> None:
+        """
+        在候选描述中标注未验证状态，避免与已确认有效的分享混淆。
+
+        :param torrent: 网盘候选
+        """
+        marker = "（未验证）"
+        description = str(torrent.description or "")
+        if marker not in description:
+            torrent.description = f"{description}{marker}" if description else marker
+
+    def _inspect_remote_share(self, torrent: TorrentInfo, platform: str) -> Tuple[Optional[Dict[str, Any]], bool]:
+        """
+        用统一取链适配器检查非夸克平台候选。
+
+        明确失效返回 `alive=False`；鉴权、超时或网络异常返回未验证标记，
+        由调用方保留候选而不是直接丢弃。
+
+        :param torrent: 待检查的网盘候选
+        :param platform: 平台标识
+        :return: (分享详情, 是否通过质量检查)
+        """
+        from app.application.netdisk.resolve import NetdiskResolveService
+        from app.domain.netdisk import NetdiskError, NetdiskErrorCode
+
+        try:
+            service = NetdiskResolveService()
+            walked = service.walk(
+                str(torrent.enclosure or ""),
+                torrent.share_password,
+                platform,
+            )
+        except NetdiskError as error:
+            if error.code is NetdiskErrorCode.SHARE_INVALID:
+                return {"alive": False}, False
+            return {"alive": True, "unverified": True}, True
+        except Exception:  # noqa: BLE001 - 网络与超时统一按未验证保留
+            return {"alive": True, "unverified": True}, True
+        files = [{"name": item.name, "size": item.size} for item in walked.files]
+        detail = {
+            "alive": True,
+            "file_size": walked.detail.size,
+            "file_names": [item.name for item in walked.detail.files],
+            "stoken": walked.detail.stoken,
+            "_files": files,
+        }
+        return detail, self._passes_quality(torrent, walked.ref.share_id, detail, None)
 
     def _filter_alive_shares(
         self,
@@ -487,7 +566,9 @@ class CloudSaverModule(_ModuleBase):
         torrents: List[TorrentInfo],
     ) -> List[TorrentInfo]:
         """
-        只保留仍然有效且通过质量检查的分享，并按发布时间优先检查最新的若干条。
+        保留有效或无法判定的分享，丢弃明确失效的分享，并按发布时间优先检查最新的若干条。
+
+        无法判定（鉴权、超时、网络异常）的候选保留并在描述中标注未验证。
 
         :param site: CD 站点配置
         :param torrents: 去重后的网盘候选
@@ -527,12 +608,10 @@ class CloudSaverModule(_ModuleBase):
                     torrent, share_code, cache_key = futures[future]
                     try:
                         detail, passed = future.result()
-                    except Exception:
-                        detail, passed = None, False
+                    except Exception:  # noqa: BLE001 - 无法判定按未验证保留
+                        detail, passed = {"alive": True, "unverified": True}, True
                     if detail is None:
-                        # 无法判定时按失效处理，保证只展示确认可用的分享。
-                        alive_flags[id(torrent)] = False
-                        continue
+                        detail, passed = {"alive": True, "unverified": True}, True
                     if not detail.get("alive"):
                         self._store_alive(cache_key, False)
                         alive_flags[id(torrent)] = False
@@ -540,12 +619,20 @@ class CloudSaverModule(_ModuleBase):
                     if not passed:
                         alive_flags[id(torrent)] = False
                         continue
-                    self._store_alive(cache_key, True, detail)
+                    if detail.get("unverified"):
+                        self._mark_unverified(torrent)
+                    else:
+                        self._store_alive(cache_key, True, detail)
                     alive_flags[id(torrent)] = True
             except TimeoutError:
-                logger.debug("CD 站点分享有效性检查超时，未完成的候选按失效处理")
+                logger.debug("CD 站点分享有效性检查超时，未完成的候选按未验证保留")
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)
+        for torrent in ordered:
+            if id(torrent) in alive_flags:
+                continue
+            alive_flags[id(torrent)] = True
+            self._mark_unverified(torrent)
         return [torrent for torrent in ordered if alive_flags.get(id(torrent))]
 
     def search_netdisk_torrents(

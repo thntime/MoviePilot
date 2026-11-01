@@ -12,6 +12,7 @@ from app.chain.download.contract import _DownloadOwnerBase
 from app.domain import episode as episode_rules
 from app.domain.context import (
     Context,
+    TorrentInfo,
 )
 from app.runtime.log import logger
 from app.runtime.stop import runtime_stop_state
@@ -207,6 +208,34 @@ class _BatchDownloadRun:
         if fingerprint:
             self.failures[fingerprint] = None
 
+    def _netdisk_episodes(self, torrent: TorrentInfo) -> Optional[List[int]]:
+        """
+        从网盘分享的文件清单解析覆盖集数。
+
+        :param torrent: 网盘候选
+        :return: 升序集数列表；分享不可读或没有可解析集数时返回 None
+        """
+        from app.application.netdisk.resolve import NetdiskResolveService
+        from app.domain.netdisk import NetdiskError
+
+        try:
+            walked = NetdiskResolveService().walk(
+                str(getattr(torrent, "enclosure", "") or ""),
+                getattr(torrent, "share_password", None),
+                getattr(torrent, "netdisk_platform", None),
+                share_token=str(getattr(torrent, "netdisk_share_token", "") or ""),
+            )
+        except NetdiskError as error:
+            logger.warn(f"网盘分享读取失败：{error.message}")
+            return None
+        except Exception as error:  # noqa: BLE001 - 网络异常按不可读处理
+            logger.warn(f"网盘分享读取异常：{type(error).__name__}")
+            return None
+        episodes: Set[int] = set()
+        for item in walked.files:
+            episodes.update(episode_rules.episode_numbers(item.name))
+        return sorted(episodes) or None
+
     def _read_torrent(
             self, context: Context, *, partial: bool = False,
     ) -> Optional[Tuple[bytes, List[int]]]:
@@ -218,8 +247,11 @@ class _BatchDownloadRun:
         meta = context.meta_info
         assert meta is not None
         if str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk":
-            # 网盘分享不是种子，无法解析集数，跳过整季/整包评估，交给单条下载路径。
-            return None
+            episodes = self._netdisk_episodes(torrent)
+            if not episodes:
+                logger.info(f"{meta.org_string} 网盘分享内未解析到可用集数")
+                return None
+            return b"", episodes
         logger.info(f"开始下载种子 {torrent.title} ...")
         errors: List[str] = []
         content, _, files = self.owner.download_torrent(torrent, on_failure=errors.append)
@@ -303,9 +335,11 @@ class _BatchDownloadRun:
 
     def _inspect_whole_season(
             self, context: Context, media_key: str, season: int,
-    ) -> Optional[Tuple[bytes, bool]]:
+    ) -> Optional[Tuple[bytes, bool, Optional[Set[int]]]]:
         """
         整季不合格也保留识别集数，供后续完整集阶段继续判断该候选。
+
+        :return: (下载内容, 是否完整覆盖, 网盘目标集数)；非网盘资源目标集数为 None
         """
         parsed = self._read_torrent(context)
         if parsed is None:
@@ -320,6 +354,25 @@ class _BatchDownloadRun:
         required = _selection.get_required_episodes(self.no_exists, media_key, season) \
             if _selection.requires_complete_coverage(info) else set()
         total = _selection.get_season_episodes(self.no_exists, media_key, season)
+        torrent = context.torrent_info
+        is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
+        if is_netdisk:
+            pack = set(episodes)
+            target = set(required).intersection(pack) if required else pack
+            if not target:
+                reason = "分享内没有目标集" if required else "分享内没有可下载集数"
+                logger.info(
+                    f"{meta.org_string} {reason}，目标 "
+                    f"{episode_rules.format_ranges(sorted(required)) or '全部'}")
+                governance = self.options.get("governance")
+                if governance:
+                    governance.report(context, "failed", f"网盘分享内没有目标集：{reason}")
+                return None
+            logger.info(
+                f"{meta.org_string} 目标集数 {episode_rules.format_ranges(sorted(target))}，"
+                f"分享内 {len(episodes)} 个文件")
+            complete = bool(required) and set(required).issubset(set(episodes))
+            return content, complete, target
         complete = bool(required) and required.issubset(set(episodes))
         if complete:
             logger.info(
@@ -334,7 +387,7 @@ class _BatchDownloadRun:
         if not required and total and len(episodes) < total:
             logger.info(f"{meta.org_string} 解析文件集数发现不是完整合集，先放弃这个种子")
             return None
-        return content, complete
+        return content, complete, None
 
     def _submit_whole_season(
             self, context: Context, media_key: str, seasons: List[int],
@@ -348,10 +401,13 @@ class _BatchDownloadRun:
             inspected = self._inspect_whole_season(context, media_key, seasons[0])
             if inspected is None:
                 return False
-            content, complete = inspected
+            content, complete, target_episodes = inspected
             logger.info(f"开始下载 {context.torrent_info.title} ...")
+            options = dict(self.options)
+            if target_episodes:
+                options["episodes"] = set(target_episodes)
             download_id = self.owner.download_single(
-                context=context, torrent_content=content, **self.options,
+                context=context, torrent_content=content, **options,
             )
         else:
             logger.info(f"开始下载 {context.torrent_info.title} ...")
@@ -394,11 +450,17 @@ class _BatchDownloadRun:
             meta = context.meta_info
             assert meta is not None
             logger.info(f"开始下载 {meta.title} ...")
-            if not self.owner.download_single(context, **self.options):
+            options = dict(self.options)
+            if str(getattr(context.torrent_info, "download_type", "torrent") or "torrent") == "netdisk":
+                options["episodes"] = set(episodes)
+            if not self.owner.download_single(context, **options):
                 self._remember_failure(context)
                 continue
             if _selection.requires_complete_coverage(info):
-                context.confirmed_full_coverage = True
+                effective_needed = _selection.apply_allowed_episodes(set(needed), context)
+                is_netdisk = str(getattr(context.torrent_info, "download_type", "torrent") or "torrent") == "netdisk"
+                if not is_netdisk or set(episodes) == effective_needed:
+                    context.confirmed_full_coverage = True
             logger.info(f"{meta.title} 添加下载成功")
             self.downloaded.append(context)
             needed = _selection.update_no_exists_episodes(
@@ -422,11 +484,31 @@ class _BatchDownloadRun:
             return set()
         if len(meta.season_list) != 1 or meta.season_list[0] != season:
             return set()
-        episodes = set(meta.episode_list)
-        if not episodes:
-            return set()
+        torrent = context.torrent_info
+        is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
         effective = _selection.apply_allowed_episodes(set(needed), context)
         if not effective:
+            return set()
+        if is_netdisk and torrent is not None:
+            share_episodes = set(self._netdisk_episodes(torrent) or [])
+            if not share_episodes:
+                logger.info(f"{meta.org_string} 网盘分享内未解析到可用集数")
+                return set()
+            target = share_episodes.intersection(effective)
+            if not target:
+                logger.info(
+                    f"{meta.org_string} 分享内没有目标集，"
+                    f"目标 {episode_rules.format_ranges(sorted(effective))}")
+                governance = self.options.get("governance")
+                if governance:
+                    governance.report(context, "failed", "网盘分享内没有目标集")
+                return set()
+            logger.info(
+                f"{meta.org_string} 目标集数 {episode_rules.format_ranges(sorted(target))}，"
+                f"分享内 {len(share_episodes)} 个文件")
+            return target
+        episodes = set(meta.episode_list)
+        if not episodes:
             return set()
         if _selection.requires_complete_coverage(info):
             required = _selection.get_required_episodes(self.no_exists, media_key, season)

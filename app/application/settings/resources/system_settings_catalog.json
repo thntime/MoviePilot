@@ -1621,13 +1621,13 @@
       "description": "AI智能体配置",
       "enum_name": "AIAgentConfig",
       "source_file": "app/schemas/types.py",
-      "source_line": 499
+      "source_line": 527
     },
     "AIAgentMcpServers": {
       "description": "AI智能体外部MCP服务器配置",
       "enum_name": "AIAgentMcpServers",
       "source_file": "app/schemas/types.py",
-      "source_line": 503
+      "source_line": 531
     },
     "AppPushCredentials": {
       "description": "App 中心推送自动接入凭据，业务内部维护且不进入通知渠道配置",
@@ -1639,7 +1639,7 @@
       "description": "洗版默认过滤规则组",
       "enum_name": "BestVersionFilterRuleGroups",
       "source_file": "app/schemas/types.py",
-      "source_line": 472
+      "source_line": 500
     },
     "CustomFilterRules": {
       "description": "用户自定义规则",
@@ -1669,19 +1669,19 @@
       "description": "默认电影订阅规则",
       "enum_name": "DefaultMovieSubscribeConfig",
       "source_file": "app/schemas/types.py",
-      "source_line": 487
+      "source_line": 515
     },
     "DefaultMusicSubscribeConfig": {
       "description": "默认音乐订阅规则",
       "enum_name": "DefaultMusicSubscribeConfig",
       "source_file": "app/schemas/types.py",
-      "source_line": 491
+      "source_line": 519
     },
     "DefaultTvSubscribeConfig": {
       "description": "默认电视剧订阅规则",
       "enum_name": "DefaultTvSubscribeConfig",
       "source_file": "app/schemas/types.py",
-      "source_line": 489
+      "source_line": 517
     },
     "Directories": {
       "description": "目录配置",
@@ -1705,13 +1705,13 @@
       "description": "Follow订阅分享者",
       "enum_name": "FollowSubscribers",
       "source_file": "app/schemas/types.py",
-      "source_line": 495
+      "source_line": 523
     },
     "GithubAuth": {
       "description": "GitHub OAuth 设备授权元数据",
       "enum_name": "GithubAuth",
       "source_file": "app/schemas/types.py",
-      "source_line": 501
+      "source_line": 529
     },
     "IndexerSites": {
       "description": "搜索站点范围",
@@ -1723,13 +1723,13 @@
       "description": "多媒体自动分类策略及其有界历史",
       "enum_name": "MediaClassificationPolicy",
       "source_file": "app/schemas/types.py",
-      "source_line": 517
+      "source_line": 545
     },
     "MediaRecognizeShareCount": {
       "description": "共享媒体识别成功次数",
       "enum_name": "MediaRecognizeShareCount",
       "source_file": "app/schemas/types.py",
-      "source_line": 515
+      "source_line": 543
     },
     "MediaServers": {
       "description": "媒体服务器配置",
@@ -1743,6 +1743,72 @@
       "source_file": "app/schemas/types.py",
       "source_line": 436
     },
+    "NetdiskAutoTransferEnabled": {
+      "description": "网盘自动转存开关",
+      "enum_name": "NetdiskAutoTransferEnabled",
+      "source_file": "app/schemas/types.py",
+      "source_line": 484
+    },
+    "NetdiskDownloadBufferSize": {
+      "description": "网盘下载读缓冲大小（字节）",
+      "enum_name": "NetdiskDownloadBufferSize",
+      "source_file": "app/schemas/types.py",
+      "source_line": 474
+    },
+    "NetdiskDownloadRetries": {
+      "description": "网盘分片重试次数",
+      "enum_name": "NetdiskDownloadRetries",
+      "source_file": "app/schemas/types.py",
+      "source_line": 472
+    },
+    "NetdiskDownloadSpeedLimit": {
+      "description": "网盘全局限速（字节/秒，0 表示不限）",
+      "enum_name": "NetdiskDownloadSpeedLimit",
+      "source_file": "app/schemas/types.py",
+      "source_line": 470
+    },
+    "NetdiskDownloadThreads": {
+      "description": "网盘下载默认并发连接数",
+      "enum_name": "NetdiskDownloadThreads",
+      "source_file": "app/schemas/types.py",
+      "source_line": 466
+    },
+    "NetdiskLinkRefreshSeconds": {
+      "description": "网盘直链刷新节流（秒）",
+      "enum_name": "NetdiskLinkRefreshSeconds",
+      "source_file": "app/schemas/types.py",
+      "source_line": 486
+    },
+    "NetdiskMaxConcurrentDownloads": {
+      "description": "网盘单任务最大并发下载文件数",
+      "enum_name": "NetdiskMaxConcurrentDownloads",
+      "source_file": "app/schemas/types.py",
+      "source_line": 468
+    },
+    "NetdiskMultiSourceEnabled": {
+      "description": "网盘多账号多源开关",
+      "enum_name": "NetdiskMultiSourceEnabled",
+      "source_file": "app/schemas/types.py",
+      "source_line": 482
+    },
+    "NetdiskProbeBudgetSeconds": {
+      "description": "网盘有效性检查总预算（秒）",
+      "enum_name": "NetdiskProbeBudgetSeconds",
+      "source_file": "app/schemas/types.py",
+      "source_line": 490
+    },
+    "NetdiskProbeConcurrency": {
+      "description": "网盘有效性检查并发数",
+      "enum_name": "NetdiskProbeConcurrency",
+      "source_file": "app/schemas/types.py",
+      "source_line": 488
+    },
+    "NetdiskProbeLimit": {
+      "description": "网盘单次搜索最多检查候选数",
+      "enum_name": "NetdiskProbeLimit",
+      "source_file": "app/schemas/types.py",
+      "source_line": 492
+    },
     "NetdiskShortDramaMaxDuration": {
       "description": "网盘短剧判定：平均每集时长上限（秒）",
       "enum_name": "NetdiskShortDramaMaxDuration",
@@ -1755,17 +1821,35 @@
       "source_file": "app/schemas/types.py",
       "source_line": 464
     },
+    "NetdiskSlowPreemptEnabled": {
+      "description": "网盘慢连接抢占开关",
+      "enum_name": "NetdiskSlowPreemptEnabled",
+      "source_file": "app/schemas/types.py",
+      "source_line": 476
+    },
+    "NetdiskSlowPreemptMinAge": {
+      "description": "网盘慢连接判定时长（秒）",
+      "enum_name": "NetdiskSlowPreemptMinAge",
+      "source_file": "app/schemas/types.py",
+      "source_line": 480
+    },
+    "NetdiskSlowPreemptMinBps": {
+      "description": "网盘慢连接判定阈值（字节/秒）",
+      "enum_name": "NetdiskSlowPreemptMinBps",
+      "source_file": "app/schemas/types.py",
+      "source_line": 478
+    },
     "NotificationClearBefore": {
       "description": "通知中心清理时间",
       "enum_name": "NotificationClearBefore",
       "source_file": "app/schemas/types.py",
-      "source_line": 507
+      "source_line": 535
     },
     "NotificationSendTime": {
       "description": "通知发送时间",
       "enum_name": "NotificationSendTime",
       "source_file": "app/schemas/types.py",
-      "source_line": 497
+      "source_line": 525
     },
     "NotificationSwitchs": {
       "description": "通知场景开关设置",
@@ -1777,7 +1861,7 @@
       "description": "通知消息格式模板",
       "enum_name": "NotificationTemplates",
       "source_file": "app/schemas/types.py",
-      "source_line": 505
+      "source_line": 533
     },
     "Notifications": {
       "description": "消息通知配置",
@@ -1789,25 +1873,25 @@
       "description": "插件文件夹分组配置",
       "enum_name": "PluginFolders",
       "source_file": "app/schemas/types.py",
-      "source_line": 485
+      "source_line": 513
     },
     "PluginInstallReport": {
       "description": "插件安装统计",
       "enum_name": "PluginInstallReport",
       "source_file": "app/schemas/types.py",
-      "source_line": 511
+      "source_line": 539
     },
     "PluginInstances": {
       "description": "共享源码插件的虚拟运行实例（已迁移到独立表，本键保留作回滚依据）",
       "enum_name": "PluginInstances",
       "source_file": "app/schemas/types.py",
-      "source_line": 480
+      "source_line": 508
     },
     "PluginInstancesImported": {
       "description": "上面那个旧键各条目导入独立表时的内容指纹 {实例ID: 摘要}，据此识别回滚到旧版本 后新增或改写过的条目，同时避免把用户删掉的分身重新导回",
       "enum_name": "PluginInstancesImported",
       "source_file": "app/schemas/types.py",
-      "source_line": 483
+      "source_line": 511
     },
     "RssSites": {
       "description": "订阅站点范围",
@@ -1819,7 +1903,7 @@
       "description": "刮削开关设置",
       "enum_name": "ScrapingSwitchs",
       "source_file": "app/schemas/types.py",
-      "source_line": 509
+      "source_line": 537
     },
     "SearchFilterRuleGroups": {
       "description": "搜索默认过滤规则组",
@@ -1837,25 +1921,25 @@
       "description": "订阅默认参数",
       "enum_name": "SubscribeDefaultParams",
       "source_file": "app/schemas/types.py",
-      "source_line": 470
+      "source_line": 498
     },
     "SubscribeFilterRuleGroups": {
       "description": "订阅默认过滤规则组",
       "enum_name": "SubscribeFilterRuleGroups",
       "source_file": "app/schemas/types.py",
-      "source_line": 466
+      "source_line": 494
     },
     "SubscribeReport": {
       "description": "订阅统计",
       "enum_name": "SubscribeReport",
       "source_file": "app/schemas/types.py",
-      "source_line": 474
+      "source_line": 502
     },
     "SubscribeSearchStrategy": {
       "description": "补全搜索策略：smart 默认、full 全量、single_page 仅第一页；洗版始终全量",
       "enum_name": "SubscribeSearchStrategy",
       "source_file": "app/schemas/types.py",
-      "source_line": 468
+      "source_line": 496
     },
     "TorrentsPriority": {
       "description": "种子优先级规则",
@@ -1873,13 +1957,13 @@
       "description": "绿联影视登录会话缓存",
       "enum_name": "UgreenSessionCache",
       "source_file": "app/schemas/types.py",
-      "source_line": 513
+      "source_line": 541
     },
     "UserCustomCSS": {
       "description": "用户自定义CSS",
       "enum_name": "UserCustomCSS",
       "source_file": "app/schemas/types.py",
-      "source_line": 476
+      "source_line": 504
     },
     "UserFilterRuleGroups": {
       "description": "用户规则组",
@@ -1891,13 +1975,13 @@
       "description": "用户已安装的插件",
       "enum_name": "UserInstalledPlugins",
       "source_file": "app/schemas/types.py",
-      "source_line": 478
+      "source_line": 506
     },
     "UserSiteAuthParams": {
       "description": "用户站点认证参数",
       "enum_name": "UserSiteAuthParams",
       "source_file": "app/schemas/types.py",
-      "source_line": 493
+      "source_line": 521
     }
   }
 }

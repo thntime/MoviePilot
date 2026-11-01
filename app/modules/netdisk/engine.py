@@ -4,6 +4,9 @@
 单条 HTTP 连接会被网盘 CDN 限速，引擎把同一文件切成多段、用多条连接各取一段，
 总带宽随连接数叠加。核心机制：分片规划、主池/弹性区、尾部收缩、慢连接抢占、
 断点续传与四道完整性校验。
+
+引擎只认识直链集合，不关心来源平台：分片按序号轮换直链源，每片使用所属源的
+请求头；直链过期时通过 ``url_provider(refresh=True)`` 重新取链后继续未完成分片。
 """
 
 from __future__ import annotations
@@ -11,12 +14,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
+from urllib.parse import urljoin
 
 from app.adapters.network.http import RequestUtils
+from app.domain.netdisk import DirectLink
 from app.runtime.log import logger
 
 # 单片下限与片数上限。
@@ -176,13 +183,13 @@ class _RateLimiter:
     全局限速令牌桶，作用于单个任务的所有连接。
     """
 
-    def __init__(self, limit_kbps: int) -> None:
+    def __init__(self, limit_bytes: int) -> None:
         """
         保存限速值。
 
-        :param limit_kbps: 限速 KB/s，0 表示不限速
+        :param limit_bytes: 限速字节每秒，0 表示不限速
         """
-        self.bytes_per_second = max(int(limit_kbps or 0), 0) * 1024
+        self.bytes_per_second = max(int(limit_bytes or 0), 0)
         self._lock = threading.Lock()
         self._started = time.monotonic()
         self._sent = 0
@@ -206,11 +213,15 @@ class ChunkedDownloader:
     单文件分片下载器。
 
     使用绝对偏移写入目标文件，配合 ``<target>.plan.json`` 记录已完成区间，
-    进程重启后从磁盘真实长度恢复。
+    进程重启后从磁盘真实长度恢复。分片按序号轮换 ``links`` 中的直链源。
     """
 
-    def __init__(self, target: Path, total: int, threads: int, rate_limit_kbps: int = 0,
-                 preempt: bool = True, headers: Optional[Dict[str, str]] = None,
+    def __init__(self, target: Path, total: int, links: Sequence[DirectLink],
+                 threads: int = 8, rate_limit_bytes: int = 0,
+                 preempt: bool = True, buffer_size: int = READ_BUFFER,
+                 retries: int = 3, preempt_bps: int = WATCHDOG_MIN_SPEED,
+                 preempt_age_seconds: float = PREEMPT_MIN_ELAPSED,
+                 refresh_seconds: int = 30, max_concurrency: int = 0,
                  on_progress: Optional[Callable[[float], None]] = None,
                  stop_event: Optional[threading.Event] = None) -> None:
         """
@@ -218,18 +229,31 @@ class ChunkedDownloader:
 
         :param target: 目标文件路径
         :param total: 文件总字节数
+        :param links: 直链源集合，分片按序号轮换
         :param threads: 并发连接数
-        :param rate_limit_kbps: 全局限速 KB/s
+        :param rate_limit_bytes: 全局限速字节每秒
         :param preempt: 是否启用慢连接抢占
-        :param headers: 下载请求头（Cookie/Referer/UA）
+        :param buffer_size: 网络读缓冲大小
+        :param retries: 分片重试次数
+        :param preempt_bps: 慢连接判定阈值，单位字节每秒
+        :param preempt_age_seconds: 慢连接判定时长
+        :param refresh_seconds: 直链刷新节流，单位秒
+        :param max_concurrency: 平台并发上限，0 表示不限制
         :param on_progress: 进度回调，参数为完成百分比
         :param stop_event: 外部停止信号
         """
         self.target = target
         self.total = total
+        self.links: Tuple[DirectLink, ...] = tuple(links)
         self.threads = max(int(threads), 1)
+        if max_concurrency > 0:
+            self.threads = min(self.threads, int(max_concurrency))
         self.preempt = preempt
-        self.headers = dict(headers or {})
+        self.buffer_size = max(int(buffer_size), 1024)
+        self.retries = max(int(retries), 1)
+        self.preempt_bps = max(int(preempt_bps), 0)
+        self.preempt_age = max(float(preempt_age_seconds), 0.0)
+        self.refresh_seconds = max(int(refresh_seconds), 0)
         self.on_progress = on_progress
         self.stop_event = stop_event or threading.Event()
         # 单文件结束标记：只用于收尾看门狗，不能复用外部 stop_event，
@@ -238,8 +262,10 @@ class ChunkedDownloader:
         # 内部异常中止信号：只用于让本文件其余分片停下，不能传给任务级暂停判断。
         self._abort = threading.Event()
         self.plan_path = target.with_suffix(target.suffix + ".plan.json")
-        self.limiter = _RateLimiter(rate_limit_kbps)
+        self.limiter = _RateLimiter(rate_limit_bytes)
         self._lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
+        self._refreshed_at = 0.0
         self._written = 0
         self._chunks: List[_Chunk] = []
         self._error: Optional[Exception] = None
@@ -295,7 +321,7 @@ class ChunkedDownloader:
             remaining = end - start + 1
             position = start
             while remaining > 0:
-                data = os.pread(handle, min(READ_BUFFER, remaining), position)
+                data = os.pread(handle, min(self.buffer_size, remaining), position)
                 if not data:
                     break
                 digest.update(data)
@@ -362,12 +388,16 @@ class ChunkedDownloader:
 
     # ---- 下载 ----
 
-    def run(self, url_provider: Callable[..., str]) -> None:
+    def run(self, url_provider: Callable[..., Sequence[DirectLink]]) -> None:
         """
         执行下载。
 
-        :param url_provider: 返回直链的回调；传入 True 表示请求刷新会话后重新取链
+        :param url_provider: 返回直链集合的回调；传入 True 表示刷新会话后重新取链
         """
+        if not self.links:
+            self.links = tuple(url_provider())
+        if not self.links:
+            raise DownloadError("没有可用的下载直链")
         self.target.parent.mkdir(parents=True, exist_ok=True)
         self._chunks = [
             _Chunk(index, start, end)
@@ -415,7 +445,7 @@ class ChunkedDownloader:
                 os.close(self._fd)
                 self._fd = None
 
-    def _run_main(self, url_provider: Callable[[], str]) -> None:
+    def _run_main(self, url_provider: Callable[..., Sequence[DirectLink]]) -> None:
         """
         下载主池分片。
 
@@ -447,7 +477,7 @@ class ChunkedDownloader:
         for thread in threads:
             thread.join()
 
-    def _run_elastic(self, url_provider: Callable[[], str], cursor: int) -> None:
+    def _run_elastic(self, url_provider: Callable[..., Sequence[DirectLink]], cursor: int) -> None:
         """
         下载弹性区：按剩余量动态切块，尾部收缩到 workers 均分。
 
@@ -511,7 +541,7 @@ class ChunkedDownloader:
         """
         return self.stop_event.is_set() or self._abort.is_set()
 
-    def _worker(self, chunk: _Chunk, url_provider: Callable[[], str]) -> None:
+    def _worker(self, chunk: _Chunk, url_provider: Callable[..., Sequence[DirectLink]]) -> None:
         """
         下载单个分片，处理抢占与续传。
         """
@@ -522,7 +552,33 @@ class ChunkedDownloader:
         except Exception as err:  # noqa: BLE001
             self._record_error(err)
 
-    def _download_chunk(self, chunk: _Chunk, url_provider: Callable[..., str]) -> None:
+    def _link_for(self, chunk: _Chunk) -> DirectLink:
+        """
+        按分片序号轮换直链源。
+
+        :param chunk: 当前分片
+        :return: 该分片使用的直链
+        """
+        if not self.links:
+            raise DownloadError("没有可用的下载直链")
+        return self.links[chunk.index % len(self.links)]
+
+    def _refresh_links(self, url_provider: Callable[..., Sequence[DirectLink]]) -> None:
+        """
+        节流刷新直链集合，同一任务在节流窗口内最多刷新一次。
+
+        :param url_provider: 直链回调
+        """
+        with self._refresh_lock:
+            now = time.monotonic()
+            if now - self._refreshed_at < self.refresh_seconds:
+                return
+            self._refreshed_at = now
+            fresh = tuple(url_provider(True))
+            if fresh:
+                self.links = fresh
+
+    def _download_chunk(self, chunk: _Chunk, url_provider: Callable[..., Sequence[DirectLink]]) -> None:
         """
         执行分片下载循环。
 
@@ -530,27 +586,27 @@ class ChunkedDownloader:
         :param url_provider: 直链回调
         """
         retries = 0
-        url = url_provider()
         while not chunk.done and not self._halted:
-            headers = dict(self.headers)
+            link = self._link_for(chunk)
+            headers = dict(link.headers)
             headers["Range"] = f"bytes={chunk.position}-{chunk.end}"
             try:
-                with RequestUtils(timeout=30).get_stream(url, headers=headers) as response:
+                with RequestUtils(timeout=30).get_stream(link.url, headers=headers) as response:
                     chunk.response = response
                     self._consume(chunk, response)
             except RangeIgnored:
                 raise
             except LinkExpired as err:
                 retries += 1
-                if retries > PREEMPT_MAX_PER_CHUNK:
+                if retries > self.retries:
                     raise DownloadError(f"分片 {chunk.index} 直链多次失效：{err}")
                 # 直链与会话绑定，失效后必须刷新会话并重新取链，而不是重试旧 URL。
-                url = url_provider(True)
+                self._refresh_links(url_provider)
             except Exception as err:  # noqa: BLE001
                 retries += 1
                 if self._halted:
                     return
-                if retries > PREEMPT_MAX_PER_CHUNK:
+                if retries > self.retries:
                     raise DownloadError(f"分片 {chunk.index} 重试次数超限：{err}")
                 logger.debug(f"分片 {chunk.index} 中断，从 {chunk.position} 续传：{err}")
                 time.sleep(0.5 * retries)
@@ -580,7 +636,7 @@ class ChunkedDownloader:
         content_range = str(headers.get("Content-Range") or "")
         if not content_range or f"bytes {chunk.position}-" not in content_range:
             raise DownloadError(f"分片 {chunk.index} 的 Content-Range 不匹配：{content_range or '缺失'}")
-        for data in response.iter_content(chunk_size=READ_BUFFER):
+        for data in response.iter_content(chunk_size=self.buffer_size):
             if self._halted:
                 raise DownloadCancelled("下载已取消")
             if not data:
@@ -604,41 +660,49 @@ class ChunkedDownloader:
         if not chunk.done:
             raise DownloadError(f"分片 {chunk.index} 提前结束，剩余 {chunk.end - chunk.position + 1} 字节")
 
-    def _single_stream(self, url_provider: Callable[..., str]) -> None:
+    def _single_stream(self, url_provider: Callable[..., Sequence[DirectLink]]) -> None:
         """
         服务端忽略 Range 时回退单流下载。
 
         :param url_provider: 直链回调
         """
-        url = url_provider()
-        headers = dict(self.headers)
-        headers.pop("Range", None)
-        position = 0
-        try:
-            with RequestUtils(timeout=30).get_stream(url, headers=headers) as response:
-                if response is None or int(getattr(response, "status_code", 0) or 0) != 200:
-                    raise DownloadError("单流回退失败：响应异常")
-                content_type = str(getattr(response, "headers", {}).get("Content-Type") or "")
-                if "text/html" in content_type.lower():
-                    raise DownloadError("单流回退失败：直链返回 HTML 页面")
-                for data in response.iter_content(chunk_size=READ_BUFFER):
-                    if self._halted:
-                        raise DownloadError("下载已取消")
-                    if not data:
-                        continue
-                    fd = self._fd
-                    if fd is None:
-                        raise DownloadError("下载文件句柄已关闭")
-                    os.pwrite(fd, data, position)
-                    position += len(data)
-                    with self._lock:
-                        self._written += len(data)
-                    self.limiter.consume(len(data))
-                    self._report()
-        except DownloadError:
-            raise
-        except Exception as err:  # noqa: BLE001
-            raise DownloadError(f"单流回退失败：{err}")
+        retries = 0
+        while True:
+            link = self.links[0] if self.links else None
+            if link is None:
+                raise DownloadError("单流回退失败：没有可用直链")
+            headers = dict(link.headers)
+            headers.pop("Range", None)
+            position = 0
+            try:
+                with RequestUtils(timeout=30).get_stream(link.url, headers=headers) as response:
+                    if response is None or int(getattr(response, "status_code", 0) or 0) != 200:
+                        raise DownloadError("单流回退失败：响应异常")
+                    content_type = str(getattr(response, "headers", {}).get("Content-Type") or "")
+                    if "text/html" in content_type.lower():
+                        raise DownloadError("单流回退失败：直链返回 HTML 页面")
+                    for data in response.iter_content(chunk_size=self.buffer_size):
+                        if self._halted:
+                            raise DownloadError("下载已取消")
+                        if not data:
+                            continue
+                        fd = self._fd
+                        if fd is None:
+                            raise DownloadError("下载文件句柄已关闭")
+                        os.pwrite(fd, data, position)
+                        position += len(data)
+                        with self._lock:
+                            self._written += len(data)
+                        self.limiter.consume(len(data))
+                        self._report()
+                break
+            except DownloadError:
+                raise
+            except Exception as err:  # noqa: BLE001
+                retries += 1
+                if retries > self.retries:
+                    raise DownloadError(f"单流回退失败：{err}")
+                self._refresh_links(url_provider)
         if position < self.total:
             raise DownloadError("单流回退下载长度不足")
         for chunk in self._chunks:
@@ -675,9 +739,9 @@ class ChunkedDownloader:
             if not speeds:
                 continue
             average = sum(speeds) / len(speeds)
-            threshold = max(WATCHDOG_MIN_SPEED, average / 2)
+            threshold = max(self.preempt_bps, average / 2)
             tail = len(active) <= PREEMPT_TAIL_INFLIGHT
-            min_elapsed = PREEMPT_TAIL_ELAPSED if tail else PREEMPT_MIN_ELAPSED
+            min_elapsed = min(PREEMPT_TAIL_ELAPSED, self.preempt_age) if tail else self.preempt_age
             preempted = 0
             for chunk in active:
                 if preempted >= PREEMPT_MAX_PER_ROUND:
@@ -715,3 +779,303 @@ class ChunkedDownloader:
             # 大文件校验可能持续数十秒，按分片回报进度，避免任务卡在 99% 无反馈。
             if self.on_progress and index % 32 == 0:
                 self.on_progress(99.0 + 1.0 * index / count)
+
+
+# ---- HLS（m3u8）下载 ----
+# 只做「解析播放列表 → 按序下载分片 → 按序合并为单文件」，不转码。
+# 断点以分片序号记录：``<target>.hls.json`` 保存已完成片数与每片字节长度，
+# ``<target>.hls.part`` 保存已合并的数据，恢复时按记录长度截断后继续。
+
+_BANDWIDTH_PATTERN = re.compile(r"BANDWIDTH=(\d+)", re.IGNORECASE)
+_MAP_PATTERN = re.compile(r'#EXT-X-MAP:.*?URI="([^"]+)"', re.IGNORECASE)
+
+
+@dataclass(frozen=True, slots=True)
+class HlsPlaylist:
+    """
+    m3u8 播放列表的解析结果。
+
+    :param segments: 媒体分片地址，已解析为绝对地址
+    :param init_segments: 初始化分片地址（``EXT-X-MAP``），fMP4 流需要
+    :param variant_url: 主播放列表选中的子播放列表地址；本身就是媒体列表时为空
+    """
+
+    segments: Tuple[str, ...] = ()
+    init_segments: Tuple[str, ...] = ()
+    variant_url: str = ""
+
+
+def parse_m3u8(text: str, base_url: str) -> HlsPlaylist:
+    """
+    解析 m3u8 文本，支持相对地址与主播放列表。
+
+    主播放列表存在多个 ``EXT-X-STREAM-INF`` 时按 BANDWIDTH 选最高码率子列表。
+
+    :param text: m3u8 文本
+    :param base_url: 播放列表地址，用于解析相对地址
+    :return: 解析结果
+    """
+    lines = [line.strip() for line in str(text or "").splitlines()]
+    variant = _pick_variant(lines, base_url)
+    if variant:
+        return HlsPlaylist(variant_url=variant)
+
+    init_segments: List[str] = []
+    segments: List[str] = []
+    for line in lines:
+        if not line:
+            continue
+        map_match = _MAP_PATTERN.match(line)
+        if map_match:
+            init_segments.append(urljoin(base_url, map_match.group(1)))
+            continue
+        if line.startswith("#"):
+            continue
+        segments.append(urljoin(base_url, line))
+    return HlsPlaylist(
+        segments=tuple(segments),
+        init_segments=tuple(init_segments),
+    )
+
+
+def _pick_variant(lines: Sequence[str], base_url: str) -> str:
+    """
+    从主播放列表中选择码率最高的子列表。
+
+    :param lines: 去除首尾空白后的文本行
+    :param base_url: 播放列表地址
+    :return: 子播放列表绝对地址；不是主播放列表时为空
+    """
+    best_url = ""
+    best_bandwidth = -1
+    for index, line in enumerate(lines):
+        if not line.upper().startswith("#EXT-X-STREAM-INF"):
+            continue
+        bandwidth_match = _BANDWIDTH_PATTERN.search(line)
+        bandwidth = int(bandwidth_match.group(1)) if bandwidth_match else 0
+        target = next(
+            (item for item in lines[index + 1:] if item and not item.startswith("#")),
+            "",
+        )
+        if not target:
+            continue
+        if bandwidth > best_bandwidth:
+            best_bandwidth = bandwidth
+            best_url = urljoin(base_url, target)
+    return best_url
+
+
+class HlsDownloader:
+    """
+    顺序下载并合并 HLS 分片。
+
+    分片按序号轮换直链源，每片使用所属源的请求头；直链过期时通过
+    ``url_provider(refresh=True)`` 重新取链。
+    """
+
+    def __init__(self, target: Path, links: Sequence[DirectLink],
+                 retries: int = 3, buffer_size: int = READ_BUFFER,
+                 on_progress: Optional[Callable[[float], None]] = None,
+                 stop_event: Optional[threading.Event] = None) -> None:
+        """
+        保存下载参数。
+
+        :param target: 目标文件路径
+        :param links: 直链源集合
+        :param retries: 单个分片的重试次数
+        :param buffer_size: 网络读缓冲大小
+        :param on_progress: 进度回调，参数为完成百分比
+        :param stop_event: 外部停止信号
+        """
+        self.target = target
+        self.links: Tuple[DirectLink, ...] = tuple(links)
+        self.retries = max(int(retries), 1)
+        self.buffer_size = max(int(buffer_size), 1024)
+        self.on_progress = on_progress
+        self.stop_event = stop_event or threading.Event()
+        self.plan_path = target.with_suffix(target.suffix + ".hls.json")
+        self.part_path = target.with_suffix(target.suffix + ".hls.part")
+
+    def run(self, url_provider: Optional[Callable[..., Sequence[DirectLink]]] = None) -> None:
+        """
+        执行 HLS 下载并合并为单文件。
+
+        :param url_provider: 返回直链集合的回调；传入 True 表示刷新后重新取链
+        """
+        if not self.links:
+            raise DownloadError("没有可用的 HLS 直链")
+        playlist = self._load_playlist(url_provider)
+        segments = playlist.init_segments + playlist.segments
+        if not segments:
+            raise DownloadError("m3u8 中没有可下载的分片")
+        done, sizes = self._load_plan(len(segments))
+        offset = sum(sizes[:done])
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        if done and self.part_path.exists() and self.part_path.stat().st_size >= offset:
+            mode = "r+b"
+        else:
+            done, sizes, offset = 0, [], 0
+            mode = "wb"
+        with open(self.part_path, mode) as handle:
+            handle.truncate(offset)
+            handle.seek(offset)
+            for index in range(done, len(segments)):
+                self._check_stop()
+                data = self._fetch_segment(index, segments[index], url_provider)
+                handle.write(data)
+                handle.flush()
+                sizes.append(len(data))
+                done = index + 1
+                self._save_plan(len(segments), done, sizes)
+                self._report(done, len(segments))
+        os.replace(self.part_path, self.target)
+        self.plan_path.unlink(missing_ok=True)
+
+    def _load_playlist(self, url_provider: Optional[Callable[..., Sequence[DirectLink]]]) -> HlsPlaylist:
+        """
+        下载并解析播放列表；主列表会继续下载选中的子列表。
+
+        :param url_provider: 直链回调
+        :return: 媒体播放列表
+        """
+        link = self.links[0]
+        text = self._fetch_text(link, link.url, url_provider)
+        playlist = parse_m3u8(text, link.url)
+        if playlist.variant_url:
+            text = self._fetch_text(link, playlist.variant_url, url_provider)
+            playlist = parse_m3u8(text, playlist.variant_url)
+        return playlist
+
+    def _link_for(self, index: int) -> DirectLink:
+        """
+        按分片序号轮换直链源。
+
+        :param index: 分片序号
+        :return: 该分片使用的直链
+        """
+        if not self.links:
+            raise DownloadError("没有可用的 HLS 直链")
+        return self.links[index % len(self.links)]
+
+    def _fetch_text(self, link: DirectLink, url: str,
+                    url_provider: Optional[Callable[..., Sequence[DirectLink]]]) -> str:
+        """
+        下载播放列表文本，直链失效时刷新一次。
+
+        :param link: 当前直链
+        :param url: 播放列表地址
+        :param url_provider: 直链回调
+        :return: 播放列表文本
+        """
+        data = self._fetch(link, url, url_provider)
+        return data.decode("utf-8", errors="replace")
+
+    def _fetch_segment(self, index: int, url: str,
+                       url_provider: Optional[Callable[..., Sequence[DirectLink]]]) -> bytes:
+        """
+        下载单个分片，失败时按配置重试。
+
+        :param index: 分片序号
+        :param url: 分片地址
+        :param url_provider: 直链回调
+        :return: 分片字节
+        """
+        retries = 0
+        while True:
+            self._check_stop()
+            link = self._link_for(index)
+            try:
+                return self._fetch(link, url, url_provider)
+            except LinkExpired as err:
+                retries += 1
+                if retries > self.retries:
+                    raise DownloadError(f"HLS 分片 {index} 直链多次失效：{err}") from err
+                if url_provider is not None:
+                    fresh = tuple(url_provider(True))
+                    if fresh:
+                        self.links = fresh
+                time.sleep(0.2 * retries)
+            except DownloadError:
+                retries += 1
+                if retries > self.retries:
+                    raise
+                time.sleep(0.5 * retries)
+
+    def _fetch(self, link: DirectLink, url: str,
+               url_provider: Optional[Callable[..., Sequence[DirectLink]]]) -> bytes:
+        """
+        发起一次 GET 并读取完整响应体。
+
+        :param link: 当前直链
+        :param url: 请求地址
+        :param url_provider: 直链回调，未使用时保留统一签名
+        :return: 响应体
+        """
+        del url_provider
+        headers = dict(link.headers)
+        with RequestUtils(timeout=30).get_stream(url, headers=headers) as response:
+            if response is None:
+                raise DownloadError("HLS 请求失败：网络不可达")
+            status = int(getattr(response, "status_code", 0) or 0)
+            content_type = str(getattr(response, "headers", {}).get("Content-Type") or "")
+            if "text/html" in content_type.lower():
+                raise LinkExpired("HLS 直链返回 HTML 页面")
+            if status in (401, 403, 412):
+                raise LinkExpired(f"HLS 直链返回 HTTP {status}")
+            if status != 200:
+                raise DownloadError(f"HLS 请求失败：HTTP {status}")
+            return b"".join(response.iter_content(chunk_size=self.buffer_size))
+
+    def _check_stop(self) -> None:
+        """
+        外部取消时抛出取消异常。
+        """
+        if self.stop_event.is_set():
+            raise DownloadCancelled("下载已取消")
+
+    def _load_plan(self, total: int) -> Tuple[int, List[int]]:
+        """
+        读取断点计划；分片总数或数据长度不匹配时重新开始。
+
+        :param total: 本次分片总数
+        :return: 已完成片数与每片字节长度
+        """
+        if not self.plan_path.exists() or not self.part_path.exists():
+            return 0, []
+        try:
+            plan = json.loads(self.plan_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return 0, []
+        if not isinstance(plan, dict) or int(plan.get("total") or 0) != total:
+            return 0, []
+        done = max(int(plan.get("done") or 0), 0)
+        sizes = [max(int(value), 0) for value in plan.get("sizes") or []]
+        if done > total or len(sizes) < done:
+            return 0, []
+        return done, sizes[:done]
+
+    def _save_plan(self, total: int, done: int, sizes: Sequence[int]) -> None:
+        """
+        原子写回断点计划。
+
+        :param total: 分片总数
+        :param done: 已完成片数
+        :param sizes: 每片字节长度
+        """
+        payload = {"total": total, "done": done, "sizes": list(sizes)}
+        try:
+            temp = self.plan_path.with_suffix(".tmp")
+            temp.write_text(json.dumps(payload), encoding="utf-8")
+            temp.replace(self.plan_path)
+        except Exception as err:  # noqa: BLE001
+            logger.warn(f"写入 HLS 断点计划失败：{err}")
+
+    def _report(self, done: int, total: int) -> None:
+        """
+        回报按片数计算的进度。
+
+        :param done: 已完成片数
+        :param total: 分片总数
+        """
+        if self.on_progress and total > 0:
+            self.on_progress(min(done / total * 100.0, 100.0))

@@ -1,5 +1,5 @@
 """
-验证分片下载引擎的规划、续传、校验与 Range 回退。
+验证通用分片下载引擎的规划、续传、校验、多源轮换与直链刷新。
 """
 
 import hashlib
@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from app.modules.quark import engine
+from app.domain.netdisk import DirectLink
+from app.modules.netdisk import engine
 
 
 class FakeStreamResponse:
@@ -47,26 +48,35 @@ class FakeStreamResponse:
 class FakeHttp:
     """
     按 Range 头返回对应字节的假网络适配器。
+
+    ``status_by_url`` 可为特定地址指定状态码，用于模拟直链过期。
     """
 
-    def __init__(self, payload: bytes, status_code: int = 206, content_type: str = "video/mp4") -> None:
+    def __init__(self, payload: bytes, status_code: int = 206,
+                 content_type: str = "video/mp4",
+                 status_by_url: Optional[Dict[str, int]] = None) -> None:
         """
         保存完整内容与响应行为。
         """
         self.payload = payload
         self.status_code = status_code
         self.content_type = content_type
-        self.ranges: List[str] = []
+        self.status_by_url = dict(status_by_url or {})
+        self.calls: List[Dict[str, Any]] = []
 
     def get_stream(self, url: str, headers: Optional[Dict[str, str]] = None, **_: Any):
         """
         返回按 Range 截取的响应上下文。
         """
-        headers = headers or {}
+        headers = dict(headers or {})
         range_header = str(headers.get("Range") or "")
-        self.ranges.append(range_header)
-        if self.status_code == 200:
+        self.calls.append({"url": url, "headers": headers, "range": range_header})
+        status = self.status_by_url.get(url, self.status_code)
+        if status == 200:
             data = self.payload
+            content_range = ""
+        elif status in (401, 403, 412):
+            data = b"<html>expired</html>"
             content_range = ""
         else:
             start_text, end_text = range_header.replace("bytes=", "").split("-")
@@ -79,7 +89,7 @@ class FakeHttp:
 
             def __enter__(self_inner):
                 """返回响应对象。"""
-                return FakeStreamResponse(data, self.status_code, content_range, self.content_type)
+                return FakeStreamResponse(data, status, content_range, self.content_type)
 
             def __exit__(self_inner, *args):
                 """结束时不做额外处理。"""
@@ -87,12 +97,29 @@ class FakeHttp:
 
         return _Ctx()
 
+    @property
+    def urls(self) -> List[str]:
+        """
+        按调用顺序返回请求地址。
+        """
+        return [call["url"] for call in self.calls]
+
 
 def install_http(monkeypatch: pytest.MonkeyPatch, http: FakeHttp) -> None:
     """
     用假网络适配器替换引擎内的 RequestUtils。
     """
     monkeypatch.setattr(engine, "RequestUtils", lambda **kwargs: http)
+
+
+def _links(*urls: str) -> List[DirectLink]:
+    """
+    构造带独立请求头的直链集合。
+    """
+    return [
+        DirectLink(url=url, headers={"Cookie": f"cookie-{index}"})
+        for index, url in enumerate(urls)
+    ]
 
 
 def test_plan_chunk_count_follows_formula() -> None:
@@ -128,12 +155,64 @@ def test_download_writes_full_content(monkeypatch: pytest.MonkeyPatch, tmp_path:
     install_http(monkeypatch, http)
     target = tmp_path / "video.mp4"
 
-    downloader = engine.ChunkedDownloader(target, len(payload), threads=4)
-    downloader.run(lambda refresh=False: "https://cdn.example.com/file")
+    downloader = engine.ChunkedDownloader(target, len(payload), _links("https://cdn/file"), threads=4)
+    downloader.run(lambda refresh=False: _links("https://cdn/file"))
 
     assert target.read_bytes() == payload
     assert not downloader.plan_path.exists()
-    assert all(rng.startswith("bytes=") for rng in http.ranges)
+    assert all(call["range"].startswith("bytes=") for call in http.calls)
+
+
+def test_multi_source_rotates_links_and_headers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    多源模式下分片按序号轮换直链，每片使用所属源的请求头。
+    """
+    payload = b"m" * (6 * 1024 * 1024)
+    http = FakeHttp(payload)
+    install_http(monkeypatch, http)
+    links = _links("https://cdn/a", "https://cdn/b")
+
+    engine.ChunkedDownloader(tmp_path / "video.mp4", len(payload), links, threads=4).run(
+        lambda refresh=False: links
+    )
+
+    assert set(http.urls) == {"https://cdn/a", "https://cdn/b"}
+    for call in http.calls:
+        expected = "cookie-0" if call["url"].endswith("/a") else "cookie-1"
+        assert call["headers"]["Cookie"] == expected
+
+
+def test_link_expired_refreshes_and_continues(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    直链过期时刷新取链，并用新直链继续未完成分片。
+    """
+    payload = b"r" * (2 * 1024 * 1024)
+    old_url, new_url = "https://cdn/old", "https://cdn/new"
+    http = FakeHttp(payload, status_by_url={old_url: 403})
+    install_http(monkeypatch, http)
+    refreshes: List[bool] = []
+
+    def provider(refresh: bool = False):
+        """首次返回旧直链，刷新后返回新直链。"""
+        refreshes.append(bool(refresh))
+        return _links(new_url) if refresh else _links(old_url)
+
+    downloader = engine.ChunkedDownloader(
+        tmp_path / "video.mp4", len(payload), _links(old_url), threads=1,
+        refresh_seconds=0,
+    )
+    downloader.run(provider)
+
+    assert target_bytes(tmp_path / "video.mp4") == payload
+    assert True in refreshes
+    assert new_url in http.urls
+
+
+def target_bytes(path: Path) -> bytes:
+    """
+    读取目标文件内容。
+    """
+    return path.read_bytes()
 
 
 def test_download_resumes_from_plan(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -149,11 +228,11 @@ def test_download_resumes_from_plan(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     plan = {"total": len(payload), "chunks": 1, "done": [[0, len(payload) - 1, digest]]}
     target.with_suffix(target.suffix + ".plan.json").write_text(json.dumps(plan), encoding="utf-8")
 
-    downloader = engine.ChunkedDownloader(target, len(payload), threads=2)
-    downloader.run(lambda refresh=False: "https://cdn.example.com/file")
+    downloader = engine.ChunkedDownloader(target, len(payload), _links("https://cdn/file"), threads=2)
+    downloader.run(lambda refresh=False: _links("https://cdn/file"))
 
     # 计划标记为全部完成时不再发起任何 Range 请求。
-    assert http.ranges == []
+    assert http.calls == []
 
 
 def test_range_ignored_falls_back_to_single_stream(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -164,8 +243,8 @@ def test_range_ignored_falls_back_to_single_stream(monkeypatch: pytest.MonkeyPat
     install_http(monkeypatch, FakeHttp(payload, status_code=200))
     target = tmp_path / "video.mp4"
 
-    engine.ChunkedDownloader(target, len(payload), threads=2).run(
-        lambda refresh=False: "https://cdn.example.com/file"
+    engine.ChunkedDownloader(target, len(payload), _links("https://cdn/file"), threads=2).run(
+        lambda refresh=False: _links("https://cdn/file")
     )
 
     assert target.read_bytes() == payload
@@ -180,9 +259,10 @@ def test_html_response_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     target = tmp_path / "video.mp4"
 
     with pytest.raises(engine.DownloadError):
-        engine.ChunkedDownloader(target, len(payload), threads=2).run(
-            lambda refresh=False: "https://cdn.example.com/file"
-        )
+        engine.ChunkedDownloader(
+            target, len(payload), _links("https://cdn/file"), threads=2, retries=1,
+            refresh_seconds=0,
+        ).run(lambda refresh=False: _links("https://cdn/file"))
 
 
 def test_partial_chunk_resume_seeds_digest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -202,12 +282,12 @@ def test_partial_chunk_resume_seeds_digest(monkeypatch: pytest.MonkeyPatch, tmp_
     }
     target.with_suffix(target.suffix + ".plan.json").write_text(json.dumps(plan), encoding="utf-8")
 
-    engine.ChunkedDownloader(target, len(payload), threads=1).run(
-        lambda refresh=False: "https://cdn.example.com/file"
+    engine.ChunkedDownloader(target, len(payload), _links("https://cdn/file"), threads=1).run(
+        lambda refresh=False: _links("https://cdn/file")
     )
 
     assert target.read_bytes() == payload
-    assert http.ranges == [f"bytes={half}-{len(payload) - 1}"]
+    assert [call["range"] for call in http.calls] == [f"bytes={half}-{len(payload) - 1}"]
 
 
 def test_stale_plan_size_resets_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -222,8 +302,8 @@ def test_stale_plan_size_resets_file(monkeypatch: pytest.MonkeyPatch, tmp_path: 
         json.dumps({"total": 3 * 1024 * 1024, "chunks": 1, "done": []}), encoding="utf-8"
     )
 
-    engine.ChunkedDownloader(target, len(payload), threads=1).run(
-        lambda refresh=False: "https://cdn.example.com/file"
+    engine.ChunkedDownloader(target, len(payload), _links("https://cdn/file"), threads=1).run(
+        lambda refresh=False: _links("https://cdn/file")
     )
 
     assert target.read_bytes() == payload
@@ -237,7 +317,9 @@ def test_cancel_does_not_report_success(monkeypatch: pytest.MonkeyPatch, tmp_pat
     install_http(monkeypatch, FakeHttp(payload))
     target = tmp_path / "video.mp4"
     stop = __import__("threading").Event()
-    downloader = engine.ChunkedDownloader(target, len(payload), threads=1, stop_event=stop)
+    downloader = engine.ChunkedDownloader(
+        target, len(payload), _links("https://cdn/file"), threads=1, stop_event=stop
+    )
 
     def on_progress(percent: float) -> None:
         """收到进度后立即取消。"""
@@ -245,7 +327,18 @@ def test_cancel_does_not_report_success(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
     downloader.on_progress = on_progress
     with pytest.raises(engine.DownloadCancelled):
-        downloader.run(lambda refresh=False: "https://cdn.example.com/file")
+        downloader.run(lambda refresh=False: _links("https://cdn/file"))
+
+
+def test_max_concurrency_caps_threads() -> None:
+    """
+    平台并发上限不可被线程配置突破。
+    """
+    downloader = engine.ChunkedDownloader(
+        Path("/tmp/video.mp4"), 100, _links("https://cdn/file"),
+        threads=32, max_concurrency=4,
+    )
+    assert downloader.threads == 4
 
 
 def test_verify_detects_corruption(tmp_path: Path) -> None:
@@ -254,7 +347,7 @@ def test_verify_detects_corruption(tmp_path: Path) -> None:
     """
     target = tmp_path / "video.mp4"
     target.write_bytes(b"a" * 100)
-    downloader = engine.ChunkedDownloader(target, 100, threads=1)
+    downloader = engine.ChunkedDownloader(target, 100, _links("https://cdn/file"), threads=1)
     downloader._chunks = [engine._Chunk(0, 0, 99)]  # pylint: disable=protected-access
     downloader._chunks[0].position = 100  # pylint: disable=protected-access
     downloader._chunks[0].expected_digest = hashlib.sha256(b"b" * 100).hexdigest()  # pylint: disable=protected-access

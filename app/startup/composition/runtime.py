@@ -340,12 +340,18 @@ def publish_runtime(composition: RuntimeComposition) -> None:
     configure_transfer_history_repository(lambda: composition.dependencies.transfer_history)
     configure_site_query_service(composition.site_query)
     configure_site_health_service(composition.site_health)
+    from app.startup.composition.netdisk import configure_netdisk_composition
+
+    configure_netdisk_composition()
 
 
 def reset_runtime() -> None:
     """
     撤销当前 lifespan 由运行时组合根发布的全部投影。
     """
+    from app.startup.composition.netdisk import reset_netdisk_composition
+
+    reset_netdisk_composition()
     reset_site_health_service()
     reset_site_query_service()
     reset_transfer_history_repository()

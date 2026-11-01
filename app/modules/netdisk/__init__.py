@@ -1,9 +1,9 @@
 """
-夸克网盘下载器模块。
+通用网盘下载器模块。
 
-只处理 ``download_type == "netdisk"`` 的候选：解析分享、取直链、并发分片下载，
-并把任务登记到本地任务存储，供整理流程轮询与清理。其他内容一律返回 None，
-交给其他下载器处理。
+只处理 ``download_type == "netdisk"`` 的候选：按平台归一化分享链接，通过
+``NetdiskResolveService`` 递归列出文件、过滤集数并逐文件取链，再交给平台无关的
+分片引擎或 HLS 下载器。其他内容一律返回 None，交给其他下载器处理。
 """
 
 from __future__ import annotations
@@ -12,14 +12,29 @@ import hashlib
 import re
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
+from app.application.netdisk.registry import find_adapter
+from app.application.netdisk.resolve import NetdiskResolveService
 from app.domain.episode import episode_numbers, is_special_name
+from app.domain.netdisk import (
+    DirectLink,
+    NetdiskPlatform,
+    NetdiskTuning,
+    ShareFile,
+    normalize_platform,
+    parse_share_link,
+)
 from app.modules._base.downloader import _DownloaderModuleBase
-from app.modules.quark import store
-from app.modules.quark.engine import ChunkedDownloader, DownloadCancelled, DownloadError
-from app.modules.quark.quark import API_USER_AGENT, DOWNLOAD_REFERER, QuarkClient, QuarkError
+from app.modules.netdisk import store
+from app.modules.netdisk.engine import (
+    HlsDownloader,
+    ChunkedDownloader,
+    DownloadCancelled,
+    DownloadError,
+)
 from app.runtime.log import logger
 from app.schemas.dashboard import DownloaderInfo
 from app.schemas.download import DOWNLOAD_TASK_ALREADY_EXISTS
@@ -35,8 +50,10 @@ from app.schemas.types import (
 _DOWNLOAD_SUFFIXES = frozenset({
     ".mp4", ".mkv", ".avi", ".ts", ".mov", ".flv", ".wmv", ".m4v", ".rmvb", ".zip", ".7z", ".rar",
 })
-# 临时转存目录前缀。
-_TEMP_DIR_PREFIX = "mp_tr_"
+# 分享目录最大递归深度。
+# 平台硬上限：迅雷超过 8 路并发会被 CDN 降级为整文件响应。
+_PLATFORM_CONCURRENCY_CAP = {NetdiskPlatform.XUNLEI: 8}
+_MAX_WALK_DEPTH = 3
 
 
 def _as_text(value: Any) -> str:
@@ -50,19 +67,13 @@ def _as_text(value: Any) -> str:
 
 def _share_code(url: str) -> str:
     """
-    从夸克分享链接中解析分享码。
+    从任意受支持的分享链接中解析分享码。
 
     :param url: 分享链接
     :return: 分享码；无法解析时为空
     """
-    text = _as_text(url)
-    marker = "/s/"
-    if marker not in text:
-        return ""
-    tail = text.split(marker, 1)[1]
-    for sep in ("#", "?", "/"):
-        tail = tail.split(sep, 1)[0]
-    return tail.strip()
+    ref = parse_share_link(_as_text(url))
+    return ref.share_id if ref else ""
 
 
 def _task_hash(share_code: str, name: str) -> str:
@@ -70,15 +81,15 @@ def _task_hash(share_code: str, name: str) -> str:
     生成稳定的任务标识。
 
     :param share_code: 分享码
-    :param name: 文件名
+    :param name: 文件名或链接
     :return: 任务标识
     """
     return hashlib.sha1(f"{share_code}:{name}".encode("utf-8")).hexdigest()[:16]
 
 
-class QuarkModule(_DownloaderModuleBase[QuarkClient]):
+class NetdiskModule(_DownloaderModuleBase[Any]):
     """
-    夸克网盘下载器：并发 Range 分片下载，并把任务接入整理流程。
+    通用网盘下载器：多平台取链、并发分片或 HLS 下载，并接入整理流程。
     """
 
     def __init__(self) -> None:
@@ -96,7 +107,7 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
         """
         按下载器配置创建本类型的实例，并校准重启后遗留的运行中状态。
         """
-        super().init_service(service_name="quark", service_type=QuarkClient)
+        super().init_service(service_name="netdisk")
         self._reconcile_store_state()
 
     def _reconcile_store_state(self) -> None:
@@ -114,20 +125,17 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
                 store.upsert_task(task_hash, {
                     "state": "paused", "dlspeed": None, "dlspeed_bytes": 0,
                 })
-                logger.info(f"夸克网盘任务已回落为暂停：{task_hash}")
+                logger.info(f"网盘任务已回落为暂停：{task_hash}")
 
     def test(self) -> Optional[Tuple[bool, str]]:
         """
-        检查已配置实例的凭据是否可用。
+        检查是否配置了可用的网盘下载器实例。
 
-        :return: 首个失败原因或整体成功；没有实例时返回 None
+        :return: 整体成功；没有实例时返回 None
         """
-        instances = self.get_instances()
-        if not instances:
+        configs = self.get_configs()
+        if not configs:
             return None
-        for name, client in instances.items():
-            if not client.cookie:
-                return False, f"夸克下载器 {name} 未配置 Cookie"
         return True, ""
 
     def init_setting(self) -> None:
@@ -149,7 +157,7 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
         """
         返回模块展示名称。
         """
-        return "Quark"
+        return "Netdisk"
 
     @staticmethod
     def get_type() -> ModuleType:
@@ -163,7 +171,7 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
         """
         获取模块子类型。
         """
-        return DownloaderType.Quark
+        return DownloaderType.Netdisk
 
     @staticmethod
     def get_priority() -> int:
@@ -179,7 +187,8 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
                  label: Optional[str] = None, downloader: Optional[str] = None,
                  custom_words: Optional[str] = None, download_type: Optional[str] = None,
                  netdisk_platform: Optional[str] = None,
-                 share_password: Optional[str] = None
+                 share_password: Optional[str] = None,
+                 netdisk_share_token: Optional[str] = None
                  ) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], str]]:
         """
         提交网盘下载任务，立即返回并在后台执行。
@@ -195,26 +204,35 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
         :param download_type: 资源类型；只有 netdisk 由本模块处理
         :param netdisk_platform: 网盘平台标识
         :param share_password: 分享提取码
+        :param netdisk_share_token: 候选透传的分享令牌，当前由适配器重新解析
         :return: 下载器名称、任务标识、内容布局与说明；非网盘内容返回 None
         """
         if _as_text(download_type) != "netdisk":
             return None
-        platform = _as_text(netdisk_platform) or "quark"
-        if platform != "quark":
-            return None, None, None, f"暂不支持 {platform} 网盘下载"
         url = _as_text(content)
-        code = _share_code(url)
-        if not code:
-            return None, None, None, "无法从分享链接中解析分享码"
-        client = self.get_instance(downloader)
-        if client is None:
-            return None, None, None, "未配置夸克下载器实例"
         passcode = _as_text(share_password)
+        ref = parse_share_link(url, passcode)
+        if ref is None:
+            return None, None, None, "无法从分享链接中解析分享码"
+        platform = normalize_platform(netdisk_platform) if _as_text(netdisk_platform) else ref.platform
+        if platform is None:
+            return None, None, None, f"暂不支持 {_as_text(netdisk_platform)} 网盘下载"
+        if platform != ref.platform:
+            return None, None, None, "分享链接与候选平台不一致"
+        if netdisk_share_token:
+            # 令牌只在候选透传时存在，取链仍以适配器解析结果为准。
+            logger.debug(f"收到候选分享令牌：{ref.share_id}")
+        code = ref.share_id
+        config = self._select_config(downloader)
+        if config is None:
+            return None, None, None, "未配置网盘下载器实例"
+        name = _as_text(getattr(config, "name", "")) or "Netdisk"
+        task_tuning = self._instance_tuning(config, platform)
         target_episodes = set(episodes or ())
         task_key = _task_hash(code, url)
         with self._lock:
             if task_key in self._tasks:
-                return client.name or "Quark", task_key, None, DOWNLOAD_TASK_ALREADY_EXISTS
+                return name, task_key, None, DOWNLOAD_TASK_ALREADY_EXISTS
             # 同一分享的不同链接形式（带 ?pwd= / # / 长短链）不应变成第二个任务：
             # 复用活跃任务的 hash，链路的下载记录才能继续关联。
             existing = store.find_by_share_code(code)
@@ -222,14 +240,14 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
                 covered = set(existing.get("episodes") or [])
                 if not target_episodes or target_episodes <= covered:
                     return (
-                        client.name or "Quark",
+                        name,
                         _as_text(existing.get("hash")),
                         None,
                         DOWNLOAD_TASK_ALREADY_EXISTS,
                     )
             stop_event = threading.Event()
             self._stops[task_key] = stop_event
-            self._tasks[task_key] = {"client": client, "stop": stop_event}
+            self._tasks[task_key] = {"stop": stop_event}
             self._discarded.discard(task_key)
         # 任务目录与记录必须在返回前同步落盘：链路提交后会立刻回读 save_path 写下载历史，
         # 放到后台线程里会出现竞态，导致 history.path 退化成下载根目录、手动整理串任务。
@@ -239,9 +257,9 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
         except Exception as err:  # noqa: BLE001
             logger.warn(f"创建网盘下载目录失败：{task_dir} - {err}")
         store.upsert_task(task_key, {
-            "title": f"quark:{code}",
+            "title": f"{platform.value}:{code}",
             "name": code,
-            "downloader": client.name or "Quark",
+            "downloader": name,
             "state": "downloading",
             "progress": 0.0,
             "size": 0.0,
@@ -250,78 +268,160 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
             "category": label,
             "files": [],
             "share_code": code,
+            "share_url": url,
+            "netdisk_platform": platform.value,
             "passcode": passcode,
+            "share_token": _as_text(netdisk_share_token),
             "episodes": sorted(target_episodes),
         })
         thread = threading.Thread(
             target=self._run_task,
-            args=(task_key, client, code, passcode, task_dir, label, target_episodes or None),
+            args=(task_key, platform, url, code, passcode, task_dir, label,
+                  target_episodes or None, _as_text(netdisk_share_token),
+                  task_tuning),
             daemon=True,
-            name=f"quark-download-{task_key}",
+            name=f"netdisk-download-{task_key}",
         )
         thread.start()
-        return client.name or "Quark", task_key, None, ""
+        return name, task_key, None, ""
 
-    def _run_task(self, task_key: str, client: QuarkClient, share_code: str,
-                  passcode: str, download_dir: Path, label: Optional[str],
-                  episodes: Optional[Set[int]] = None) -> None:
+    def _select_config(self, downloader: Optional[str]) -> Optional[Any]:
+        """
+        选择网盘下载器配置；显式名称不存在时回退到默认配置。
+
+        :param downloader: 下载器实例名称
+        :return: 下载器配置；没有配置时返回 None
+        """
+        configs = self.get_configs()
+        if not configs:
+            return None
+        if downloader and downloader in configs:
+            return configs[downloader]
+        marked = next(
+            (conf for conf in configs.values() if getattr(conf, "default", False)),
+            None,
+        )
+        return marked or next(iter(configs.values()))
+
+    @staticmethod
+    def _instance_tuning(config: Any, platform: NetdiskPlatform) -> NetdiskTuning:
+        """
+        读取下载器实例覆盖项，并把线程数夹在平台硬上限内。
+
+        :param config: 下载器实例配置
+        :param platform: 网盘平台
+        :return: 合并后的参数快照
+        """
+        base = NetdiskResolveService().tuning
+        raw = getattr(config, "config", {}) or {}
+        adapter = find_adapter(platform)
+        cap = max(1, min(512, int(getattr(adapter, "max_concurrency", 512) or 512)))
+        cap = min(cap, _PLATFORM_CONCURRENCY_CAP.get(platform, cap))
+
+        def int_value(key: str, default: int, minimum: int, maximum: int) -> int:
+            """
+            读取并夹紧整型配置。
+            """
+            try:
+                number = int(raw.get(key, default))
+            except (TypeError, ValueError):
+                return default
+            return max(minimum, min(maximum, number))
+
+        def bool_value(key: str, default: bool) -> bool:
+            """
+            读取布尔配置。
+            """
+            value = raw.get(key)
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+        # 实例配置沿用历史单位 KB/s，引擎与系统设置使用字节/秒。
+        if "rate_limit" in raw:
+            rate_limit = int_value("rate_limit", 0, 0, 1 << 30) * 1024
+        else:
+            rate_limit = base.rate_limit
+        return replace(
+            base,
+            threads=int_value("threads", base.threads, 1, cap),
+            rate_limit=rate_limit,
+            preempt_enabled=bool_value("preempt", base.preempt_enabled),
+            multi_source=bool_value("multi_source", base.multi_source),
+        )
+
+    def _run_task(self, task_key: str, platform: NetdiskPlatform, share_url: str,
+                  share_code: str, passcode: str, download_dir: Path,
+                  label: Optional[str],
+                  episodes: Optional[Set[int]] = None,
+                  share_token: str = "",
+                  tuning: Optional[NetdiskTuning] = None) -> None:
         """
         后台执行分享解析、取链与下载。
 
         :param task_key: 任务标识
-        :param client: 夸克客户端
+        :param platform: 网盘平台
+        :param share_url: 分享链接
         :param share_code: 分享码
         :param passcode: 提取码
         :param download_dir: 下载目录
         :param label: 任务标签
         :param episodes: 目标集数集合，为空表示整包下载
+        :param share_token: 候选透传的分享令牌
+        :param tuning: 下载器实例覆盖后的参数快照
         """
         task_dir = download_dir
         stop_event = self._stops.get(task_key) or threading.Event()
+        resolver = NetdiskResolveService()
         try:
-            stoken, files, root_name = self._collect_files(
-                client, share_code, passcode, episodes
+            resolved = resolver.walk(
+                share_url, passcode, platform, max_depth=_MAX_WALK_DEPTH,
+                share_token=share_token,
             )
-            if root_name:
-                store.upsert_task(task_key, {"title": root_name})
+            files = self._collect_files(resolved.files, episodes)
+            if resolved.detail.title:
+                store.upsert_task(task_key, {"title": resolved.detail.title})
             if not files:
                 if episodes:
                     raise DownloadError(
                         f"分享内没有目标集数（{sorted(episodes)}）对应的文件"
                     )
                 raise DownloadError("分享内没有可下载的视频文件")
-            total_size = sum(int(item.get("size") or 0) for item in files)
+            total_size = sum(int(item.size or 0) for item in files)
             store.upsert_task(task_key, {
                 "size": float(total_size),
                 "files": [
-                    {"name": item["name"], "size": int(item.get("size") or 0), "progress": 0.0}
+                    {"name": item.name, "size": int(item.size or 0), "progress": 0.0}
                     for item in files
                 ],
             })
-            temp_dir = ""
             done_before = 0.0
             for item in files:
                 if stop_event.is_set():
                     raise DownloadError("下载已取消")
-                self._download_one(client, share_code, passcode, item, stoken,
-                                   task_dir, task_key, stop_event, temp_dir,
-                                   total_size, done_before)
-                done_before += float(item.get("size") or 0)
+                self._download_one(
+                    resolver, platform, share_url, passcode, item, task_dir,
+                    task_key, stop_event, total_size, done_before,
+                    share_token, tuning,
+                )
+                done_before += float(item.size or 0)
             if task_key not in self._discarded:
                 store.upsert_task(task_key, {"state": "completed", "progress": 100.0})
-            logger.info(f"夸克网盘下载完成：{share_code}")
+            logger.info(f"网盘下载完成：{platform.value}:{share_code}")
         except DownloadCancelled:
-            logger.info(f"夸克网盘下载已暂停：{share_code}")
+            logger.info(f"网盘下载已暂停：{share_code}")
             if task_key not in self._discarded:
                 store.upsert_task(task_key, {"state": "paused"})
         except Exception as err:  # noqa: BLE001
             # 模块热重载后异常类对象可能不是同一个，按消息兜底识别用户暂停。
             if isinstance(err, DownloadCancelled) or "下载已取消" in str(err):
-                logger.info(f"夸克网盘下载已暂停：{share_code}")
+                logger.info(f"网盘下载已暂停：{share_code}")
                 if task_key not in self._discarded:
                     store.upsert_task(task_key, {"state": "paused"})
             else:
-                logger.warn(f"夸克网盘下载失败：{share_code} - {err}")
+                logger.warn(f"网盘下载失败：{share_code} - {err}")
                 if task_key not in self._discarded:
                     store.upsert_task(task_key, {"state": "error", "error": str(err)})
         finally:
@@ -342,46 +442,22 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
             return download_dir
         return download_dir / share_code
 
-    def _collect_files(self, client: QuarkClient, share_code: str,
-                       passcode: str,
-                       episodes: Optional[Set[int]] = None
-                       ) -> Tuple[str, List[Dict[str, Any]], str]:
+    def _collect_files(self, files: Sequence[ShareFile],
+                       episodes: Optional[Set[int]] = None) -> List[ShareFile]:
         """
-        读取分享内的待下载文件，根层为目录时下钻一层。
+        过滤出待下载文件，并给不含季集标记的文件名补前缀。
 
-        分享内文件的 fid_token 只在签发它的 stoken 下有效，每次换取 stoken 都会让旧的失效，
-        因此把本次使用的 stoken 一并返回，取链与转存必须复用它。
-
-        :param client: 夸克客户端
-        :param share_code: 分享码
-        :param passcode: 提取码
+        :param files: 分享内递归展开后的全部文件
         :param episodes: 目标集数集合；为空表示整包下载
-        :return: 本次 stoken、文件条目（fid/name/size/fid_token）与分享根目录名
+        :return: 过滤后的文件条目
         """
-        stoken = client.share_token(share_code, passcode)
-        entries = client.share_files(share_code, stoken)
-        files = [item for item in entries if not item["is_dir"] and self._wanted(item["name"])]
-        folders = [item for item in entries if item["is_dir"] and item["fid"]]
-        for folder in folders:
-            if files:
-                break
-            children = client.share_files(share_code, stoken, pdir_fid=folder["fid"])
-            files.extend(
-                item for item in children
-                if not item["is_dir"] and self._wanted(item["name"])
-            )
-        # 根层有多个子目录时只扫到了第一个，目标集可能在未扫描的目录里，此时放弃过滤。
-        files = self._filter_episodes(files, episodes, skip_filter=len(folders) > 1)
-        for item in files:
-            item["name"] = self._episode_name(item["name"])
-        # 单一根目录时把目录名带回，作为任务标题展示，不参与落盘路径。
-        root_name = folders[0]["name"] if len(folders) == 1 and folders else ""
-        return stoken, files, root_name
+        wanted = [item for item in files if not item.is_dir and self._wanted(item.name)]
+        wanted = self._filter_episodes(wanted, episodes)
+        return [replace(item, name=self._episode_name(item.name)) for item in wanted]
 
     @staticmethod
-    def _filter_episodes(files: List[Dict[str, Any]],
-                         episodes: Optional[Set[int]],
-                         skip_filter: bool = False) -> List[Dict[str, Any]]:
+    def _filter_episodes(files: Sequence[ShareFile],
+                         episodes: Optional[Set[int]]) -> List[ShareFile]:
         """
         只保留目标集数对应的文件。
 
@@ -389,7 +465,7 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
         变得可解析，从而破坏「解析不确定就全下」的兜底语义。
 
         放行规则（任一命中即保留，宁可多下也不漏集）：
-        没有目标集数、文件名解析不出唯一集数、集数不在目标集合内则丢弃。
+        没有目标集数、文件名解析不出唯一集数、集数在目标集合内则保留。
 
         :param files: 分享内的文件条目
         :param episodes: 目标集数集合
@@ -397,15 +473,12 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
         """
         wanted = set(episodes or ())
         if not wanted:
-            return files
-        if skip_filter:
-            logger.info("分享根层有多个子目录，无法确认目标集位置，本次整包下载")
-            return files
-        kept: List[Dict[str, Any]] = []
+            return list(files)
+        kept: List[ShareFile] = []
         for item in files:
-            if is_special_name(item["name"]):
+            if is_special_name(item.name):
                 continue
-            numbers = episode_numbers(item["name"])
+            numbers = episode_numbers(item.name)
             if len(numbers) != 1 or numbers[0] in wanted:
                 kept.append(item)
         logger.info(
@@ -443,38 +516,61 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
         suffix = name[name.rfind("."):].lower() if "." in name else ""
         return suffix in _DOWNLOAD_SUFFIXES
 
-    def _download_one(self, client: QuarkClient, share_code: str, passcode: str,
-                      item: Dict[str, Any], stoken: str, download_dir: Path,
-                      task_key: str, stop_event: threading.Event, temp_dir: str,
-                      total_size: int = 0, done_before: float = 0.0) -> None:
+    def _download_one(self, resolver: NetdiskResolveService, platform: NetdiskPlatform,
+                      share_url: str, passcode: str, item: ShareFile,
+                      download_dir: Path, task_key: str, stop_event: threading.Event,
+                      total_size: int = 0, done_before: float = 0.0,
+                      share_token: str = "", tuning: Optional[NetdiskTuning] = None) -> None:
         """
-        下载单个文件：优先免转存，失败回退转存。
+        下载单个文件：按多源开关取链，直链失效时重新取链。
 
-        :param client: 夸克客户端
-        :param share_code: 分享码
+        :param resolver: 取链服务
+        :param platform: 网盘平台
+        :param share_url: 分享链接
         :param passcode: 提取码
         :param item: 文件条目
-        :param stoken: 签发该文件 fid_token 的分享令牌，不能另行换取
         :param download_dir: 下载目录
         :param task_key: 任务标识
         :param stop_event: 停止信号
-        :param temp_dir: 已创建的临时目录标识
         :param total_size: 整任务字节数，用于把单文件进度换算成整任务进度
         :param done_before: 本文件之前已完成任务的字节数
+        :param share_token: 候选透传的分享令牌
+        :param tuning: 下载器实例覆盖后的参数快照
         """
-        name = item["name"]
-        target = download_dir / name
-        cleanup_fid = ""
-        try:
-            link = client.share_link(share_code, stoken, item["fid"], item["fid_token"])
-        except QuarkError as err:
-            logger.info(f"免转存取链失败，回退转存：{err}")
-            link, cleanup_fid = self._transfer_link(client, share_code, stoken, item)
-        url = link["url"]
-        size = int(link.get("size") or item.get("size") or 0)
-        if size <= 0:
-            raise DownloadError(f"无法确定文件大小：{name}")
-        headers = {"User-Agent": API_USER_AGENT, "Referer": DOWNLOAD_REFERER, "Cookie": client.cookie}
+        tuning = tuning or resolver.tuning
+        multi_source = bool(tuning.multi_source)
+        links = tuple(resolver.resolve_file(
+            share_url, passcode, item, platform, multi_source=multi_source,
+            share_token=share_token,
+        ))
+        if not links:
+            raise DownloadError(f"无法获取下载直链：{item.name}")
+        size = int(item.size or links[0].size or 0)
+        is_hls = any(link.is_hls for link in links)
+        if not is_hls and size <= 0:
+            raise DownloadError(f"无法确定文件大小：{item.name}")
+        target = download_dir / item.name
+        seen: List[DirectLink] = list(links)
+
+        def url_provider(refresh: bool = False) -> Sequence[DirectLink]:
+            """
+            返回直链集合；刷新时跳过缓存并重新选择账号取链。
+
+            :param refresh: 是否请求刷新
+            :return: 当前直链集合
+            """
+            nonlocal links
+            if not refresh:
+                return links
+            fresh = tuple(resolver.resolve_file(
+                share_url, passcode, item, platform,
+                multi_source=multi_source, force_refresh=True,
+                share_token=share_token,
+            ))
+            if fresh:
+                links = fresh
+                seen.extend(fresh)
+            return links
 
         sample = {"at": time.monotonic(), "done": float(done_before)}
 
@@ -490,70 +586,53 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
             overall = (done / total_size * 100.0) if total_size > 0 else percent
             store.update_progress(task_key, overall, dlspeed=speed)
 
-        downloader = ChunkedDownloader(
-            target=target,
-            total=size,
-            threads=client.threads,
-            rate_limit_kbps=client.rate_limit,
-            preempt=client.preempt,
-            headers=headers,
-            on_progress=on_progress,
-            stop_event=stop_event,
-        )
-        state = {"stoken": stoken, "url": url, "refreshed_at": 0.0}
-
-        def url_provider(refresh: bool = False) -> str:
-            """
-            返回直链；直链失效时刷新会话并重新取链，10 秒内不重复刷新。
-
-            :param refresh: 是否请求刷新
-            :return: 可用直链
-            """
-            if not refresh:
-                return str(state["url"])
-            now = time.monotonic()
-            if now - float(state["refreshed_at"] or 0) < 10:
-                return str(state["url"])
-            state["refreshed_at"] = now
-            client.ensure_cookie()
-            # 重新换取 stoken 会让旧 fid_token 失效，必须连同文件令牌一起刷新。
-            state["stoken"], fresh_files, _root = self._collect_files(client, share_code, passcode)
-            fresh = next((entry for entry in fresh_files if entry["fid"] == item["fid"]), None)
-            if fresh:
-                item["fid_token"] = fresh["fid_token"]
-            link = client.share_link(share_code, state["stoken"], item["fid"], item["fid_token"])
-            state["url"] = link["url"]
-            return str(state["url"])
-
+        adapter = find_adapter(platform)
+        max_concurrency = int(getattr(adapter, "max_concurrency", 0) or 0)
         try:
-            downloader.run(url_provider)
+            if is_hls:
+                HlsDownloader(
+                    target=target,
+                    links=links,
+                    retries=tuning.retries,
+                    buffer_size=tuning.buffer_size,
+                    on_progress=on_progress,
+                    stop_event=stop_event,
+                ).run(url_provider)
+            else:
+                ChunkedDownloader(
+                    target=target,
+                    total=size,
+                    links=links,
+                    threads=tuning.threads,
+                    rate_limit_bytes=tuning.rate_limit,
+                    preempt=tuning.preempt_enabled,
+                    buffer_size=tuning.buffer_size,
+                    retries=tuning.retries,
+                    preempt_bps=tuning.preempt_bps,
+                    preempt_age_seconds=tuning.preempt_age_seconds,
+                    refresh_seconds=tuning.refresh_seconds,
+                    max_concurrency=max_concurrency,
+                    on_progress=on_progress,
+                    stop_event=stop_event,
+                ).run(url_provider)
         finally:
-            if cleanup_fid:
-                client.delete_files([cleanup_fid])
+            self._cleanup_links(resolver, seen)
 
     @staticmethod
-    def _transfer_link(client: QuarkClient, share_code: str, stoken: str,
-                       item: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    def _cleanup_links(resolver: NetdiskResolveService, links: Sequence[DirectLink]) -> None:
         """
-        回退路径：转存到唯一临时目录后取链。
+        清理下载过程中所有转存句柄，同一句柄只清理一次。
 
-        临时目录在下载结束后由调用方清理，避免取链与下载之间目录被删。
-
-        :param client: 夸克客户端
-        :param share_code: 分享码
-        :param stoken: 分享访问令牌
-        :param item: 文件条目
-        :return: 直链信息与待清理的临时目录标识
+        :param resolver: 取链服务
+        :param links: 下载过程中使用过的直链
         """
-        folder_name = f"{_TEMP_DIR_PREFIX}{int(time.time() * 1000)}"
-        folder_fid = client.create_folder(folder_name)
-        try:
-            task_id = client.save_share(share_code, stoken, item["fid"], item["fid_token"], folder_fid)
-            new_fid = client.poll_saved_fid(task_id)
-            return client.file_link(new_fid), folder_fid
-        except Exception:
-            client.delete_files([folder_fid])
-            raise
+        handles = set()
+        for link in links:
+            handle = link.cleanup_handle
+            if handle is None or handle in handles:
+                continue
+            handles.add(handle)
+            resolver.cleanup(link)
 
     # ---- 任务抽象 ----
 
@@ -625,7 +704,7 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
     def remove_torrents(self, hashs: Union[str, list[str]], delete_file: Optional[bool] = True,
                         downloader: Optional[str] = None) -> Optional[bool]:
         """
-        删除任务，并按需删除已下载文件。
+        删除任务，并按需删除已下载文件与断点计划。
 
         :param hashs: 任务标识或列表
         :param delete_file: 是否删除文件
@@ -645,11 +724,13 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
                     path = Path(record.get("path") or "") / str(item.get("name") or "")
                     # 分片计划与文件同名绑定，删除任务时必须一并清掉，否则残留孤儿计划。
                     plan_path = path.with_suffix(path.suffix + ".plan.json")
-                    try:
-                        path.unlink(missing_ok=True)
-                        plan_path.unlink(missing_ok=True)
-                    except Exception as err:  # noqa: BLE001
-                        logger.warn(f"删除网盘下载文件失败：{path} - {err}")
+                    hls_plan = path.with_suffix(path.suffix + ".hls.json")
+                    hls_part = path.with_suffix(path.suffix + ".hls.part")
+                    for candidate in (path, plan_path, hls_plan, hls_part):
+                        try:
+                            candidate.unlink(missing_ok=True)
+                        except Exception as err:  # noqa: BLE001
+                            logger.warn(f"删除网盘下载文件失败：{candidate} - {err}")
             self._discarded.add(task_hash)
             store.remove_task(task_hash)
         return True
@@ -691,26 +772,27 @@ class QuarkModule(_DownloaderModuleBase[QuarkClient]):
             if not record:
                 continue
             share_code = _as_text(record.get("share_code"))
+            share_url = _as_text(record.get("share_url"))
+            platform = normalize_platform(record.get("netdisk_platform"))
             download_dir = _as_text(record.get("path"))
-            if not share_code or not download_dir:
-                continue
-            client = self.get_instance(_as_text(record.get("downloader")) or downloader)
-            if client is None:
+            if not share_code or not share_url or platform is None or not download_dir:
                 continue
             with self._lock:
                 if task_hash in self._tasks:
                     continue
                 stop_event = threading.Event()
                 self._stops[task_hash] = stop_event
-                self._tasks[task_hash] = {"client": client, "stop": stop_event}
+                self._tasks[task_hash] = {"stop": stop_event}
             store.upsert_task(task_hash, {"state": "downloading", "error": None})
             thread = threading.Thread(
                 target=self._run_task,
-                args=(task_hash, client, share_code, _as_text(record.get("passcode")),
-                      Path(download_dir), record.get("category"),
-                      set(record.get("episodes") or []) or None),
+                args=(task_hash, platform, share_url, share_code,
+                      _as_text(record.get("passcode")), Path(download_dir),
+                      record.get("category"),
+                      set(record.get("episodes") or []) or None,
+                      _as_text(record.get("share_token")), None),
                 daemon=True,
-                name=f"quark-download-{task_hash}",
+                name=f"netdisk-download-{task_hash}",
             )
             thread.start()
             started = True

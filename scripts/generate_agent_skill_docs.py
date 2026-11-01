@@ -170,6 +170,11 @@ DATABASE_TABLE_GUIDES: dict[str, tuple[str, str, str]] = {
         "Diagnosing site pressure, cooldown deferrals, recent failures, and active search ownership.",
         "Owned by the subscription site-budget coordinator; do not clear cooldowns or counters by direct SQL.",
     ),
+    "netdiskaccount": (
+        "Stores encrypted cloud-drive credentials, primary-account markers, and sign-in status.",
+        "Checking account status and primary selection when a netdisk download reports an authentication failure.",
+        "Owned by the netdisk account service; credentials are encrypted and must never be read or written directly.",
+    ),
     "systemconfig": (
         "Stores JSON business configuration values keyed by SystemConfigKey.",
         "Verifying the physical value only when the managed settings API behaves unexpectedly.",

@@ -222,6 +222,12 @@ and pass the flag only for an explicitly authorized repair.
 - Write boundary: Written by messaging and notification services; clean it through the message API or retention job.
 - Columns: `id`, `channel`, `source`, `mtype`, `title`, `text`, `image`, `poster`, `link`, `userid`, `reg_time`, `action`, `note`
 
+### `netdiskaccount`
+- Purpose: Stores encrypted cloud-drive credentials, primary-account markers, and sign-in status.
+- Useful queries: Checking account status and primary selection when a netdisk download reports an authentication failure.
+- Write boundary: Owned by the netdisk account service; credentials are encrypted and must never be read or written directly.
+- Columns: `id`, `platform`, `name`, `credential_enc`, `is_primary`, `status`, `expires_at`, `last_checked_at`, `created_at`, `updated_at`
+
 ### `outboxmessage`
 - Purpose: Stores externally visible side-effect intents committed atomically with business transactions.
 - Useful queries: Diagnosing pending/processing/failed state, leases, attempts, and the last error.

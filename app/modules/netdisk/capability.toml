@@ -1,13 +1,13 @@
 schema_version = 1
-id = "QuarkModule"
+id = "NetdiskModule"
 kind = "host_module"
-entrypoint = "app.modules.quark:QuarkModule"
+entrypoint = "app.modules.netdisk:NetdiskModule"
 depends_on = []
 
 [metadata]
-name = "Quark"
+name = "Netdisk"
 type = "downloader"
-subtype = "Quark"
+subtype = "Netdisk"
 priority = 0
 
 [activation]
@@ -18,5 +18,5 @@ watch = ["Downloaders"]
 kind = "system_config_item"
 key = "Downloaders"
 match_field = "type"
-match_value = "quark"
+match_value = "netdisk"
 enabled_field = "enabled"

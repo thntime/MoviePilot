@@ -18,6 +18,7 @@ _MODEL_EXPORTS = {
     "DownloadHistory": ("app.db.models.downloadhistory", "DownloadHistory"),
     "MediaServerItem": ("app.db.models.mediaserver", "MediaServerItem"),
     "Message": ("app.db.models.message", "Message"),
+    "NetdiskAccount": ("app.db.models.netdiskaccount", "NetdiskAccount"),
     "OutboxMessage": ("app.db.models.outbox", "OutboxMessage"),
     "PassKey": ("app.db.models.passkey", "PassKey"),
     "PluginData": ("app.db.models.plugindata", "PluginData"),

@@ -5812,6 +5812,7 @@
         "custom_words",
         "download_type",
         "netdisk_platform",
+        "netdisk_share_token",
         "share_password"
       ],
       "plugin_short_circuit": true,

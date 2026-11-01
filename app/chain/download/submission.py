@@ -818,6 +818,7 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             download_type=str(getattr(prepared.torrent, "download_type", "torrent") or "torrent"),
             netdisk_platform=getattr(prepared.torrent, "netdisk_platform", None),
             share_password=getattr(prepared.torrent, "share_password", None),
+            netdisk_share_token=getattr(prepared.torrent, "netdisk_share_token", None),
         )
         actual_downloader, download_hash, layout, error_msg = (
             result if result else (None, None, None, "未找到下载器")

@@ -73,6 +73,7 @@ to make the directory tree look symmetrical.
 | `app/application/agent.py` | Agent orchestration facade and typed `AgentDataContext`; startup injects one explicit data context into the manager, memory, tool and scheduler owners without a process-wide persistence locator |
 | `app/application/invocation.py` | Frozen Agent write-call identity, claim and receipt contracts; the injected repository provides atomic claim, fenced settlement and unresolved-state reads, while `db/adapters/invocation.py` owns short transactions and cold-start recovery is invoked by startup |
 | `app/application/network.py` | System network-test target catalog, immutable public/private projections, URL and redirect admission, response validation and the injected transport Port; startup owns concrete HTTP Adapter assembly |
+| `app/application/netdisk/` | 网盘取链用例与 Port：账号凭据、登录会话、免转存/转存编排、错误分类、限流与直链刷新；只依赖 Port，不导入具体 Adapter |
 | `app/application/community/` | `medals.py` 按实例管理员 GitHub 数字 ID 查询 MoviePilot-Wiki 社区勋章名单、管理同凭据缓存与过期回退；通过 Domain GitHub Port 注入异步传输，名单拉取与协议校验归 `adapters/external/github.py`，启动由 system 组合根装配，不作为插件 SDK |
 | `app/application/outbox.py` | Durable intent, transaction-only stager, short-transaction dispatch store, claim fencing and structured post-commit result contracts |
 | `app/application/transfer/` | Durable transfer use cases: `workflow.py` owns queue service orchestration; `models.py` owns admission/planning/task contracts; `jobs.py` owns in-process task views; `notifications.py` owns success/failure notification snapshots, batch waiting and quiet-window aggregation; `projection.py` owns domain projections; `execution.py` owns stable operation identity, step/checkpoint state, retry/manual-review commands and terminal-settlement DTOs; `recovery.py` owns read-only AI takeover admission plus failed/corrupt task cleanup and history detachment through the execution repository; `history.py` projects history write fields and file fingerprints; `feedback.py` owns failure stages, notification snapshots and message text, while Chain owns notification delivery and cleanup side effects |
@@ -361,7 +362,8 @@ not a second application-facing service directory.
 | `app/adapters/cache/` | Redis and filesystem cache implementations and Redis clients |
 | `app/adapters/network/` | Generic HTTP, browser, DNS, Cloudflare and IP transport mechanisms |
 | `app/adapters/system/` | OS/filesystem/process facilities, stdio, display, packages, resources and optional Rust acceleration |
-| `app/adapters/external/` | CookieCloud, plugin market, OCR, IP-location providers and MoviePilot Server |
+| `app/adapters/external/` | CookieCloud, plugin market, OCR, IP-location providers, MoviePilot Server and netdisk platform protocols |
+| `app/adapters/external/netdisk/` | 网盘平台协议适配器（解析分享、列目录、取直链、转存清理、登录轮询）与共享 HTTP 封装；只做协议，不访问数据库或调度 |
 | `app/adapters/web/` | FastAPI-specific technical adapters, including raw dynamic plugin routes |
 | `app/adapters/observability/` | Optional telemetry exporters; core code depends only on runtime observation ports |
 | `app/adapters/external/plugin/client.py` | Plugin-market transport, index/release queries and local-repository candidate resolution; `PluginHelper` is only the stable compatibility facade that delegates here |
@@ -1237,6 +1239,7 @@ driven workflow registration.
 |---|---|
 | `app/application/agent.py` | Agent orchestration facade plus typed `AgentDataContext`; lightweight service providers register through `app/startup/initializers/agent.py`, with no static `application -> agent` edge or global persistence locator |
 | `app/application/network.py` | Server-owned network-test catalog, public/private DTOs, URL and redirect admission, content validation and the injected HTTPS transport Port |
+| `app/application/netdisk/` | 网盘取链、账号与登录用例；`contract.py` 声明 Adapter、账号仓储、凭据加密、Cookie 导入与扫码登录 Port，`resolve.py` 负责策略分支与刷新，`registry.py` 只保存组合根注入的端口 |
 | `app/db/adapters/agent.py` | Agent task and plugin-data persistence implementations; ORM values are projected to Application snapshots before Session close |
 | `app/agent/manager.py` | Stable `AgentManager` construction facade and singleton identity |
 | `app/agent/session.py` | Session queue/worker/status/cancellation and deferred-cleanup owner |

@@ -73,7 +73,7 @@ BASELINE_ASSESSED_MODULES = frozenset(
         "aria2",
         "cloudsaver",
         "discord",
-        "quark",
+        "netdisk",
         "douban",
         "emby",
         "fanart",

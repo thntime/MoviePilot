@@ -413,6 +413,7 @@ class TorrentInfo(OptionalMediaIdentityMixin, BaseModel):
     download_type: str = Field(default="torrent", description="资源类型：torrent 种子资源，netdisk 网盘分享资源")
     netdisk_platform: Optional[str] = Field(default=None, description="网盘平台标识，例如 quark/115/pan123")
     share_password: Optional[str] = Field(default=None, description="网盘分享链接的提取码，无提取码时为空")
+    netdisk_share_token: Optional[str] = Field(default=None, description="网盘分享令牌，候选透传后下载阶段复用")
 
 
 class SubtitleInfo(BaseModel):

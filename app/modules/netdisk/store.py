@@ -3,6 +3,9 @@
 
 任务记录保存在配置目录下的单个 JSON 文件中，供下载器任务列表、整理流程与
 进程重启后的恢复共用；所有读写都在进程内串行化。
+
+首次读取时若只存在历史夸克任务索引 ``quark_download_tasks.json``，会把内容
+复制到新索引后保留旧文件，避免升级后丢失在途任务。
 """
 
 from __future__ import annotations
@@ -18,7 +21,8 @@ from app.foundation.environment import get_config_path
 from app.runtime.log import logger
 
 _STORE_LOCK = threading.RLock()
-_STORE_FILENAME = "quark_download_tasks.json"
+_STORE_FILENAME = "netdisk_download_tasks.json"
+_LEGACY_STORE_FILENAME = "quark_download_tasks.json"
 
 
 def _store_path() -> Path:
@@ -30,10 +34,52 @@ def _store_path() -> Path:
     return get_config_path() / _STORE_FILENAME
 
 
+def _legacy_store_path() -> Path:
+    """
+    返回历史夸克任务索引的磁盘路径。
+
+    :return: 配置目录下的旧任务索引文件
+    """
+    return get_config_path() / _LEGACY_STORE_FILENAME
+
+
+def _migrate_legacy() -> None:
+    """
+    把旧夸克任务索引复制为新索引，旧文件保留不删除。
+
+    只在目标文件缺失时执行；旧文件损坏时按空表处理，不阻断启动。
+    """
+    target = _store_path()
+    if target.exists():
+        return
+    legacy = _legacy_store_path()
+    if not legacy.exists():
+        return
+    try:
+        payload = json.loads(legacy.read_text(encoding="utf-8"))
+    except Exception as err:  # noqa: BLE001
+        logger.warn(f"历史网盘任务索引读取失败，跳过迁移：{err}")
+        return
+    if not isinstance(payload, dict):
+        logger.warn("历史网盘任务索引不是对象，跳过迁移")
+        return
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp = target.with_suffix(".tmp")
+        temp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temp.replace(target)
+        logger.info(f"已迁移历史网盘任务索引：{legacy.name} -> {target.name}")
+    except Exception as err:  # noqa: BLE001
+        logger.warn(f"迁移历史网盘任务索引失败：{err}")
+
+
 def _load() -> Dict[str, Dict[str, Any]]:
     """
     读取全部任务记录，文件缺失或损坏时返回空字典。
     """
+    _migrate_legacy()
     path = _store_path()
     if not path.exists():
         return {}
