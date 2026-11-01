@@ -13,14 +13,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.application.configuration import get_configured_system_config
 from app.application.site.observation import report_site_search_outcome, report_site_search_page
+from app.domain import episode as episode_rules
 from app.domain.context import TorrentInfo
 from app.modules import _ModuleBase
-from app.domain import episode as episode_rules
 from app.modules.cloudsaver.cloudsaver import CloudSaverClient, CloudSaverError, parse_share_code
 from app.modules.cloudsaver.quark_share import MAX_PAGES, QuarkShareClient
 from app.runtime.log import logger
 from app.schemas.types import ModuleType, OtherModulesType, SystemConfigKey
-
 
 _STANDARD_EPISODE = re.compile(r"\bS\d{1,2}\s*E\d{1,4}(?:\s*-\s*E\d{1,4})?\b", re.IGNORECASE)
 # 只把视频文件计入集数清晰度与短剧判定。

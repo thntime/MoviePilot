@@ -14,13 +14,13 @@ from app.runtime.version import get_app_version
 
 _BACKUP_NAME = re.compile(
     r"^(?:(?P<target>[0-9A-Za-z][0-9A-Za-z_-]*)"
-    r"(?:_(?P<version>v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?))?_)?"
+    r"(?:_(?P<version>v\d+\.\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?))?_)?"
     r"(?P<db_type>sqlite|postgresql)_"
     r"(?P<timestamp>\d{8}_\d{6})"
     r"(?:_(?P<sequence>\d+))?"
     r"(?P<suffix>\.db|\.dump)$"
 )
-_RELEASE_VERSION = re.compile(r"^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+_RELEASE_VERSION = re.compile(r"^v\d+\.\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?$")
 
 
 class BackupFiles:

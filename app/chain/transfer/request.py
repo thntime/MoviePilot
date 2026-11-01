@@ -24,8 +24,8 @@ from app.domain.episode import (
     parse_season_number,
 )
 from app.domain.meta.metabase import MetaBase
-from app.runtime.log import logger
 from app.domain.metainfo import MetaInfoPath
+from app.runtime.log import logger
 from app.schemas.exception import OperationInterrupted
 from app.schemas.file import FileItem
 from app.schemas.transfer import TransferInfo

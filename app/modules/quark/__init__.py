@@ -15,7 +15,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-from app.domain.context import TorrentInfo
 from app.domain.episode import episode_numbers, is_special_name
 from app.modules._base.downloader import _DownloaderModuleBase
 from app.modules.quark import store
@@ -28,7 +27,6 @@ from app.schemas.transfer import DownloaderFile, DownloaderTorrent
 from app.schemas.types import (
     DownloaderType,
     ModuleType,
-    OtherModulesType,
     TorrentQueryStatus,
     TorrentStatus,
 )
