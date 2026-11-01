@@ -959,8 +959,8 @@
       "runtime_only": true
     }
   },
-  "edge_count": 9967,
-  "edge_sha256": "2e118a0776f8ead9da13b197773d15007fe381c6bddb7dfac3fdcfc8faf6b4ea",
+  "edge_count": 9966,
+  "edge_sha256": "b963a97400cee4f391ea55b5c549fd5c29644bc301339eb3b987bde9b8b12d99",
   "edges": [
     "app -> app.foundation",
     "app -> app.foundation.environment",
@@ -8354,7 +8354,6 @@
     "app.modules.qqbot.qqbot -> app.runtime.log",
     "app.modules.qqbot.qqbot -> app.runtime.thread",
     "app.modules.quark -> app.domain",
-    "app.modules.quark -> app.domain.context",
     "app.modules.quark -> app.domain.episode",
     "app.modules.quark -> app.modules",
     "app.modules.quark -> app.modules._base",
