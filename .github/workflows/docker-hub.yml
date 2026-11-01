@@ -1,6 +1,7 @@
 name: Docker Hub Image
 
-# 手动触发或 v3 分支有提交时，构建包含前端的完整镜像并推送到 Docker Hub。
+# 每次推送到 v3 都先递增小版本号（v3.2.2.N），再把「后端 + 自建前端」打成镜像推 Docker Hub。
+# 上游版本（前三段）变化时，小版本自动从 0 开始。
 on:
   workflow_dispatch:
   push:
@@ -11,21 +12,73 @@ on:
       - '**/*.md'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: docker-hub-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   IMAGE_NAME: thntime/moviepilot-v3
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      app_version: ${{ steps.bump.outputs.app_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: v3
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump patch version
+        id: bump
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, pathlib
+
+          path = pathlib.Path("version.py")
+          text = path.read_text(encoding="utf-8")
+          pattern = re.compile(r"^(APP_VERSION|FRONTEND_VERSION)\s*=\s*'v?(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?'", re.M)
+
+          def bump(match: re.Match[str]) -> str:
+              name, major, minor, patch, sub = match.groups()
+              next_sub = int(sub) + 1 if sub is not None else 0
+              return f"{name} = 'v{major}.{minor}.{patch}.{next_sub}'"
+
+          updated, count = pattern.subn(bump, text)
+          if count == 0:
+              raise SystemExit("version.py 中未找到可递增的版本声明")
+          path.write_text(updated, encoding="utf-8")
+          version = re.search(r"^APP_VERSION\s*=\s*'([^']+)'", updated, re.M)
+          assert version, "递增后仍未找到 APP_VERSION"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"app_version={version.group(1).lstrip('v')}\n")
+          print(f"版本号更新为 {version.group(1)}")
+          PY
+
+      - name: Commit and push version bump
+        run: |
+          set -euo pipefail
+          version=$(sed -nE "s/^APP_VERSION[[:space:]]*=[[:space:]]*'([^']+)'/\1/p" version.py)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add version.py
+          git commit -m "chore(version): 发布 ${version} [skip ci]"
+          git push origin "HEAD:v3"
+
   build:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - name: Checkout backend
         uses: actions/checkout@v7
+        with:
+          ref: v3
 
       - name: Checkout frontend
         uses: actions/checkout@v7
@@ -65,8 +118,10 @@ jobs:
         run: |
           set -euo pipefail
           app_version=$(sed -nE "s/^APP_VERSION[[:space:]]*=[[:space:]]*'v?([^']+)'[[:space:]]*$/\1/p" version.py)
+          frontend_version=$(sed -nE "s/^FRONTEND_VERSION[[:space:]]*=[[:space:]]*'v?([^']+)'[[:space:]]*$/\1/p" version.py)
           test -n "$app_version"
           echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
+          echo "frontend_version=$frontend_version" >> "$GITHUB_OUTPUT"
           echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
@@ -102,7 +157,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            MOVIEPILOT_FRONTEND_VERSION=${{ steps.version.outputs.app_version }}
+            MOVIEPILOT_FRONTEND_VERSION=${{ steps.version.outputs.frontend_version }}
             MOVIEPILOT_PYTHON_VARIANT=standard
           cache-from: type=gha,scope=dockerhub-amd64
           cache-to: type=gha,scope=dockerhub-amd64,mode=max

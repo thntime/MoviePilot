@@ -66,12 +66,12 @@ class SystemUpdateManager(metaclass=SingletonClass):
 
     _BACKEND_RELEASES_API = "https://api.github.com/repos/jxxghp/MoviePilot/releases"
     _FRONTEND_RELEASE_API = (
-        "https://api.github.com/repos/jxxghp/MoviePilot-Frontend/releases/tags/{tag}"
+        "https://api.github.com/repos/thntime/MoviePilot-Frontend/releases/tags/{tag}"
     )
     _BACKEND_ARCHIVE_URL = (
         "https://github.com/jxxghp/MoviePilot/archive/refs/tags/{tag}.zip"
     )
-    _VERSION_PATTERN = re.compile(r"^v3\.\d+\.\d+(?:[-.](?:alpha|beta|rc)\d*)?$", re.I)
+    _VERSION_PATTERN = re.compile(r"^v3\.\d+\.\d+(?:\.\d+)?(?:[-.](?:alpha|beta|rc)\d*)?$", re.I)
     # 镜像构建时写入的系统基线（ISO 日期），记录镜像系统软件包刷新到的安全基线。
     _SYSTEM_BASELINE_FILE = Path("/etc/moviepilot/system-baseline")
     # 基线机制引入前的下限：没有基线文件的旧镜像按此值比较，因此只有目标版本把
@@ -79,7 +79,7 @@ class SystemUpdateManager(metaclass=SingletonClass):
     _LEGACY_SYSTEM_BASELINE = "2026-01-01"
     _SYSTEM_BASELINE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
     # 稳定版允许 -N 后缀，用于不升小版本的临时修复（如 v3.0.10-1）
-    _STABLE_VERSION_PATTERN = re.compile(r"^v3\.\d+\.\d+(?:-\d+)?$", re.I)
+    _STABLE_VERSION_PATTERN = re.compile(r"^v3\.\d+\.\d+(?:\.\d+)?(?:-\d+)?$", re.I)
 
     def __init__(self) -> None:
         """

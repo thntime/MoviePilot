@@ -261,7 +261,7 @@ RUN set -eu; \
     else \
         frontend_version="${MOVIEPILOT_FRONTEND_VERSION:-$(sed -n "s/^FRONTEND_VERSION[[:space:]]*=[[:space:]]*'\([^']*\)'/\1/p" /tmp/moviepilot-version.py)}"; \
         test -n "${frontend_version}"; \
-        curl -fsSL "https://github.com/jxxghp/MoviePilot-Frontend/releases/download/${frontend_version}/dist.zip" -o /tmp/frontend.zip; \
+        curl -fsSL "https://github.com/thntime/MoviePilot-Frontend/releases/download/${frontend_version}/dist.zip" -o /tmp/frontend.zip; \
         if [ -n "${MOVIEPILOT_FRONTEND_SHA256}" ]; then \
             printf '%s  %s\n' "${MOVIEPILOT_FRONTEND_SHA256}" /tmp/frontend.zip | sha256sum -c -; \
         fi; \

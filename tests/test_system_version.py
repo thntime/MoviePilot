@@ -73,10 +73,10 @@ def release_http(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("getter", "repository"),
+    ("getter", "owner", "repository"),
     [
-        (SystemChain._SystemChain__get_server_release_version, "MoviePilot"),
-        (SystemChain._SystemChain__get_front_release_version, "MoviePilot-Frontend"),
+        (SystemChain._SystemChain__get_server_release_version, "jxxghp", "MoviePilot"),
+        (SystemChain._SystemChain__get_front_release_version, "thntime", "MoviePilot-Frontend"),
     ],
 )
 @pytest.mark.parametrize(
@@ -88,7 +88,7 @@ def release_http(monkeypatch):
         ([], None),
     ],
 )
-def test_remote_version_selects_v3(release_http, getter, repository, tags, expected):
+def test_remote_version_selects_v3(release_http, getter, owner, repository, tags, expected):
     """
     前后端只比较 V3 标签的数值版本，缺少 V3 时不回退到其他代际。
     """
@@ -97,7 +97,7 @@ def test_remote_version_selects_v3(release_http, getter, repository, tags, expec
 
     assert getter() == expected
     release_http.get.assert_called_once_with(
-        f"https://api.github.com/repos/jxxghp/{repository}/releases",
+        f"https://api.github.com/repos/{owner}/{repository}/releases",
         proxies=None,
         headers={},
     )

@@ -1,0 +1,107 @@
+name: Sync Upstream
+
+# 每天定时把上游 v3 分支合并进来。前端仓库先跑（19:00 UTC），后端 30 分钟后跑，
+# 冲突时不推送，改为开 issue 说明哪些文件同步失败。
+on:
+  schedule:
+    - cron: '30 19 * * *' # 03:30 Asia/Shanghai
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: jxxghp/MoviePilot
+      UPSTREAM_BRANCH: v3
+      ISSUE_TITLE: 上游同步失败
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: v3
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          behind=$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}")
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          echo "upstream_head=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")" >> "$GITHUB_OUTPUT"
+          if [ "$behind" -eq 0 ]; then
+            echo "上游无新提交，跳过"
+          else
+            echo "上游领先 ${behind} 个提交"
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.fetch.outputs.behind != '0'
+        run: |
+          set +e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit "upstream/${UPSTREAM_BRANCH}" > /tmp/merge.log 2>&1
+          status=$?
+          cat /tmp/merge.log
+          if [ "$status" -ne 0 ]; then
+            conflicts=$(git diff --name-only --diff-filter=U | sort)
+            # version.py 只放版本号，直接采用上游版本，交给发布工作流把第四段重置为 0。
+            others=$(printf '%s\n' "$conflicts" | grep -v '^version\.py$' || true)
+            if [ -z "$others" ] && printf '%s\n' "$conflicts" | grep -qx 'version\.py'; then
+              git checkout --theirs version.py
+              git add version.py
+              git commit --no-edit
+              echo "conflicted=false" >> "$GITHUB_OUTPUT"
+              echo "已自动采用上游 version.py"
+              exit 0
+            fi
+            {
+              echo "conflicts<<EOF"
+              echo "$conflicts"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
+            echo "conflicted=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "conflicted=false" >> "$GITHUB_OUTPUT"
+
+      - name: Push merge
+        if: steps.fetch.outputs.behind != '0' && steps.merge.outputs.conflicted == 'false'
+        run: git push origin "HEAD:v3"
+
+      - name: Report sync failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          UPSTREAM_HEAD: ${{ steps.fetch.outputs.upstream_head }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CONFLICTS:-}" ]; then
+            body=$(printf '自动同步上游 `%s` 失败。\n\n- 仓库：`%s`\n- 上游提交：`%s`\n- 运行记录：%s\n\n失败发生在拉取或合并阶段，请查看运行日志。\n' \
+              "$UPSTREAM_REPO" "$GITHUB_REPOSITORY" "${UPSTREAM_HEAD:-unknown}" "$RUN_URL")
+          else
+            files=$(printf '%s\n' "$CONFLICTS" | sed 's/^/- `/; s/$/`/')
+            body=$(printf '自动同步上游 `%s` 失败，存在合并冲突，未推送任何改动。\n\n- 仓库：`%s`\n- 上游提交：`%s`\n- 运行记录：%s\n\n**同步失败的文件：**\n\n%s\n' \
+              "$UPSTREAM_REPO" "$GITHUB_REPOSITORY" "${UPSTREAM_HEAD:-unknown}" "$RUN_URL" "$files")
+          fi
+          existing=$(gh issue list --state open --search "\"$ISSUE_TITLE\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$ISSUE_TITLE" --body "$body"
+          fi
