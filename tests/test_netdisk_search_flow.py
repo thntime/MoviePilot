@@ -275,6 +275,205 @@ def test_apply_site_kinds_defaults_unknown_site_to_pt() -> None:
     assert tagged[0]["kind"] == "pt"
 
 
+class _Sites:
+    """
+    站点目录替身：只返回一个 PT 索引器，避免依赖真实资源包。
+    """
+
+    @staticmethod
+    def get_indexers():
+        """
+        返回同步站点索引配置。
+
+        :return: 单条 PT 站点索引配置
+        """
+        return [{"id": 1, "name": "PT 站点"}]
+
+    @staticmethod
+    async def async_get_indexers():
+        """
+        返回异步站点索引配置。
+
+        :return: 单条 PT 站点索引配置
+        """
+        return [{"id": 1, "name": "PT 站点"}]
+
+
+def test_sync_indexers_merges_cd_sites_from_repository(monkeypatch) -> None:
+    """
+    同步站点目录补上仓库中的 CD 站点，并用快照类型标注已有索引器。
+    """
+    monkeypatch.setattr(provider_module, "SitesHelper", _Sites)
+    owner = object.__new__(provider_module._SearchProviderSyncOwner)
+    owner.site_repository = SimpleNamespace(
+        list_active=lambda: [_snapshot(1, "pt", "PT 站点"), _snapshot(2, "cd", "网盘站点")]
+    )
+
+    indexers = owner._sync_indexers([1, 2])
+
+    assert [site["id"] for site in indexers] == [1, 2]
+    assert [site["kind"] for site in indexers] == ["pt", "cd"]
+
+
+def test_sync_indexers_without_repository_keeps_catalog(monkeypatch) -> None:
+    """
+    未装配站点仓库时保持原有资源包目录，不追加网盘站点。
+    """
+    monkeypatch.setattr(provider_module, "SitesHelper", _Sites)
+    owner = object.__new__(provider_module._SearchProviderSyncOwner)
+
+    indexers = owner._sync_indexers([1])
+
+    assert [site["id"] for site in indexers] == [1]
+    assert "kind" not in indexers[0]
+
+
+def test_async_indexers_merges_cd_sites_from_repository(monkeypatch) -> None:
+    """
+    异步站点目录同样补上仓库中的 CD 站点。
+    """
+    monkeypatch.setattr(provider_module, "SitesHelper", _Sites)
+    owner = object.__new__(provider_module._SearchProviderSyncOwner)
+
+    async def list_active():
+        """
+        返回启用中的站点快照。
+
+        :return: PT 与 CD 站点快照
+        """
+        return [_snapshot(1, "pt", "PT 站点"), _snapshot(2, "cd", "网盘站点")]
+
+    owner.site_repository = SimpleNamespace(async_list_active=list_active)
+
+    indexers = asyncio.run(owner._async_indexers([1, 2]))
+
+    assert [site["id"] for site in indexers] == [1, 2]
+    assert [site["kind"] for site in indexers] == ["pt", "cd"]
+
+
+def test_async_indexers_without_repository_keeps_catalog(monkeypatch) -> None:
+    """
+    异步路径未装配站点仓库时同样不追加网盘站点。
+    """
+    monkeypatch.setattr(provider_module, "SitesHelper", _Sites)
+    owner = object.__new__(provider_module._SearchProviderSyncOwner)
+
+    indexers = asyncio.run(owner._async_indexers([1]))
+
+    assert [site["id"] for site in indexers] == [1]
+    assert "kind" not in indexers[0]
+
+
+def test_sync_indexers_subtitles_skips_repository_projection(monkeypatch) -> None:
+    """
+    字幕搜索不投影 CD 站点，保持资源包原始目录。
+    """
+    monkeypatch.setattr(provider_module, "SitesHelper", _Sites)
+    owner = object.__new__(provider_module._SearchProviderSyncOwner)
+    owner.site_repository = SimpleNamespace(list_active=lambda: [_snapshot(2, "cd", "网盘站点")])
+
+    assert owner._sync_indexers([1], subtitles=True) == []
+
+
+def test_async_indexers_subtitles_skips_repository_projection(monkeypatch) -> None:
+    """
+    异步字幕搜索同样不投影 CD 站点。
+    """
+    monkeypatch.setattr(provider_module, "SitesHelper", _Sites)
+    owner = object.__new__(provider_module._SearchProviderSyncOwner)
+
+    async def list_active():
+        """
+        返回不应被读取的站点快照。
+
+        :return: CD 站点快照
+        """
+        return [_snapshot(2, "cd", "网盘站点")]
+
+    owner.site_repository = SimpleNamespace(async_list_active=list_active)
+
+    assert asyncio.run(owner._async_indexers([1], subtitles=True)) == []
+
+
+def test_async_search_routes_cd_site_to_netdisk_search(monkeypatch) -> None:
+    """
+    异步搜索流对 CD 站点改走网盘搜索入口，而不是 PT 索引器搜索。
+    """
+    calls: list[str] = []
+    owner = object.__new__(provider_module.SearchProviderOwner)
+
+    async def indexers(sites, *, subtitles=False):  # noqa: ARG001
+        """
+        返回固定的 CD 站点索引配置。
+
+        :return: 单条 CD 站点配置
+        """
+        return [{"id": 2, "name": "网盘站点", "kind": "cd"}]
+
+    async def plugin_results(**kwargs):  # noqa: ARG001
+        """
+        不返回插件资源。
+
+        :return: 空列表
+        """
+        return []
+
+    async def netdisk_results(**kwargs):  # noqa: ARG001
+        """
+        记录网盘搜索调用并返回一条候选。
+
+        :return: 网盘候选列表
+        """
+        calls.append("netdisk")
+        return [TorrentInfo(title="网盘候选", download_type="netdisk")]
+
+    async def torrent_results(**kwargs):  # noqa: ARG001
+        """
+        记录不应发生的索引器搜索调用。
+
+        :return: 空列表
+        """
+        calls.append("torrent")
+        return []
+
+    async def provider_events(*, indexer_sites, search_page, **kwargs):  # noqa: ARG001
+        """
+        只驱动单页搜索并发布追加事件，替代真实并发调度。
+
+        :param indexer_sites: 站点配置列表
+        :param search_page: 单页搜索回调
+        """
+        for site in indexer_sites:
+            items = await search_page(site, 0)
+            yield {"type": "append", "items": items}
+
+    owner._async_indexers = indexers
+    owner.async_search_plugin_torrents = plugin_results
+    owner.async_search_netdisk_torrents = netdisk_results
+    owner.async_search_site_torrents = torrent_results
+    owner._iter_provider_events = provider_events
+    owner._build_search_pages = lambda page=0: [0]
+
+    results = asyncio.run(owner._async_search_all_sites(keyword="测试"))
+
+    assert calls == ["netdisk"]
+    assert [item.title for item in results] == ["网盘候选"]
+
+    async def blocked(site):  # noqa: ARG001
+        """
+        模拟站点仍在请求冷却中。
+
+        :return: 始终表示需要等待
+        """
+        return True
+
+    monkeypatch.setattr(provider_module, "_async_wait_for_site_request", blocked)
+    blocked_results = asyncio.run(owner._async_search_all_sites(keyword="测试"))
+
+    assert blocked_results == []
+    assert calls == ["netdisk"]
+
+
 def test_manual_page_groups_netdisk_keywords_per_round() -> None:
     """
     CD 站点的多个关键词拆成独立分组后同轮并发，PT 站点仍按轮次串行。

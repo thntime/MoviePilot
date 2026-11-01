@@ -206,6 +206,24 @@ def test_uninspectable_magnet_is_not_cooled_down_as_a_download_failure(batch):
     batch.helper.get_torrent_episodes.assert_not_called()
 
 
+def test_netdisk_share_skips_whole_season_file_inspection(batch):
+    """
+    网盘分享不是种子，整季阶段直接跳过文件检查，不触发种子下载与集数解析。
+    """
+    netdisk = _context("netdisk")
+    netdisk.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing()}}
+
+    result, remaining = batch.chain.batch_download([netdisk], missing)
+
+    assert result == []
+    assert remaining is missing
+    assert remaining == missing
+    batch.chain.download_torrent.assert_not_called()
+    batch.helper.get_torrent_episodes.assert_not_called()
+    batch.chain._record_download_failure.assert_not_called()
+
+
 def test_partial_packs_only_settle_successful_allowed_episode_selections(batch):
     """
     分集包仅结算成功提交且在允许范围内的剧集。
