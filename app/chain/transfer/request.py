@@ -17,7 +17,14 @@ from app.chain.media import MediaChain
 from app.chain.storage import StorageChain
 from app.chain.transfer.music import append_cue_companions
 from app.domain.context import MediaInfo, MusicInfo
+from app.domain.episode import (
+    episode_numbers,
+    is_special_name,
+    parse_episode_selection,
+    parse_season_number,
+)
 from app.domain.meta.metabase import MetaBase
+from app.runtime.log import logger
 from app.domain.metainfo import MetaInfoPath
 from app.schemas.exception import OperationInterrupted
 from app.schemas.file import FileItem
@@ -173,12 +180,63 @@ class _TransferCandidatePlanner:
             storage=fileitem.storage, batch_mtype=self._batch_mtype,
         )
         if self._meta:
-            return self._build_file_meta(fileitem), history_info
-        if history_meta:
-            return history_meta, history_info
-        if inherited:
-            return deepcopy(inherited), history_info
-        return self._build_file_meta(fileitem, self._chain._get_subscribe_custom_words(history)), history_info
+            meta = self._build_file_meta(fileitem)
+        elif history_meta:
+            meta = history_meta
+        elif inherited:
+            meta = deepcopy(inherited)
+        else:
+            meta = self._build_file_meta(
+                fileitem, self._chain._get_subscribe_custom_words(history)
+            )
+        self._fill_episode_from_history(meta, fileitem, history)
+        return meta, history_info
+
+    def _fill_episode_from_history(
+            self,
+            meta: Optional[MetaBase],
+            fileitem: FileItem,
+            history: Optional[DownloadHistorySnapshot],
+    ) -> None:
+        """
+        文件名解析不出集数时，用下载记录的季集兜底。
+
+        网盘分享保留原始文件名（`164 4K.mkv`、`01~4K.mp4`），MetaInfo 认不出集数，
+        整理会直接拒绝。这里只在证据充分时填空：必须是同一条下载任务、TV 类型、
+        文件名只有一个候选集数且该集数落在本次下载的集数集合内。
+
+        :param meta: 已构建的文件元数据，原地修改
+        :param fileitem: 当前整理文件
+        :param history: 该任务的下载记录
+        """
+        if meta is None or history is None or meta.begin_episode is not None:
+            return
+        if self._meta is not None:
+            return
+        if not self._download_hash or history.download_hash != self._download_hash:
+            return
+        if str(history.type or "") != MediaType.TV.value:
+            return
+        name = Path(fileitem.path or "").name or str(getattr(fileitem, "name", "") or "")
+        if not name or is_special_name(name):
+            return
+        universe = set(parse_episode_selection(history.episodes or ""))
+        if not universe:
+            return
+        candidates = episode_numbers(name)
+        if len(candidates) != 1:
+            return
+        episode = candidates[0]
+        if episode not in universe:
+            return
+        meta.type = MediaType.TV
+        meta.begin_season = parse_season_number(history.seasons or "") or 1
+        meta.begin_episode = episode
+        meta.end_episode = None
+        meta.total_episode = 1
+        logger.info(
+            f"{name} 文件名缺少集数，已用下载记录回填：S{meta.begin_season:02d}E{episode:03d}"
+        )
 
     def _has_reliable_video_source(self) -> bool:
         """

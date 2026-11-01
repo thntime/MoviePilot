@@ -65,7 +65,7 @@ class _PreparedDownload:
     :param media: 已识别的影视或音乐目标信息
     :param meta: 下载资源自身的标题解析元数据
     :param torrent_content: 可交给下载器的磁力链接、下载地址或种子字节内容
-    :param folder_name: 种子内容对应的顶层目录名称
+    :param folder_name: 种子内容对应的顶层目录名称；网盘任务没有种子目录时为 None
     :param file_list: 种子中待处理文件的相对路径列表
     :param download_dir: 最终下载保存 URI 的 Path 表示，保留既有下载器调用格式
     :param download_uri: 按目录配置解析出的最终下载保存地址
@@ -77,7 +77,7 @@ class _PreparedDownload:
     media: Union[MediaInfo, MusicInfo]
     meta: MetaBase
     torrent_content: Union[str, bytes]
-    folder_name: str
+    folder_name: Optional[str]
     file_list: list[str]
     download_dir: Path
     download_uri: str
@@ -713,32 +713,38 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             nonlocal download_error
             download_error = error_msg
 
-        if not torrent_file and not torrent_content:
-            torrent_content, _, _ = self.download_torrent(
-                torrent, channel=channel, source=source, userid=userid,
-                on_failure=remember_failure,
-            )
-        elif torrent_file:
-            torrent_content = (
-                torrent_file.read_bytes()
-                if torrent_file.exists()
-                # 与 TorrentHelper.download_torrent 的写入路由一致，种子只缓存在本地文件系统
-                else FileCache(local_only=True).get(
-                    torrent_file.as_posix(), region="torrents"
+        is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
+        if is_netdisk:
+            # 网盘候选的 enclosure 是分享链接而不是种子，跳过抓取与种子解析。
+            torrent_content = torrent.enclosure or ""
+            folder_name, file_list = None, []
+        else:
+            if not torrent_file and not torrent_content:
+                torrent_content, _, _ = self.download_torrent(
+                    torrent, channel=channel, source=source, userid=userid,
+                    on_failure=remember_failure,
                 )
+            elif torrent_file:
+                torrent_content = (
+                    torrent_file.read_bytes()
+                    if torrent_file.exists()
+                    # 与 TorrentHelper.download_torrent 的写入路由一致，种子只缓存在本地文件系统
+                    else FileCache(local_only=True).get(
+                        torrent_file.as_posix(), region="torrents"
+                    )
+                )
+            if not torrent_content:
+                self._record_download_failure(
+                    context=context,
+                    error_msg=download_error,
+                    downloader=downloader or site_downloader,
+                    source=source,
+                    episodes=episodes,
+                )
+                return None, download_error
+            folder_name, file_list = cast(Any, TorrentHelper)().get_fileinfo_from_torrent_content(
+                torrent_content
             )
-        if not torrent_content:
-            self._record_download_failure(
-                context=context,
-                error_msg=download_error,
-                downloader=downloader or site_downloader,
-                source=source,
-                episodes=episodes,
-            )
-            return None, download_error
-        folder_name, file_list = cast(Any, TorrentHelper)().get_fileinfo_from_torrent_content(
-            torrent_content
-        )
         self._record_music_album_track_keys(context, file_list)
         storage, download_dir, error_msg = self._resolve_media_download_dir(
             media_info=media,
@@ -809,6 +815,9 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             label=label,
             downloader=downloader or prepared.site_downloader,
             custom_words=custom_words,
+            download_type=str(getattr(prepared.torrent, "download_type", "torrent") or "torrent"),
+            netdisk_platform=getattr(prepared.torrent, "netdisk_platform", None),
+            share_password=getattr(prepared.torrent, "share_password", None),
         )
         actual_downloader, download_hash, layout, error_msg = (
             result if result else (None, None, None, "未找到下载器")

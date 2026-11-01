@@ -1,0 +1,22 @@
+schema_version = 1
+id = "QuarkModule"
+kind = "host_module"
+entrypoint = "app.modules.quark:QuarkModule"
+depends_on = []
+
+[metadata]
+name = "Quark"
+type = "downloader"
+subtype = "Quark"
+priority = 0
+
+[activation]
+policy = "when_configured"
+watch = ["Downloaders"]
+
+[activation.selector]
+kind = "system_config_item"
+key = "Downloaders"
+match_field = "type"
+match_value = "quark"
+enabled_field = "enabled"

@@ -4846,6 +4846,28 @@
       "timeout_policy": "caller_budget",
       "version": 1
     },
+    "async_search_netdisk_torrents": {
+      "aggregation": "ordered_list_merge",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "media-discovery",
+      "input_contract": "TorrentSearchRequest",
+      "optional_parameters": [],
+      "plugin_short_circuit": true,
+      "public_to_plugins": true,
+      "required_parameters": [
+        "keyword",
+        "mtype",
+        "page",
+        "site"
+      ],
+      "result_contract": "list[TorrentInfo]",
+      "result_shape": "list",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
     "async_search_persons": {
       "aggregation": "ordered_list_merge",
       "error_policy": "isolate_provider",
@@ -5787,7 +5809,10 @@
       "family": "downloader",
       "input_contract": "DownloadTaskRequest",
       "optional_parameters": [
-        "custom_words"
+        "custom_words",
+        "download_type",
+        "netdisk_platform",
+        "share_password"
       ],
       "plugin_short_circuit": true,
       "public_to_plugins": true,
@@ -7388,6 +7413,25 @@
       "timeout_policy": "caller_budget",
       "version": 1
     },
+    "refresh_netdisk_token": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "site",
+      "input_contract": "SiteTokenRefreshRequest",
+      "optional_parameters": [],
+      "plugin_short_circuit": true,
+      "public_to_plugins": true,
+      "required_parameters": [
+        "site"
+      ],
+      "result_contract": "bool | None",
+      "result_shape": "any",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
     "refresh_torrents": {
       "aggregation": "ordered_list_merge",
       "error_policy": "isolate_provider",
@@ -7582,6 +7626,28 @@
         "meta"
       ],
       "result_contract": "list[MusicInfo]",
+      "result_shape": "list",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
+    "search_netdisk_torrents": {
+      "aggregation": "ordered_list_merge",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "media-discovery",
+      "input_contract": "TorrentSearchRequest",
+      "optional_parameters": [],
+      "plugin_short_circuit": true,
+      "public_to_plugins": true,
+      "required_parameters": [
+        "keyword",
+        "mtype",
+        "page",
+        "site"
+      ],
+      "result_contract": "list[TorrentInfo]",
       "result_shape": "list",
       "supports_async": true,
       "supports_sync": true,
@@ -7823,6 +7889,25 @@
         "storage"
       ],
       "result_contract": "StorageProviderResult",
+      "result_shape": "any",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
+    "test_netdisk_site": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "site",
+      "input_contract": "SiteTestRequest",
+      "optional_parameters": [],
+      "plugin_short_circuit": true,
+      "public_to_plugins": true,
+      "required_parameters": [
+        "site"
+      ],
+      "result_contract": "tuple[bool, str] | None",
       "result_shape": "any",
       "supports_async": true,
       "supports_sync": true,
@@ -8483,10 +8568,10 @@
     }
   },
   "run_module": {
-    "call_count": 273,
+    "call_count": 276,
     "dynamic_call_count": 0,
     "dynamic_calls": [],
-    "method_count": 221,
+    "method_count": 223,
     "methods": {
       "anilist_credits": [
         {
@@ -9816,6 +9901,13 @@
           "mode": "sync"
         }
       ],
+      "refresh_netdisk_token": [
+        {
+          "caller": "app.chain.base",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
       "refresh_torrents": [
         {
           "caller": "app.chain.base",
@@ -9974,6 +10066,18 @@
       "storage_manage": [
         {
           "caller": "app.chain.storage",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
+      "test_netdisk_site": [
+        {
+          "caller": "app.chain.base",
+          "count": 1,
+          "mode": "sync"
+        },
+        {
+          "caller": "app.chain.site",
           "count": 1,
           "mode": "sync"
         }

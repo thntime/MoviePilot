@@ -25,6 +25,17 @@ _STANDARD_EPISODE_PATTERN = re.compile(r"\bS\d{1,2}\s*E\d{1,4}\b", re.IGNORECASE
 # 中文集数标记（更新至164集 / 第12集），转成标准 SxxExx 以便媒体识别提取集数。
 _CN_EPISODE_PATTERN = re.compile(r"[\[【(（]?\s*(?:更新至?|第)\s*(\d{1,4})\s*[集话]\s*[\]】)）]?")
 
+# 分享正文里的结构标记：「描述：」之后才是正文。
+_DESCRIPTION_MARKER_PATTERN = re.compile(r"(?:描述|简介|剧情简介)\s*[：:]\s*")
+
+# 正文结尾常见的平台引导语，没有实际内容。
+_PLATFORM_TAIL_PATTERN = re.compile(
+    r"(?:夸克网盘|夸克|百度网盘|百度|阿里云盘|阿里|115|天翼|123云盘|迅雷|UC|链接)\s*[：:]\s*$"
+)
+
+# 频道推送里的 HTML 标记（如 tg-emoji、mark），展示前必须去掉。
+_HTML_TAG_PATTERN = re.compile(r"<[^>]*>")
+
 # 提取码常见于内容文本，兼容中英文冒号与常见叫法。
 _PASSWORD_TEXT_PATTERN = re.compile(r"(?:提取码|访问码|提取密码|密码)\s*[：:]\s*([A-Za-z0-9]{2,16})")
 
@@ -94,6 +105,34 @@ def _clean_title(value: Any) -> str:
     return " ".join(text.split())
 
 
+def _clean_description(value: Any) -> str:
+    """
+    清洗分享正文，使其可以直接作为纯文本展示。
+
+    去掉 HTML 标记与实体、压缩空白，并去掉开头重复的标题与结尾的平台引导语；
+    有「描述：」标记时只保留其后的正文，没有时保留清洗后的全文。
+
+    :param value: 接口返回的 content 字段
+    :return: 清洗后的描述文本，空值返回空字符串
+    """
+    text = html.unescape(_as_text(value))
+    text = _HTML_TAG_PATTERN.sub(" ", text)
+    text = " ".join(text.split())
+    marker = _DESCRIPTION_MARKER_PATTERN.search(text)
+    if marker:
+        body = text[marker.end():].strip()
+        if body:
+            text = body
+    else:
+        text = _TITLE_PREFIX_PATTERN.sub("", text)
+    while True:
+        trimmed = _PLATFORM_TAIL_PATTERN.sub("", text).strip()
+        if trimmed == text:
+            break
+        text = trimmed
+    return text
+
+
 def _as_text(value: Any) -> str:
     """
     将接口字段转换为去除首尾空白的文本，空值统一为空字符串。
@@ -101,6 +140,55 @@ def _as_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _as_flag(value: Any) -> bool:
+    """
+    将接口的文件夹标记转换为布尔值，兼容布尔、数字与字符串三种形态。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return _as_text(value).lower() in {"1", "true", "yes", "y"}
+
+
+def _normalize_share_entries(items: Any) -> List[Dict[str, Any]]:
+    """
+    归一分享目录条目，保留文件名、文件标识与文件夹标记。
+
+    :param items: 接口返回的 list 字段
+    :return: 每项包含 name/file_id/is_folder 的列表，非法条目被丢弃
+    """
+    if not isinstance(items, list):
+        return []
+    entries: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = _as_text(item.get("fileName") or item.get("file_name") or item.get("name"))
+        if not name:
+            continue
+        entries.append({
+            "name": name,
+            "file_id": _as_text(item.get("fileId") or item.get("file_id") or item.get("fid")),
+            "is_folder": _as_flag(item.get("isFolder") or item.get("is_folder") or item.get("dir")),
+        })
+    return entries
+
+
+def _empty_share_detail() -> Dict[str, Any]:
+    """
+    构造分享详情的空结果，统一失效与不可用分支的返回结构。
+
+    :return: 判定为失效或不可用的分享详情
+    """
+    return {
+        "alive": False,
+        "file_size": 0,
+        "file_names": [],
+        "stoken": "",
+    }
 
 
 def _normalize_platform(value: Any) -> str:
@@ -202,7 +290,7 @@ def _normalize_search_data(data: Any) -> List[Dict[str, Any]]:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            content = _as_text(item.get("content"))
+            content = _clean_description(item.get("content"))
             entries.append({
                 "title": _clean_title(item.get("title")),
                 "content": content,
@@ -285,7 +373,7 @@ class CloudSaverClient:
             headers["Authorization"] = f"Bearer {token}"
         http = self._get_http()
         url = f"{self.base_url}{path}"
-        request_kwargs = {"headers": headers}
+        request_kwargs: Dict[str, Any] = {"headers": headers}
         if timeout is not None:
             request_kwargs["timeout"] = timeout
         if method.upper() == "POST":
@@ -376,7 +464,7 @@ class CloudSaverClient:
         """
         code = _as_text(share_code)
         if not code:
-            return {"alive": False, "file_size": 0, "file_names": [], "stoken": ""}
+            return _empty_share_detail()
         params: Dict[str, Any] = {"shareCode": code}
         if receive_code:
             params["receiveCode"] = _as_text(receive_code)
@@ -394,20 +482,16 @@ class CloudSaverClient:
             return None
         if status >= 500:
             # 失效分享在 CloudSaver 侧表现为 5xx + success=false。
-            return {"alive": False, "file_size": 0, "file_names": [], "stoken": ""}
+            return _empty_share_detail()
         if status >= 400 or payload is None:
             return None
         if payload.get("success") is False:
-            return {"alive": False, "file_size": 0, "file_names": [], "stoken": ""}
+            return _empty_share_detail()
         data = payload.get("data")
         if not isinstance(data, dict):
-            return {"alive": False, "file_size": 0, "file_names": [], "stoken": ""}
+            return _empty_share_detail()
         files = data.get("list") if isinstance(data.get("list"), list) else []
-        names = [
-            _as_text(item.get("fileName") or item.get("name"))
-            for item in files
-            if isinstance(item, dict)
-        ]
+        entries = _normalize_share_entries(files)
         try:
             file_size = int(data.get("fileSize") or 0)
         except (TypeError, ValueError):
@@ -415,7 +499,7 @@ class CloudSaverClient:
         return {
             "alive": bool(files),
             "file_size": max(file_size, 0),
-            "file_names": [name for name in names if name],
+            "file_names": [entry["name"] for entry in entries],
             "stoken": _as_text(data.get("stoken")),
         }
 

@@ -28,6 +28,7 @@ from app.application.site.query import (
 from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
 from app.domain.context import Context, MediaInfo, MusicInfo, SubtitleInfo, TorrentInfo
+from app.domain.episode import parse_episode_selection
 from app.domain.media import is_music_media_source, normalize_music_type
 from app.domain.meta.metabase import MetaBase
 from app.domain.metainfo import MetaInfo
@@ -238,10 +239,14 @@ def download(
     torrent_in: _SchemaTorrentInfo,
     downloader: Annotated[str | None, Body()] = None,
     save_path: Annotated[str | None, Body()] = None,
+    episode_selection: Annotated[str | None, Body()] = None,
     current_user: ApiPrincipal = Depends(get_current_active_user),
 ) -> Any:
     """
     添加下载任务（含媒体信息）
+
+    :param episode_selection: 指定集数文本（如 `153-162` 或 `164`），仅网盘下载器使用；
+                              留空表示下载分享内全部文件。
     """
     mediainfo: MediaInfo | MusicInfo
     if isinstance(media_in, _SchemaMusicInfo):
@@ -257,10 +262,12 @@ def download(
     torrentinfo.site_downloader = downloader
     # 上下文
     context = Context(meta_info=metainfo, media_info=mediainfo, torrent_info=torrentinfo)
+    episodes = set(parse_episode_selection(episode_selection or "")) or None
     did = DownloadChain().download_single(
         context=context,
         username=current_user.name,
         save_path=save_path,
+        episodes=episodes,
         source="Manual",
     )
     if not did:
@@ -347,10 +354,14 @@ def add(
     downloader: Annotated[str | None, Body()] = None,
     # 保存路径, 支持<storage>:<path>（如rclone:/MP, smb:/server/share/Movies）或已配置下载目录的名称（别名）
     save_path: Annotated[str | None, Body()] = None,
+    episode_selection: Annotated[str | None, Body()] = None,
     current_user: ApiPrincipal = Depends(get_current_active_user),
 ) -> Any:
     """
     添加下载任务（不含媒体信息）
+
+    :param episode_selection: 指定集数文本（如 `153-162` 或 `164`），仅网盘下载器使用；
+                              留空表示下载分享内全部文件。
     """
     metainfo, mediainfo, error = _resolve_add_media(
         torrent_in,
@@ -369,11 +380,13 @@ def add(
     # 上下文
     context = Context(meta_info=metainfo, media_info=mediainfo, torrent_info=torrentinfo)
 
+    episodes = set(parse_episode_selection(episode_selection or "")) or None
     did = DownloadChain().download_single(
         context=context,
         username=current_user.name,
         downloader=downloader,
         save_path=save_path,
+        episodes=episodes,
         source="Manual",
     )
     if not did:

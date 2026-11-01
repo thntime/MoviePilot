@@ -492,7 +492,9 @@ class TransHandler:
                         preview=preview,
                         skip_reason="未识别到文件集数，识别为特典/附加视频文件",
                     )
-                raise TransferPlanningRejectedError("未识别到文件集数")
+                raise TransferPlanningRejectedError(
+                    "未识别到文件集数，请配置集数定位模板或自定义识别词后重试"
+                )
             planning_meta.end_season = None
             if planning_meta.total_season:
                 planning_meta.total_season = 1

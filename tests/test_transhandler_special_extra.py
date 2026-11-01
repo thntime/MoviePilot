@@ -114,7 +114,7 @@ def test_regular_tv_file_without_episode_remains_failure() -> None:
     result, source_oper, target_oper = _transfer_without_episode("Test.Show.Bonus.mkv")
 
     assert result.success is False
-    assert result.message == "未识别到文件集数"
+    assert result.message == "未识别到文件集数，请配置集数定位模板或自定义识别词后重试"
     assert result.need_notify is True
     assert result.fail_list == ["/downloads/Test.Show.Bonus.mkv"]
     assert source_oper.mock_calls == []

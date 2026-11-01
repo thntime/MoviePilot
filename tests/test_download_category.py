@@ -2,6 +2,7 @@
 下载链到 qBittorrent SDK 的分类与自动管理参数回归。
 """
 
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -33,7 +34,13 @@ def qb_download():
     module.get_instance = Mock(return_value=server)
     module.normalize_path = Mock(side_effect=lambda path, _name: path.as_posix())
     chain = DownloadChain.__new__(DownloadChain)
-    chain.run_module = lambda method, **kwargs: getattr(module, method)(**kwargs)
+    def _run_module(method: str, **kwargs):
+        """按目标方法签名过滤参数，对齐真实调度器只传契约参数的行为。"""
+        func = getattr(module, method)
+        allowed = set(inspect.signature(func).parameters)
+        return func(**{key: value for key, value in kwargs.items() if key in allowed})
+
+    chain.run_module = _run_module
     chain._settle_accepted_download = Mock()
     chain._record_rejected_download = Mock()
     return chain, server, torrent_hash

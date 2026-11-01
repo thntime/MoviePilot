@@ -1513,15 +1513,15 @@ def test_host_planning_value_error_commits_rejection_instead_of_retrying():
     )
     chain = _chain(repository=repository)
     chain.plan_transfer.side_effect = TransferPlanningRejectedError(
-        "未识别到文件集数"
+        "未识别到文件集数，请配置集数定位模板或自定义识别词后重试"
     )
 
     result = chain._plan_checkpoint_and_execute(task)
 
     assert result.success is False
-    assert result.message == "未识别到文件集数"
+    assert result.message == "未识别到文件集数，请配置集数定位模板或自定义识别词后重试"
     assert task.plan_checkpoint is not None
-    assert task.plan_checkpoint.rejection_error == "未识别到文件集数"
+    assert task.plan_checkpoint.rejection_error == "未识别到文件集数，请配置集数定位模板或自定义识别词后重试"
     assert task.plan_checkpoint.items == ()
     assert task.execution_checkpoint is not None
     repository.record_planning_failure.assert_not_called()

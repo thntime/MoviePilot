@@ -11,21 +11,27 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.application.configuration import get_configured_system_config
 from app.application.site.observation import report_site_search_outcome, report_site_search_page
 from app.domain.context import TorrentInfo
 from app.modules import _ModuleBase
+from app.domain import episode as episode_rules
 from app.modules.cloudsaver.cloudsaver import CloudSaverClient, CloudSaverError, parse_share_code
+from app.modules.cloudsaver.quark_share import MAX_PAGES, QuarkShareClient
 from app.runtime.log import logger
-from app.schemas.types import ModuleType, OtherModulesType
+from app.schemas.types import ModuleType, OtherModulesType, SystemConfigKey
 
 
-# 从分享文件名校验集数：中文集数、E01 形式与纯数字文件名。
-_EPISODE_NAME_PATTERNS = (
-    re.compile(r"第\s*(\d{1,4})\s*[集话]"),
-    re.compile(r"[Ee][Pp]?\s*(\d{1,4})"),
-    re.compile(r"^(\d{1,4})\.[A-Za-z0-9]{2,5}$"),
-)
-_STANDARD_EPISODE = re.compile(r"\bS\d{1,2}\s*E\d{1,4}\b", re.IGNORECASE)
+_STANDARD_EPISODE = re.compile(r"\bS\d{1,2}\s*E\d{1,4}(?:\s*-\s*E\d{1,4})?\b", re.IGNORECASE)
+# 只把视频文件计入集数清晰度与短剧判定。
+_VIDEO_EXTENSIONS = frozenset({
+    ".mp4", ".mkv", ".avi", ".ts", ".mov", ".flv", ".wmv", ".m4v", ".rmvb",
+})
+# 能解析出集数的视频文件占比下限。
+_EPISODE_COVERAGE_THRESHOLD = 0.8
+# 短剧判定阈值的默认值，可在系统设置中修改。
+_DEFAULT_SHORT_DRAMA_SECONDS = 300
+_DEFAULT_SHORT_DRAMA_MB = 150
 
 # 当前只展示夸克分享；其他平台既不支持转存，也没有有效性检查接口。
 _ALLOWED_PLATFORMS = frozenset({"quark"})
@@ -36,7 +42,7 @@ _MAX_ALIVE_CHECKS = 200
 # 有效性结果缓存，避免同一分享在多次搜索中重复检查。
 _ALIVE_CACHE_TTL = 1800
 _ALIVE_CACHE_LIMIT = 2000
-_alive_cache: Dict[str, Tuple[float, bool]] = {}
+_alive_cache: Dict[str, Tuple[float, bool, Optional[Dict[str, Any]]]] = {}
 _alive_lock = threading.Lock()
 
 
@@ -188,7 +194,7 @@ class CloudSaverModule(_ModuleBase):
         :return: 网盘候选列表
         """
         torrents: List[TorrentInfo] = []
-        seen: set[Tuple[str, str]] = set()
+        seen: set[str] = set()
         site_name = self._as_text(site.get("name")) or None
         site_downloader = self._as_text(site.get("downloader")) or None
         for entry in entries or []:
@@ -246,72 +252,235 @@ class CloudSaverModule(_ModuleBase):
         """
         return f"{site.get('id') or site.get('url')}:{share_code}"
 
-    def _cached_alive(self, key: str) -> Optional[bool]:
+    def _cached_alive(self, key: str) -> Optional[Tuple[bool, Optional[Dict[str, Any]]]]:
         """
-        读取缓存中的分享有效性。
+        读取缓存中的分享有效性与分享详情。
+
+        只缓存有效性，集数与短剧判定每次搜索都重新计算，阈值调整后才能立即生效。
 
         :param key: 缓存键
-        :return: 命中时返回有效性，未命中或过期返回 None
+        :return: 命中时返回 (有效性, 分享详情)，未命中或过期返回 None
         """
         now = time.time()
         with _alive_lock:
             hit = _alive_cache.get(key)
         if hit and now - hit[0] < _ALIVE_CACHE_TTL:
-            return hit[1]
+            return bool(hit[1]), hit[2]
         return None
 
     @staticmethod
-    def _store_alive(key: str, alive: bool) -> None:
+    def _store_alive(key: str, alive: bool, detail: Optional[Dict[str, Any]] = None) -> None:
         """
         写入分享有效性缓存，超过容量时整体清空。
 
         :param key: 缓存键
         :param alive: 分享是否有效
+        :param detail: 有效时一并缓存的分享详情，供后续搜索复用
         """
         with _alive_lock:
             if len(_alive_cache) >= _ALIVE_CACHE_LIMIT:
                 _alive_cache.clear()
-            _alive_cache[key] = (time.time(), alive)
+            _alive_cache[key] = (time.time(), alive, detail if alive else None)
+
+    @staticmethod
+    def _episode_numbers(file_name: str) -> List[int]:
+        """
+        从一个文件名中提取集数，规则由 app.domain.episode 统一维护。
+
+        :param file_name: 分享内的文件名或文件夹名
+        :return: 该文件名包含的集数列表；没有可识别集数时为空
+        """
+        return episode_rules.episode_numbers(file_name)
+
+    @staticmethod
+    def _is_plausible_episode(value: int) -> bool:
+        """
+        判断一个数字是否可能是集数，排除分辨率与年份。
+
+        :param value: 待判断的数字
+        :return: 可能是集数返回 True
+        """
+        return episode_rules.is_plausible_episode(value)
+
+    @staticmethod
+    def _bare_episode(file_name: str) -> Optional[int]:
+        """
+        从文件名中提取裸数字集数，只在能明确判定时返回。
+
+        :param file_name: 分享内的文件名
+        :return: 集数；无法明确判定时为空
+        """
+        return episode_rules.bare_episode(file_name)
 
     @staticmethod
     def _episode_token(file_names: List[str]) -> Optional[str]:
         """
-        从分享文件名推导季集标记，优先使用最小与最大集数。
+        从分享文件名推导季集标记，使用最小与最大集数构成连续区间。
 
-        :param file_names: 分享根目录文件名列表
-        :return: 形如 S01E12 或 S01E01-E24 的标记；无法推导时为空
+        :param file_names: 分享内的真实文件名列表
+        :return: 形如 S01E12 或 S01E153-E162 的标记；无法推导时为空
         """
-        episodes: List[int] = []
-        for name in file_names or []:
-            for pattern in _EPISODE_NAME_PATTERNS:
-                matched = pattern.search(name)
-                if matched:
-                    episodes.append(int(matched.group(1)))
-                    break
-        episodes = [value for value in episodes if 0 < value <= 9999]
-        if not episodes:
-            return None
-        begin, end = min(episodes), max(episodes)
-        if begin == end:
-            return f"S01E{begin:02d}"
-        return f"S01E{begin:02d}-E{end:02d}"
+        return episode_rules.episode_token(file_names)
 
     @staticmethod
-    def _apply_share_detail(torrent: TorrentInfo, detail: Dict[str, Any]) -> None:
+    def _video_files(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        用分享详情补齐候选大小与集数。
+        只保留视频文件，忽略图片、字幕与压缩包。
+
+        :param files: 分享文件树中的文件条目
+        :return: 视频文件条目列表
+        """
+        videos: List[Dict[str, Any]] = []
+        for entry in files or []:
+            name = str(entry.get("name") or "")
+            suffix = name[name.rfind("."):].lower() if "." in name else ""
+            if suffix in _VIDEO_EXTENSIONS:
+                videos.append(entry)
+        return videos
+
+    @staticmethod
+    def _is_episode_clear(videos: List[Dict[str, Any]]) -> bool:
+        """
+        判断文件树的集数是否清晰：能解析出集数的视频占比达到下限。
+
+        :param videos: 视频文件条目
+        :return: 集数清晰返回 True
+        """
+        if not videos:
+            return False
+        parsed = [entry for entry in videos if CloudSaverModule._episode_numbers(entry.get("name") or "")]
+        return len(parsed) / len(videos) >= _EPISODE_COVERAGE_THRESHOLD
+
+    @staticmethod
+    def _quality_limits() -> Tuple[int, int]:
+        """
+        读取短剧判定的两个阈值，未配置或非法时使用默认值。
+
+        :return: 平均每集时长上限（秒）与平均每集大小上限（MB）
+        """
+        duration_limit = _DEFAULT_SHORT_DRAMA_SECONDS
+        size_limit = _DEFAULT_SHORT_DRAMA_MB
+        try:
+            config = get_configured_system_config()
+            duration = config.get(SystemConfigKey.NetdiskShortDramaMaxDuration)
+            size = config.get(SystemConfigKey.NetdiskShortDramaMaxSize)
+            if isinstance(duration, (int, float)) and duration > 0:
+                duration_limit = int(duration)
+            if isinstance(size, (int, float)) and size > 0:
+                size_limit = int(size)
+        except Exception:  # noqa: BLE001
+            pass
+        return duration_limit, size_limit
+
+    @staticmethod
+    def _is_short_drama(videos: List[Dict[str, Any]], duration_limit: int, size_limit: int) -> bool:
+        """
+        判断是否为短剧：平均每集时长与平均每集大小同时低于阈值。
+
+        :param videos: 视频文件条目
+        :param duration_limit: 平均每集时长上限（秒）
+        :param size_limit: 平均每集大小上限（MB）
+        :return: 判定为短剧返回 True
+        """
+        durations = [int(entry.get("duration") or 0) for entry in videos if int(entry.get("duration") or 0) > 0]
+        sizes = [int(entry.get("size") or 0) for entry in videos if int(entry.get("size") or 0) > 0]
+        if not durations or not sizes:
+            return False
+        average_duration = sum(durations) / len(durations)
+        average_size = sum(sizes) / len(sizes) / 1024 / 1024
+        return average_duration < duration_limit and average_size < size_limit
+
+    @staticmethod
+    def _apply_share_detail(torrent: TorrentInfo, detail: Dict[str, Any], files: List[Dict[str, Any]]) -> None:
+        """
+        用分享详情补齐候选大小，并用文件树的真实集数覆盖标题推断值。
+
+        标题里的季集标记可能只是标题推断（如「更新至164集」转成的 S01E164），
+        文件树推导成功时先剥离再用真实区间重写；推导失败时保留标题原值。
 
         :param torrent: 待补齐的网盘候选
         :param detail: share_detail 返回的分享详情
+        :param files: 分享文件树中的文件条目
         """
         file_size = int(detail.get("file_size") or 0)
         if file_size > 0:
             torrent.size = float(file_size)
-        if _STANDARD_EPISODE.search(torrent.title or ""):
+        token = CloudSaverModule._episode_token([str(entry.get("name") or "") for entry in files or []])
+        if not token:
             return
-        token = CloudSaverModule._episode_token(detail.get("file_names") or [])
-        if token:
-            torrent.title = f"{torrent.title or ''} {token}".strip()
+        title = _STANDARD_EPISODE.sub(" ", torrent.title or "")
+        torrent.title = " ".join(f"{title} {token}".split())
+
+    def _share_files(self, client: QuarkShareClient, share_code: str, detail: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """
+        读取分享内的完整文件树，优先复用分享详情返回的访问令牌。
+
+        :param client: 夸克分享客户端
+        :param share_code: 分享码
+        :param detail: share_detail 返回的分享详情
+        :return: 文件条目列表；无法获取时返回 None
+        """
+        stoken = self._as_text(detail.get("stoken"))
+        if not stoken:
+            stoken = client.fetch_stoken(share_code)
+        if not stoken:
+            return None
+        return client.collect_files(share_code, stoken, max_pages=MAX_PAGES)
+
+    def _passes_quality(
+        self,
+        torrent: TorrentInfo,
+        share_code: str,
+        detail: Dict[str, Any],
+        quark: QuarkShareClient,
+    ) -> bool:
+        """
+        判断候选是否通过质量检查：文件树完整、集数清晰、不是短剧。
+
+        检查通过时把真实大小与集数写回候选；不通过时候选应被丢弃。
+
+        :param torrent: 待检查的网盘候选
+        :param share_code: 分享码
+        :param detail: share_detail 返回的分享详情
+        :param quark: 夸克分享客户端
+        :return: 通过返回 True
+        """
+        files = self._share_files(quark, share_code, detail)
+        videos = self._video_files(files or [])
+        if files is None or not self._is_episode_clear(videos):
+            # 拿不到完整文件树或集数不清晰：丢弃，避免展示错误集数。
+            return False
+        duration_limit, size_limit = self._quality_limits()
+        if self._is_short_drama(videos, duration_limit, size_limit):
+            # 短剧判定依赖可调阈值，结论不写入缓存，阈值调整后下次搜索即可生效。
+            return False
+        self._apply_share_detail(torrent, detail, files)
+        return True
+
+    def _inspect_share(
+        self,
+        client: CloudSaverClient,
+        quark: QuarkShareClient,
+        share_code: str,
+        torrent: TorrentInfo,
+        cached_detail: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], bool]:
+        """
+        检查单个候选：读取分享详情（可复用缓存）并执行质量检查。
+
+        在线程池中执行，避免逐个候选串行请求。
+
+        :param client: CloudSaver 客户端
+        :param quark: 夸克分享客户端
+        :param share_code: 分享码
+        :param torrent: 待检查的网盘候选
+        :param cached_detail: 缓存中已有的分享详情，可跳过详情请求
+        :return: (分享详情, 是否通过质量检查)；无法判定时详情为 None
+        """
+        detail = cached_detail or client.share_detail(share_code, torrent.share_password)
+        if not detail or not detail.get("alive"):
+            return detail, False
+        return detail, self._passes_quality(torrent, share_code, detail, quark)
 
     def _filter_alive_shares(
         self,
@@ -319,7 +488,7 @@ class CloudSaverModule(_ModuleBase):
         torrents: List[TorrentInfo],
     ) -> List[TorrentInfo]:
         """
-        只保留仍然有效的分享，并按发布时间优先检查最新的若干条。
+        只保留仍然有效且通过质量检查的分享，并按发布时间优先检查最新的若干条。
 
         :param site: CD 站点配置
         :param torrents: 去重后的网盘候选
@@ -328,45 +497,52 @@ class CloudSaverModule(_ModuleBase):
         if not torrents:
             return []
         client = self._get_client(site)
+        quark = QuarkShareClient()
         ordered = sorted(
             torrents,
             key=lambda torrent: torrent.pubdate or "",
             reverse=True,
         )[:_MAX_ALIVE_CHECKS]
         alive_flags: Dict[int, bool] = {}
-        pending: List[Tuple[TorrentInfo, str, str]] = []
+        pending: List[Tuple[TorrentInfo, str, str, Optional[Dict[str, Any]]]] = []
         for torrent in ordered:
             share_code = parse_share_code(torrent.enclosure or "")
             if not share_code:
                 continue
             cache_key = self._alive_cache_key(site, share_code)
             cached = self._cached_alive(cache_key)
-            if cached is None:
-                pending.append((torrent, share_code, cache_key))
-            else:
-                alive_flags[id(torrent)] = cached
+            if cached is not None and not cached[0]:
+                alive_flags[id(torrent)] = False
+                continue
+            pending.append((torrent, share_code, cache_key, cached[1] if cached else None))
         if pending:
             executor = ThreadPoolExecutor(max_workers=_ALIVE_WORKERS)
             try:
                 futures = {
-                    executor.submit(client.share_detail, share_code, torrent.share_password): (torrent, cache_key)
-                    for torrent, share_code, cache_key in pending
+                    executor.submit(
+                        self._inspect_share, client, quark, share_code, torrent, cached_detail
+                    ): (torrent, share_code, cache_key)
+                    for torrent, share_code, cache_key, cached_detail in pending
                 }
                 for future in as_completed(futures, timeout=_ALIVE_BUDGET_SECONDS):
-                    torrent, cache_key = futures[future]
+                    torrent, share_code, cache_key = futures[future]
                     try:
-                        detail = future.result()
+                        detail, passed = future.result()
                     except Exception:
-                        detail = None
-                    if not detail:
+                        detail, passed = None, False
+                    if detail is None:
                         # 无法判定时按失效处理，保证只展示确认可用的分享。
                         alive_flags[id(torrent)] = False
                         continue
-                    alive = bool(detail.get("alive"))
-                    self._store_alive(cache_key, alive)
-                    alive_flags[id(torrent)] = alive
-                    if alive:
-                        self._apply_share_detail(torrent, detail)
+                    if not detail.get("alive"):
+                        self._store_alive(cache_key, False)
+                        alive_flags[id(torrent)] = False
+                        continue
+                    if not passed:
+                        alive_flags[id(torrent)] = False
+                        continue
+                    self._store_alive(cache_key, True, detail)
+                    alive_flags[id(torrent)] = True
             except TimeoutError:
                 logger.debug("CD 站点分享有效性检查超时，未完成的候选按失效处理")
             finally:

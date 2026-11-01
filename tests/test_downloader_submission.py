@@ -3,6 +3,7 @@
 """
 
 import hashlib
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
@@ -25,6 +26,14 @@ _CUSTOM_WORDS = (
     "&& S01 <> 2160p >> EP+165"
 )
 _FILES = ["A.Will.Eternal.S04E05.2160p.mkv", "A.Will.Eternal.S04E06.2160p.mkv"]
+
+
+
+def _run_module_by_signature(module, method: str, **kwargs):
+    """按目标方法签名过滤参数，对齐真实调度器只传契约参数的行为。"""
+    func = getattr(module, method)
+    allowed = set(inspect.signature(func).parameters)
+    return func(**{key: value for key, value in kwargs.items() if key in allowed})
 
 
 def _torrent(version="v1"):
@@ -101,7 +110,7 @@ def test_subscription_mapping_reaches_real_downloader_selection(downloader):
     """
     module, server, content, torrent_hash = downloader
     chain = DownloadChain.__new__(DownloadChain)
-    chain.run_module = lambda method, **kwargs: getattr(module, method)(**kwargs)
+    chain.run_module = lambda method, **kwargs: _run_module_by_signature(module, method, **kwargs)
     chain._settle_accepted_download = Mock()
     chain._record_rejected_download = Mock()
 
@@ -215,7 +224,7 @@ def test_transmission_stopped_after_accepted_start_never_settles_success(downloa
     client = _use_transmission_rpc(module, server)
     client.trc.get_torrent.return_value = SimpleNamespace(status="stopped")
     chain = DownloadChain.__new__(DownloadChain)
-    chain.run_module = lambda method, **kwargs: getattr(module, method)(**kwargs)
+    chain.run_module = lambda method, **kwargs: _run_module_by_signature(module, method, **kwargs)
     chain._settle_accepted_download = Mock()
     chain._record_rejected_download = Mock()
 
@@ -263,7 +272,7 @@ def test_transmission_async_pause_guards_file_selection(downloader, transmission
     client.trc.get_torrent.side_effect = read_status
     client.get_files.side_effect = read_paused_files
     chain = DownloadChain.__new__(DownloadChain)
-    chain.run_module = lambda method, **kwargs: getattr(module, method)(**kwargs)
+    chain.run_module = lambda method, **kwargs: _run_module_by_signature(module, method, **kwargs)
     chain._settle_accepted_download = Mock()
     chain._record_rejected_download = Mock()
 
@@ -316,7 +325,7 @@ def test_selection_failure_keeps_paused_task_and_never_settles_success(downloade
     elif failure == "start":
         server.start_torrents.return_value = False
     chain = DownloadChain.__new__(DownloadChain)
-    chain.run_module = lambda method, **kwargs: getattr(module, method)(**kwargs)
+    chain.run_module = lambda method, **kwargs: _run_module_by_signature(module, method, **kwargs)
     chain._settle_accepted_download = Mock()
     chain._record_rejected_download = Mock()
 
@@ -501,7 +510,7 @@ def test_downloader_task_identity_decides_reuse_flag(downloader, existing):
     if existing:
         _report_existing_task(server, module, torrent_hash)
     chain = DownloadChain.__new__(DownloadChain)
-    chain.run_module = lambda method, **kwargs: getattr(module, method)(**kwargs)
+    chain.run_module = lambda method, **kwargs: _run_module_by_signature(module, method, **kwargs)
     chain._settle_accepted_download = Mock()
     chain._record_rejected_download = Mock()
 

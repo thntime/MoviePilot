@@ -381,6 +381,18 @@ SYSTEMCONFIG_CONTRACTS: dict[SystemConfigKey, _SystemConfigContract] = {
         "filter.group.update",
         "filter.group.delete",
     ),
+    SystemConfigKey.NetdiskShortDramaMaxDuration: _contract(
+        "netdisk",
+        Optional[int],
+        unit="秒",
+        examples=(300,),
+    ),
+    SystemConfigKey.NetdiskShortDramaMaxSize: _contract(
+        "netdisk",
+        Optional[int],
+        unit="MB",
+        examples=(150,),
+    ),
     SystemConfigKey.SearchFilterRuleGroups: _contract(
         "filter_defaults",
         Optional[list[str]],

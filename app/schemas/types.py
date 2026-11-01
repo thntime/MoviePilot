@@ -458,6 +458,10 @@ class SystemConfigKey(Enum):
     UserFilterRuleGroups = "UserFilterRuleGroups"
     # 搜索默认过滤规则组
     SearchFilterRuleGroups = "SearchFilterRuleGroups"
+    # 网盘短剧判定：平均每集时长上限（秒）
+    NetdiskShortDramaMaxDuration = "NetdiskShortDramaMaxDuration"
+    # 网盘短剧判定：平均每集大小上限（MB）
+    NetdiskShortDramaMaxSize = "NetdiskShortDramaMaxSize"
     # 订阅默认过滤规则组
     SubscribeFilterRuleGroups = "SubscribeFilterRuleGroups"
     # 补全搜索策略：smart 默认、full 全量、single_page 仅第一页；洗版始终全量
@@ -694,6 +698,8 @@ class DownloaderType(Enum):
     Rtorrent = "Rtorrent"
     # Aria2 下载器
     Aria2 = "Aria2"
+    # 夸克网盘下载器（并发 Range 分片）
+    Quark = "Quark"
 
 
 # 媒体服务器类型

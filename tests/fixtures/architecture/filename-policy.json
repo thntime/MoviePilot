@@ -153,6 +153,11 @@
   ],
   "reviewed_multiword_files": [
     {
+      "evidence": "GitHub OAuth 授权由 API、启动组合根和现有 Copilot 登录共同调用，单独能力服务需要保持稳定的跨层导入路径。",
+      "path": "app/application/github_auth.py",
+      "reason": "GitHub Token 授权是宿主级应用能力，不属于单一 API 端点或外部适配器实现。"
+    },
+    {
       "evidence": "多条现有 Chain 直接导入该私有协议集合，迁移必须随 chain 同名包治理完成。",
       "path": "app/chain/_contracts.py",
       "reason": "跨既有 Chain 的私有运行协议尚未归入单一能力包。"
@@ -188,14 +193,14 @@
       "reason": "数据库模型包内共享身份列是私有实现。"
     },
     {
+      "path": "app/modules/cloudsaver/quark_share.py",
+      "reason": "夸克分享解析客户端是 cloudsaver 模块的私有实现，不对外暴露。",
+      "evidence": "仅被 app/modules/cloudsaver/__init__.py 导入，用于分享列表翻页与文件树解析。"
+    },
+    {
       "evidence": "路径属于内含 tmdbv3api 代码，包根已按 contained_vendor 单独登记。",
       "path": "app/modules/themoviedb/tmdbv3api/as_obj.py",
       "reason": "保留内含上游库的原始模块名以维持其内部导入。"
-    },
-    {
-      "evidence": "GitHub OAuth 授权由 API、启动组合根和现有 Copilot 登录共同调用，单独能力服务需要保持稳定的跨层导入路径。",
-      "path": "app/application/github_auth.py",
-      "reason": "GitHub Token 授权是宿主级应用能力，不属于单一 API 端点或外部适配器实现。"
     }
   ],
   "schema_version": 2,

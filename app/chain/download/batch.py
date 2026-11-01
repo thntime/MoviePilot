@@ -217,6 +217,9 @@ class _BatchDownloadRun:
         torrent = context.torrent_info
         meta = context.meta_info
         assert meta is not None
+        if str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk":
+            # 网盘分享不是种子，无法解析集数，跳过整季/整包评估，交给单条下载路径。
+            return None
         logger.info(f"开始下载种子 {torrent.title} ...")
         errors: List[str] = []
         content, _, files = self.owner.download_torrent(torrent, on_failure=errors.append)
