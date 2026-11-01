@@ -1,7 +1,7 @@
 name: Sync Upstream
 
-# 每天定时把上游 v3 分支合并进来。前端仓库先跑（19:00 UTC），后端 30 分钟后跑，
-# 冲突时不推送，改为开 issue 说明哪些文件同步失败。
+# 每天定时把上游 v3 分支合并进来。前端仓库先跑（19:00 UTC），后端 30 分钟后跑。
+# 生成物（架构基线、架构文档、version.py）自动解决；其余冲突不推送，改开 issue 列出文件。
 on:
   schedule:
     - cron: '30 19 * * *' # 03:30 Asia/Shanghai
@@ -49,34 +49,70 @@ jobs:
         id: merge
         if: steps.fetch.outputs.behind != '0'
         run: |
-          set +e
+          set -uo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # .gitattributes 里登记的生成物用 ours 驱动，避免整份文件重写造成假冲突。
+          git config merge.ours.driver true
           git merge --no-edit "upstream/${UPSTREAM_BRANCH}" > /tmp/merge.log 2>&1
           status=$?
           cat /tmp/merge.log
-          if [ "$status" -ne 0 ]; then
-            conflicts=$(git diff --name-only --diff-filter=U | sort)
-            # version.py 只放版本号，直接采用上游版本，交给发布工作流把第四段重置为 0。
-            others=$(printf '%s\n' "$conflicts" | grep -v '^version\.py$' || true)
-            if [ -z "$others" ] && printf '%s\n' "$conflicts" | grep -qx 'version\.py'; then
-              git checkout --theirs version.py
-              git add version.py
-              git commit --no-edit
-              echo "conflicted=false" >> "$GITHUB_OUTPUT"
-              echo "已自动采用上游 version.py"
-              exit 0
-            fi
-            {
-              echo "conflicts<<EOF"
-              echo "$conflicts"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
-            git merge --abort
-            echo "conflicted=true" >> "$GITHUB_OUTPUT"
-            exit 1
+          if [ "$status" -eq 0 ]; then
+            echo "conflicted=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          echo "conflicted=false" >> "$GITHUB_OUTPUT"
+
+          conflicts=$(git diff --name-only --diff-filter=U | sort)
+          unresolved=""
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              # 版本号与架构文档只跟上游走，派生数字由后面的重新生成步骤修正。
+              version.py | docs/architecture-overview.md)
+                git checkout --theirs -- "$file"
+                git add -- "$file"
+                echo "已自动采用上游版本：$file"
+                ;;
+              *)
+                unresolved="${unresolved}${file}"$'\n'
+                ;;
+            esac
+          done <<< "$conflicts"
+
+          if [ -z "$unresolved" ]; then
+            git commit --no-edit
+            echo "conflicted=false" >> "$GITHUB_OUTPUT"
+            echo "冲突均为生成物，已自动解决"
+            exit 0
+          fi
+
+          {
+            echo "conflicts<<EOF"
+            printf '%s' "$unresolved"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          git merge --abort
+          echo "conflicted=true" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Set up uv
+        if: steps.fetch.outputs.behind != '0' && steps.merge.outputs.conflicted == 'false'
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Regenerate architecture baseline
+        if: steps.fetch.outputs.behind != '0' && steps.merge.outputs.conflicted == 'false'
+        run: |
+          set -euo pipefail
+          uv sync --frozen --quiet
+          uv run --frozen python scripts/architecture/baseline.py --write-host
+          uv run --frozen python scripts/refresh_architecture_docs.py
+          git add -A
+          if git diff --cached --quiet; then
+            echo "架构基线无需更新"
+          else
+            git commit --amend --no-edit
+            echo "已把重新生成的架构基线并入合并提交"
+          fi
 
       - name: Push merge
         if: steps.fetch.outputs.behind != '0' && steps.merge.outputs.conflicted == 'false'
@@ -92,7 +128,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${CONFLICTS:-}" ]; then
-            body=$(printf '自动同步上游 `%s` 失败。\n\n- 仓库：`%s`\n- 上游提交：`%s`\n- 运行记录：%s\n\n失败发生在拉取或合并阶段，请查看运行日志。\n' \
+            body=$(printf '自动同步上游 `%s` 失败。\n\n- 仓库：`%s`\n- 上游提交：`%s`\n- 运行记录：%s\n\n失败发生在拉取、合并或重新生成阶段，请查看运行日志。\n' \
               "$UPSTREAM_REPO" "$GITHUB_REPOSITORY" "${UPSTREAM_HEAD:-unknown}" "$RUN_URL")
           else
             files=$(printf '%s\n' "$CONFLICTS" | sed 's/^/- `/; s/$/`/')

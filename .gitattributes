@@ -1,0 +1,2 @@
+# 架构基线由脚本扫描代码生成，合并上游时保留本地版本，合并后再重新生成。
+tests/fixtures/architecture/*-baseline.json merge=ours
