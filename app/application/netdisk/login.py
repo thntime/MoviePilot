@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
@@ -30,6 +32,22 @@ class _PendingLogin:
     name: str
     is_primary: bool
     account_id: Optional[int] = None
+    expires_at: float = 0.0
+
+
+# 扫码会话的待落库上下文必须跨请求共享：接口每次请求都会新建用例实例，
+# 若存在实例属性上，下一次轮询就找不到会话。
+_QR_SESSION_TTL_SECONDS = 300
+_PENDING: dict[str, _PendingLogin] = {}
+_PENDING_LOCK = threading.RLock()
+
+
+def reset_pending_sessions() -> None:
+    """
+    清空待完成扫码会话，供测试与生命周期重置使用。
+    """
+    with _PENDING_LOCK:
+        _PENDING.clear()
 
 
 class NetdiskLoginService:
@@ -37,14 +55,19 @@ class NetdiskLoginService:
     网盘凭据获取与登录会话用例。
     """
 
-    def __init__(self, accounts: Optional[NetdiskAccountService] = None) -> None:
+    def __init__(
+        self,
+        accounts: Optional[NetdiskAccountService] = None,
+        pending: Optional[dict[str, _PendingLogin]] = None,
+    ) -> None:
         """
         保存账号服务与待完成会话。
 
         :param accounts: 账号用例；缺省时使用组合根注册的仓储
+        :param pending: 待完成会话表；缺省时使用进程级共享表
         """
         self._accounts = accounts or NetdiskAccountService()
-        self._pending: dict[str, _PendingLogin] = {}
+        self._pending = pending if pending is not None else _PENDING
 
     def paste_cookie(
         self,
@@ -162,12 +185,18 @@ class NetdiskLoginService:
         resolved = self._require_platform(platform)
         adapter = registry.get_adapter(resolved)
         session = registry.get_login_adapter().start(resolved, adapter.login_url, account_id)
-        self._pending[session.session_id] = _PendingLogin(
-            platform=resolved,
-            name=name or self._default_name(resolved),
-            is_primary=is_primary,
-            account_id=account_id,
-        )
+        now = time.monotonic()
+        with _PENDING_LOCK:
+            expired = [key for key, item in self._pending.items() if item.expires_at and item.expires_at <= now]
+            for key in expired:
+                self._pending.pop(key, None)
+            self._pending[session.session_id] = _PendingLogin(
+                platform=resolved,
+                name=name or self._default_name(resolved),
+                is_primary=is_primary,
+                account_id=account_id,
+                expires_at=now + _QR_SESSION_TTL_SECONDS,
+            )
         return session
 
     def poll_qr(self, session_id: str) -> LoginResult:
@@ -177,19 +206,25 @@ class NetdiskLoginService:
         :param session_id: 会话标识
         :return: 轮询结果
         """
-        context = self._pending.get(session_id)
+        with _PENDING_LOCK:
+            context = self._pending.get(session_id)
+            if context is not None and context.expires_at and context.expires_at <= time.monotonic():
+                self._pending.pop(session_id, None)
+                context = None
         if context is None:
             return LoginResult(status="failed", message="登录会话不存在或已过期")
         result = registry.get_login_adapter().poll(session_id)
         if result.status != "success" or not result.credential:
             if result.status in {"failed", "expired"}:
-                self._pending.pop(session_id, None)
+                with _PENDING_LOCK:
+                    self._pending.pop(session_id, None)
             return result
         try:
             adapter = registry.get_adapter(context.platform)
             probe = adapter.validate_credential(result.credential)
             if probe.status != "active":
-                self._pending.pop(session_id, None)
+                with _PENDING_LOCK:
+                    self._pending.pop(session_id, None)
                 return LoginResult(status="failed", message=probe.message or "登录态校验失败")
             if context.account_id:
                 self._accounts.update(
@@ -206,7 +241,8 @@ class NetdiskLoginService:
                     validate=False,
                 )
         finally:
-            self._pending.pop(session_id, None)
+            with _PENDING_LOCK:
+                self._pending.pop(session_id, None)
             registry.get_login_adapter().cancel(session_id)
         return LoginResult(status="success", message="登录成功")
 
@@ -216,7 +252,8 @@ class NetdiskLoginService:
 
         :param session_id: 会话标识
         """
-        self._pending.pop(session_id, None)
+        with _PENDING_LOCK:
+            self._pending.pop(session_id, None)
         registry.get_login_adapter().cancel(session_id)
 
     def _credential_from_text(

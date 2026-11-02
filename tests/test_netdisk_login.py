@@ -15,7 +15,7 @@ from app.application.netdisk.contract import (
     NetdiskAccountWrite,
     NetdiskTuning,
 )
-from app.application.netdisk.login import NetdiskLoginService
+from app.application.netdisk.login import NetdiskLoginService, reset_pending_sessions
 from app.domain.netdisk import AccountProbe, LinkPolicy, NetdiskError, NetdiskErrorCode, NetdiskPlatform
 
 
@@ -163,6 +163,7 @@ def env():
         login_adapter=login_adapter,
     )
     yield NetdiskLoginService(NetdiskAccountService(store)), store, login_adapter, cookie_import
+    reset_pending_sessions()
     registry.reset_netdisk_services()
 
 
@@ -252,3 +253,139 @@ def test_qr_login_expired(env):
     result = service.poll_qr("s-1")
     assert result.status == "expired"
     assert store.records == {}
+
+
+def test_qr_pending_session_survives_new_service_instance(env):
+    """
+    接口每次请求都会新建用例实例，扫码会话必须跨实例仍可轮询。
+    """
+    _, store, _, _ = env
+    reset_pending_sessions()
+    first = NetdiskLoginService(NetdiskAccountService(store))
+    second = NetdiskLoginService(NetdiskAccountService(store))
+
+    first.start_qr("pan123", name="扫码账号")
+    result = second.poll_qr("s-1")
+
+    assert result.status == "success"
+    assert store.records[1].credential == {"token": "jwt-qr"}
+
+
+class _FakeQrPage:
+    """
+    模拟登录页与二维码元素，用于验证截图裁剪。
+    """
+
+    def __init__(self, box: dict[str, float], element_image: bytes = b"qr-png") -> None:
+        """
+        保存二维码元素尺寸与截图。
+        """
+        self._box = box
+        self._element_image = element_image
+        self.selectors: list[str] = []
+
+    def goto(self, url: str, **kwargs: object) -> None:
+        """
+        模拟打开页面。
+        """
+        del url, kwargs
+
+    def wait_for_load_state(self, state: str, timeout: int) -> None:
+        """
+        模拟等待加载。
+        """
+        del state, timeout
+
+    def wait_for_timeout(self, timeout: int) -> None:
+        """
+        模拟等待渲染。
+        """
+        del timeout
+
+    def locator(self, selector: str) -> "_FakeQrLocator":
+        """
+        返回二维码元素定位器。
+        """
+        self.selectors.append(selector)
+        return _FakeQrLocator(self._box, self._element_image)
+
+    def screenshot(self) -> bytes:
+        """
+        返回整页截图。
+        """
+        return b"full-page"
+
+
+class _FakeQrLocator:
+    """
+    模拟 Playwright 定位器。
+    """
+
+    def __init__(self, box: dict[str, float], image: bytes) -> None:
+        """
+        保存元素尺寸与截图。
+        """
+        self._box = box
+        self._image = image
+
+    def count(self) -> int:
+        """
+        返回匹配数量。
+        """
+        return 1
+
+    def nth(self, index: int) -> "_FakeQrLocator":
+        """
+        返回指定元素。
+        """
+        del index
+        return self
+
+    def is_visible(self) -> bool:
+        """
+        元素可见。
+        """
+        return True
+
+    def bounding_box(self) -> dict[str, float]:
+        """
+        返回元素尺寸。
+        """
+        return self._box
+
+    def screenshot(self) -> bytes:
+        """
+        返回元素截图。
+        """
+        return self._image
+
+
+def test_qr_capture_crops_to_qr_element() -> None:
+    """
+    二维码元素足够大时应截取元素本身，而不是整页。
+    """
+    from types import SimpleNamespace
+    from app.adapters.external.netdisk.login.browser import BrowserQrLoginAdapter
+
+    page = _FakeQrPage({"width": 220, "height": 220})
+    adapter = BrowserQrLoginAdapter()
+
+    image = adapter._capture(SimpleNamespace(active_page=page), "https://example.com")  # pylint: disable=protected-access
+
+    assert image == b"qr-png"
+    assert page.selectors
+
+
+def test_qr_capture_falls_back_to_full_page() -> None:
+    """
+    找不到足够大的二维码元素时回退整页截图。
+    """
+    from types import SimpleNamespace
+    from app.adapters.external.netdisk.login.browser import BrowserQrLoginAdapter
+
+    page = _FakeQrPage({"width": 20, "height": 20})
+    adapter = BrowserQrLoginAdapter()
+
+    image = adapter._capture(SimpleNamespace(active_page=page), "https://example.com")  # pylint: disable=protected-access
+
+    assert image == b"full-page"

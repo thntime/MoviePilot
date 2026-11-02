@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional, cast
 
 from app.adapters.network.browser import BrowserSessionHelper, _BrowserSessionState
 from app.domain.netdisk import LoginResult, LoginSession
@@ -36,6 +36,19 @@ _COOKIE_DOMAINS: dict[NetdiskPlatform, tuple[str, ...]] = {
 _SESSION_TTL_SECONDS = 300
 # 页面加载等待上限。
 _PAGE_TIMEOUT_SECONDS = 45
+# 二维码元素选择器：优先截取元素本身，避免整页截图把二维码缩得过小。
+_QR_SELECTORS = (
+    "img[src*='qrcode']",
+    "img[src*='qr']",
+    "canvas",
+    "[class*='qrcode']",
+    "[class*='qr-code']",
+    "[class*='qrCode']",
+    "[id*='qrcode']",
+    "[id*='qr-code']",
+)
+# 二维码元素的最小边长，过滤页面上的装饰性 canvas。
+_QR_MIN_SIZE = 120
 
 
 @dataclass(slots=True)
@@ -66,7 +79,10 @@ class BrowserQrLoginAdapter:
         """
         初始化会话表与浏览器辅助类。
         """
-        self._helper = BrowserSessionHelper(headless=True)
+        self._helper = BrowserSessionHelper(
+            headless=True,
+            viewport={"width": 1440, "height": 900},
+        )
         self._sessions: dict[str, _QrSession] = {}
         self._lock = threading.RLock()
 
@@ -168,8 +184,33 @@ class BrowserQrLoginAdapter:
         :return: PNG 截图字节
         """
         page = state.active_page
-        page.goto(login_url)
-        page.wait_for_load_state("networkidle", timeout=_PAGE_TIMEOUT_SECONDS * 1000)
+        # BrowserPage 协议只声明常用方法，二维码元素定位依赖 Playwright 的扩展 API。
+        raw = cast(Any, page)
+        page.goto(login_url, wait_until="domcontentloaded", timeout=_PAGE_TIMEOUT_SECONDS * 1000)
+        try:
+            # 部分登录页存在长连接，networkidle 可能永远不触发；等待失败也继续截图。
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:  # noqa: BLE001 - 页面已可用时继续
+            pass
+        # 二维码通常由前端脚本异步渲染，等待一小段时间再查找元素。
+        raw.wait_for_timeout(1200)
+        for selector in _QR_SELECTORS:
+            try:
+                locator = raw.locator(selector)
+                count = min(locator.count(), 3)
+            except Exception:  # noqa: BLE001 - 选择器不适用时继续尝试下一个
+                continue
+            for index in range(count):
+                try:
+                    item = locator.nth(index)
+                    if not item.is_visible():
+                        continue
+                    box = item.bounding_box()
+                    if not box or box["width"] < _QR_MIN_SIZE or box["height"] < _QR_MIN_SIZE:
+                        continue
+                    return cast(bytes, item.screenshot())
+                except Exception:  # noqa: BLE001 - 元素截图失败时回退整页
+                    continue
         return page.screenshot()
 
     def _read_cookie(self, state: _BrowserSessionState, platform: NetdiskPlatform) -> str:
