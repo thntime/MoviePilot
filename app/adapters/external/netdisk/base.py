@@ -10,6 +10,10 @@ import time
 from typing import Any, Mapping, Optional
 
 from app.adapters.network.http import RequestUtils
+
+# 网盘业务 API 均为国内直连域名；宿主代理常按域名分流，某些域名（如 yun.123pan.cn）
+# 经代理会直接失败。这里显式关闭代理，避免环境变量 HTTPS_PROXY 干扰取链与登录校验。
+_DIRECT_PROXIES = {"http": "", "https": ""}
 from app.domain.netdisk import NetdiskAccountRecord
 from app.domain.netdisk import (
     AccountProbe,
@@ -161,7 +165,11 @@ class NetdiskHttp:
         :param headers: 额外请求头
         :return: JSON 对象
         """
-        request = RequestUtils(headers=self.headers(account, extra=headers), timeout=self.timeout)
+        request = RequestUtils(
+            headers=self.headers(account, extra=headers),
+            timeout=self.timeout,
+            proxies=_DIRECT_PROXIES,
+        )
         response = request.get_res(url, params=dict(params or {}), allow_redirects=True)
         return self._json(response)
 
@@ -186,7 +194,11 @@ class NetdiskHttp:
         :param headers: 额外请求头
         :return: JSON 对象
         """
-        request = RequestUtils(headers=self.headers(account, extra=headers), timeout=self.timeout)
+        request = RequestUtils(
+            headers=self.headers(account, extra=headers),
+            timeout=self.timeout,
+            proxies=_DIRECT_PROXIES,
+        )
         response = request.post_res(
             url,
             data=dict(data) if data is not None else None,
@@ -213,7 +225,11 @@ class NetdiskHttp:
         :param headers: 额外请求头
         :return: 响应文本
         """
-        request = RequestUtils(headers=self.headers(account, extra=headers), timeout=self.timeout)
+        request = RequestUtils(
+            headers=self.headers(account, extra=headers),
+            timeout=self.timeout,
+            proxies=_DIRECT_PROXIES,
+        )
         response = request.get_res(url, params=dict(params or {}), allow_redirects=True)
         if response is None:
             raise NetdiskError(NetdiskErrorCode.UNKNOWN, "网盘接口无响应", platform=self.platform)
