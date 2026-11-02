@@ -389,3 +389,106 @@ def test_qr_capture_falls_back_to_full_page() -> None:
     image = adapter._capture(SimpleNamespace(active_page=page), "https://example.com")  # pylint: disable=protected-access
 
     assert image == b"full-page"
+
+
+def test_qr_missing_cookie_fields_keeps_pending(env, monkeypatch):
+    """
+    扫码后会话字段尚未下发时保持 pending，下一次轮询再落库。
+    """
+    service, store, _, _ = env
+    calls = {"count": 0}
+    original = _Adapter.validate_credential
+
+    def fake_validate(self, credential):
+        """
+        第一次返回缺少字段，第二次走正常校验。
+        """
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return AccountProbe(status="expired", message="凭据缺少必填字段：__pus、__puus")
+        return original(self, credential)
+
+    monkeypatch.setattr(_Adapter, "validate_credential", fake_validate)
+    service.start_qr("pan123", name="扫码账号")
+
+    first = service.poll_qr("s-1")
+    assert first.status == "pending"
+    assert store.records == {}
+
+    second = service.poll_qr("s-1")
+    assert second.status == "success"
+    assert store.records[1].credential == {"token": "jwt-qr"}
+
+
+class _FakeCookieContext:
+    """
+    模拟浏览器上下文中的 Cookie 列表。
+    """
+
+    def __init__(self, cookies: list[dict[str, str]]) -> None:
+        """
+        保存 Cookie 列表。
+        """
+        self.cookies_list = cookies
+
+    def cookies(self) -> list[dict[str, str]]:
+        """
+        返回 Cookie 列表。
+        """
+        return list(self.cookies_list)
+
+
+class _FakeNavPage:
+    """
+    模拟登录后跳转：进入网盘页时补发 __puus。
+    """
+
+    def __init__(self, context: _FakeCookieContext) -> None:
+        """
+        保存上下文引用。
+        """
+        self._context = context
+        self.urls: list[str] = []
+
+    def goto(self, url: str, **kwargs: object) -> None:
+        """
+        记录跳转并在进入网盘页后补发 __puus。
+        """
+        del kwargs
+        self.urls.append(url)
+        if url.endswith("/list"):
+            self._context.cookies_list.append(
+                {"name": "__puus", "value": "new-token", "domain": ".quark.cn"}
+            )
+
+    def wait_for_timeout(self, timeout: int) -> None:
+        """
+        模拟等待。
+        """
+        del timeout
+
+
+def test_quark_qr_login_navigates_to_drive_for_puus() -> None:
+    """
+    夸克扫码后停留在登录页时，读取 Cookie 应进入网盘页触发 __puus 下发。
+    """
+    from types import SimpleNamespace
+    from app.adapters.external.netdisk.login.browser import BrowserQrLoginAdapter
+    from app.domain.netdisk import NetdiskPlatform
+
+    context = _FakeCookieContext(
+        [
+            {"name": "b-user-id", "value": "u-1", "domain": ".quark.cn"},
+            {"name": "__pus", "value": "old", "domain": ".quark.cn"},
+        ]
+    )
+    page = _FakeNavPage(context)
+    state = SimpleNamespace(context=context, active_page=page)
+    session = SimpleNamespace(post_login_navigated=False)
+    adapter = BrowserQrLoginAdapter()
+
+    cookie = adapter._read_cookie(state, NetdiskPlatform.QUARK, session)  # pylint: disable=protected-access
+
+    assert page.urls == ["https://pan.quark.cn/list"]
+    assert "__puus=new-token" in cookie
+    assert session.post_login_navigated is True

@@ -68,6 +68,7 @@ class _QrSession:
     platform: NetdiskPlatform
     created_at: float
     expires_at: float
+    post_login_navigated: bool = False
 
 
 class BrowserQrLoginAdapter:
@@ -150,7 +151,7 @@ class BrowserQrLoginAdapter:
         try:
             cookie = self._helper.with_session(
                 session.session_key,
-                lambda state: self._read_cookie(state, session.platform),
+                lambda state: self._read_cookie(state, session.platform, session),
                 timeout=_PAGE_TIMEOUT_SECONDS,
             )
         except Exception as error:  # noqa: BLE001 - 浏览器读取失败统一归类
@@ -193,33 +194,70 @@ class BrowserQrLoginAdapter:
         except Exception:  # noqa: BLE001 - 页面已可用时继续
             pass
         # 二维码通常由前端脚本异步渲染，等待一小段时间再查找元素。
-        raw.wait_for_timeout(1200)
-        for selector in _QR_SELECTORS:
-            try:
-                locator = raw.locator(selector)
-                count = min(locator.count(), 3)
-            except Exception:  # noqa: BLE001 - 选择器不适用时继续尝试下一个
-                continue
-            for index in range(count):
+        raw.wait_for_timeout(2000)
+        # UC/微信等登录二维码在 iframe 中，必须逐个 frame 查找。
+        frames = list(getattr(raw, "frames", None) or [page])
+        for frame in frames:
+            for selector in _QR_SELECTORS:
                 try:
-                    item = locator.nth(index)
-                    if not item.is_visible():
-                        continue
-                    box = item.bounding_box()
-                    if not box or box["width"] < _QR_MIN_SIZE or box["height"] < _QR_MIN_SIZE:
-                        continue
-                    return cast(bytes, item.screenshot())
-                except Exception:  # noqa: BLE001 - 元素截图失败时回退整页
+                    locator = frame.locator(selector)
+                    count = min(locator.count(), 3)
+                except Exception:  # noqa: BLE001 - 选择器不适用时继续尝试下一个
                     continue
+                for index in range(count):
+                    try:
+                        item = locator.nth(index)
+                        if not item.is_visible():
+                            continue
+                        box = item.bounding_box()
+                        if not box or box["width"] < _QR_MIN_SIZE or box["height"] < _QR_MIN_SIZE:
+                            continue
+                        return cast(bytes, item.screenshot())
+                    except Exception:  # noqa: BLE001 - 元素截图失败时回退整页
+                        continue
         return page.screenshot()
 
-    def _read_cookie(self, state: _BrowserSessionState, platform: NetdiskPlatform) -> str:
+    def _read_cookie(
+        self,
+        state: _BrowserSessionState,
+        platform: NetdiskPlatform,
+        session: Optional[_QrSession] = None,
+    ) -> str:
         """
         从浏览器上下文筛出平台 Cookie 并拼成请求头。
 
         :param state: 浏览器会话状态
         :param platform: 平台标识
+        :param session: 扫码会话，用于记录登录后跳转
         :return: Cookie 头；未登录时为空串
+        """
+        cookie = self._cookie_header(state, platform)
+        # 夸克扫码成功后需要进入网盘页才会下发 __puus，停留在登录页会缺字段。
+        if (
+            session is not None
+            and not session.post_login_navigated
+            and platform is NetdiskPlatform.QUARK
+            and "b-user-id=" in cookie
+            and "__puus=" not in cookie
+        ):
+            session.post_login_navigated = True
+            try:
+                page = cast(Any, state.active_page)
+                page.goto("https://pan.quark.cn/list", wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1500)
+            except Exception as error:  # noqa: BLE001 - 跳转失败时保留现有 Cookie
+                logger.warning(f"夸克登录后跳转失败：error={type(error).__name__}")
+            cookie = self._cookie_header(state, platform)
+        return cookie
+
+    @staticmethod
+    def _cookie_header(state: _BrowserSessionState, platform: NetdiskPlatform) -> str:
+        """
+        按平台域名过滤并拼接 Cookie 头。
+
+        :param state: 浏览器会话状态
+        :param platform: 平台标识
+        :return: Cookie 头
         """
         suffixes = _COOKIE_DOMAINS.get(platform, ())
         pairs: list[str] = []

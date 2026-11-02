@@ -223,6 +223,10 @@ class NetdiskLoginService:
             adapter = registry.get_adapter(context.platform)
             probe = adapter.validate_credential(result.credential)
             if probe.status != "active":
+                # 扫码成功后页面可能尚未完成跳转，__puus 等会话字段还没下发；
+                # 此时保留会话继续轮询，避免刚扫完就提示登录失败。
+                if "缺少必填字段" in (probe.message or ""):
+                    return LoginResult(status="pending", message="正在等待登录完成")
                 with _PENDING_LOCK:
                     self._pending.pop(session_id, None)
                 return LoginResult(status="failed", message=probe.message or "登录态校验失败")
@@ -240,10 +244,14 @@ class NetdiskLoginService:
                     is_primary=context.is_primary,
                     validate=False,
                 )
-        finally:
+        except Exception:
             with _PENDING_LOCK:
                 self._pending.pop(session_id, None)
             registry.get_login_adapter().cancel(session_id)
+            raise
+        with _PENDING_LOCK:
+            self._pending.pop(session_id, None)
+        registry.get_login_adapter().cancel(session_id)
         return LoginResult(status="success", message="登录成功")
 
     def cancel_qr(self, session_id: str) -> None:
