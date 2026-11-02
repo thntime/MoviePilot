@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from app.application.netdisk import registry
 from app.application.netdisk.accounts import NetdiskAccountService, parse_cookie_header
@@ -163,6 +163,70 @@ class NetdiskLoginService:
             name or str(username or "").strip() or self._default_name(resolved),
             credential,
             is_primary=is_primary,
+        )
+
+    def send_sms_code(self, platform: object, phone: str) -> dict[str, Any]:
+        """
+        发送短信验证码。
+
+        :param platform: 平台标识
+        :param phone: 手机号
+        :return: 验证会话信息
+        """
+        resolved = self._require_platform(platform)
+        adapter = registry.get_adapter(resolved)
+        sender = getattr(adapter, "send_sms_code", None)
+        if sender is None:
+            raise NetdiskError(
+                NetdiskErrorCode.UNSUPPORTED,
+                "该平台不支持短信验证码登录",
+                platform=resolved,
+            )
+        return dict(sender(str(phone or "").strip()))
+
+    def sms_login(
+        self,
+        platform: object,
+        phone: str,
+        code: str,
+        verification_id: str,
+        *,
+        name: Optional[str] = None,
+        is_primary: bool = False,
+    ) -> NetdiskAccountView:
+        """
+        使用短信验证码登录并保存账号。
+
+        :param platform: 平台标识
+        :param phone: 手机号
+        :param code: 短信验证码
+        :param verification_id: 发码接口返回的验证会话
+        :param name: 账号名称
+        :param is_primary: 是否设为主账号
+        :return: 新账号的脱敏投影
+        """
+        resolved = self._require_platform(platform)
+        adapter = registry.get_adapter(resolved)
+        login = getattr(adapter, "sms_login", None)
+        if login is None:
+            raise NetdiskError(
+                NetdiskErrorCode.UNSUPPORTED,
+                "该平台不支持短信验证码登录",
+                platform=resolved,
+            )
+        credential = login(
+            str(phone or "").strip(),
+            str(code or "").strip(),
+            str(verification_id or "").strip(),
+        )
+        if not credential:
+            raise NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "短信验证码登录失败", platform=resolved)
+        return self._accounts.create(
+            resolved,
+            name or str(phone or "").strip() or self._default_name(resolved),
+            credential,
+            is_primary=is_primary,
+            validate=False,
         )
 
     def start_qr(

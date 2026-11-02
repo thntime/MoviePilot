@@ -272,6 +272,7 @@ class LoginSession:
     :param session_id: 会话标识
     :param platform: 平台标识
     :param image: 二维码图片字节，非图片登录时为 None
+    :param page_image: 完整登录页截图字节，便于用户查看页面其他入口
     :param status: `pending`、`success`、`failed` 或 `expired`
     :param message: 可直接展示的说明
     :param expires_at: 会话过期时间
@@ -280,6 +281,7 @@ class LoginSession:
     session_id: str
     platform: NetdiskPlatform
     image: Optional[bytes] = None
+    page_image: Optional[bytes] = None
     status: str = "pending"
     message: str = ""
     expires_at: Optional[datetime] = None

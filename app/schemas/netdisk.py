@@ -40,6 +40,28 @@ class NetdiskPasswordRequest(BaseModel):
     is_primary: bool = Field(False, description="是否设为该平台主账号")
 
 
+class NetdiskSmsSendRequest(BaseModel):
+    """
+    发送短信验证码的请求体。
+    """
+
+    platform: str = Field(..., description="网盘平台标识，仅光鸭支持")
+    phone: str = Field(..., description="手机号")
+
+
+class NetdiskSmsLoginRequest(BaseModel):
+    """
+    短信验证码登录的请求体。
+    """
+
+    platform: str = Field(..., description="网盘平台标识，仅光鸭支持")
+    phone: str = Field(..., description="手机号")
+    code: str = Field(..., description="短信验证码")
+    verification_id: str = Field(..., description="发送验证码接口返回的验证会话")
+    name: Optional[str] = Field(default=None, description="账号名称")
+    is_primary: bool = Field(False, description="是否设为该平台主账号")
+
+
 class NetdiskQrStartRequest(BaseModel):
     """
     启动扫码登录的请求体。
@@ -103,8 +125,12 @@ class NetdiskData(BaseModel):
     platform: Optional[str] = Field(default=None, description="相关平台")
     status: Optional[str] = Field(default=None, description="状态")
     image: Optional[str] = Field(default=None, description="二维码图片（base64）")
+    page_image: Optional[str] = Field(default=None, description="完整登录页截图（base64）")
     expires_at: Optional[str] = Field(default=None, description="会话过期时间")
     deleted: Optional[bool] = Field(default=None, description="是否已删除")
     refreshed: Optional[bool] = Field(default=None, description="是否已刷新")
+    sms_verification_id: Optional[str] = Field(default=None, description="短信验证会话")
+    sms_is_user: Optional[bool] = Field(default=None, description="手机号是否已注册")
+    sms_expires_in: Optional[int] = Field(default=None, description="验证码有效期（秒）")
     code: Optional[str] = Field(default=None, description="错误分类")
     account_name: Optional[str] = Field(default=None, description="相关账号名称")

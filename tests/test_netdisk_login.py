@@ -370,9 +370,12 @@ def test_qr_capture_crops_to_qr_element() -> None:
     page = _FakeQrPage({"width": 220, "height": 220})
     adapter = BrowserQrLoginAdapter()
 
-    image = adapter._capture(SimpleNamespace(active_page=page), "https://example.com")  # pylint: disable=protected-access
+    image, page_image = adapter._capture(  # pylint: disable=protected-access
+        SimpleNamespace(active_page=page), "https://example.com"
+    )
 
     assert image == b"qr-png"
+    assert page_image == b"full-page"
     assert page.selectors
 
 
@@ -386,9 +389,12 @@ def test_qr_capture_falls_back_to_full_page() -> None:
     page = _FakeQrPage({"width": 20, "height": 20})
     adapter = BrowserQrLoginAdapter()
 
-    image = adapter._capture(SimpleNamespace(active_page=page), "https://example.com")  # pylint: disable=protected-access
+    image, page_image = adapter._capture(  # pylint: disable=protected-access
+        SimpleNamespace(active_page=page), "https://example.com"
+    )
 
     assert image == b"full-page"
+    assert page_image == b"full-page"
 
 
 def test_qr_missing_cookie_fields_keeps_pending(env, monkeypatch):

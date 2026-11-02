@@ -26,6 +26,8 @@ from app.schemas.netdisk import (
     NetdiskCookieRequest,
     NetdiskPasswordRequest,
     NetdiskQrStartRequest,
+    NetdiskSmsLoginRequest,
+    NetdiskSmsSendRequest,
 )
 from app.schemas.response import Response as _SchemaResponse
 
@@ -186,6 +188,51 @@ async def create_password_account(
     return _SchemaResponse(success=True, data=NetdiskData(account=_account_view(view)))
 
 
+@router.post("/accounts/sms/send", summary="发送短信验证码")
+async def send_sms_code(
+    payload: NetdiskSmsSendRequest,
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> _SchemaResponse[NetdiskData]:
+    """
+    发送光鸭等平台的短信验证码。
+    """
+    try:
+        result = await run_in_threadpool(_login().send_sms_code, payload.platform, payload.phone)
+    except NetdiskError as error:
+        return _error_response(error)
+    return _SchemaResponse(
+        success=True,
+        data=NetdiskData(
+            sms_verification_id=str(result.get("verification_id") or ""),
+            sms_is_user=bool(result.get("is_user")),
+            sms_expires_in=int(result.get("expires_in") or 0),
+        ),
+    )
+
+
+@router.post("/accounts/sms/login", summary="短信验证码登录")
+async def login_with_sms(
+    payload: NetdiskSmsLoginRequest,
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> _SchemaResponse[NetdiskData]:
+    """
+    校验短信验证码并保存账号。
+    """
+    try:
+        view = await run_in_threadpool(
+            _login().sms_login,
+            payload.platform,
+            payload.phone,
+            payload.code,
+            payload.verification_id,
+            name=payload.name,
+            is_primary=payload.is_primary,
+        )
+    except NetdiskError as error:
+        return _error_response(error)
+    return _SchemaResponse(success=True, data=NetdiskData(account=_account_view(view)))
+
+
 @router.post("/accounts/qr", summary="启动扫码登录")
 async def start_qr_login(
     payload: NetdiskQrStartRequest,
@@ -205,6 +252,7 @@ async def start_qr_login(
     except NetdiskError as error:
         return _error_response(error)
     image = session.image.decode("ascii") if session.image else ""
+    page_image = session.page_image.decode("ascii") if session.page_image else ""
     return _SchemaResponse(
         success=True,
         data=NetdiskData(
@@ -212,6 +260,7 @@ async def start_qr_login(
             platform=session.platform.value,
             status=session.status,
             image=image,
+            page_image=page_image,
             expires_at=session.expires_at.isoformat() if session.expires_at else None,
         ),
     )

@@ -43,6 +43,9 @@ _WEB_SITE = "https://www.guangyapan.com"
 
 _SIGNIN_URL = f"{_ACCOUNT_BASE}/v1/auth/signin"
 _USER_ME_URL = f"{_ACCOUNT_BASE}/v1/user/me"
+_CAPTCHA_INIT_URL = f"{_ACCOUNT_BASE}/v1/shield/captcha/init"
+_VERIFICATION_URL = f"{_ACCOUNT_BASE}/v1/auth/verification"
+_VERIFICATION_VERIFY_URL = f"{_ACCOUNT_BASE}/v1/auth/verification/verify"
 _SHARE_SUMMARY_URL = f"{_API_BASE}/userres/v1/get_share_summary"
 _SHARE_TOKEN_URL = f"{_API_BASE}/userres/v1/get_share_access_token"
 _SHARE_FILES_URL = f"{_API_BASE}/userres/v1/get_share_page_files_list"
@@ -929,6 +932,10 @@ class GuangYaAdapter(BaseNetdiskAdapter):
                 "请填写光鸭账号与密码",
                 platform=self.platform,
             )
+        captcha_token = self._captcha_init("POST:/v1/auth/signin", {"username": account_name})
+        headers = self._account_headers()
+        if captcha_token:
+            headers["X-Captcha-Token"] = captcha_token
         try:
             payload = self.http.post_json(
                 _SIGNIN_URL,
@@ -937,7 +944,7 @@ class GuangYaAdapter(BaseNetdiskAdapter):
                     "username": account_name,
                     "password": password,
                 },
-                headers=self._account_headers(),
+                headers=headers,
             )
         except NetdiskError as error:
             raise _normalize_error(error) from error
@@ -974,6 +981,164 @@ class GuangYaAdapter(BaseNetdiskAdapter):
                 "光鸭登录失败：响应缺少 access_token",
                 platform=self.platform,
                 account_name=account_name,
+            )
+        return {"token": token}
+
+    def _captcha_init(self, action: str, meta: Mapping[str, Any]) -> Optional[str]:
+        """
+        初始化光鸭人机验证。
+
+        :param action: 触发动作，如 `POST:/v1/auth/signin`
+        :param meta: 动作相关参数
+        :return: 人机验证令牌；服务端未要求时为空
+        :raises NetdiskError: 需要网页人机验证时抛出 RISK_BLOCKED
+        """
+        payload = self.http.post_json(
+            _CAPTCHA_INIT_URL,
+            json={
+                "client_id": _CLIENT_ID,
+                "action": action,
+                "device_id": self._device_id,
+                "captcha_token": "",
+                "meta": dict(meta),
+            },
+            headers=self._account_headers(),
+        )
+        url = as_text(payload.get("url"))
+        if url:
+            raise NetdiskError(
+                NetdiskErrorCode.RISK_BLOCKED,
+                f"光鸭需要网页人机验证，请先在浏览器打开 {url} 完成验证",
+                platform=self.platform,
+            )
+        return as_text(payload.get("captcha_token")) or None
+
+    def send_sms_code(self, phone: str) -> dict[str, Any]:
+        """
+        发送光鸭短信验证码。
+
+        :param phone: 手机号
+        :return: 验证会话信息
+        """
+        phone_number = _normalize_account(phone)
+        if not phone_number:
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "请填写光鸭手机号",
+                platform=self.platform,
+            )
+        meta = {"phone_number": phone_number}
+        for _attempt in range(3):
+            token = self._captcha_init("POST:/v1/auth/verification", meta)
+            headers = self._account_headers()
+            headers["X-Captcha-Token"] = token or ""
+            payload = self.http.post_json(
+                _VERIFICATION_URL,
+                json={"client_id": _CLIENT_ID, "phone_number": phone_number, "target": "ANY"},
+                headers=headers,
+            )
+            code = as_text(payload.get("code")) or as_text(payload.get("error"))
+            if code in {"captcha_required", "captcha_invalid"}:
+                continue
+            if not _is_success(payload):
+                message = _first_non_blank(
+                    payload.get("msg"),
+                    payload.get("message"),
+                    payload.get("error_description"),
+                )
+                raise NetdiskError(
+                    _signin_error_code(code, message),
+                    _signin_error_message(code, message),
+                    platform=self.platform,
+                    account_name=phone_number,
+                )
+            verification_id = as_text(payload.get("verification_id"))
+            if not verification_id:
+                raise NetdiskError(
+                    NetdiskErrorCode.RATE_LIMITED,
+                    "光鸭验证码请求过于频繁，请稍后重试",
+                    platform=self.platform,
+                )
+            return {
+                "verification_id": verification_id,
+                "is_user": bool(payload.get("is_user")),
+                "expires_in": as_int(payload.get("expires_in")) or 600,
+            }
+        raise NetdiskError(
+            NetdiskErrorCode.RISK_BLOCKED,
+            "光鸭安全验证未通过，请稍后重试或改用账号密码登录",
+            platform=self.platform,
+        )
+
+    def sms_login(self, phone: str, code: str, verification_id: str) -> Mapping[str, str]:
+        """
+        使用短信验证码登录光鸭。
+
+        :param phone: 手机号
+        :param code: 短信验证码
+        :param verification_id: 发码接口返回的验证会话
+        :return: 可保存的凭据字段
+        """
+        phone_number = _normalize_account(phone)
+        verification_code = str(code or "").strip()
+        if not phone_number or not verification_code or not verification_id:
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "请填写手机号、验证码并先获取验证码",
+                platform=self.platform,
+            )
+        verify = self.http.post_json(
+            _VERIFICATION_VERIFY_URL,
+            json={
+                "client_id": _CLIENT_ID,
+                "verification_id": verification_id,
+                "verification_code": verification_code,
+            },
+            headers=self._account_headers(),
+        )
+        if not _is_success(verify):
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "光鸭短信验证码错误或已过期，请重新获取",
+                platform=self.platform,
+            )
+        verification_token = as_text(verify.get("verification_token"))
+        if not verification_token:
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "光鸭短信验证码错误或已过期，请重新获取",
+                platform=self.platform,
+            )
+        payload = self.http.post_json(
+            _SIGNIN_URL,
+            json={
+                "client_id": _CLIENT_ID,
+                "username": phone_number,
+                "verification_code": verification_code,
+                "verification_token": verification_token,
+            },
+            headers=self._account_headers(),
+        )
+        if not _is_success(payload):
+            message = _first_non_blank(
+                payload.get("msg"),
+                payload.get("message"),
+                payload.get("error_description"),
+            )
+            raise NetdiskError(
+                _signin_error_code(as_text(payload.get("code")), message),
+                _signin_error_message(as_text(payload.get("code")), message),
+                platform=self.platform,
+                account_name=phone_number,
+            )
+        data = (payload.get("data") if isinstance(payload.get("data"), dict) else payload) or {}
+        token = _first_non_blank(data.get("access_token"), data.get("accessToken"))
+        if not token:
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "光鸭登录失败：响应缺少 access_token",
+                platform=self.platform,
+                account_name=phone_number,
             )
         return {"token": token}
 

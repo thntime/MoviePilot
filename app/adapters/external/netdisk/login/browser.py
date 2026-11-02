@@ -104,7 +104,7 @@ class BrowserQrLoginAdapter:
         session_id = uuid.uuid4().hex
         session_key = f"netdisk-qr-{session_id}"
         try:
-            image = self._helper.with_session(
+            image, page_image = self._helper.with_session(
                 session_key,
                 lambda session: self._capture(session, login_url),
                 timeout=_PAGE_TIMEOUT_SECONDS,
@@ -130,6 +130,7 @@ class BrowserQrLoginAdapter:
             session_id=session_id,
             platform=platform,
             image=base64.b64encode(image),
+            page_image=base64.b64encode(page_image),
             status="pending",
             message="请使用对应 App 扫码登录",
             expires_at=datetime.now() + timedelta(seconds=_SESSION_TTL_SECONDS),
@@ -176,13 +177,13 @@ class BrowserQrLoginAdapter:
         except Exception as error:  # noqa: BLE001 - 关闭失败只记录
             logger.warning(f"关闭网盘登录浏览器失败：error={type(error).__name__}")
 
-    def _capture(self, state: _BrowserSessionState, login_url: str) -> bytes:
+    def _capture(self, state: _BrowserSessionState, login_url: str) -> tuple[bytes, bytes]:
         """
         在浏览器会话中打开登录页并截图。
 
         :param state: 浏览器会话状态
         :param login_url: 登录页地址
-        :return: PNG 截图字节
+        :return: 二维码截图与完整页面截图
         """
         page = state.active_page
         # BrowserPage 协议只声明常用方法，二维码元素定位依赖 Playwright 的扩展 API。
@@ -195,6 +196,7 @@ class BrowserQrLoginAdapter:
             pass
         # 二维码通常由前端脚本异步渲染，等待一小段时间再查找元素。
         raw.wait_for_timeout(2000)
+        page_png = page.screenshot()
         # UC/微信等登录二维码在 iframe 中，必须逐个 frame 查找。
         frames = list(getattr(raw, "frames", None) or [page])
         for frame in frames:
@@ -212,10 +214,10 @@ class BrowserQrLoginAdapter:
                         box = item.bounding_box()
                         if not box or box["width"] < _QR_MIN_SIZE or box["height"] < _QR_MIN_SIZE:
                             continue
-                        return cast(bytes, item.screenshot())
+                        return cast(bytes, item.screenshot()), page_png
                     except Exception:  # noqa: BLE001 - 元素截图失败时回退整页
                         continue
-        return page.screenshot()
+        return page_png, page_png
 
     def _read_cookie(
         self,
