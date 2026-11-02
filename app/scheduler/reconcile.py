@@ -480,10 +480,15 @@ class SchedulerReconcileOwner(_SchedulerOwnerBase):
         用户认证检查
         """
         config = get_scheduler_runtime_config()
-        if SitesHelper().auth_level >= 2:
+        sites_helper = SitesHelper()
+        if sites_helper.auth_level >= 2:
             if self._auth_plugin_routes_pending:
                 register_plugin_api()
                 self._auth_plugin_routes_pending = False
+            return
+        # 没有配置站点认证时不做无意义的反复重试，也不发系统警告。
+        auth_conf = get_configured_system_config().get(SystemConfigKey.UserSiteAuthParams)
+        if not auth_conf and not get_runtime_setting("AUTH_SITE"):
             return
         # 最大重试次数
         __max_try__ = 30
@@ -497,8 +502,6 @@ class SchedulerReconcileOwner(_SchedulerOwnerBase):
                 self._auth_message = True
             return
         logger.info("用户未认证，正在尝试认证...")
-        auth_conf = get_configured_system_config().get(SystemConfigKey.UserSiteAuthParams)
-        sites_helper = SitesHelper()
         if get_runtime_setting("AUTH_SITE"):
             status, msg = sites_helper.check_user()
         else:

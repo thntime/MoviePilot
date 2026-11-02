@@ -44,7 +44,7 @@ def test_parse_139_and_123_and_115():
     139、123 与 115 的链接形态都能识别。
     """
     c139 = parse_share_link("https://yun.139.com/shareweb/#/w/i/xyz789")
-    assert c139 is not None and c139.platform is NetdiskPlatform.C139
+    assert c139 is not None and c139.platform is NetdiskPlatform.PAN139
     pan123 = parse_share_link("https://www.123pan.com/s/2785Vv-T4Ded")
     assert pan123 is not None and pan123.share_id == "2785Vv-T4Ded"
     pan115 = parse_share_link("https://115.com/s/swabc123?password=abcd")
@@ -81,6 +81,15 @@ def test_normalize_platform_aliases():
     CloudSaver 与用户输入的平台别名收敛到统一枚举。
     """
     assert normalize_platform("baiduPan") is NetdiskPlatform.BAIDU
-    assert normalize_platform("yidong") is NetdiskPlatform.C139
+    assert normalize_platform("yidong") is NetdiskPlatform.PAN139
     assert normalize_platform("115") is NetdiskPlatform.PAN115
     assert normalize_platform("unknown") is None
+
+
+def test_platform_c139_renamed_to_pan139():
+    """
+    平台标识统一为 pan139，同时兼容历史 c139。
+    """
+    assert NetdiskPlatform.PAN139.value == "pan139"
+    assert normalize_platform("pan139") is NetdiskPlatform.PAN139
+    assert normalize_platform("c139") is NetdiskPlatform.PAN139

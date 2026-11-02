@@ -163,7 +163,10 @@ def _has_login(fields: Mapping[str, str]) -> bool:
     """
     if _authorization(fields):
         return True
-    return bool(fields.get("Os_Sso_Sid")) and bool(fields.get("RMKEY"))
+    if fields.get("Os_Sso_Sid") and fields.get("RMKEY"):
+        return True
+    # YunX 网页登录导出的 Cookie 也可能只带 a_k/skey（分享接口使用）。
+    return bool(fields.get("a_k")) and bool(fields.get("skey"))
 
 
 def _md5(text: str) -> str:
@@ -249,12 +252,14 @@ class C139Adapter(BaseNetdiskAdapter):
     列目录为匿名端点，取直链需要登录账号；分享下载不需要转存。
     """
 
-    platform = NetdiskPlatform.C139
+    platform = NetdiskPlatform.PAN139
     link_policy = LinkPolicy.DIRECT
     requires_account = True
     guest_supported = False
     max_concurrency = 512
-    cookie_required_keys = ("Os_Sso_Sid", "RMKEY")
+    # 139 支持 authorization、Os_Sso_Sid+RMKEY、a_k+skey 三种登录态，
+    # 由 validate_credential 统一判断，避免预检查只认移动端字段。
+    cookie_required_keys: tuple[str, ...] = ()
     cookie_domains = (".139.com", ".10086.cn")
     login_url = "https://yun.139.com/"
     supports_password_login = False
@@ -609,10 +614,14 @@ class C139Adapter(BaseNetdiskAdapter):
         """
         fields = _credential_fields(credential)
         if not _has_login(fields):
-            return AccountProbe(status="expired", message="凭据缺少必填字段：Os_Sso_Sid、RMKEY（或 authorization）")
+            return AccountProbe(
+                status="expired",
+                message="凭据缺少必填字段：authorization、Os_Sso_Sid+RMKEY 或 a_k+skey",
+            )
         authorization = _authorization(fields)
         if not authorization:
-            return AccountProbe(status="active", message="凭据字段完整")
+            # 没有 authorization 时无法调用个人盘接口，按字段完整性接受，后续取链再校验。
+            return AccountProbe(status="active", message="凭据字段完整（未校验个人盘接口）")
         try:
             info = self._account_info(authorization)
         except NetdiskError as error:

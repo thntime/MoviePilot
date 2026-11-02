@@ -182,3 +182,24 @@ def test_scheduler_auth_prefers_environment_configuration(monkeypatch) -> None:
     owner.user_auth()
 
     helper.check_user.assert_called_once_with()
+
+
+def test_check_auth_skips_warning_without_auth_sites(monkeypatch) -> None:
+    """
+    未配置站点认证时不发用户认证失败系统消息。
+    """
+    helper = Mock()
+    helper.auth_level = 0
+    helper.get_authsites.return_value = {}
+    message = Mock()
+
+    config = Mock()
+    config.get.return_value = {}
+    monkeypatch.setattr(module_initializer, "SitesHelper", Mock(return_value=helper))
+    monkeypatch.setattr(module_initializer, "get_configured_system_config", Mock(return_value=config))
+    monkeypatch.setattr(module_initializer, "get_runtime_setting", lambda key: "")
+    monkeypatch.setattr(module_initializer, "MessageHelper", Mock(return_value=message))
+
+    module_initializer.check_auth()
+
+    message.put.assert_not_called()

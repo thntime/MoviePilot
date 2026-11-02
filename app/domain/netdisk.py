@@ -21,7 +21,7 @@ class NetdiskPlatform(StrEnum):
 
     :cvar QUARK: 夸克网盘
     :cvar UC: UC 网盘
-    :cvar C139: 中国移动云盘（139）
+    :cvar PAN139: 中国移动云盘（139）
     :cvar PAN123: 123 云盘
     :cvar PAN115: 115 网盘
     :cvar GUANGYA: 光鸭云盘
@@ -31,7 +31,7 @@ class NetdiskPlatform(StrEnum):
 
     QUARK = "quark"
     UC = "uc"
-    C139 = "c139"
+    PAN139 = "pan139"
     PAN123 = "pan123"
     PAN115 = "pan115"
     GUANGYA = "guangya"
@@ -321,10 +321,11 @@ _PLATFORM_ALIASES: dict[str, NetdiskPlatform] = {
     "quark": NetdiskPlatform.QUARK,
     "uc": NetdiskPlatform.UC,
     "ucdrive": NetdiskPlatform.UC,
-    "c139": NetdiskPlatform.C139,
-    "139": NetdiskPlatform.C139,
-    "yidong": NetdiskPlatform.C139,
-    "mobile": NetdiskPlatform.C139,
+    "pan139": NetdiskPlatform.PAN139,
+    "c139": NetdiskPlatform.PAN139,
+    "139": NetdiskPlatform.PAN139,
+    "yidong": NetdiskPlatform.PAN139,
+    "mobile": NetdiskPlatform.PAN139,
     "pan123": NetdiskPlatform.PAN123,
     "123": NetdiskPlatform.PAN123,
     "pan115": NetdiskPlatform.PAN115,
@@ -413,7 +414,7 @@ def parse_share_link(text: str, password: Optional[str] = None) -> Optional[Shar
         (_UC_PATTERN, NetdiskPlatform.UC),
         (_XUNLEI_PATTERN, NetdiskPlatform.XUNLEI),
         (_BAIDU_PATTERN, NetdiskPlatform.BAIDU),
-        (_C139_PATTERN, NetdiskPlatform.C139),
+        (_C139_PATTERN, NetdiskPlatform.PAN139),
         (_PAN123_PATTERN, NetdiskPlatform.PAN123),
         (_PAN123_SUB_PATTERN, NetdiskPlatform.PAN123),
         (_PAN123_SRR_PATTERN, NetdiskPlatform.PAN123),

@@ -1334,6 +1334,27 @@ class SiteChain(InteractionChainMixin, ChainBase):
         site_url = site_info.url
         if site_id is None or not site_url:
             return False, "站点配置不完整"
+        # CD 站点没有网页登录与 Cookie，凭据更新本质是测试 CloudSaver 登录。
+        if getattr(site_info, "kind", "pt") == "cd":
+            result = self.run_module(
+                "test_netdisk_site",
+                site={
+                    "id": site_id,
+                    "name": getattr(site_info, "name", ""),
+                    "domain": getattr(site_info, "domain", ""),
+                    "url": site_url,
+                    "kind": "cd",
+                    "auth_type": getattr(site_info, "auth_type", "auth"),
+                    "username": username,
+                    "password": password,
+                    "timeout": getattr(site_info, "timeout", 60),
+                    "auth_refresh_interval": getattr(site_info, "auth_refresh_interval", 300),
+                },
+            )
+            if result is None:
+                return False, "CloudSaver 模块不可用"
+            state, message = result
+            return bool(state), message or ("登录成功" if state else "登录失败")
         result = CookieHelper().get_site_cookie_ua(
             url=site_url,
             username=username,

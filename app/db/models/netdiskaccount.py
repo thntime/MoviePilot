@@ -25,7 +25,7 @@ class NetdiskAccount(Base):
     )
 
     id = get_id_column()
-    # 平台标识：quark / uc / c139 / pan123 / pan115 / guangya / baidu / xunlei
+    # 平台标识：quark / uc / pan139 / pan123 / pan115 / guangya / baidu / xunlei
     platform: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     # 用户可读的账号名称，同平台内唯一
     name: Mapped[str] = mapped_column(String(64), nullable=False)
