@@ -2,6 +2,7 @@
 验证通用网盘下载器模块的下载分流、任务抽象、取链编排与存储迁移。
 """
 
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -20,6 +21,7 @@ from app.domain.netdisk import (
     TransferHandle,
 )
 from app.modules.netdisk import NetdiskModule, _share_code, store
+from app.modules.netdisk.engine import DownloadError
 from app.schemas.types import DownloaderType, ModuleType, TorrentQueryStatus
 
 
@@ -369,3 +371,83 @@ def test_run_task_applies_instance_tuning(
     assert kwargs["rate_limit_bytes"] == 123
     assert kwargs["preempt"] is False
     assert resolver.resolve_calls[0]["multi_source"] is False
+
+
+def test_list_torrents_exposes_netdisk_source_and_error() -> None:
+    """
+    任务列表应携带网盘平台、分享码与最近一次失败原因，供前端展示来源与失败详情。
+    """
+    module = NetdiskModule()
+    store.upsert_task("t6", {
+        "state": "error",
+        "error": "分片 3 重试次数超限：连接超时",
+        "netdisk_platform": "xunlei",
+        "share_code": "VP5RkWv5",
+    })
+
+    tasks = module.list_torrents()
+
+    assert tasks is not None
+    assert tasks[0].netdisk_platform == "xunlei"
+    assert tasks[0].share_code == "VP5RkWv5"
+    assert tasks[0].error == "分片 3 重试次数超限：连接超时"
+
+
+class _FailingResolver:
+    """
+    walk 直接抛出内部错误的取链服务替身。
+    """
+
+    tuning = NetdiskTuning()
+
+    def walk(self, *args: Any, **kwargs: Any) -> Any:
+        """
+        模拟分享解析失败。
+        """
+        raise DownloadError("无法获取分享文件列表")
+
+
+def test_run_task_reports_internal_failure_as_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    没有外部停止信号时，内部异常必须落为失败，不能被前端当成自动暂停。
+    """
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda: _FailingResolver())
+    module = NetdiskModule()
+    store.upsert_task("t7", {"state": "downloading", "dlspeed": "1 MiB/s"})
+
+    module._run_task(  # pylint: disable=protected-access
+        "t7", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None,
+    )
+
+    record = store.get_task("t7")
+    assert record is not None
+    assert record["state"] == "error"
+    assert "无法获取分享文件列表" in record["error"]
+    assert record["dlspeed"] is None
+
+
+def test_run_task_reports_stop_signal_as_paused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    外部停止信号置位时，即使底层抛出任意异常也应记录为暂停。
+    """
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda: _FailingResolver())
+    module = NetdiskModule()
+    stop_event = threading.Event()
+    stop_event.set()
+    module._stops["t8"] = stop_event
+    store.upsert_task("t8", {"state": "downloading"})
+
+    module._run_task(  # pylint: disable=protected-access
+        "t8", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None,
+    )
+
+    record = store.get_task("t8")
+    assert record is not None
+    assert record["state"] == "paused"
+    assert record["error"] is None

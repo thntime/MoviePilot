@@ -86,6 +86,7 @@ def configure_scheduler_services() -> None:
             clear_wallpaper_cache=WallpaperHelper().clear_cache,
             refresh_site_data=site_chain.refresh_userdatas,
             refresh_netdisk_tokens=site_chain.refresh_netdisk_tokens,
+            refresh_netdisk_accounts=scheduler_chain.refresh_netdisk_accounts,
             refresh_recommend=recommend_chain.refresh_recommend,
             cache_subscribe_calendar=subscribe_chain.cache_calendar,
             list_workflows=workflow_chain.get_timer_workflows,

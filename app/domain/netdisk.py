@@ -21,7 +21,7 @@ class NetdiskPlatform(StrEnum):
 
     :cvar QUARK: 夸克网盘
     :cvar UC: UC 网盘
-    :cvar C139: 中国移动云盘（139）
+    :cvar PAN139: 中国移动云盘（139）
     :cvar PAN123: 123 云盘
     :cvar PAN115: 115 网盘
     :cvar GUANGYA: 光鸭云盘
@@ -31,7 +31,7 @@ class NetdiskPlatform(StrEnum):
 
     QUARK = "quark"
     UC = "uc"
-    C139 = "c139"
+    PAN139 = "pan139"
     PAN123 = "pan123"
     PAN115 = "pan115"
     GUANGYA = "guangya"
@@ -272,6 +272,7 @@ class LoginSession:
     :param session_id: 会话标识
     :param platform: 平台标识
     :param image: 二维码图片字节，非图片登录时为 None
+    :param page_image: 完整登录页截图字节，便于用户查看页面其他入口
     :param status: `pending`、`success`、`failed` 或 `expired`
     :param message: 可直接展示的说明
     :param expires_at: 会话过期时间
@@ -280,6 +281,7 @@ class LoginSession:
     session_id: str
     platform: NetdiskPlatform
     image: Optional[bytes] = None
+    page_image: Optional[bytes] = None
     status: str = "pending"
     message: str = ""
     expires_at: Optional[datetime] = None
@@ -298,6 +300,7 @@ class LoginResult:
     status: str
     credential: Optional[Mapping[str, str]] = None
     message: str = ""
+    account_name: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,10 +322,11 @@ _PLATFORM_ALIASES: dict[str, NetdiskPlatform] = {
     "quark": NetdiskPlatform.QUARK,
     "uc": NetdiskPlatform.UC,
     "ucdrive": NetdiskPlatform.UC,
-    "c139": NetdiskPlatform.C139,
-    "139": NetdiskPlatform.C139,
-    "yidong": NetdiskPlatform.C139,
-    "mobile": NetdiskPlatform.C139,
+    "pan139": NetdiskPlatform.PAN139,
+    "c139": NetdiskPlatform.PAN139,
+    "139": NetdiskPlatform.PAN139,
+    "yidong": NetdiskPlatform.PAN139,
+    "mobile": NetdiskPlatform.PAN139,
     "pan123": NetdiskPlatform.PAN123,
     "123": NetdiskPlatform.PAN123,
     "pan115": NetdiskPlatform.PAN115,
@@ -411,7 +415,7 @@ def parse_share_link(text: str, password: Optional[str] = None) -> Optional[Shar
         (_UC_PATTERN, NetdiskPlatform.UC),
         (_XUNLEI_PATTERN, NetdiskPlatform.XUNLEI),
         (_BAIDU_PATTERN, NetdiskPlatform.BAIDU),
-        (_C139_PATTERN, NetdiskPlatform.C139),
+        (_C139_PATTERN, NetdiskPlatform.PAN139),
         (_PAN123_PATTERN, NetdiskPlatform.PAN123),
         (_PAN123_SUB_PATTERN, NetdiskPlatform.PAN123),
         (_PAN123_SRR_PATTERN, NetdiskPlatform.PAN123),
@@ -426,3 +430,75 @@ def parse_share_link(text: str, password: Optional[str] = None) -> Optional[Shar
             share_id = share_id.removeprefix("1")
         return build(platform, share_id, pwd)
     return None
+
+
+@dataclass(frozen=True, slots=True)
+class DriveQuota:
+    """
+    个人网盘空间配额。
+
+    :param used: 已用字节
+    :param total: 总字节；0 表示平台未返回
+    """
+
+    used: int = 0
+    total: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DriveFile:
+    """
+    个人网盘文件或目录条目。
+
+    :param file_id: 平台文件标识
+    :param name: 文件名
+    :param size: 字节数；目录为 0
+    :param is_dir: 是否目录
+    :param updated_at: 修改时间
+    :param parent_id: 父目录标识
+    """
+
+    file_id: str
+    name: str
+    size: int = 0
+    is_dir: bool = False
+    updated_at: Optional[datetime] = None
+    parent_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DriveShare:
+    """
+    个人盘分享结果。
+
+    :param url: 分享链接
+    :param password: 提取码
+    :param expires_at: 过期时间
+    """
+
+    url: str
+    password: str = ""
+    expires_at: Optional[datetime] = None
+
+
+@dataclass(frozen=True, slots=True)
+class DriveCapabilities:
+    """
+    平台个人盘能力声明。
+
+    :param quota: 是否支持空间查询
+    :param browse: 是否支持目录浏览
+    :param download: 是否支持单文件取直链
+    :param share: 是否支持创建分享
+    :param move: 是否支持移动
+    :param rename: 是否支持重命名
+    :param delete: 是否支持删除
+    """
+
+    quota: bool = False
+    browse: bool = False
+    download: bool = False
+    share: bool = False
+    move: bool = False
+    rename: bool = False
+    delete: bool = False

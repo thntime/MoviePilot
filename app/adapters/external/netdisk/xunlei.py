@@ -21,10 +21,15 @@ from app.adapters.external.netdisk.base import (
     as_int,
     as_text,
 )
+from app.adapters.network.http import RequestUtils
 from app.domain.netdisk import NetdiskAccountRecord
 from app.domain.netdisk import (
     AccountProbe,
     DirectLink,
+    DriveCapabilities,
+    DriveFile,
+    DriveQuota,
+    DriveShare,
     LinkPolicy,
     NetdiskError,
     NetdiskErrorCode,
@@ -43,6 +48,8 @@ _SHARE_URL = f"{_PAN_BASE}/drive/v1/share"
 _SHARE_DETAIL_URL = f"{_PAN_BASE}/drive/v1/share/detail"
 _RESTORE_URL = f"{_PAN_BASE}/drive/v1/share/restore"
 _ABOUT_URL = f"{_PAN_BASE}/drive/v1/about"
+_MOVE_URL = f"{_FILES_URL}:batchMove"
+_TRASH_URL = f"{_FILES_URL}:batchTrash"
 
 # 网页客户端 UA 与请求头常量，与迅雷网页版抓包一致。
 _CLIENT_UA = (
@@ -58,6 +65,11 @@ _TEMP_DIR_PREFIX = "MoviePilot临时转存"
 # 分享列表单页条数与最大翻页次数。
 _PAGE_LIMIT = 100
 _MAX_PAGES = 100
+# 个人盘文件列表单页条数（对齐 YunX 抓包）。
+_DRIVE_PAGE_LIMIT = 50
+
+# 云盘业务接口均为国内直连域名，显式关闭宿主代理。
+_DIRECT_PROXIES = {"http": "", "https": ""}
 
 # 凭据中可能出现的 Cookie 容器字段。
 _COOKIE_KEYS = frozenset({"cookie", "cookie_header", "cookies"})
@@ -193,6 +205,15 @@ class XunleiAdapter(BaseNetdiskAdapter):
     link_policy = LinkPolicy.TRANSFER_REQUIRED
     requires_account = True
     guest_supported = False
+    drive_capabilities = DriveCapabilities(
+        quota=True,
+        browse=True,
+        download=True,
+        share=True,
+        move=True,
+        rename=True,
+        delete=True,
+    )
     max_concurrency = 8
     cookie_required_keys = ("access_token", "deviceid")
     cookie_domains = (".xunlei.com",)
@@ -735,16 +756,255 @@ class XunleiAdapter(BaseNetdiskAdapter):
             headers.update({str(key): str(value) for key, value in extra.items()})
         return headers
 
+    # ---- 个人盘 ----
+
+    def _patch_json(
+        self,
+        url: str,
+        *,
+        account: NetdiskAccountRecord,
+        json: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """
+        发起 PATCH 请求并解析 JSON。
+
+        共享 HTTP 封装只提供 GET/POST，重命名需要 PATCH，这里按同一套请求头与直连策略补一个入口。
+
+        :param url: 请求地址
+        :param account: 账号
+        :param json: JSON 请求体
+        :return: 响应 JSON
+        """
+        request = RequestUtils(
+            headers=self._api_headers(account, extra={"Content-Type": "application/json"}),
+            timeout=self.http.timeout,
+            proxies=_DIRECT_PROXIES,
+        )
+        response = request.request("patch", url, json=dict(json))
+        if response is None:
+            raise NetdiskError(NetdiskErrorCode.UNKNOWN, "网盘接口无响应", platform=self.platform)
+        if response.status_code >= 400:
+            raise self.http.error_for_status(response.status_code)
+        try:
+            payload = response.json()
+        except Exception as error:  # noqa: BLE001 - 非 JSON 响应统一归类
+            raise NetdiskError(
+                NetdiskErrorCode.UNKNOWN,
+                "网盘接口返回了非 JSON 响应",
+                platform=self.platform,
+            ) from error
+        if not isinstance(payload, dict):
+            return {"data": payload}
+        return {str(key): value for key, value in payload.items()}
+
+    def quota(self, account: NetdiskAccountRecord) -> DriveQuota:
+        """
+        查询迅雷云盘空间。
+
+        :param account: 账号
+        :return: 已用/总空间
+        """
+        self._identity(account)
+        payload = self.http.get_json(_ABOUT_URL, headers=self._api_headers(account))
+        self._check_payload(payload, "查询迅雷云盘空间")
+        data = self._data(payload)
+        quota = data.get("quota")
+        if not isinstance(quota, Mapping):
+            quota = payload.get("quota")
+        if not isinstance(quota, Mapping):
+            return DriveQuota()
+        return DriveQuota(used=as_int(quota.get("usage")), total=as_int(quota.get("limit")))
+
+    def list_dir(self, account: NetdiskAccountRecord, parent_id: str) -> list[DriveFile]:
+        """
+        分页列出迅雷个人盘目录。
+
+        :param account: 账号
+        :param parent_id: 父目录标识，空串为根目录
+        :return: 目录条目
+        """
+        self._identity(account)
+        collected: list[DriveFile] = []
+        page_token = ""
+        filters = json.dumps({"trashed": {"eq": False}})
+        for _ in range(_MAX_PAGES):
+            payload = self.http.get_json(
+                _FILES_URL,
+                params={
+                    "parent_id": parent_id,
+                    "page_token": page_token,
+                    "limit": _DRIVE_PAGE_LIMIT,
+                    "with_audit": "true",
+                    "filters": filters,
+                },
+                headers=self._api_headers(account),
+            )
+            self._check_payload(payload, "获取迅雷云盘文件列表")
+            data = self._data(payload)
+            for item in data.get("files") or []:
+                if not isinstance(item, Mapping):
+                    continue
+                collected.append(
+                    DriveFile(
+                        file_id=as_text(item.get("id")),
+                        name=as_text(item.get("name")),
+                        size=as_int(item.get("size")),
+                        is_dir=as_text(item.get("kind")) == "drive#folder",
+                        parent_id=as_text(item.get("parent_id")),
+                    )
+                )
+            page_token = as_text(data.get("next_page_token"))
+            if not page_token:
+                break
+        return collected
+
+    def download_file(self, account: NetdiskAccountRecord, file: DriveFile) -> DirectLink:
+        """
+        获取迅雷个人盘文件直链。
+
+        :param account: 账号
+        :param file: 文件条目
+        :return: 直链
+        """
+        if file.is_dir:
+            raise NetdiskError(
+                NetdiskErrorCode.UNSUPPORTED,
+                "迅雷云盘不支持直接下载目录",
+                platform=self.platform,
+            )
+        self._identity(account)
+        url, size = self._file_link(file.file_id, account)
+        return DirectLink(
+            url=url,
+            headers=self.download_headers(account),
+            size=size or file.size,
+            account_id=account.id,
+        )
+
+    def share_file(
+        self,
+        account: NetdiskAccountRecord,
+        files: list[DriveFile],
+        *,
+        password: str = "",
+        expires_in: int = 0,
+    ) -> DriveShare:
+        """
+        创建迅雷云盘分享。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param password: 提取码，留空由服务端生成
+        :param expires_in: 有效期秒数，0 为永久
+        :return: 分享结果
+        """
+        if not files:
+            raise NetdiskError(
+                NetdiskErrorCode.UNSUPPORTED,
+                "迅雷云盘分享至少需要一个文件",
+                platform=self.platform,
+            )
+        self._identity(account)
+        expiration = "-1"
+        if expires_in > 0:
+            expiration = "1" if expires_in <= 86400 else "7" if expires_in <= 7 * 86400 else "30"
+        params: dict[str, Any] = {
+            "subscribe_push": "false",
+            "WithPassCodeInLink": "true",
+            "with_pass_code_in_link": "true",
+        }
+        if password:
+            params["pass_code"] = password
+        payload = self.http.post_json(
+            _SHARE_URL,
+            json={
+                "file_ids": [item.file_id for item in files],
+                "share_to": "copy",
+                "params": params,
+                "title": files[0].name or "分享文件",
+                "restore_limit": "-1",
+                "expiration_days": expiration,
+            },
+            headers=self._api_headers(account, extra={"Content-Type": "application/json"}),
+        )
+        self._check_payload(payload, "创建迅雷云盘分享")
+        data = self._data(payload)
+        url = as_text(data.get("share_url"))
+        if not url:
+            raise NetdiskError(
+                NetdiskErrorCode.UNKNOWN,
+                "创建迅雷云盘分享失败：响应缺少分享链接",
+                platform=self.platform,
+            )
+        return DriveShare(url=url, password=as_text(data.get("pass_code")) or password)
+
+    def move_files(self, account: NetdiskAccountRecord, files: list[DriveFile], target_id: str) -> None:
+        """
+        移动迅雷个人盘文件。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param target_id: 目标目录标识
+        """
+        if not files:
+            return
+        self._identity(account)
+        payload = self.http.post_json(
+            _MOVE_URL,
+            json={
+                "ids": [item.file_id for item in files],
+                "to": {"parent_id": target_id, "space": ""},
+                "space": "",
+            },
+            headers=self._api_headers(account, extra={"Content-Type": "application/json"}),
+        )
+        self._check_payload(payload, "移动迅雷云盘文件")
+
+    def rename_file(self, account: NetdiskAccountRecord, file: DriveFile, name: str) -> None:
+        """
+        重命名迅雷个人盘文件。
+
+        :param account: 账号
+        :param file: 文件条目
+        :param name: 新名称
+        """
+        self._identity(account)
+        payload = self._patch_json(
+            f"{_FILES_URL}/{file.file_id}",
+            account=account,
+            json={"name": name},
+        )
+        self._check_payload(payload, "重命名迅雷云盘文件")
+
+    def delete_files(self, account: NetdiskAccountRecord, files: list[DriveFile]) -> None:
+        """
+        删除迅雷个人盘文件（移入回收站）。
+
+        :param account: 账号
+        :param files: 文件列表
+        """
+        if not files:
+            return
+        self._identity(account)
+        payload = self.http.post_json(
+            _TRASH_URL,
+            json={"ids": [item.file_id for item in files], "space": ""},
+            headers=self._api_headers(account, extra={"Content-Type": "application/json"}),
+        )
+        self._check_payload(payload, "删除迅雷云盘文件")
+
     # ---- 账号 ----
 
-    def _probe(self, fields: Mapping[str, str]) -> AccountProbe:
+    @staticmethod
+    def _about_headers(access: str, device: str, captcha: str) -> dict[str, str]:
         """
-        调用云盘 about 接口确认凭据是否可用。
+        组装 `/drive/v1/about` 请求头。
 
-        :param fields: 展开后的凭据字段
-        :return: 探测结果
+        :param access: 访问令牌
+        :param device: 设备标识
+        :param captcha: 验证码令牌
+        :return: 请求头
         """
-        access, device, captcha = _identity_from(fields)
         headers = {
             "User-Agent": _CLIENT_UA,
             "X-Client-Version": _CLIENT_VERSION,
@@ -755,6 +1015,17 @@ class XunleiAdapter(BaseNetdiskAdapter):
         }
         if captcha:
             headers["X-Captcha-Token"] = captcha
+        return headers
+
+    def _probe(self, fields: Mapping[str, str]) -> AccountProbe:
+        """
+        调用云盘 about 接口确认凭据是否可用。
+
+        :param fields: 展开后的凭据字段
+        :return: 探测结果
+        """
+        access, device, captcha = _identity_from(fields)
+        headers = self._about_headers(access, device, captcha)
         try:
             payload = self.http.get_json(_ABOUT_URL, headers=headers)
         except NetdiskError as error:
@@ -788,6 +1059,40 @@ class XunleiAdapter(BaseNetdiskAdapter):
         if missing:
             return AccountProbe(status="expired", message="凭据缺少必填字段：" + "、".join(missing))
         return self._probe(fields)
+
+    def login_account_name(self, credential: Mapping[str, str]) -> str:
+        """
+        读取迅雷网页账号昵称。
+
+        网页 localStorage 通常不写昵称，优先使用浏览器凭据里的字段，
+        缺失时再调用 `/drive/v1/about` 尝试读取。
+
+        :param credential: 浏览器抓到的凭据
+        :return: 昵称；无法获取时为空串
+        """
+        fields = _fields(credential)
+        nickname = _pick(fields, "nickname", "nick_name", "nickName", "user_name", "userName", "name")
+        if nickname:
+            return nickname
+        access, device, captcha = _identity_from(fields)
+        if not access or not device:
+            return ""
+        try:
+            payload = self.http.get_json(_ABOUT_URL, headers=self._about_headers(access, device, captcha))
+        except NetdiskError:
+            return ""
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            data = payload
+        return _pick(
+            {str(key): as_text(value) for key, value in data.items()},
+            "nickname",
+            "nick_name",
+            "nickName",
+            "user_name",
+            "userName",
+            "name",
+        )
 
     def probe_account(self, account: NetdiskAccountRecord) -> AccountProbe:
         """

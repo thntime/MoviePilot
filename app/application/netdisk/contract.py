@@ -13,6 +13,10 @@ from typing import Mapping, Optional, Protocol, Sequence, runtime_checkable
 from app.domain.netdisk import (
     AccountProbe,
     DirectLink,
+    DriveCapabilities,
+    DriveFile,
+    DriveQuota,
+    DriveShare,
     LinkPolicy,
     LoginResult,
     LoginSession,
@@ -49,6 +53,9 @@ class NetdiskAccountView:
     expires_at: Optional[datetime] = None
     last_checked_at: Optional[datetime] = None
     masked: Mapping[str, str] = field(default_factory=dict)
+    nickname: str = ""
+    quota_used: int = 0
+    quota_total: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +73,9 @@ class NetdiskAccountWrite:
     name: str
     credential: Mapping[str, str]
     is_primary: bool = False
+    nickname: str = ""
+    quota_used: int = 0
+    quota_total: int = 0
 
 
 class CredentialCipher(Protocol):
@@ -135,6 +145,9 @@ class NetdiskAccountStore(Protocol):
         is_primary: Optional[bool] = None,
         status: Optional[str] = None,
         expires_at: Optional[datetime] = None,
+        nickname: Optional[str] = None,
+        quota_used: Optional[int] = None,
+        quota_total: Optional[int] = None,
     ) -> Optional[NetdiskAccountView]:
         """
         更新账号字段。
@@ -145,6 +158,9 @@ class NetdiskAccountStore(Protocol):
         :param is_primary: 是否设为主账号
         :param status: 新状态
         :param expires_at: 新过期时间
+        :param nickname: 账号昵称/手机号
+        :param quota_used: 已用空间
+        :param quota_total: 总空间
         :return: 更新后的脱敏投影；账号不存在时返回 None
         """
         ...
@@ -185,6 +201,83 @@ class NetdiskAdapter(Protocol):
     cookie_domains: tuple[str, ...]
     login_url: str
     supports_password_login: bool
+    supports_refresh: bool
+    drive_capabilities: DriveCapabilities
+
+    def login_account_name(self, credential: Mapping[str, str]) -> str:
+        """
+        从登录凭据中提取可展示的账号名。
+
+        :param credential: 浏览器抓到的凭据
+        :return: 账号名
+        """
+        ...
+
+    def quota(self, account: NetdiskAccountRecord) -> DriveQuota:
+        """
+        查询个人网盘空间。
+
+        :param account: 账号
+        :return: 空间配额
+        """
+        ...
+
+    def list_dir(self, account: NetdiskAccountRecord, parent_id: str) -> list[DriveFile]:
+        """
+        列出个人网盘目录。
+
+        :param account: 账号
+        :param parent_id: 父目录
+        :return: 目录条目
+        """
+        ...
+
+    def download_file(self, account: NetdiskAccountRecord, file: DriveFile) -> DirectLink:
+        """
+        获取个人盘文件直链。
+
+        :param account: 账号
+        :param file: 文件条目
+        :return: 直链
+        """
+        ...
+
+    def share_file(
+        self,
+        account: NetdiskAccountRecord,
+        files: list[DriveFile],
+        *,
+        password: str = "",
+        expires_in: int = 0,
+    ) -> DriveShare:
+        """
+        创建个人盘分享。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param password: 提取码
+        :param expires_in: 有效期秒数
+        :return: 分享结果
+        """
+        ...
+
+    def move_files(self, account: NetdiskAccountRecord, files: list[DriveFile], target_id: str) -> None:
+        """
+        移动文件。
+        """
+        ...
+
+    def rename_file(self, account: NetdiskAccountRecord, file: DriveFile, name: str) -> None:
+        """
+        重命名文件。
+        """
+        ...
+
+    def delete_files(self, account: NetdiskAccountRecord, files: list[DriveFile]) -> None:
+        """
+        删除文件。
+        """
+        ...
 
     def parse_share(self, url: str, password: Optional[str]) -> ShareRef:
         """

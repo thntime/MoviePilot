@@ -19,6 +19,7 @@ import base64
 import json
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
 from app.adapters.external.netdisk.base import (
@@ -32,6 +33,10 @@ from app.domain.netdisk import NetdiskAccountRecord
 from app.domain.netdisk import (
     AccountProbe,
     DirectLink,
+    DriveCapabilities,
+    DriveFile,
+    DriveQuota,
+    DriveShare,
     LinkPolicy,
     NetdiskError,
     NetdiskErrorCode,
@@ -52,6 +57,13 @@ _FILE_ADD_URL = f"{_API_BASE}/files/add"
 _FILE_DELETE_URL = f"{_API_BASE}/rb/delete"
 _FILE_DOWNLOAD_URL = f"{_API_BASE}/files/download"
 _APP_DOWNLOAD_URL = "https://proapi.115.com/app/chrome/downurl"
+_INDEX_INFO_URL = f"{_API_BASE}/files/index_info?count_space_nums=1"
+_FILE_MOVE_URL = f"{_API_BASE}/files/move"
+_MOVE_PROGRESS_URL = f"{_API_BASE}/files/move_progress"
+_FILE_RENAME_URL = f"{_API_BASE}/files/batch_rename"
+_SHARE_SEND_URL = f"{_API_BASE}/share/send"
+_SHARE_UPDATE_URL = f"{_API_BASE}/share/updateshare"
+_ALLOW_PROTOCOL_URL = f"{_API_BASE}/user/allow_protocol"
 
 _SHARE_HOST = "https://115cdn.com"
 _REFERER = "https://115.com/"
@@ -84,6 +96,11 @@ _ERRNO_EMPTY_FOLDER = 4100016
 _ERRNO_BUSY = 990009
 _ERRNO_WEB_SIZE_LIMIT = 50028
 _ERRNO_CLIENT_TOO_OLD = 50029
+_ERRNO_NEED_CONFIRM = 800007
+
+# 移动是异步任务：响应含 move_proid 时按固定间隔轮询进度。
+_MOVE_POLL_MAX = 20
+_MOVE_POLL_INTERVAL = 0.4
 
 # 电脑端取链接口的固定协议参数（RSA + XOR，见 `_encode_payload` / `_decode_payload`）。
 _RSA_BLOCK = 128
@@ -400,6 +417,27 @@ def _parse_personal_files(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+def _parse_time(value: Any) -> Optional[datetime]:
+    """
+    解析接口返回的修改时间。
+
+    :param value: ISO 时间文本或秒级时间戳
+    :return: 带时区的时间；无法解析时返回 None
+    """
+    text = as_text(value)
+    if not text:
+        return None
+    if text.isdigit():
+        try:
+            return datetime.fromtimestamp(int(text), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _same_name(candidate: str, name: str) -> bool:
     """
     判断目录条目是否为「原名」或重名后的「原名(序号).后缀」。
@@ -640,6 +678,15 @@ class Pan115Adapter(BaseNetdiskAdapter):
     link_policy: LinkPolicy = LinkPolicy.DIRECT_WITH_FALLBACK
     requires_account: bool = True
     guest_supported: bool = True
+    drive_capabilities: DriveCapabilities = DriveCapabilities(
+        quota=True,
+        browse=True,
+        download=True,
+        share=True,
+        move=True,
+        rename=True,
+        delete=True,
+    )
     max_concurrency: int = 512
     cookie_required_keys: tuple[str, ...] = ("UID", "SEID")
     cookie_domains: tuple[str, ...] = (".115.com", ".115cdn.com")
@@ -1305,6 +1352,28 @@ class Pan115Adapter(BaseNetdiskAdapter):
         )
         return self._probe(record)
 
+    def login_account_name(self, credential: Mapping[str, str]) -> str:
+        """
+        从 115 账号信息接口读取昵称。
+
+        :param credential: 浏览器抓到的凭据
+        :return: 昵称；接口不可用时为空串
+        """
+        cookie = _filter_login_cookies(_credential_cookie(credential))
+        if not cookie:
+            return ""
+        record = NetdiskAccountRecord(
+            id=0,
+            platform=self.platform,
+            name="",
+            credential={"cookie": cookie},
+        )
+        try:
+            payload = self._get_json(_USER_INFO_URL, account=record, action="读取115账号信息")
+        except NetdiskError:
+            return ""
+        return as_text(payload.get("data"))
+
     def probe_account(self, account: NetdiskAccountRecord) -> AccountProbe:
         """
         探测账号登录态。
@@ -1313,3 +1382,327 @@ class Pan115Adapter(BaseNetdiskAdapter):
         :return: 探测结果
         """
         return self._probe(account)
+
+    # ---- 个人盘 ----
+
+    @staticmethod
+    def _user_id(account: NetdiskAccountRecord) -> str:
+        """
+        从登录 Cookie 的 UID 中取出纯数字用户标识。
+
+        :param account: 账号
+        :return: 用户标识；缺失时为空串
+        """
+        for part in cookie_header(account).split(";"):
+            item = part.strip()
+            if item.startswith("UID="):
+                return item[4:].split("_", 1)[0]
+        return ""
+
+    def _personal_page(
+        self,
+        account: NetdiskAccountRecord,
+        parent_id: str,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """
+        读取一页个人盘目录原始条目。
+
+        :param account: 账号
+        :param parent_id: 父目录标识，空串为根
+        :param offset: 索引分页偏移
+        :return: 原始条目与总数
+        """
+        payload = self._get_json(
+            _FILES_URL,
+            account=account,
+            params={
+                "aid": _AID_PERSONAL,
+                "cid": parent_id or _ROOT_CID,
+                "o": "user_ptime",
+                "asc": "0",
+                "offset": str(offset),
+                "show_dir": "1",
+                "limit": str(_FILE_PAGE_LIMIT),
+                "snap": "0",
+                "natsort": "1",
+                "record_open_time": "1",
+                "count_folders": "1",
+                "format": "json",
+            },
+            action="读取个人盘目录",
+        )
+        return _parse_personal_files(payload), as_int(payload.get("count"))
+
+    def _find_item(self, account: NetdiskAccountRecord, file: DriveFile) -> dict[str, Any]:
+        """
+        在文件所在目录中定位原始条目，取链需要其中的 pickcode。
+
+        :param account: 账号
+        :param file: 文件条目
+        :return: 原始条目
+        :raises NetdiskError: 目录中找不到该文件时抛出
+        """
+        offset = 0
+        for _ in range(_SHARE_MAX_PAGES):
+            items, total = self._personal_page(account, file.parent_id, offset)
+            for item in items:
+                if (as_text(item.get("fid")) or as_text(item.get("cid"))) == file.file_id:
+                    return item
+            if not items or len(items) < _FILE_PAGE_LIMIT or (total and offset + len(items) >= total):
+                break
+            offset += len(items)
+        raise NetdiskError(
+            NetdiskErrorCode.UNKNOWN,
+            "115 未找到目标文件",
+            platform=self.platform,
+        )
+
+    def quota(self, account: NetdiskAccountRecord) -> DriveQuota:
+        """
+        查询 115 个人盘空间。
+
+        :param account: 账号
+        :return: 已用/总空间
+        """
+        payload = self._get_json(_INDEX_INFO_URL, account=account, action="获取 115 空间信息失败")
+        raw = payload.get("data")
+        data: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+        space = data.get("space_info")
+        if not isinstance(space, Mapping):
+            return DriveQuota()
+        total_raw = space.get("all_total")
+        used_raw = space.get("all_use")
+        return DriveQuota(
+            used=as_int(used_raw.get("size")) if isinstance(used_raw, Mapping) else 0,
+            total=as_int(total_raw.get("size")) if isinstance(total_raw, Mapping) else 0,
+        )
+
+    def list_dir(self, account: NetdiskAccountRecord, parent_id: str) -> list[DriveFile]:
+        """
+        列出 115 个人盘目录。
+
+        :param account: 账号
+        :param parent_id: 父目录标识，空串为根
+        :return: 目录条目
+        """
+        files: list[DriveFile] = []
+        offset = 0
+        for _ in range(_SHARE_MAX_PAGES):
+            items, total = self._personal_page(account, parent_id, offset)
+            for item in items:
+                is_dir = not as_text(item.get("fid"))
+                file_id = as_text(item.get("cid")) if is_dir else as_text(item.get("fid"))
+                if not file_id:
+                    continue
+                parent = as_text(item.get("pid")) if is_dir else as_text(item.get("cid"))
+                files.append(
+                    DriveFile(
+                        file_id=file_id,
+                        name=as_text(item.get("n")),
+                        size=0 if is_dir else as_int(item.get("s")),
+                        is_dir=is_dir,
+                        updated_at=_parse_time(item.get("t")),
+                        parent_id=parent or parent_id,
+                    )
+                )
+            if not items or len(items) < _FILE_PAGE_LIMIT or (total and offset + len(items) >= total):
+                break
+            offset += len(items)
+        return files
+
+    def download_file(self, account: NetdiskAccountRecord, file: DriveFile) -> DirectLink:
+        """
+        获取 115 个人盘文件直链，客户端加密通道优先、网页端兜底。
+
+        :param account: 账号
+        :param file: 文件条目
+        :return: 直链
+        """
+        item = self._find_item(account, file)
+        pickcode = as_text(item.get("pc"))
+        if not pickcode:
+            raise NetdiskError(
+                NetdiskErrorCode.UNKNOWN,
+                "115 文件缺少 pickcode，无法取链",
+                platform=self.platform,
+            )
+        link = self._personal_link(pickcode, account)
+        share_file = ShareFile(
+            file_id=file.file_id,
+            name=file.name,
+            size=file.size,
+            is_dir=file.is_dir,
+            parent_id=file.parent_id,
+        )
+        return self._build_link(link, share_file, account, None)
+
+    @staticmethod
+    def _share_duration(expires_in: int) -> str:
+        """
+        把有效期秒数换算为 115 的天数档位。
+
+        :param expires_in: 有效期秒数，0 表示长期
+        :return: `share_duration` 表单值
+        """
+        if expires_in <= 0:
+            return "-1"
+        return str(max(1, (expires_in + 86399) // 86400))
+
+    def share_file(
+        self,
+        account: NetdiskAccountRecord,
+        files: list[DriveFile],
+        *,
+        password: str = "",
+        expires_in: int = 0,
+    ) -> DriveShare:
+        """
+        创建 115 个人盘分享，并在创建后设置有效期。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param password: 期望提取码，平台自动生成时以平台为准
+        :param expires_in: 有效期秒数，0 表示长期
+        :return: 分享结果
+        """
+        if not files:
+            raise NetdiskError(NetdiskErrorCode.UNKNOWN, "请选择要分享的文件", platform=self.platform)
+        user_id = self._user_id(account)
+        if not user_id:
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "115 登录态缺少用户标识，请重新登录",
+                platform=self.platform,
+            )
+        file_ids = [item.file_id for item in files if item.file_id]
+        if not file_ids:
+            raise NetdiskError(NetdiskErrorCode.UNKNOWN, "请选择要分享的文件", platform=self.platform)
+        try:
+            self._post_form(
+                _ALLOW_PROTOCOL_URL,
+                {"action": "pubshare"},
+                account=account,
+                action="确认 115 分享协议",
+            )
+        except NetdiskError as error:
+            self.log_failure("确认分享协议", error, account)
+        payload = self._post_form(
+            _SHARE_SEND_URL,
+            {
+                "user_id": user_id,
+                "file_ids": ",".join(file_ids),
+                "ignore_warn": "1",
+            },
+            account=account,
+            action="创建 115 分享失败",
+        )
+        raw = payload.get("data")
+        data: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+
+        def field(name: str) -> str:
+            """优先读取 data 内层字段，兼容服务端放在顶层的旧格式。"""
+            return as_text(data.get(name)) or as_text(payload.get(name))
+
+        share_code = field("share_code")
+        if not share_code:
+            raise NetdiskError(
+                NetdiskErrorCode.UNKNOWN,
+                "创建 115 分享失败：响应缺少分享编号",
+                platform=self.platform,
+            )
+        try:
+            self._post_form(
+                _SHARE_UPDATE_URL,
+                {
+                    "share_code": share_code,
+                    "share_duration": self._share_duration(expires_in),
+                },
+                account=account,
+                action="设置 115 分享有效期",
+            )
+        except NetdiskError as error:
+            self.log_failure("设置分享有效期", error, account)
+        return DriveShare(
+            url=field("share_url") or f"https://115cdn.com/s/{share_code}",
+            password=field("receive_code") or field("sys_receive_code") or password,
+        )
+
+    def move_files(self, account: NetdiskAccountRecord, files: list[DriveFile], target_id: str) -> None:
+        """
+        移动 115 个人盘文件，响应含 move_proid 时轮询异步进度。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param target_id: 目标目录标识
+        """
+        file_ids = [item.file_id for item in files if item.file_id]
+        if not file_ids:
+            return
+        body: dict[str, Any] = {"pid": target_id or _ROOT_CID}
+        for index, file_id in enumerate(file_ids):
+            body[f"fid[{index}]"] = file_id
+        payload = self._post_form(_FILE_MOVE_URL, body, account=account, action="移动 115 文件失败")
+        raw = payload.get("data")
+        data: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+        move_id = as_text(payload.get("move_proid")) or as_text(data.get("move_proid"))
+        if not move_id:
+            return
+        for _ in range(_MOVE_POLL_MAX):
+            self.sleep(_MOVE_POLL_INTERVAL)
+            try:
+                progress = self._get_json(
+                    _MOVE_PROGRESS_URL,
+                    account=account,
+                    params={"move_proid": move_id},
+                    action="查询 115 移动进度",
+                )
+            except NetdiskError:
+                return
+            if not progress.get("state"):
+                return
+            progress_data = progress.get("data")
+            if not isinstance(progress_data, Mapping):
+                return
+            percent = float(progress_data.get("percent") or 0)
+            if percent >= 100 or as_int(progress_data.get("count")) <= 0:
+                return
+
+    def rename_file(self, account: NetdiskAccountRecord, file: DriveFile, name: str) -> None:
+        """
+        重命名 115 个人盘文件。
+
+        :param account: 账号
+        :param file: 文件条目
+        :param name: 新名称
+        """
+        self._post_form(
+            _FILE_RENAME_URL,
+            {
+                "fid": file.file_id,
+                "file_name": name,
+                f"files_new_name[{file.file_id}]": name,
+            },
+            account=account,
+            action="重命名 115 文件失败",
+        )
+
+    def delete_files(self, account: NetdiskAccountRecord, files: list[DriveFile]) -> None:
+        """
+        删除 115 个人盘文件（移入回收站），需要二次确认时重试一次。
+
+        :param account: 账号
+        :param files: 文件列表
+        """
+        file_ids = [item.file_id for item in files if item.file_id]
+        if not file_ids:
+            return
+        body: dict[str, Any] = {"pid": _ROOT_CID, "ignore_warn": "1"}
+        for index, file_id in enumerate(file_ids):
+            body[f"fid[{index}]"] = file_id
+        try:
+            self._post_form(_FILE_DELETE_URL, body, account=account, action="删除 115 文件失败")
+        except NetdiskError as error:
+            if str(_ERRNO_NEED_CONFIRM) not in error.message:
+                raise
+            self._post_form(_FILE_DELETE_URL, body, account=account, action="删除 115 文件失败")

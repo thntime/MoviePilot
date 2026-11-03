@@ -42,7 +42,7 @@ class VirtualDisplayResource:
 
         display = Display(
             visible=False,
-            size=(1024, 768),
+            size=(1440, 900),
         )
         self._display = display
         display.start()

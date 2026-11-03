@@ -17,6 +17,7 @@ import json
 import random
 import string
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 from urllib.parse import quote
 
@@ -24,12 +25,17 @@ from app.adapters.external.netdisk.base import (
     BaseNetdiskAdapter,
     as_int,
     as_text,
+    cookie_header,
     credential_value,
 )
 from app.domain.netdisk import NetdiskAccountRecord
 from app.domain.netdisk import (
     AccountProbe,
     DirectLink,
+    DriveCapabilities,
+    DriveFile,
+    DriveQuota,
+    DriveShare,
     LinkPolicy,
     NetdiskError,
     NetdiskErrorCode,
@@ -47,6 +53,17 @@ _SHARE_LINK_URL = f"{_SHARE_BASE}/yun-share/richlifeApp/devapp/IOutLink/dlFromOu
 _SHARE_GENERAL_URL = f"{_SHARE_BASE}/yun-share/richlifeApp/devapp/IOutLink/getOutLinkGeneral"
 # 个人网盘管理接口，用于确认 authorization 是否仍可用。
 _CLOUD_LIST_URL = "https://personal-kd-njs.yun.139.com/hcy/file/list"
+_CLOUD_UPDATE_URL = "https://personal-kd-njs.yun.139.com/hcy/file/update"
+_CLOUD_MOVE_URL = "https://personal-kd-njs.yun.139.com/hcy/file/batchMove"
+_CLOUD_TRASH_URL = "https://personal-kd-njs.yun.139.com/hcy/recyclebin/batchTrash"
+_CLOUD_DOWNLOAD_URL = "https://personal-kd-njs.yun.139.com/hcy/file/getDownloadUrl"
+_CLOUD_QUOTA_URL = "https://user-njs.yun.139.com/user/disk/quota/detail"
+_OUTLINK_CREATE_URL = (
+    "https://yun.139.com/orchestration/personalCloud-rebuild/outlink/v1.0/getOutLink"
+)
+# 个人盘根目录在列目录、移动与创建目录接口中统一使用 `/`。
+_DRIVE_ROOT_ID = "/"
+_DRIVE_PAGE_SIZE = 100
 
 # 分享接口必须使用浏览器/WebView UA，okhttp 等客户端 UA 会被设备校验拒绝。
 _SHARE_MOBILE_UA = (
@@ -163,7 +180,10 @@ def _has_login(fields: Mapping[str, str]) -> bool:
     """
     if _authorization(fields):
         return True
-    return bool(fields.get("Os_Sso_Sid")) and bool(fields.get("RMKEY"))
+    if fields.get("Os_Sso_Sid") and fields.get("RMKEY"):
+        return True
+    # YunX 网页登录导出的 Cookie 也可能只带 a_k/skey（分享接口使用）。
+    return bool(fields.get("a_k")) and bool(fields.get("skey"))
 
 
 def _md5(text: str) -> str:
@@ -204,6 +224,27 @@ def _sign_header(body: str) -> str:
     rand = "".join(random.choices(string.ascii_letters + string.digits, k=16))
     signature = _md5(digest + _md5(f"{stamp}:{rand}")).upper()
     return f"{stamp},{rand},{signature}"
+
+
+def _parse_time(value: Any) -> Optional[datetime]:
+    """
+    解析个人盘条目返回的修改时间。
+
+    :param value: ISO 时间文本或秒级时间戳
+    :return: 带时区的时间；无法解析时返回 None
+    """
+    text = as_text(value)
+    if not text:
+        return None
+    if text.isdigit():
+        try:
+            return datetime.fromtimestamp(int(text), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _parse_share_files(data: Mapping[str, Any], parent_id: str) -> list[ShareFile]:
@@ -249,12 +290,23 @@ class C139Adapter(BaseNetdiskAdapter):
     列目录为匿名端点，取直链需要登录账号；分享下载不需要转存。
     """
 
-    platform = NetdiskPlatform.C139
+    platform = NetdiskPlatform.PAN139
     link_policy = LinkPolicy.DIRECT
     requires_account = True
     guest_supported = False
+    drive_capabilities: DriveCapabilities = DriveCapabilities(
+        quota=True,
+        browse=True,
+        download=True,
+        share=True,
+        move=True,
+        rename=True,
+        delete=True,
+    )
     max_concurrency = 512
-    cookie_required_keys = ("Os_Sso_Sid", "RMKEY")
+    # 139 支持 authorization、Os_Sso_Sid+RMKEY、a_k+skey 三种登录态，
+    # 由 validate_credential 统一判断，避免预检查只认移动端字段。
+    cookie_required_keys: tuple[str, ...] = ()
     cookie_domains = (".139.com", ".10086.cn")
     login_url = "https://yun.139.com/"
     supports_password_login = False
@@ -600,6 +652,32 @@ class C139Adapter(BaseNetdiskAdapter):
         data = payload.get("data")
         return dict(data) if isinstance(data, Mapping) else {}
 
+    def login_ready(self, credential: Mapping[str, str]) -> bool:
+        """
+        网页登录必须拿到 authorization 或移动端会话字段才可确认。
+
+        `a_k`/`skey` 在未完成登录时也可能存在，不能作为登录完成依据。
+
+        :param credential: 浏览器抓到的凭据
+        :return: 是否已登录
+        """
+        fields = _credential_fields(credential)
+        if _authorization(fields):
+            return True
+        return bool(fields.get("Os_Sso_Sid")) and bool(fields.get("RMKEY"))
+
+    def login_account_name(self, credential: Mapping[str, str]) -> str:
+        """
+        从 139 凭据中提取手机号。
+
+        :param credential: 浏览器抓到的凭据
+        :return: 账号名；无法提取时为空
+        """
+        try:
+            return _account_number(_credential_fields(credential))
+        except Exception:  # noqa: BLE001 - 账号提取失败不影响登录
+            return ""
+
     def validate_credential(self, credential: Mapping[str, str]) -> AccountProbe:
         """
         校验凭据：先按字段判断，有 authorization 时再调用管理接口确认。
@@ -609,10 +687,14 @@ class C139Adapter(BaseNetdiskAdapter):
         """
         fields = _credential_fields(credential)
         if not _has_login(fields):
-            return AccountProbe(status="expired", message="凭据缺少必填字段：Os_Sso_Sid、RMKEY（或 authorization）")
+            return AccountProbe(
+                status="expired",
+                message="凭据缺少必填字段：authorization、Os_Sso_Sid+RMKEY 或 a_k+skey",
+            )
         authorization = _authorization(fields)
         if not authorization:
-            return AccountProbe(status="active", message="凭据字段完整")
+            # 没有 authorization 时无法调用个人盘接口，按字段完整性接受，后续取链再校验。
+            return AccountProbe(status="active", message="凭据字段完整（未校验个人盘接口）")
         try:
             info = self._account_info(authorization)
         except NetdiskError as error:
@@ -631,3 +713,297 @@ class C139Adapter(BaseNetdiskAdapter):
         :return: 探测结果
         """
         return self.validate_credential(account.credential or {})
+
+    # ---- 个人盘 ----
+
+    def _cloud_post(
+        self,
+        url: str,
+        body: Mapping[str, Any],
+        account: NetdiskAccountRecord,
+        fallback: str,
+        *,
+        with_cookie: bool = False,
+    ) -> dict[str, Any]:
+        """
+        调用个人盘管理接口并校验业务响应码。
+
+        :param url: 接口地址
+        :param body: 明文 JSON 请求体
+        :param account: 账号
+        :param fallback: 失败兜底说明
+        :param with_cookie: 是否附带 Cookie 与 `mcloud-skey`（创建分享与空间查询需要）
+        :return: 响应 JSON
+        :raises NetdiskError: 登录态缺失或接口失败时抛出
+        """
+        fields = _credential_fields(account.credential or {})
+        authorization = _authorization(fields)
+        if not authorization:
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "139 云盘个人盘操作需要 authorization",
+                platform=self.platform,
+                account_name=account.name,
+            )
+        headers = self._cloud_headers(authorization, body)
+        if with_cookie:
+            cookie = cookie_header(account)
+            if cookie:
+                headers["Cookie"] = cookie
+            skey = as_text(fields.get("skey"))
+            if skey:
+                headers["mcloud-skey"] = skey
+        payload = self.http.post_json(url, json=body, headers=headers)
+        self._check_cloud(payload, fallback)
+        return payload
+
+    def quota(self, account: NetdiskAccountRecord) -> DriveQuota:
+        """
+        查询 139 个人盘空间。
+
+        接口返回 MB，统一换算为字节；已用空间优先取个人云配额，缺失时用总量减剩余。
+
+        :param account: 账号
+        :return: 已用/总空间
+        """
+        fields = _credential_fields(account.credential or {})
+        number = _account_number(fields)
+        if not number:
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "139 云盘登录态缺少账号信息，请重新登录",
+                platform=self.platform,
+                account_name=account.name,
+            )
+        payload = self._cloud_post(
+            _CLOUD_QUOTA_URL,
+            {
+                "userDomainId": "",
+                "commonAccountInfo": {"account": number, "accountType": 1},
+            },
+            account,
+            "获取 139 空间信息失败",
+            with_cookie=True,
+        )
+        data = payload.get("data")
+        info: Mapping[str, Any] = data if isinstance(data, Mapping) else {}
+        total = as_int(info.get("diskSize")) * 1024 * 1024
+        quota_list = info.get("quotaList")
+        used = 0
+        if isinstance(quota_list, list) and quota_list and isinstance(quota_list[0], Mapping):
+            used = as_int(quota_list[0].get("usedSize")) * 1024 * 1024
+        if not used:
+            free = as_int(info.get("freeDiskSize")) * 1024 * 1024
+            used = max(total - free, 0)
+        return DriveQuota(used=used, total=total)
+
+    def list_dir(self, account: NetdiskAccountRecord, parent_id: str) -> list[DriveFile]:
+        """
+        按游标分页列出 139 个人盘目录。
+
+        :param account: 账号
+        :param parent_id: 父目录标识，空串表示根目录
+        :return: 目录条目
+        """
+        parent = parent_id or _DRIVE_ROOT_ID
+        files: list[DriveFile] = []
+        cursor: Optional[str] = None
+        for _ in range(_MAX_PAGES):
+            payload = self._cloud_post(
+                _CLOUD_LIST_URL,
+                {
+                    "pageInfo": {"pageSize": _DRIVE_PAGE_SIZE, "pageCursor": cursor},
+                    "orderBy": "updated_at",
+                    "orderDirection": "DESC",
+                    "parentFileId": parent,
+                    "imageThumbnailStyleList": ["Small", "Large"],
+                },
+                account,
+                "获取 139 个人盘文件列表失败",
+            )
+            data = payload.get("data")
+            info: Mapping[str, Any] = data if isinstance(data, Mapping) else {}
+            items = info.get("items")
+            if not isinstance(items, list) or not items:
+                break
+            for item in items:
+                if isinstance(item, Mapping):
+                    files.append(self._to_drive_file(item, parent))
+            next_cursor = as_text(info.get("nextPageCursor"))
+            if not next_cursor:
+                break
+            cursor = next_cursor
+        return files
+
+    def download_file(self, account: NetdiskAccountRecord, file: DriveFile) -> DirectLink:
+        """
+        获取 139 个人盘文件直链。
+
+        :param account: 账号
+        :param file: 文件条目
+        :return: 直链
+        """
+        payload = self._cloud_post(
+            _CLOUD_DOWNLOAD_URL,
+            {"fileId": file.file_id},
+            account,
+            "获取 139 下载链接失败",
+        )
+        data = payload.get("data")
+        info: Mapping[str, Any] = data if isinstance(data, Mapping) else {}
+        url = as_text(info.get("url"))
+        if not url:
+            raise NetdiskError(NetdiskErrorCode.UNKNOWN, "139 云盘未返回下载地址", platform=self.platform)
+        return DirectLink(
+            url=url,
+            headers={"User-Agent": _CLOUD_UA},
+            size=as_int(info.get("size")) or file.size,
+            account_id=account.id,
+        )
+
+    def share_file(
+        self,
+        account: NetdiskAccountRecord,
+        files: list[DriveFile],
+        *,
+        password: str = "",
+        expires_in: int = 0,
+    ) -> DriveShare:
+        """
+        创建 139 个人盘分享。
+
+        139 由服务端生成提取码，`password` 仅作为响应缺失时的兜底；有效期只支持
+        永久、1 天、7 天与 30 天，超出范围按 30 天处理。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param password: 提取码兜底值
+        :param expires_in: 有效期秒数，0 表示永久
+        :return: 分享结果
+        """
+        fields = _credential_fields(account.credential or {})
+        number = _account_number(fields)
+        if not number:
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "139 云盘登录态缺少账号信息，请重新登录",
+                platform=self.platform,
+                account_name=account.name,
+            )
+        if expires_in <= 0:
+            period: Optional[int] = None
+        elif expires_in <= 86400:
+            period = 1
+        elif expires_in <= 7 * 86400:
+            period = 7
+        else:
+            period = 30
+        title = files[0].name if files else "分享文件"
+        body = {
+            "getOutLinkReq": {
+                "subLinkType": 0,
+                "encrypt": 1,
+                "coIDLst": [item.file_id for item in files if not item.is_dir],
+                "caIDLst": [item.file_id for item in files if item.is_dir],
+                "pubType": 1,
+                "dedicatedName": title,
+                "periodUnit": 1,
+                **({"period": period} if period is not None else {}),
+                "viewerLst": [],
+                "extInfo": {"isWatermark": 0, "shareChannel": "3001"},
+                "commonAccountInfo": {"account": number, "accountType": 1},
+            }
+        }
+        payload = self._cloud_post(
+            _OUTLINK_CREATE_URL,
+            body,
+            account,
+            "创建 139 分享失败",
+            with_cookie=True,
+        )
+        data = payload.get("data")
+        info: Mapping[str, Any] = data if isinstance(data, Mapping) else {}
+        result = info.get("getOutLinkRes")
+        result_info: Mapping[str, Any] = result if isinstance(result, Mapping) else {}
+        items = result_info.get("getOutLinkResSet")
+        first = items[0] if isinstance(items, list) and items and isinstance(items[0], Mapping) else {}
+        url = as_text(first.get("linkUrl"))
+        if not url:
+            raise NetdiskError(NetdiskErrorCode.UNKNOWN, "139 云盘未返回分享链接", platform=self.platform)
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=expires_in) if expires_in > 0 else None
+        )
+        return DriveShare(
+            url=url,
+            password=as_text(first.get("passwd")) or password,
+            expires_at=expires_at,
+        )
+
+    def move_files(self, account: NetdiskAccountRecord, files: list[DriveFile], target_id: str) -> None:
+        """
+        移动 139 个人盘文件。
+
+        接口异步执行，响应中的 taskId 由平台排队处理。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param target_id: 目标目录，空串表示根目录
+        """
+        self._cloud_post(
+            _CLOUD_MOVE_URL,
+            {
+                "fileIds": [item.file_id for item in files],
+                "toParentFileId": target_id or _DRIVE_ROOT_ID,
+            },
+            account,
+            "移动 139 文件失败",
+        )
+
+    def rename_file(self, account: NetdiskAccountRecord, file: DriveFile, name: str) -> None:
+        """
+        重命名 139 个人盘文件。
+
+        :param account: 账号
+        :param file: 文件条目
+        :param name: 新名称
+        """
+        self._cloud_post(
+            _CLOUD_UPDATE_URL,
+            {"fileId": file.file_id, "name": name, "description": ""},
+            account,
+            "重命名 139 文件失败",
+        )
+
+    def delete_files(self, account: NetdiskAccountRecord, files: list[DriveFile]) -> None:
+        """
+        删除 139 个人盘文件（移入回收站）。
+
+        接口异步执行，响应中的 taskId 由平台排队处理。
+
+        :param account: 账号
+        :param files: 文件列表
+        """
+        self._cloud_post(
+            _CLOUD_TRASH_URL,
+            {"fileIds": [item.file_id for item in files]},
+            account,
+            "删除 139 文件失败",
+        )
+
+    @staticmethod
+    def _to_drive_file(item: Mapping[str, Any], parent_id: str) -> DriveFile:
+        """
+        把个人盘条目转换为领域文件对象。
+
+        :param item: 接口条目
+        :param parent_id: 请求的父目录标识
+        :return: 领域文件对象
+        """
+        return DriveFile(
+            file_id=as_text(item.get("fileId")),
+            name=as_text(item.get("name")),
+            size=as_int(item.get("size")),
+            is_dir=as_text(item.get("type")) == "folder",
+            updated_at=_parse_time(item.get("updatedAt")),
+            parent_id=parent_id,
+        )

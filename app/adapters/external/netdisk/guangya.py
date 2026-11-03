@@ -27,6 +27,10 @@ from app.domain.netdisk import NetdiskAccountRecord
 from app.domain.netdisk import (
     AccountProbe,
     DirectLink,
+    DriveCapabilities,
+    DriveFile,
+    DriveQuota,
+    DriveShare,
     LinkPolicy,
     NetdiskError,
     NetdiskErrorCode,
@@ -43,6 +47,9 @@ _WEB_SITE = "https://www.guangyapan.com"
 
 _SIGNIN_URL = f"{_ACCOUNT_BASE}/v1/auth/signin"
 _USER_ME_URL = f"{_ACCOUNT_BASE}/v1/user/me"
+_CAPTCHA_INIT_URL = f"{_ACCOUNT_BASE}/v1/shield/captcha/init"
+_VERIFICATION_URL = f"{_ACCOUNT_BASE}/v1/auth/verification"
+_VERIFICATION_VERIFY_URL = f"{_ACCOUNT_BASE}/v1/auth/verification/verify"
 _SHARE_SUMMARY_URL = f"{_API_BASE}/userres/v1/get_share_summary"
 _SHARE_TOKEN_URL = f"{_API_BASE}/userres/v1/get_share_access_token"
 _SHARE_FILES_URL = f"{_API_BASE}/userres/v1/get_share_page_files_list"
@@ -50,9 +57,13 @@ _SHARE_DOWNLOAD_URL = f"{_API_BASE}/userres/v1/get_share_download_url"
 _RESTORE_SHARE_URL = f"{_API_BASE}/userres/v1/restore_share"
 _FILE_LIST_URL = f"{_API_BASE}/userres/v1/file/get_file_list"
 _CREATE_DIR_URL = f"{_API_BASE}/userres/v1/file/create_dir"
+_RENAME_URL = f"{_API_BASE}/userres/v1/file/rename"
+_MOVE_FILE_URL = f"{_API_BASE}/userres/v1/file/move_file"
 _DELETE_FILE_URL = f"{_API_BASE}/userres/v1/file/delete_file"
 _RES_DOWNLOAD_URL = f"{_API_BASE}/userres/v1/get_res_download_url"
 _TASK_STATUS_URL = f"{_API_BASE}/userres/v1/get_task_status"
+_ASSETS_URL = f"{_API_BASE}/assets/v1/get_assets"
+_SHARE_FILE_URL = f"{_API_BASE}/userres/v1/share_file"
 
 _CLIENT_ID = "aMe-8VSlkrbQXpUR"
 _CLIENT_VERSION = "0.0.1"
@@ -288,6 +299,15 @@ class GuangYaAdapter(BaseNetdiskAdapter):
     link_policy: LinkPolicy = LinkPolicy.DIRECT_WITH_FALLBACK
     requires_account: bool = True
     guest_supported: bool = True
+    drive_capabilities: DriveCapabilities = DriveCapabilities(
+        quota=True,
+        browse=True,
+        download=True,
+        share=True,
+        move=True,
+        rename=True,
+        delete=True,
+    )
     max_concurrency: int = 512
     cookie_required_keys: tuple[str, ...] = ("token",)
     cookie_domains: tuple[str, ...] = (".guangyapan.com",)
@@ -860,6 +880,186 @@ class GuangYaAdapter(BaseNetdiskAdapter):
         except Exception as error:  # noqa: BLE001 - 清理失败不阻断下载
             self.log_failure("清理临时目录", error, None)
 
+    # ---- 个人盘 ----
+
+    def quota(self, account: NetdiskAccountRecord) -> DriveQuota:
+        """
+        查询光鸭个人盘空间。
+
+        :param account: 账号
+        :return: 已用/总空间
+        """
+        token = self._account_token(account)
+        payload = self._post_business(_ASSETS_URL, {}, token=token, action="获取容量信息")
+        data = payload.get("data") or {}
+        return DriveQuota(
+            used=as_int(data.get("usedSpaceSize")),
+            total=as_int(data.get("totalSpaceSize")),
+        )
+
+    def list_dir(self, account: NetdiskAccountRecord, parent_id: str) -> list[DriveFile]:
+        """
+        列出光鸭个人盘目录。
+
+        光鸭目录条目没有独立的时间字段语义，`updated_at` 统一留空。
+
+        :param account: 账号
+        :param parent_id: 父目录标识，空串为根目录
+        :return: 目录条目
+        """
+        token = self._account_token(account)
+        return [
+            DriveFile(
+                file_id=item.file_id,
+                name=item.name,
+                size=item.size,
+                is_dir=item.is_dir,
+                parent_id=item.parent_id or parent_id,
+            )
+            for item in self._list_cloud(token, parent_id)
+        ]
+
+    def download_file(self, account: NetdiskAccountRecord, file: DriveFile) -> DirectLink:
+        """
+        获取光鸭个人盘文件直链。
+
+        :param account: 账号
+        :param file: 文件条目
+        :return: 直链
+        """
+        if file.is_dir:
+            raise NetdiskError(
+                NetdiskErrorCode.UNSUPPORTED,
+                "光鸭不支持直接下载目录",
+                platform=self.platform,
+            )
+        token = self._account_token(account)
+        target = ShareFile(
+            file_id=file.file_id,
+            name=file.name,
+            size=file.size,
+            parent_id=file.parent_id,
+        )
+        link = self._file_link(token, target)
+        return self._build_link(link, target, account, None)
+
+    def share_file(
+        self,
+        account: NetdiskAccountRecord,
+        files: list[DriveFile],
+        *,
+        password: str = "",
+        expires_in: int = 0,
+    ) -> DriveShare:
+        """
+        创建光鸭个人盘分享。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param password: 提取码，留空为公开分享
+        :param expires_in: 有效期秒数，0 为平台默认
+        :return: 分享结果
+        """
+        if not files:
+            raise NetdiskError(
+                NetdiskErrorCode.UNSUPPORTED,
+                "光鸭分享至少需要一个文件",
+                platform=self.platform,
+            )
+        token = self._account_token(account)
+        days = 0 if expires_in <= 0 else max(1, (expires_in + 86399) // 86400)
+        payload = self._post_business(
+            _SHARE_FILE_URL,
+            {
+                "fileIds": [item.file_id for item in files],
+                "title": files[0].name or "分享文件",
+                "validateDuration": days,
+                "shareType": 1 if password else 0,
+                "code": password,
+                "autoFillCode": False,
+                "trafficLimit": "0",
+                "maxRestoreCount": 0,
+                "downloadType": 1,
+            },
+            token=token,
+            action="创建分享",
+        )
+        data = payload.get("data") or {}
+        share_id = _first_non_blank(data.get("shareId"), data.get("id"))
+        share_url = _first_non_blank(data.get("shareUrl"))
+        if not share_url:
+            if not share_id:
+                raise NetdiskError(
+                    NetdiskErrorCode.UNKNOWN,
+                    "创建分享失败：响应缺少分享链接",
+                    platform=self.platform,
+                )
+            share_url = f"{_WEB_SITE}/s/{share_id}"
+        return DriveShare(
+            url=share_url,
+            password=_first_non_blank(data.get("code")) or password,
+        )
+
+    def move_files(self, account: NetdiskAccountRecord, files: list[DriveFile], target_id: str) -> None:
+        """
+        移动光鸭个人盘文件。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param target_id: 目标目录标识
+        """
+        if not files:
+            return
+        token = self._account_token(account)
+        payload = self._post_business(
+            _MOVE_FILE_URL,
+            {"fileIds": [item.file_id for item in files], "parentId": target_id},
+            token=token,
+            action="移动文件",
+        )
+        task_id = as_text((payload.get("data") or {}).get("taskId"))
+        if task_id:
+            self._wait_task(token, task_id)
+
+    def rename_file(self, account: NetdiskAccountRecord, file: DriveFile, name: str) -> None:
+        """
+        重命名光鸭个人盘文件。
+
+        :param account: 账号
+        :param file: 文件条目
+        :param name: 新名称
+        """
+        token = self._account_token(account)
+        payload = self._post_business(
+            _RENAME_URL,
+            {"fileId": file.file_id, "newName": name},
+            token=token,
+            action="重命名文件",
+        )
+        task_id = as_text((payload.get("data") or {}).get("taskId"))
+        if task_id:
+            self._wait_task(token, task_id)
+
+    def delete_files(self, account: NetdiskAccountRecord, files: list[DriveFile]) -> None:
+        """
+        删除光鸭个人盘文件。
+
+        :param account: 账号
+        :param files: 文件列表
+        """
+        if not files:
+            return
+        token = self._account_token(account)
+        payload = self._post_business(
+            _DELETE_FILE_URL,
+            {"fileIds": [item.file_id for item in files]},
+            token=token,
+            action="删除文件",
+        )
+        task_id = as_text((payload.get("data") or {}).get("taskId"))
+        if task_id:
+            self._wait_task(token, task_id)
+
     # ---- 账号 ----
 
     def _probe_token(self, token: str) -> AccountProbe:
@@ -899,6 +1099,28 @@ class GuangYaAdapter(BaseNetdiskAdapter):
             return AccountProbe(status="expired", message="凭据缺少必填字段：token")
         return self._probe_token(token)
 
+    def login_account_name(self, credential: Mapping[str, str]) -> str:
+        """
+        从光鸭 `/v1/user/me` 读取昵称。
+
+        :param credential: 浏览器抓到的凭据
+        :return: 昵称；接口不可用时为空串
+        """
+        token = _first_non_blank(credential.get("token"), credential.get("access_token"))
+        if not token:
+            return ""
+        headers = self._account_headers()
+        headers["Authorization"] = f"Bearer {token}"
+        try:
+            payload = self.http.get_json(_USER_ME_URL, headers=headers)
+        except NetdiskError:
+            return ""
+        if not _is_success(payload):
+            return ""
+        raw = payload.get("data")
+        data = raw if isinstance(raw, dict) else payload
+        return _first_non_blank(data.get("nickname"), data.get("nick_name"), data.get("name"))
+
     def probe_account(self, account: NetdiskAccountRecord) -> AccountProbe:
         """
         探测账号登录态。
@@ -929,6 +1151,10 @@ class GuangYaAdapter(BaseNetdiskAdapter):
                 "请填写光鸭账号与密码",
                 platform=self.platform,
             )
+        captcha_token = self._captcha_init("POST:/v1/auth/signin", {"username": account_name})
+        headers = self._account_headers()
+        if captcha_token:
+            headers["X-Captcha-Token"] = captcha_token
         try:
             payload = self.http.post_json(
                 _SIGNIN_URL,
@@ -937,7 +1163,7 @@ class GuangYaAdapter(BaseNetdiskAdapter):
                     "username": account_name,
                     "password": password,
                 },
-                headers=self._account_headers(),
+                headers=headers,
             )
         except NetdiskError as error:
             raise _normalize_error(error) from error
@@ -974,6 +1200,164 @@ class GuangYaAdapter(BaseNetdiskAdapter):
                 "光鸭登录失败：响应缺少 access_token",
                 platform=self.platform,
                 account_name=account_name,
+            )
+        return {"token": token}
+
+    def _captcha_init(self, action: str, meta: Mapping[str, Any]) -> Optional[str]:
+        """
+        初始化光鸭人机验证。
+
+        :param action: 触发动作，如 `POST:/v1/auth/signin`
+        :param meta: 动作相关参数
+        :return: 人机验证令牌；服务端未要求时为空
+        :raises NetdiskError: 需要网页人机验证时抛出 RISK_BLOCKED
+        """
+        payload = self.http.post_json(
+            _CAPTCHA_INIT_URL,
+            json={
+                "client_id": _CLIENT_ID,
+                "action": action,
+                "device_id": self._device_id,
+                "captcha_token": "",
+                "meta": dict(meta),
+            },
+            headers=self._account_headers(),
+        )
+        url = as_text(payload.get("url"))
+        if url:
+            raise NetdiskError(
+                NetdiskErrorCode.RISK_BLOCKED,
+                f"光鸭需要网页人机验证，请先在浏览器打开 {url} 完成验证",
+                platform=self.platform,
+            )
+        return as_text(payload.get("captcha_token")) or None
+
+    def send_sms_code(self, phone: str) -> dict[str, Any]:
+        """
+        发送光鸭短信验证码。
+
+        :param phone: 手机号
+        :return: 验证会话信息
+        """
+        phone_number = _normalize_account(phone)
+        if not phone_number:
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "请填写光鸭手机号",
+                platform=self.platform,
+            )
+        meta = {"phone_number": phone_number}
+        for _attempt in range(3):
+            token = self._captcha_init("POST:/v1/auth/verification", meta)
+            headers = self._account_headers()
+            headers["X-Captcha-Token"] = token or ""
+            payload = self.http.post_json(
+                _VERIFICATION_URL,
+                json={"client_id": _CLIENT_ID, "phone_number": phone_number, "target": "ANY"},
+                headers=headers,
+            )
+            code = as_text(payload.get("code")) or as_text(payload.get("error"))
+            if code in {"captcha_required", "captcha_invalid"}:
+                continue
+            if not _is_success(payload):
+                message = _first_non_blank(
+                    payload.get("msg"),
+                    payload.get("message"),
+                    payload.get("error_description"),
+                )
+                raise NetdiskError(
+                    _signin_error_code(code, message),
+                    _signin_error_message(code, message),
+                    platform=self.platform,
+                    account_name=phone_number,
+                )
+            verification_id = as_text(payload.get("verification_id"))
+            if not verification_id:
+                raise NetdiskError(
+                    NetdiskErrorCode.RATE_LIMITED,
+                    "光鸭验证码请求过于频繁，请稍后重试",
+                    platform=self.platform,
+                )
+            return {
+                "verification_id": verification_id,
+                "is_user": bool(payload.get("is_user")),
+                "expires_in": as_int(payload.get("expires_in")) or 600,
+            }
+        raise NetdiskError(
+            NetdiskErrorCode.RISK_BLOCKED,
+            "光鸭安全验证未通过，请稍后重试或改用账号密码登录",
+            platform=self.platform,
+        )
+
+    def sms_login(self, phone: str, code: str, verification_id: str) -> Mapping[str, str]:
+        """
+        使用短信验证码登录光鸭。
+
+        :param phone: 手机号
+        :param code: 短信验证码
+        :param verification_id: 发码接口返回的验证会话
+        :return: 可保存的凭据字段
+        """
+        phone_number = _normalize_account(phone)
+        verification_code = str(code or "").strip()
+        if not phone_number or not verification_code or not verification_id:
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "请填写手机号、验证码并先获取验证码",
+                platform=self.platform,
+            )
+        verify = self.http.post_json(
+            _VERIFICATION_VERIFY_URL,
+            json={
+                "client_id": _CLIENT_ID,
+                "verification_id": verification_id,
+                "verification_code": verification_code,
+            },
+            headers=self._account_headers(),
+        )
+        if not _is_success(verify):
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "光鸭短信验证码错误或已过期，请重新获取",
+                platform=self.platform,
+            )
+        verification_token = as_text(verify.get("verification_token"))
+        if not verification_token:
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "光鸭短信验证码错误或已过期，请重新获取",
+                platform=self.platform,
+            )
+        payload = self.http.post_json(
+            _SIGNIN_URL,
+            json={
+                "client_id": _CLIENT_ID,
+                "username": phone_number,
+                "verification_code": verification_code,
+                "verification_token": verification_token,
+            },
+            headers=self._account_headers(),
+        )
+        if not _is_success(payload):
+            message = _first_non_blank(
+                payload.get("msg"),
+                payload.get("message"),
+                payload.get("error_description"),
+            )
+            raise NetdiskError(
+                _signin_error_code(as_text(payload.get("code")), message),
+                _signin_error_message(as_text(payload.get("code")), message),
+                platform=self.platform,
+                account_name=phone_number,
+            )
+        data = (payload.get("data") if isinstance(payload.get("data"), dict) else payload) or {}
+        token = _first_non_blank(data.get("access_token"), data.get("accessToken"))
+        if not token:
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                "光鸭登录失败：响应缺少 access_token",
+                platform=self.platform,
+                account_name=phone_number,
             )
         return {"token": token}
 

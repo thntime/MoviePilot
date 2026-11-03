@@ -22,6 +22,10 @@ from app.domain.netdisk import NetdiskAccountRecord
 from app.domain.netdisk import (
     AccountProbe,
     DirectLink,
+    DriveCapabilities,
+    DriveFile,
+    DriveQuota,
+    DriveShare,
     LinkPolicy,
     NetdiskError,
     NetdiskErrorCode,
@@ -228,6 +232,16 @@ class QuarkAdapter(BaseNetdiskAdapter):
     link_policy: LinkPolicy = LinkPolicy.DIRECT_WITH_FALLBACK
     requires_account: bool = True
     guest_supported: bool = True
+    supports_refresh: bool = True
+    drive_capabilities: DriveCapabilities = DriveCapabilities(
+        quota=True,
+        browse=True,
+        download=True,
+        share=True,
+        move=True,
+        rename=True,
+        delete=True,
+    )
     max_concurrency: int = 512
     cookie_required_keys: tuple[str, ...] = ("__pus", "__puus")
     cookie_domains: tuple[str, ...] = (".quark.cn",)
@@ -786,6 +800,26 @@ class QuarkAdapter(BaseNetdiskAdapter):
         )
         return self._probe(record)
 
+    def login_account_name(self, credential: Mapping[str, str]) -> str:
+        """
+        从夸克账号信息接口读取昵称。
+
+        :param credential: 浏览器抓到的凭据
+        :return: 昵称；接口不可用时为空串
+        """
+        record = NetdiskAccountRecord(
+            id=0,
+            platform=self.platform,
+            name="",
+            credential=dict(credential),
+        )
+        try:
+            payload = self._get_json(_ACCOUNT_INFO_URL, account=record, action="读取夸克账号信息")
+        except NetdiskError:
+            return ""
+        data = payload.get("data")
+        return as_text(data.get("nickname")) if isinstance(data, Mapping) else ""
+
     def probe_account(self, account: NetdiskAccountRecord) -> AccountProbe:
         """
         探测账号登录态。
@@ -794,6 +828,189 @@ class QuarkAdapter(BaseNetdiskAdapter):
         :return: 探测结果
         """
         return self._probe(account)
+
+    # ---- 个人盘 ----
+
+    _DRIVE_BASE = "https://drive-pc.quark.cn/1/clouddrive"
+
+    def quota(self, account: NetdiskAccountRecord) -> DriveQuota:
+        """
+        查询夸克空间。
+
+        :param account: 账号
+        :return: 已用/总空间
+        """
+        payload = self.http.get_json(
+            f"{self._DRIVE_BASE}/member?pr=ucpro&fr=pc&fetch_subscribe=true&_ch=home",
+            account=account,
+        )
+        raw = payload.get("data")
+        data: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+        return DriveQuota(
+            used=as_int(data.get("use_capacity")),
+            total=as_int(data.get("total_capacity")),
+        )
+
+    def list_dir(self, account: NetdiskAccountRecord, parent_id: str) -> list[DriveFile]:
+        """
+        列出夸克个人盘目录。
+
+        :param account: 账号
+        :param parent_id: 父目录，空串为根
+        :return: 目录条目
+        """
+        parent = parent_id or "0"
+        payload = self.http.get_json(
+            f"{self._DRIVE_BASE}/file/sort?pr=ucpro&fr=pc&uc_param_str=&pdir_fid={parent}"
+            "&_page=1&_size=100&_fetch_total=1&_fetch_sub_dirs=0"
+            "&_sort=file_type:asc,updated_at:desc&fetch_all_file=1&fetch_risk_file_name=1",
+            account=account,
+        )
+        raw = payload.get("data")
+        data: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+        raw_items = data.get("list")
+        files: list[DriveFile] = []
+        for item in raw_items if isinstance(raw_items, list) else []:
+            if not isinstance(item, Mapping):
+                continue
+            files.append(
+                DriveFile(
+                    file_id=as_text(item.get("fid")),
+                    name=as_text(item.get("file_name")) or as_text(item.get("fname")),
+                    size=as_int(item.get("size")),
+                    is_dir=bool(item.get("dir")),
+                    parent_id=as_text(item.get("pdir_fid")),
+                )
+            )
+        return files
+
+    def download_file(self, account: NetdiskAccountRecord, file: DriveFile) -> DirectLink:
+        """
+        获取夸克个人盘文件直链。
+
+        :param account: 账号
+        :param file: 文件条目
+        :return: 直链
+        """
+        payload = self.http.post_json(
+            f"{self._DRIVE_BASE}/file/download?pr=ucpro&fr=pc&sys=win32&ve=3.23.2",
+            account=account,
+            json={"fids": [file.file_id]},
+        )
+        data = payload.get("data") if isinstance(payload.get("data"), list) else []
+        item = data[0] if data and isinstance(data[0], Mapping) else {}
+        url = as_text(item.get("download_url"))
+        if not url:
+            raise NetdiskError(NetdiskErrorCode.UNKNOWN, "夸克未返回下载直链", platform=self.platform)
+        return DirectLink(
+            url=url,
+            headers=self.http.headers(account),
+            size=as_int(item.get("size")) or file.size,
+            account_id=account.id if account else 0,
+        )
+
+    def share_file(
+        self,
+        account: NetdiskAccountRecord,
+        files: list[DriveFile],
+        *,
+        password: str = "",
+        expires_in: int = 0,
+    ) -> DriveShare:
+        """
+        创建夸克分享并轮询异步任务。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param password: 提取码
+        :param expires_in: 有效期秒数，0 为永久
+        :return: 分享结果
+        """
+        expired_type = 1 if expires_in <= 0 else (2 if expires_in <= 86400 else 3 if expires_in <= 7 * 86400 else 4)
+        payload = self.http.post_json(
+            f"{self._DRIVE_BASE}/share?pr=ucpro&fr=pc&uc_param_str=",
+            account=account,
+            json={
+                "fid_list": [item.file_id for item in files],
+                "title": files[0].name if files else "分享文件",
+                "url_type": 2 if password else 1,
+                **({"passcode": password} if password else {}),
+                "expired_type": expired_type,
+                "support_error_code": ["41060"],
+            },
+        )
+        raw = payload.get("data")
+        data: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+        task_id = as_text(data.get("task_id"))
+        share_id = as_text(data.get("share_id"))
+        for _ in range(15):
+            if share_id:
+                break
+            if not task_id:
+                break
+            task = self.http.get_json(
+                f"{self._DRIVE_BASE}/task?pr=ucpro&fr=pc&task_id={task_id}&retry_index=0",
+                account=account,
+            )
+            raw_task = task.get("data")
+            task_data: Mapping[str, Any] = raw_task if isinstance(raw_task, Mapping) else {}
+            finished = as_int(task_data.get("finished_at")) > 0 or as_int(task_data.get("status")) == 2
+            share_id = as_text(task_data.get("share_id")) if finished else ""
+            if not share_id:
+                time.sleep(1)
+        if not share_id:
+            raise NetdiskError(NetdiskErrorCode.UNKNOWN, "夸克分享创建超时", platform=self.platform)
+        return DriveShare(url=f"https://pan.quark.cn/s/{share_id}", password=password)
+
+    def move_files(self, account: NetdiskAccountRecord, files: list[DriveFile], target_id: str) -> None:
+        """
+        移动夸克文件。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param target_id: 目标目录
+        """
+        self.http.post_json(
+            f"{self._DRIVE_BASE}/file/move?pr=ucpro&fr=pc&uc_param_str=",
+            account=account,
+            json={
+                "action_type": 1,
+                "to_pdir_fid": target_id or "0",
+                "filelist": [item.file_id for item in files],
+                "exclude_fids": [],
+            },
+        )
+
+    def rename_file(self, account: NetdiskAccountRecord, file: DriveFile, name: str) -> None:
+        """
+        重命名夸克文件。
+
+        :param account: 账号
+        :param file: 文件条目
+        :param name: 新名称
+        """
+        self.http.post_json(
+            f"{self._DRIVE_BASE}/file/rename?pr=ucpro&fr=pc&uc_param_str=",
+            account=account,
+            json={"fid": file.file_id, "file_name": name},
+        )
+
+    def delete_files(self, account: NetdiskAccountRecord, files: list[DriveFile]) -> None:
+        """
+        删除夸克文件。
+
+        :param account: 账号
+        :param files: 文件列表
+        """
+        self.http.post_json(
+            f"{self._DRIVE_BASE}/file/delete?pr=ucpro&fr=pc&uc_param_str=",
+            account=account,
+            json={
+                "action_type": 2,
+                "filelist": [item.file_id for item in files],
+                "exclude_fids": [],
+            },
+        )
 
     def refresh_account(self, account: NetdiskAccountRecord) -> Optional[Mapping[str, str]]:
         """

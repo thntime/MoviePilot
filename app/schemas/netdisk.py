@@ -2,9 +2,16 @@
 网盘账号与登录接口的请求模型。
 """
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+
+from app.schemas.netdisk_files import (
+    NetdiskDriveCapabilitiesModel,
+    NetdiskDriveFileModel,
+    NetdiskDriveQuotaModel,
+    NetdiskDriveShareModel,
+)
 
 
 class NetdiskCookieRequest(BaseModel):
@@ -36,6 +43,48 @@ class NetdiskPasswordRequest(BaseModel):
     platform: str = Field(..., description="网盘平台标识，仅 123 与光鸭支持")
     username: str = Field(..., description="登录账号")
     password: str = Field(..., description="登录密码，仅用于换取令牌")
+    name: Optional[str] = Field(default=None, description="账号名称")
+    is_primary: bool = Field(False, description="是否设为该平台主账号")
+
+
+class NetdiskQrInputRequest(BaseModel):
+    """
+    网页登录页面操作请求。
+
+    kind 为 click 时使用 x/y，drag 时使用 x1/y1/x2/y2，type 时使用 text，
+    key 时使用 key，scroll 时使用 delta_y。
+    """
+
+    kind: Literal["click", "type", "key", "scroll", "drag"] = Field(..., description="操作类型")
+    x: Optional[float] = Field(default=None, description="点击横坐标（页面像素）")
+    y: Optional[float] = Field(default=None, description="点击纵坐标（页面像素）")
+    x1: Optional[float] = Field(default=None, description="拖拽起点横坐标（页面像素）")
+    y1: Optional[float] = Field(default=None, description="拖拽起点纵坐标（页面像素）")
+    x2: Optional[float] = Field(default=None, description="拖拽终点横坐标（页面像素）")
+    y2: Optional[float] = Field(default=None, description="拖拽终点纵坐标（页面像素）")
+    text: Optional[str] = Field(default=None, description="输入文本")
+    key: Optional[str] = Field(default=None, description="按键名，如 Enter")
+    delta_y: Optional[float] = Field(default=None, description="滚动距离")
+
+
+class NetdiskSmsSendRequest(BaseModel):
+    """
+    发送短信验证码的请求体。
+    """
+
+    platform: str = Field(..., description="网盘平台标识，仅光鸭支持")
+    phone: str = Field(..., description="手机号")
+
+
+class NetdiskSmsLoginRequest(BaseModel):
+    """
+    短信验证码登录的请求体。
+    """
+
+    platform: str = Field(..., description="网盘平台标识，仅光鸭支持")
+    phone: str = Field(..., description="手机号")
+    code: str = Field(..., description="短信验证码")
+    verification_id: str = Field(..., description="发送验证码接口返回的验证会话")
     name: Optional[str] = Field(default=None, description="账号名称")
     is_primary: bool = Field(False, description="是否设为该平台主账号")
 
@@ -73,6 +122,7 @@ class NetdiskPlatformInfo(BaseModel):
     max_concurrency: int = Field(..., description="平台并发上限")
     cookie_required_keys: list[str] = Field(default_factory=list, description="凭据必填字段")
     supports_password_login: bool = Field(..., description="是否支持账号密码登录")
+    supports_refresh: bool = Field(False, description="是否支持刷新令牌")
     login_url: str = Field(..., description="平台登录页地址")
 
 
@@ -89,6 +139,9 @@ class NetdiskAccountView(BaseModel):
     expires_at: Optional[str] = Field(default=None, description="过期时间")
     last_checked_at: Optional[str] = Field(default=None, description="最近检测时间")
     masked: dict[str, str] = Field(default_factory=dict, description="脱敏后的凭据字段")
+    nickname: str = Field("", description="账号昵称/手机号")
+    quota_used: int = Field(0, description="已用空间")
+    quota_total: int = Field(0, description="总空间")
 
 
 class NetdiskData(BaseModel):
@@ -100,11 +153,23 @@ class NetdiskData(BaseModel):
     accounts: list[NetdiskAccountView] = Field(default_factory=list, description="账号列表")
     account: Optional[NetdiskAccountView] = Field(default=None, description="单个账号")
     session_id: Optional[str] = Field(default=None, description="扫码会话标识")
+    ticket: Optional[str] = Field(default=None, description="WebSocket 一次性票据")
     platform: Optional[str] = Field(default=None, description="相关平台")
     status: Optional[str] = Field(default=None, description="状态")
     image: Optional[str] = Field(default=None, description="二维码图片（base64）")
+    page_image: Optional[str] = Field(default=None, description="完整登录页截图（base64）")
+    page_width: Optional[int] = Field(default=None, description="登录页视口宽度")
+    page_height: Optional[int] = Field(default=None, description="登录页视口高度")
+    vnc_path: Optional[str] = Field(default=None, description="noVNC WebSocket 路径")
     expires_at: Optional[str] = Field(default=None, description="会话过期时间")
     deleted: Optional[bool] = Field(default=None, description="是否已删除")
     refreshed: Optional[bool] = Field(default=None, description="是否已刷新")
+    sms_verification_id: Optional[str] = Field(default=None, description="短信验证会话")
+    sms_is_user: Optional[bool] = Field(default=None, description="手机号是否已注册")
+    sms_expires_in: Optional[int] = Field(default=None, description="验证码有效期（秒）")
     code: Optional[str] = Field(default=None, description="错误分类")
     account_name: Optional[str] = Field(default=None, description="相关账号名称")
+    files: list[NetdiskDriveFileModel] = Field(default_factory=list, description="目录条目")
+    quota: Optional[NetdiskDriveQuotaModel] = Field(default=None, description="空间配额")
+    share: Optional[NetdiskDriveShareModel] = Field(default=None, description="分享结果")
+    capabilities: Optional[NetdiskDriveCapabilitiesModel] = Field(default=None, description="个人盘能力")

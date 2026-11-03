@@ -10,10 +10,18 @@ import time
 from typing import Any, Mapping, Optional
 
 from app.adapters.network.http import RequestUtils
+
+# 网盘业务 API 均为国内直连域名；宿主代理常按域名分流，某些域名（如 yun.123pan.cn）
+# 经代理会直接失败。这里显式关闭代理，避免环境变量 HTTPS_PROXY 干扰取链与登录校验。
+_DIRECT_PROXIES = {"http": "", "https": ""}
 from app.domain.netdisk import NetdiskAccountRecord
 from app.domain.netdisk import (
     AccountProbe,
     DirectLink,
+    DriveCapabilities,
+    DriveFile,
+    DriveQuota,
+    DriveShare,
     LinkPolicy,
     NetdiskError,
     NetdiskErrorCode,
@@ -161,7 +169,11 @@ class NetdiskHttp:
         :param headers: 额外请求头
         :return: JSON 对象
         """
-        request = RequestUtils(headers=self.headers(account, extra=headers), timeout=self.timeout)
+        request = RequestUtils(
+            headers=self.headers(account, extra=headers),
+            timeout=self.timeout,
+            proxies=_DIRECT_PROXIES,
+        )
         response = request.get_res(url, params=dict(params or {}), allow_redirects=True)
         return self._json(response)
 
@@ -186,7 +198,11 @@ class NetdiskHttp:
         :param headers: 额外请求头
         :return: JSON 对象
         """
-        request = RequestUtils(headers=self.headers(account, extra=headers), timeout=self.timeout)
+        request = RequestUtils(
+            headers=self.headers(account, extra=headers),
+            timeout=self.timeout,
+            proxies=_DIRECT_PROXIES,
+        )
         response = request.post_res(
             url,
             data=dict(data) if data is not None else None,
@@ -213,7 +229,11 @@ class NetdiskHttp:
         :param headers: 额外请求头
         :return: 响应文本
         """
-        request = RequestUtils(headers=self.headers(account, extra=headers), timeout=self.timeout)
+        request = RequestUtils(
+            headers=self.headers(account, extra=headers),
+            timeout=self.timeout,
+            proxies=_DIRECT_PROXIES,
+        )
         response = request.get_res(url, params=dict(params or {}), allow_redirects=True)
         if response is None:
             raise NetdiskError(NetdiskErrorCode.UNKNOWN, "网盘接口无响应", platform=self.platform)
@@ -289,6 +309,8 @@ class BaseNetdiskAdapter:
     link_policy: LinkPolicy = LinkPolicy.DIRECT
     requires_account: bool = True
     guest_supported: bool = False
+    supports_refresh: bool = False
+    drive_capabilities: DriveCapabilities = DriveCapabilities()
     max_concurrency: int = 512
     cookie_required_keys: tuple[str, ...] = ()
     cookie_domains: tuple[str, ...] = ()
@@ -395,6 +417,119 @@ class BaseNetdiskAdapter:
         if missing:
             return AccountProbe(status="expired", message="凭据缺少必填字段：" + "、".join(missing))
         return AccountProbe(status="active", message="凭据字段完整")
+
+    def quota(self, account: NetdiskAccountRecord) -> DriveQuota:
+        """
+        查询个人网盘空间。
+
+        :param account: 账号
+        :return: 空间配额
+        :raises NetdiskError: 平台不支持时抛出 UNSUPPORTED
+        """
+        del account
+        raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "该平台不支持空间查询", platform=self.platform)
+
+    def list_dir(self, account: NetdiskAccountRecord, parent_id: str) -> list[DriveFile]:
+        """
+        列出个人网盘目录。
+
+        :param account: 账号
+        :param parent_id: 父目录标识，空串表示根目录
+        :return: 目录条目
+        :raises NetdiskError: 平台不支持时抛出 UNSUPPORTED
+        """
+        del account, parent_id
+        raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "该平台不支持目录浏览", platform=self.platform)
+
+    def download_file(self, account: NetdiskAccountRecord, file: DriveFile) -> DirectLink:
+        """
+        获取个人盘文件直链。
+
+        :param account: 账号
+        :param file: 文件条目
+        :return: 直链
+        :raises NetdiskError: 平台不支持时抛出 UNSUPPORTED
+        """
+        del account, file
+        raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "该平台不支持个人盘下载", platform=self.platform)
+
+    def share_file(
+        self,
+        account: NetdiskAccountRecord,
+        files: list[DriveFile],
+        *,
+        password: str = "",
+        expires_in: int = 0,
+    ) -> DriveShare:
+        """
+        创建个人盘分享。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param password: 提取码
+        :param expires_in: 有效期秒数，0 表示平台默认
+        :return: 分享结果
+        :raises NetdiskError: 平台不支持时抛出 UNSUPPORTED
+        """
+        del account, files, password, expires_in
+        raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "该平台不支持创建分享", platform=self.platform)
+
+    def move_files(self, account: NetdiskAccountRecord, files: list[DriveFile], target_id: str) -> None:
+        """
+        移动文件。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param target_id: 目标目录
+        :raises NetdiskError: 平台不支持时抛出 UNSUPPORTED
+        """
+        del account, files, target_id
+        raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "该平台不支持移动文件", platform=self.platform)
+
+    def rename_file(self, account: NetdiskAccountRecord, file: DriveFile, name: str) -> None:
+        """
+        重命名文件。
+
+        :param account: 账号
+        :param file: 文件条目
+        :param name: 新名称
+        :raises NetdiskError: 平台不支持时抛出 UNSUPPORTED
+        """
+        del account, file, name
+        raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "该平台不支持重命名", platform=self.platform)
+
+    def delete_files(self, account: NetdiskAccountRecord, files: list[DriveFile]) -> None:
+        """
+        删除文件。
+
+        :param account: 账号
+        :param files: 文件列表
+        :raises NetdiskError: 平台不支持时抛出 UNSUPPORTED
+        """
+        del account, files
+        raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "该平台不支持删除", platform=self.platform)
+
+    def login_ready(self, credential: Mapping[str, str]) -> bool:
+        """
+        判断网页登录是否已拿到可保存的登录态。
+
+        默认只要适配器返回了 Cookie 就认为可保存；平台可覆盖为更严格的判断。
+
+        :param credential: 浏览器抓到的凭据
+        :return: 是否可进入待确认状态
+        """
+        del credential
+        return True
+
+    def login_account_name(self, credential: Mapping[str, str]) -> str:
+        """
+        从登录凭据中提取可展示的账号名。
+
+        :param credential: 浏览器抓到的凭据
+        :return: 账号名；无法提取时为空
+        """
+        del credential
+        return ""
 
     def probe_account(self, account: NetdiskAccountRecord) -> AccountProbe:
         """

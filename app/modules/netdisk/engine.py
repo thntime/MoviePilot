@@ -266,6 +266,7 @@ class ChunkedDownloader:
         self._lock = threading.Lock()
         self._refresh_lock = threading.Lock()
         self._refreshed_at = 0.0
+        self._link_generation = 0
         self._written = 0
         self._chunks: List[_Chunk] = []
         self._error: Optional[Exception] = None
@@ -563,20 +564,31 @@ class ChunkedDownloader:
             raise DownloadError("没有可用的下载直链")
         return self.links[chunk.index % len(self.links)]
 
-    def _refresh_links(self, url_provider: Callable[..., Sequence[DirectLink]]) -> None:
+    def _refresh_links(self, url_provider: Callable[..., Sequence[DirectLink]],
+                       force: bool = False,
+                       seen_generation: Optional[int] = None) -> None:
         """
         节流刷新直链集合，同一任务在节流窗口内最多刷新一次。
 
+        直链明确失效时必须绕过节流，否则在节流窗口内会反复重试同一条过期直链，
+        最终把可恢复的失效误判为下载失败。多个分片同时失效时只刷新一次：
+        ``seen_generation`` 与当前代际不一致说明其它分片已完成刷新。
+
         :param url_provider: 直链回调
+        :param force: 是否绕过节流窗口
+        :param seen_generation: 请求前看到的直链代际
         """
         with self._refresh_lock:
+            if seen_generation is not None and seen_generation != self._link_generation:
+                return
             now = time.monotonic()
-            if now - self._refreshed_at < self.refresh_seconds:
+            if not force and now - self._refreshed_at < self.refresh_seconds:
                 return
             self._refreshed_at = now
             fresh = tuple(url_provider(True))
             if fresh:
                 self.links = fresh
+                self._link_generation += 1
 
     def _download_chunk(self, chunk: _Chunk, url_provider: Callable[..., Sequence[DirectLink]]) -> None:
         """
@@ -587,6 +599,7 @@ class ChunkedDownloader:
         """
         retries = 0
         while not chunk.done and not self._halted:
+            generation = self._link_generation
             link = self._link_for(chunk)
             headers = dict(link.headers)
             headers["Range"] = f"bytes={chunk.position}-{chunk.end}"
@@ -601,7 +614,7 @@ class ChunkedDownloader:
                 if retries > self.retries:
                     raise DownloadError(f"分片 {chunk.index} 直链多次失效：{err}")
                 # 直链与会话绑定，失效后必须刷新会话并重新取链，而不是重试旧 URL。
-                self._refresh_links(url_provider)
+                self._refresh_links(url_provider, force=True, seen_generation=generation)
             except Exception as err:  # noqa: BLE001
                 retries += 1
                 if self._halted:
@@ -638,7 +651,10 @@ class ChunkedDownloader:
             raise DownloadError(f"分片 {chunk.index} 的 Content-Range 不匹配：{content_range or '缺失'}")
         for data in response.iter_content(chunk_size=self.buffer_size):
             if self._halted:
-                raise DownloadCancelled("下载已取消")
+                # 内部异常中止由首个错误负责上报，这里静默退出，避免把真实错误伪装成用户暂停。
+                if self.stop_event.is_set():
+                    raise DownloadCancelled("下载已取消")
+                return
             if not data:
                 continue
             if chunk.position + len(data) - 1 > chunk.end:
@@ -683,7 +699,9 @@ class ChunkedDownloader:
                         raise DownloadError("单流回退失败：直链返回 HTML 页面")
                     for data in response.iter_content(chunk_size=self.buffer_size):
                         if self._halted:
-                            raise DownloadError("下载已取消")
+                            if self.stop_event.is_set():
+                                raise DownloadCancelled("下载已取消")
+                            raise DownloadError("单流回退被内部异常中止")
                         if not data:
                             continue
                         fd = self._fd

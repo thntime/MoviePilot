@@ -99,6 +99,11 @@ RUN apt-get update \
     nano \
     unar \
     supervisor \
+    xvfb \
+    x11vnc \
+    novnc \
+    websockify \
+    openbox \
     postgresql-client-18 \
     libchromaprint-tools \
     libjemalloc2 \

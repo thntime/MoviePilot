@@ -238,7 +238,10 @@ def test_qr_login_success_saves_and_cancels(env):
     session = service.start_qr("pan123", name="扫码账号")
     assert session.session_id == "s-1"
     result = service.poll_qr("s-1")
-    assert result.status == "success"
+    assert result.status == "detected"
+    assert store.records == {}
+    view = service.confirm_qr("s-1")
+    assert view.platform == "pan123"
     assert store.records[1].credential == {"token": "jwt-qr"}
     assert login_adapter.cancelled == ["s-1"]
 
@@ -267,7 +270,8 @@ def test_qr_pending_session_survives_new_service_instance(env):
     first.start_qr("pan123", name="扫码账号")
     result = second.poll_qr("s-1")
 
-    assert result.status == "success"
+    assert result.status == "detected"
+    second.confirm_qr("s-1")
     assert store.records[1].credential == {"token": "jwt-qr"}
 
 
@@ -309,10 +313,11 @@ class _FakeQrPage:
         self.selectors.append(selector)
         return _FakeQrLocator(self._box, self._element_image)
 
-    def screenshot(self) -> bytes:
+    def screenshot(self, **kwargs: object) -> bytes:
         """
         返回整页截图。
         """
+        del kwargs
         return b"full-page"
 
 
@@ -370,9 +375,12 @@ def test_qr_capture_crops_to_qr_element() -> None:
     page = _FakeQrPage({"width": 220, "height": 220})
     adapter = BrowserQrLoginAdapter()
 
-    image = adapter._capture(SimpleNamespace(active_page=page), "https://example.com")  # pylint: disable=protected-access
+    image, page_image = adapter._capture(  # pylint: disable=protected-access
+        SimpleNamespace(active_page=page), "https://example.com"
+    )
 
     assert image == b"qr-png"
+    assert page_image == b"full-page"
     assert page.selectors
 
 
@@ -386,6 +394,145 @@ def test_qr_capture_falls_back_to_full_page() -> None:
     page = _FakeQrPage({"width": 20, "height": 20})
     adapter = BrowserQrLoginAdapter()
 
-    image = adapter._capture(SimpleNamespace(active_page=page), "https://example.com")  # pylint: disable=protected-access
+    image, page_image = adapter._capture(  # pylint: disable=protected-access
+        SimpleNamespace(active_page=page), "https://example.com"
+    )
 
     assert image == b"full-page"
+    assert page_image == b"full-page"
+
+
+def test_qr_missing_cookie_fields_keeps_pending(env, monkeypatch):
+    """
+    扫码后会话字段尚未下发时保持 pending，下一次轮询再落库。
+    """
+    service, store, _, _ = env
+    calls = {"count": 0}
+    original = _Adapter.validate_credential
+
+    def fake_validate(self, credential):
+        """
+        第一次返回缺少字段，第二次走正常校验。
+        """
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return AccountProbe(status="expired", message="凭据缺少必填字段：__pus、__puus")
+        return original(self, credential)
+
+    monkeypatch.setattr(_Adapter, "validate_credential", fake_validate)
+    service.start_qr("pan123", name="扫码账号")
+
+    first = service.poll_qr("s-1")
+    assert first.status == "pending"
+    assert store.records == {}
+
+    second = service.poll_qr("s-1")
+    assert second.status == "detected"
+    service.confirm_qr("s-1")
+    assert store.records[1].credential == {"token": "jwt-qr"}
+
+
+class _FakeCookieContext:
+    """
+    模拟浏览器上下文中的 Cookie 列表。
+    """
+
+    def __init__(self, cookies: list[dict[str, str]]) -> None:
+        """
+        保存 Cookie 列表。
+        """
+        self.cookies_list = cookies
+
+    def cookies(self) -> list[dict[str, str]]:
+        """
+        返回 Cookie 列表。
+        """
+        return list(self.cookies_list)
+
+
+class _FakeNavPage:
+    """
+    模拟登录后跳转：进入网盘页时补发 __puus。
+    """
+
+    def __init__(self, context: _FakeCookieContext) -> None:
+        """
+        保存上下文引用。
+        """
+        self._context = context
+        self.urls: list[str] = []
+
+    def goto(self, url: str, **kwargs: object) -> None:
+        """
+        记录跳转并在进入网盘页后补发 __puus。
+        """
+        del kwargs
+        self.urls.append(url)
+        if url.endswith("/list"):
+            self._context.cookies_list.append(
+                {"name": "__puus", "value": "new-token", "domain": ".quark.cn"}
+            )
+
+    def wait_for_timeout(self, timeout: int) -> None:
+        """
+        模拟等待。
+        """
+        del timeout
+
+
+def test_quark_qr_login_navigates_to_drive_for_puus() -> None:
+    """
+    夸克扫码后停留在登录页时，读取 Cookie 应进入网盘页触发 __puus 下发。
+    """
+    from types import SimpleNamespace
+    from app.adapters.external.netdisk.login.browser import BrowserQrLoginAdapter
+    from app.domain.netdisk import NetdiskPlatform
+
+    context = _FakeCookieContext(
+        [
+            {"name": "b-user-id", "value": "u-1", "domain": ".quark.cn"},
+            {"name": "__pus", "value": "old", "domain": ".quark.cn"},
+        ]
+    )
+    page = _FakeNavPage(context)
+    state = SimpleNamespace(context=context, active_page=page)
+    session = SimpleNamespace(post_login_navigated=False)
+    adapter = BrowserQrLoginAdapter()
+
+    cookie = adapter._read_cookie(state, NetdiskPlatform.QUARK, session)  # pylint: disable=protected-access
+
+    assert page.urls == ["https://pan.quark.cn/list"]
+    assert "__puus=new-token" in cookie
+    assert session.post_login_navigated is True
+
+
+def test_qr_frame_and_input_delegate_to_login_adapter(env):
+    """
+    网页登录画面读取与点击/输入转发到登录适配器。
+    """
+    service, _, login_adapter, _ = env
+    actions: list[tuple[str, dict]] = []
+    login_adapter.frame = lambda session_id: {"image": b"png", "width": 1440, "height": 900}  # type: ignore[attr-defined]
+    login_adapter.input = lambda session_id, **kwargs: actions.append((session_id, kwargs))  # type: ignore[attr-defined]
+    service.start_qr("pan123")
+
+    frame = service.qr_frame("s-1")
+    result = service.qr_input("s-1", kind="click", x=10, y=20)
+
+    assert frame["width"] == 1440
+    assert result["height"] == 900
+    assert actions == [("s-1", {"kind": "click", "x": 10, "y": 20})]
+
+
+def test_qr_login_waits_until_login_ready(env, monkeypatch):
+    """
+    平台判定尚未真正登录时（如 139 只有 a_k/skey），保持 pending 不弹确认。
+    """
+    service, store, _, _ = env
+    monkeypatch.setattr(_Adapter, "login_ready", lambda self, credential: False)
+    service.start_qr("pan123", name="扫码账号")
+
+    result = service.poll_qr("s-1")
+
+    assert result.status == "pending"
+    assert store.records == {}

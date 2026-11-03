@@ -141,7 +141,7 @@ def _account(credential: dict[str, str]) -> NetdiskAccountRecord:
     """
     return NetdiskAccountRecord(
         id=9,
-        platform=NetdiskPlatform.C139,
+        platform=NetdiskPlatform.PAN139,
         name="139 主号",
         credential=credential,
     )
@@ -154,7 +154,7 @@ def _ref() -> ShareRef:
     :return: 分享引用
     """
     return ShareRef(
-        platform=NetdiskPlatform.C139,
+        platform=NetdiskPlatform.PAN139,
         share_id="2qieNwKvQ0G1o",
         url="https://yun.139.com/shareweb/#/w/i/2qieNwKvQ0G1o",
     )
@@ -192,12 +192,12 @@ def test_platform_metadata() -> None:
     """
     adapter = c139.C139Adapter()
 
-    assert adapter.platform is NetdiskPlatform.C139
+    assert adapter.platform is NetdiskPlatform.PAN139
     assert adapter.link_policy.value == "direct"
     assert adapter.requires_account is True
     assert adapter.guest_supported is False
     assert adapter.max_concurrency == 512
-    assert adapter.cookie_required_keys == ("Os_Sso_Sid", "RMKEY")
+    assert adapter.cookie_required_keys == ()
     assert adapter.cookie_domains == (".139.com", ".10086.cn")
     assert adapter.login_url == "https://yun.139.com/"
 
@@ -210,7 +210,7 @@ def test_parse_share_link() -> None:
 
     ref = adapter.parse_share("https://yun.139.com/shareweb/#/w/i/2qieNwKvQ0G1o", None)
 
-    assert ref.platform is NetdiskPlatform.C139
+    assert ref.platform is NetdiskPlatform.PAN139
     assert ref.share_id == "2qieNwKvQ0G1o"
 
 
@@ -251,7 +251,7 @@ def test_share_detail_prefers_explicit_password(monkeypatch: pytest.MonkeyPatch)
     adapter, calls, responses = _install(monkeypatch)
     responses[c139._SHARE_GENERAL_URL] = [_general_payload(password="leaked")]
     responses[c139._SHARE_LIST_URL] = [_list_payload([], [])]
-    ref = ShareRef(platform=NetdiskPlatform.C139, share_id="abc", password="input")
+    ref = ShareRef(platform=NetdiskPlatform.PAN139, share_id="abc", password="input")
 
     detail = adapter.share_detail(ref, None)
 
@@ -453,3 +453,16 @@ def test_http_error_classification(
         adapter.share_detail(_ref(), None)
 
     assert error.value.code is expected
+
+
+def test_validate_credential_accepts_yunx_web_cookie() -> None:
+    """
+    YunX 网页登录导出的 a_k/skey Cookie 应被接受。
+    """
+    adapter = c139.C139Adapter()
+
+    probe = adapter.validate_credential(
+        {"cookie": "a_k=ak-value; skey=skey-value; ORCHES-I-ACCOUNT-ENCRYPT=abc"}
+    )
+
+    assert probe.status == "active"

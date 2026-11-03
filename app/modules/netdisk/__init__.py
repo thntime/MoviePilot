@@ -30,10 +30,9 @@ from app.domain.netdisk import (
 from app.modules._base.downloader import _DownloaderModuleBase
 from app.modules.netdisk import store
 from app.modules.netdisk.engine import (
-    HlsDownloader,
     ChunkedDownloader,
-    DownloadCancelled,
     DownloadError,
+    HlsDownloader,
 )
 from app.runtime.log import logger
 from app.schemas.dashboard import DownloaderInfo
@@ -123,7 +122,8 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 continue
             if task_hash:
                 store.upsert_task(task_hash, {
-                    "state": "paused", "dlspeed": None, "dlspeed_bytes": 0,
+                    "state": "paused", "error": None,
+                    "dlspeed": None, "dlspeed_bytes": 0,
                 })
                 logger.info(f"网盘任务已回落为暂停：{task_hash}")
 
@@ -261,8 +261,11 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             "name": code,
             "downloader": name,
             "state": "downloading",
+            "error": None,
             "progress": 0.0,
             "size": 0.0,
+            "dlspeed": None,
+            "dlspeed_bytes": 0,
             "save_path": str(task_dir),
             "path": str(task_dir),
             "category": label,
@@ -408,22 +411,28 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 )
                 done_before += float(item.size or 0)
             if task_key not in self._discarded:
-                store.upsert_task(task_key, {"state": "completed", "progress": 100.0})
+                store.upsert_task(task_key, {
+                    "state": "completed", "progress": 100.0,
+                    "error": None, "dlspeed": None, "dlspeed_bytes": 0,
+                })
             logger.info(f"网盘下载完成：{platform.value}:{share_code}")
-        except DownloadCancelled:
-            logger.info(f"网盘下载已暂停：{share_code}")
-            if task_key not in self._discarded:
-                store.upsert_task(task_key, {"state": "paused"})
         except Exception as err:  # noqa: BLE001
-            # 模块热重载后异常类对象可能不是同一个，按消息兜底识别用户暂停。
-            if isinstance(err, DownloadCancelled) or "下载已取消" in str(err):
+            # 只有外部停止信号置位才算用户暂停；内部异常中止一律按失败记录，
+            # 否则引擎的「下载已取消」会掩盖真实错误，前端表现为任务自动暂停。
+            if stop_event.is_set():
                 logger.info(f"网盘下载已暂停：{share_code}")
                 if task_key not in self._discarded:
-                    store.upsert_task(task_key, {"state": "paused"})
+                    store.upsert_task(task_key, {
+                        "state": "paused", "error": None,
+                        "dlspeed": None, "dlspeed_bytes": 0,
+                    })
             else:
                 logger.warn(f"网盘下载失败：{share_code} - {err}")
                 if task_key not in self._discarded:
-                    store.upsert_task(task_key, {"state": "error", "error": str(err)})
+                    store.upsert_task(task_key, {
+                        "state": "error", "error": str(err),
+                        "dlspeed": None, "dlspeed_bytes": 0,
+                    })
         finally:
             with self._lock:
                 self._stops.pop(task_key, None)
@@ -672,6 +681,9 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 size=float(record.get("size") or 0.0),
                 progress=progress,
                 state=state,
+                error=record.get("error"),
+                netdisk_platform=record.get("netdisk_platform"),
+                share_code=record.get("share_code"),
                 save_path=record.get("save_path"),
                 content_path=record.get("path"),
                 category=record.get("category"),
@@ -783,7 +795,10 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 stop_event = threading.Event()
                 self._stops[task_hash] = stop_event
                 self._tasks[task_hash] = {"stop": stop_event}
-            store.upsert_task(task_hash, {"state": "downloading", "error": None})
+            store.upsert_task(task_hash, {
+                "state": "downloading", "error": None,
+                "dlspeed": None, "dlspeed_bytes": 0,
+            })
             thread = threading.Thread(
                 target=self._run_task,
                 args=(task_hash, platform, share_url, share_code,
@@ -819,7 +834,8 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             record = store.get_task(task_hash)
             if record and _as_text(record.get("state")) == "downloading":
                 store.upsert_task(task_hash, {
-                    "state": "paused", "dlspeed": None, "dlspeed_bytes": 0,
+                    "state": "paused", "error": None,
+                    "dlspeed": None, "dlspeed_bytes": 0,
                 })
                 stopped = True
         return stopped

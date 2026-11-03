@@ -88,7 +88,16 @@ def _load() -> Dict[str, Dict[str, Any]]:
     except Exception as err:  # noqa: BLE001
         logger.warn(f"网盘下载任务索引读取失败：{err}")
         return {}
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        return {}
+    changed = False
+    for task in payload.values():
+        if isinstance(task, dict) and task.get("netdisk_platform") == "c139":
+            task["netdisk_platform"] = "pan139"
+            changed = True
+    if changed:
+        _dump(payload)
+    return payload
 
 
 def _dump(tasks: Dict[str, Dict[str, Any]]) -> None:

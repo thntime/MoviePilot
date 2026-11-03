@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from typing import Mapping, Optional, Sequence
+from dataclasses import dataclass
+from typing import List, Mapping, Optional, Sequence
 
 from app.application.netdisk import registry
 from app.application.netdisk.contract import (
@@ -24,6 +25,24 @@ from app.domain.netdisk import (
     mask_credential,
     normalize_platform,
 )
+from app.runtime.log import logger
+
+
+@dataclass(frozen=True, slots=True)
+class NetdiskAccountFailure:
+    """
+    一轮批量刷新中需要用户重新登录的账号。
+
+    :param account_id: 账号主键
+    :param platform: 平台标识
+    :param name: 账号名称
+    :param message: 可直接展示的失败原因，不含凭据明文
+    """
+
+    account_id: int
+    platform: str
+    name: str
+    message: str
 
 
 def parse_cookie_header(text: str) -> dict[str, str]:
@@ -90,6 +109,7 @@ class NetdiskAccountService:
         *,
         is_primary: bool = False,
         validate: bool = True,
+        nickname: str = "",
     ) -> NetdiskAccountView:
         """
         创建账号并在保存前校验凭据。
@@ -99,6 +119,7 @@ class NetdiskAccountService:
         :param credential: 明文凭据字段
         :param is_primary: 是否设为主账号
         :param validate: 是否调用平台接口校验
+        :param nickname: 登录账号昵称/手机号
         :return: 新账号的脱敏投影
         :raises NetdiskError: 平台未知、字段缺失或凭据无效时抛出
         """
@@ -126,6 +147,7 @@ class NetdiskAccountService:
                 name=clean_name,
                 credential=payload,
                 is_primary=is_primary,
+                nickname=nickname,
             )
         )
 
@@ -211,6 +233,27 @@ class NetdiskAccountService:
         except NetdiskError as error:
             probe = AccountProbe(status="expired", message=error.message)
         self.store.touch_account(account_id, probe)
+        quota_used: Optional[int] = None
+        quota_total: Optional[int] = None
+        nickname = ""
+        try:
+            if adapter.drive_capabilities.quota:
+                quota = adapter.quota(record)
+                quota_used = quota.used
+                quota_total = quota.total
+        except Exception:  # noqa: BLE001 - 配额失败不影响探测结果
+            pass
+        try:
+            nickname = adapter.login_account_name(record.credential or {})
+        except Exception:  # noqa: BLE001 - 昵称失败不影响探测结果
+            nickname = ""
+        if quota_used is not None or nickname:
+            self.store.update_account(
+                account_id,
+                nickname=nickname or None,
+                quota_used=quota_used,
+                quota_total=quota_total,
+            )
         return probe
 
     def refresh(self, account_id: int) -> Optional[NetdiskAccountRecord]:
@@ -227,6 +270,83 @@ class NetdiskAccountService:
             return None
         self.store.update_account(account_id, credential=credential, status="active")
         return self._require_record(account_id)
+
+    def refresh_all(self) -> List[NetdiskAccountFailure]:
+        """
+        批量刷新并探测全部个人网盘账号。
+
+        支持刷新的平台先写回新凭据，再统一探测登录态；单个账号异常只记录告警，
+        不中断其余账号。
+
+        :return: 需要重新登录的账号列表
+        """
+        failures: list[NetdiskAccountFailure] = []
+        for view in self.store.list_accounts():
+            try:
+                failure = self._refresh_one(view.id)
+            except Exception as error:  # noqa: BLE001 - 单账号异常不中断整轮
+                logger.warning(f"网盘账号 {view.platform} / {view.name} 刷新异常：{error}")
+                failures.append(
+                    NetdiskAccountFailure(
+                        account_id=view.id,
+                        platform=view.platform,
+                        name=view.name,
+                        message=str(error) or type(error).__name__,
+                    )
+                )
+                continue
+            if failure is not None:
+                failures.append(failure)
+        return failures
+
+    def _refresh_one(self, account_id: int) -> Optional[NetdiskAccountFailure]:
+        """
+        刷新并探测单个账号，返回失败项或 None。
+
+        :param account_id: 账号主键
+        :return: 需要重新登录时返回失败项
+        """
+        record = self.store.get_record(account_id)
+        if record is None:
+            logger.warning(f"网盘账号 {account_id} 不存在，跳过刷新")
+            return None
+        adapter = registry.get_adapter(record.platform)
+        refresh_error = ""
+        if getattr(adapter, "supports_refresh", False):
+            try:
+                credential = adapter.refresh_account(record)
+            except Exception as error:  # noqa: BLE001 - 刷新失败继续探测并汇总
+                refresh_error = str(error) or type(error).__name__
+                logger.warning(f"网盘账号 {record.platform.value} / {record.name} 刷新失败：{refresh_error}")
+            else:
+                if credential:
+                    self.store.update_account(record.id, credential=credential, status="active")
+                    refreshed = self.store.get_record(record.id)
+                    if refreshed is not None:
+                        record = refreshed
+        try:
+            probe = adapter.probe_account(record)
+        except NetdiskError as error:
+            probe = AccountProbe(status="expired", message=error.message)
+        except Exception as error:  # noqa: BLE001 - 探测异常按失效处理
+            probe = AccountProbe(status="expired", message=str(error) or type(error).__name__)
+            logger.warning(f"网盘账号 {record.platform.value} / {record.name} 探测异常：{probe.message}")
+        self.store.touch_account(record.id, probe)
+        if probe.status == "expired":
+            return NetdiskAccountFailure(
+                account_id=record.id,
+                platform=record.platform.value,
+                name=record.name,
+                message=probe.message or refresh_error or "登录态已失效",
+            )
+        if refresh_error:
+            return NetdiskAccountFailure(
+                account_id=record.id,
+                platform=record.platform.value,
+                name=record.name,
+                message=refresh_error,
+            )
+        return None
 
     def select(self, platform: object, exclude_ids: Sequence[int] = ()) -> NetdiskAccountRecord:
         """

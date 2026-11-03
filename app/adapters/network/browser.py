@@ -237,11 +237,16 @@ class BrowserPage(Protocol):
         ...
 
 
-def launch_browser_context(headless: bool = True, **kwargs: Any) -> BrowserContext:
+def launch_browser_context(
+    headless: bool = True,
+    args: Optional[list[str]] = None,
+    **kwargs: Any,
+) -> BrowserContext:
     """
     启动同步浏览器上下文；有界面模式先显式获取宿主显示资源。
 
     :param headless: 是否使用无头模式
+    :param args: 浏览器启动参数
     :param kwargs: 浏览器实现接受的其余启动参数
     :return: 浏览器上下文
     """
@@ -253,17 +258,19 @@ def launch_browser_context(headless: bool = True, **kwargs: Any) -> BrowserConte
         )
     from cloakbrowser import launch_context
 
-    return cast(BrowserContext, launch_context(headless=headless, **kwargs))
+    return cast(BrowserContext, launch_context(headless=headless, args=args, **kwargs))
 
 
 async def launch_browser_context_async(
     headless: bool = True,
+    args: Optional[list[str]] = None,
     **kwargs: Any,
 ) -> Any:
     """
     启动异步浏览器上下文；有界面模式等待宿主显示资源就绪。
 
     :param headless: 是否使用无头模式
+    :param args: 浏览器启动参数
     :param kwargs: 浏览器实现接受的其余启动参数
     :return: 浏览器上下文
     """
@@ -275,7 +282,7 @@ async def launch_browser_context_async(
         )
     from cloakbrowser import launch_context_async
 
-    return await launch_context_async(headless=headless, **kwargs)
+    return await launch_context_async(headless=headless, args=args, **kwargs)
 
 
 @dataclass
@@ -335,15 +342,22 @@ class BrowserSessionHelper:
     _session_thread_ids: dict[str, int] = {}
     _sessions_lock = threading.RLock()
 
-    def __init__(self, headless: bool = True, viewport: Optional[dict[str, int]] = None):
+    def __init__(
+        self,
+        headless: bool = True,
+        viewport: Optional[dict[str, int]] = None,
+        args: Optional[list[str]] = None,
+    ):
         """
         初始化浏览器会话辅助类。
 
         :param headless: 是否使用无头浏览器
         :param viewport: 默认视口大小
+        :param args: 浏览器启动参数
         """
         self.headless = headless
         self.viewport = viewport or self.DEFAULT_VIEWPORT
+        self.args = list(args or [])
 
     @classmethod
     def validate_url(cls, url: str, allow_private_network: bool = False) -> str:
@@ -958,6 +972,7 @@ class BrowserSessionHelper:
         headless: bool,
         user_agent: Optional[str] = None,
         viewport: Optional[dict[str, int]] = None,
+        args: Optional[list[str]] = None,
     ) -> BrowserContext:
         """
         按宿主反检测配置创建 CloakBrowser 上下文。
@@ -970,7 +985,7 @@ class BrowserSessionHelper:
             context_kwargs["user_agent"] = user_agent
         if viewport:
             context_kwargs["viewport"] = viewport
-        return launch_browser_context(headless=headless, **context_kwargs)
+        return launch_browser_context(headless=headless, args=args, **context_kwargs)
 
     def _get_or_create_session(
         self,
@@ -998,6 +1013,7 @@ class BrowserSessionHelper:
             headless=self.headless,
             user_agent=user_agent,
             viewport=self.viewport,
+            args=self.args,
         )
         page = context.new_page()
         if cookies:

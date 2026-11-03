@@ -346,6 +346,8 @@ def test_password_login_returns_token(monkeypatch) -> None:
         """
         记录登录请求并返回令牌。
         """
+        if url == guangya_module._CAPTCHA_INIT_URL:
+            return {"captcha_token": "cap-1"}
         assert url == guangya_module._SIGNIN_URL
         sent["body"] = body
         sent["headers"] = headers
@@ -365,6 +367,7 @@ def test_password_login_returns_token(monkeypatch) -> None:
     assert sent["body"]["client_id"] == guangya_module._CLIENT_ID
     assert sent["headers"]["X-Client-Id"] == guangya_module._CLIENT_ID
     assert "X-Device-Sign" in sent["headers"]
+    assert sent["headers"]["X-Captcha-Token"] == "cap-1"
 
 
 @pytest.mark.parametrize(
@@ -564,3 +567,60 @@ def test_cleanup_swallows_delete_failure(monkeypatch) -> None:
     )
 
     adapter.cleanup(handle, _account())
+
+
+def test_send_sms_code_returns_verification(monkeypatch) -> None:
+    """
+    发送短信验证码先初始化人机验证并返回验证会话。
+    """
+    calls = []
+
+    def handler(method, http, url, account, params, body, headers):
+        """
+        按接口返回人机验证与发码结果。
+        """
+        calls.append((url, headers))
+        if url == guangya_module._CAPTCHA_INIT_URL:
+            return {"captcha_token": "cap-sms"}
+        assert url == guangya_module._VERIFICATION_URL
+        return {
+            "success": True,
+            "code": "0",
+            "verification_id": "v-1",
+            "is_user": True,
+            "expires_in": 600,
+        }
+
+    _patch_http(monkeypatch, handler)
+    adapter = guangya_module.GuangYaAdapter()
+
+    result = adapter.send_sms_code("13800138000")
+
+    assert result == {"verification_id": "v-1", "is_user": True, "expires_in": 600}
+    assert calls[-1][1]["X-Captcha-Token"] == "cap-sms"
+
+
+def test_sms_login_returns_token(monkeypatch) -> None:
+    """
+    短信验证码登录先校验验证码再换取 token。
+    """
+    urls = []
+
+    def handler(method, http, url, account, params, body, headers):
+        """
+        返回验证码校验与登录结果。
+        """
+        urls.append(url)
+        if url == guangya_module._VERIFICATION_VERIFY_URL:
+            return {"success": True, "code": "0", "verification_token": "vt-1"}
+        assert url == guangya_module._SIGNIN_URL
+        assert body["verification_token"] == "vt-1"
+        return {"success": True, "code": "0", "data": {"access_token": "at-sms"}}
+
+    _patch_http(monkeypatch, handler)
+    adapter = guangya_module.GuangYaAdapter()
+
+    credential = adapter.sms_login("13800138000", "123456", "v-1")
+
+    assert credential == {"token": "at-sms"}
+    assert urls == [guangya_module._VERIFICATION_VERIFY_URL, guangya_module._SIGNIN_URL]

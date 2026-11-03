@@ -252,6 +252,13 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
                 *_wallpaper_job_specs(services, config.wallpaper),
                 JobSpec("sitedata_refresh", "站点数据刷新", services.refresh_site_data, "site"),
                 JobSpec("netdisk_token_refresh", "网盘站点令牌刷新", services.refresh_netdisk_tokens, "site"),
+                JobSpec(
+                    "netdisk_account_refresh",
+                    "网盘账号登录态刷新",
+                    services.refresh_netdisk_accounts,
+                    "site",
+                    manual=True,
+                ),
                 JobSpec("recommend_refresh", "推荐缓存", services.refresh_recommend, "recommend"),
                 JobSpec(
                     "plugin_market_refresh",
@@ -485,6 +492,16 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
             name="网盘站点令牌刷新",
             minutes=5,
             kwargs={"job_id": "netdisk_token_refresh"},
+        )
+
+        # 个人网盘账号登录态刷新与探测
+        self._scheduler.add_job(
+            self.start,
+            "interval",
+            id="netdisk_account_refresh",
+            name="网盘账号登录态刷新",
+            hours=6,
+            kwargs={"job_id": "netdisk_account_refresh"},
         )
 
         # 推荐缓存

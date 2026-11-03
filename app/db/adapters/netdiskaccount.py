@@ -50,6 +50,9 @@ def _to_view(model: NetdiskAccount, credential: Mapping[str, str]) -> NetdiskAcc
         expires_at=model.expires_at,
         last_checked_at=model.last_checked_at,
         masked=mask_credential(credential),
+        nickname=model.nickname or "",
+        quota_used=int(model.quota_used or 0),
+        quota_total=int(model.quota_total or 0),
     )
 
 
@@ -192,6 +195,9 @@ class TransactionalNetdiskAccountRepository:
                     "credential_enc": encrypted,
                     "is_primary": payload.is_primary,
                     "status": "active",
+                    "nickname": payload.nickname,
+                    "quota_used": payload.quota_used,
+                    "quota_total": payload.quota_total,
                 }
             )
             return _to_view(model, payload.credential)
@@ -207,6 +213,9 @@ class TransactionalNetdiskAccountRepository:
         is_primary: Optional[bool] = None,
         status: Optional[str] = None,
         expires_at: Optional[datetime] = None,
+        nickname: Optional[str] = None,
+        quota_used: Optional[int] = None,
+        quota_total: Optional[int] = None,
     ) -> Optional[NetdiskAccountView]:
         """
         更新账号字段。
@@ -248,6 +257,12 @@ class TransactionalNetdiskAccountRepository:
                 fields["status"] = status
             if expires_at is not None:
                 fields["expires_at"] = expires_at
+            if nickname is not None:
+                fields["nickname"] = nickname
+            if quota_used is not None:
+                fields["quota_used"] = quota_used
+            if quota_total is not None:
+                fields["quota_total"] = quota_total
             if is_primary is True:
                 oper.clear_primary(model.platform, exclude_id=account_id)
                 fields["is_primary"] = True

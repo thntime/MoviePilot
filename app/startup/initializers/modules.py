@@ -538,7 +538,14 @@ def check_auth() -> None:
     """
     检查认证状态
     """
-    if SitesHelper().auth_level < 2:
+    sites_helper = SitesHelper()
+    if sites_helper.auth_level >= 2:
+        return
+    # 未配置站点认证参数时，认证等级低是正常状态，不应反复提示。
+    auth_conf = get_configured_system_config().get(SystemConfigKey.UserSiteAuthParams)
+    if not auth_conf and not get_runtime_setting("AUTH_SITE"):
+        return
+    if sites_helper.auth_level < 2:
         err_msg = "用户认证失败，站点相关功能将无法使用！"
         MessageHelper().put(f"注意：{err_msg}", title="用户认证", role="system", level="warning")
         CommandChain().post_message(

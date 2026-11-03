@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from app.adapters.external.netdisk.base import (
     BaseNetdiskAdapter,
@@ -26,6 +26,10 @@ from app.domain.netdisk import NetdiskAccountRecord
 from app.domain.netdisk import (
     AccountProbe,
     DirectLink,
+    DriveCapabilities,
+    DriveFile,
+    DriveQuota,
+    DriveShare,
     LinkPolicy,
     NetdiskError,
     NetdiskErrorCode,
@@ -64,6 +68,10 @@ _LOCATE_URL = "https://d.pcs.baidu.com/rest/2.0/pcs/file"
 _DELETE_URL = "https://pan.baidu.com/api/filemanager"
 # 网盘空间配额。
 _QUOTA_URL = "https://pan.baidu.com/api/quota"
+# 个人网盘目录列表。
+_LIST_URL = "https://pan.baidu.com/api/list"
+# 创建分享。
+_SHARE_SET_URL = "https://pan.baidu.com/share/set"
 
 # locatedownload 抓包常量：psign 固定，rand/devuid/cuid/deviceid 在登录态下可复用。
 _LOCATE_RAND = "5ed606e9da222cde0474cdf70eda884b"
@@ -176,6 +184,15 @@ class BaiduAdapter(BaseNetdiskAdapter):
     link_policy = LinkPolicy.TRANSFER_REQUIRED
     requires_account = True
     guest_supported = False
+    drive_capabilities = DriveCapabilities(
+        quota=True,
+        browse=True,
+        download=True,
+        share=True,
+        move=True,
+        rename=True,
+        delete=True,
+    )
     max_concurrency = 512
     cookie_required_keys = ("BDUSS",)
     cookie_domains = (".baidu.com",)
@@ -888,6 +905,312 @@ class BaiduAdapter(BaseNetdiskAdapter):
             headers.update({str(key): str(value) for key, value in extra.items()})
         return headers
 
+    # ---- 个人盘 ----
+
+    @staticmethod
+    def _path(file: DriveFile) -> str:
+        """
+        还原个人盘文件的完整路径。
+
+        百度目录以完整路径作为标识，文件以 `fs_id` 作为标识；写操作与 `locatedownload`
+        都按路径定位，因此文件路径由父目录与文件名拼接。
+
+        :param file: 文件条目
+        :return: 完整路径
+        """
+        if file.is_dir and file.file_id.startswith("/"):
+            return file.file_id
+        if file.name:
+            return f"{file.parent_id.rstrip('/')}/{file.name}"
+        return file.file_id
+
+    def quota(self, account: NetdiskAccountRecord) -> DriveQuota:
+        """
+        查询百度网盘空间。
+
+        :param account: 账号
+        :return: 已用/总空间
+        """
+        self._require_cookie(account)
+        payload = self._get_json(
+            _QUOTA_URL,
+            account=account,
+            params={
+                "clienttype": 0,
+                "app_id": _APP_ID,
+                "web": 1,
+                "channel": "chunlei",
+                "version": int(time.time()),
+            },
+            headers={"X-Requested-With": "XMLHttpRequest", "Referer": "https://pan.baidu.com/disk/main"},
+        )
+        self._check(payload, "查询百度网盘空间")
+        return DriveQuota(used=as_int(payload.get("used")), total=as_int(payload.get("total")))
+
+    def _list_cloud_page(
+        self,
+        directory: str,
+        page: int,
+        account: NetdiskAccountRecord,
+    ) -> tuple[list[DriveFile], int]:
+        """
+        读取个人盘目录的一页。
+
+        `bdstoken` 失效（errno=-6）时清缓存重取并重试一次。
+
+        :param directory: 目录完整路径
+        :param page: 页码，从 1 开始
+        :param account: 账号
+        :return: `(目录条目, 服务端返回的原始条数)`
+        """
+        params: dict[str, Any] = {
+            "clienttype": 0,
+            "app_id": _APP_ID,
+            "web": 1,
+            "channel": "chunlei",
+            "showempty": 0,
+            "order": "time",
+            "desc": 1,
+            "dir": directory,
+            "num": _PAGE_LIMIT,
+            "page": page,
+            "bdstoken": self._bdstoken(account),
+        }
+        headers = {"X-Requested-With": "XMLHttpRequest", "Referer": "https://pan.baidu.com/disk/main"}
+        payload = self._get_json(_LIST_URL, account=account, params=params, headers=headers)
+        if _errno(payload) == -6:
+            self._tokens.pop(account.id, None)
+            params["bdstoken"] = self._bdstoken(account)
+            payload = self._get_json(_LIST_URL, account=account, params=params, headers=headers)
+        self._check(payload, "获取百度网盘文件列表")
+        raw_items = payload.get("list")
+        items = raw_items if isinstance(raw_items, list) else []
+        files: list[DriveFile] = []
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            is_dir = as_text(item.get("isdir")) == "1"
+            path = as_text(item.get("path"))
+            files.append(
+                DriveFile(
+                    file_id=path if is_dir else as_text(item.get("fs_id")),
+                    name=as_text(item.get("server_filename")),
+                    size=as_int(item.get("size")),
+                    is_dir=is_dir,
+                    parent_id=directory,
+                )
+            )
+        return files, len(items)
+
+    def list_dir(self, account: NetdiskAccountRecord, parent_id: str) -> list[DriveFile]:
+        """
+        分页列出百度个人盘目录。
+
+        :param account: 账号
+        :param parent_id: 父目录完整路径，空串为根目录
+        :return: 目录条目
+        """
+        self._require_cookie(account)
+        directory = parent_id or "/"
+        collected: list[DriveFile] = []
+        for page in range(1, _MAX_PAGES + 1):
+            files, count = self._list_cloud_page(directory, page, account)
+            collected.extend(files)
+            if count < _PAGE_LIMIT:
+                break
+        return collected
+
+    def download_file(self, account: NetdiskAccountRecord, file: DriveFile) -> DirectLink:
+        """
+        获取百度个人盘文件直链。
+
+        `locatedownload` 只接受完整路径，且必须携带手机端 UA 才能拿到 appall 明文直链。
+
+        :param account: 账号
+        :param file: 文件条目
+        :return: 直链
+        """
+        if file.is_dir:
+            raise NetdiskError(
+                NetdiskErrorCode.UNSUPPORTED,
+                "百度网盘不支持直接下载目录",
+                platform=self.platform,
+            )
+        self._require_cookie(account)
+        url = self._locate_download(self._path(file), account)
+        return DirectLink(
+            url=url,
+            headers=self.download_headers(account),
+            size=file.size,
+            account_id=account.id,
+        )
+
+    def share_file(
+        self,
+        account: NetdiskAccountRecord,
+        files: list[DriveFile],
+        *,
+        password: str = "",
+        expires_in: int = 0,
+    ) -> DriveShare:
+        """
+        创建百度网盘分享。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param password: 提取码
+        :param expires_in: 有效期秒数，0 为永久
+        :return: 分享结果
+        """
+        if not files:
+            raise NetdiskError(
+                NetdiskErrorCode.UNSUPPORTED,
+                "百度网盘分享至少需要一个文件",
+                platform=self.platform,
+            )
+        self._require_cookie(account)
+        bdstoken = self._bdstoken(account)
+        period = 0
+        if expires_in > 0:
+            period = 1 if expires_in <= 86400 else 7 if expires_in <= 7 * 86400 else 30
+        payload = self._post_json(
+            _SHARE_SET_URL,
+            account=account,
+            params={
+                "channel": "chunlei",
+                "web": 1,
+                "app_id": _APP_ID,
+                "bdstoken": bdstoken,
+                "clienttype": 0,
+            },
+            data={
+                "fid_list": json.dumps([item.file_id for item in files]),
+                "schannel": 4,
+                "channel_list": "[]",
+                "period": period,
+                "pwd": password,
+            },
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Referer": "https://pan.baidu.com/disk/main",
+            },
+        )
+        self._check(payload, "创建百度网盘分享")
+        link = as_text(payload.get("shorturl")) or as_text(payload.get("link"))
+        if not link:
+            raise NetdiskError(
+                NetdiskErrorCode.UNKNOWN,
+                "创建百度网盘分享失败：响应缺少分享链接",
+                platform=self.platform,
+            )
+        url = link if link.startswith("http") else f"https://pan.baidu.com/s/{link}"
+        return DriveShare(url=url, password=password)
+
+    def move_files(self, account: NetdiskAccountRecord, files: list[DriveFile], target_id: str) -> None:
+        """
+        移动百度个人盘文件。
+
+        :param account: 账号
+        :param files: 文件列表
+        :param target_id: 目标目录完整路径
+        """
+        if not files:
+            return
+        self._require_cookie(account)
+        items = [
+            {"path": self._path(item), "dest": target_id or "/", "newname": item.name}
+            for item in files
+        ]
+        self._filemanager("move", items, account, "移动百度网盘文件", async_op=2)
+
+    def rename_file(self, account: NetdiskAccountRecord, file: DriveFile, name: str) -> None:
+        """
+        重命名百度个人盘文件。
+
+        :param account: 账号
+        :param file: 文件条目
+        :param name: 新名称
+        """
+        self._require_cookie(account)
+        self._filemanager(
+            "rename",
+            [{"path": self._path(file), "newname": name}],
+            account,
+            "重命名百度网盘文件",
+            async_op=0,
+        )
+
+    def delete_files(self, account: NetdiskAccountRecord, files: list[DriveFile]) -> None:
+        """
+        删除百度个人盘文件。
+
+        :param account: 账号
+        :param files: 文件列表
+        """
+        if not files:
+            return
+        self._require_cookie(account)
+        bdstoken = self._bdstoken(account)
+        payload = self._post_json(
+            _DELETE_URL,
+            account=account,
+            params={
+                "async": 2,
+                "onnest": "fail",
+                "opera": "delete",
+                "bdstoken": bdstoken,
+                "newVerify": 1,
+                "clienttype": 0,
+                "app_id": _APP_ID,
+                "web": 1,
+            },
+            data={"filelist": json.dumps([self._path(item) for item in files], ensure_ascii=False)},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Referer": "https://pan.baidu.com/disk/main",
+            },
+        )
+        self._check(payload, "删除百度网盘文件")
+
+    def _filemanager(
+        self,
+        opera: str,
+        items: Sequence[Mapping[str, Any]],
+        account: NetdiskAccountRecord,
+        action: str,
+        *,
+        async_op: int,
+    ) -> None:
+        """
+        调用百度 `filemanager` 完成移动或重命名。
+
+        :param opera: 操作名，`move` 或 `rename`
+        :param items: `filelist` 条目
+        :param account: 账号
+        :param action: 用于错误提示的动作名
+        :param async_op: `async` 参数，移动为 2，重命名为 0
+        """
+        bdstoken = self._bdstoken(account)
+        payload = self._post_json(
+            _DELETE_URL,
+            account=account,
+            params={
+                "async": async_op,
+                "onnest": "fail",
+                "opera": opera,
+                "bdstoken": bdstoken,
+                "clienttype": 0,
+                "app_id": _APP_ID,
+                "web": 1,
+            },
+            data={"filelist": json.dumps(list(items), ensure_ascii=False)},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Referer": "https://pan.baidu.com/disk/main",
+            },
+        )
+        self._check(payload, action)
+
     # ---- 账号 ----
 
     def _username(self, cookie: str) -> str:
@@ -930,6 +1253,21 @@ class BaiduAdapter(BaseNetdiskAdapter):
             return AccountProbe(status="unknown", message=error.message)
         message = f"百度网盘登录态有效：{nickname}" if nickname else "百度网盘登录态有效"
         return AccountProbe(status="active", message=message)
+
+    def login_account_name(self, credential: Mapping[str, str]) -> str:
+        """
+        从百度模板变量接口读取账号昵称。
+
+        :param credential: 浏览器抓到的凭据
+        :return: 昵称；接口不可用时为空串
+        """
+        cookie = _credential_cookie(credential)
+        if "BDUSS=" not in cookie:
+            return ""
+        try:
+            return self._username(cookie)
+        except NetdiskError:
+            return ""
 
     def probe_account(self, account: NetdiskAccountRecord) -> AccountProbe:
         """

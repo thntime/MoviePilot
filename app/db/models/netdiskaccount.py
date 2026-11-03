@@ -7,7 +7,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, get_id_column
@@ -25,7 +25,7 @@ class NetdiskAccount(Base):
     )
 
     id = get_id_column()
-    # 平台标识：quark / uc / c139 / pan123 / pan115 / guangya / baidu / xunlei
+    # 平台标识：quark / uc / pan139 / pan123 / pan115 / guangya / baidu / xunlei
     platform: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     # 用户可读的账号名称，同平台内唯一
     name: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -33,6 +33,11 @@ class NetdiskAccount(Base):
     credential_enc: Mapped[str] = mapped_column(Text, nullable=False)
     # 是否为主账号，同平台最多一个
     is_primary: Mapped[bool] = mapped_column(Boolean(), default=False)
+    # 登录账号昵称/手机号，便于账号卡片展示
+    nickname: Mapped[Optional[str]] = mapped_column(String(64))
+    # 个人盘已用/总空间（字节）
+    quota_used: Mapped[int] = mapped_column(BigInteger, default=0)
+    quota_total: Mapped[int] = mapped_column(BigInteger, default=0)
     # 账号状态：active / expired / disabled
     status: Mapped[str] = mapped_column(String(16), default="active")
     # 已知过期时间

@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from app.application.netdisk import registry
 from app.application.netdisk.accounts import NetdiskAccountService, parse_cookie_header
@@ -33,11 +33,14 @@ class _PendingLogin:
     is_primary: bool
     account_id: Optional[int] = None
     expires_at: float = 0.0
+    credential: Optional[Mapping[str, str]] = None
+    account_name: str = ""
+    validation_failures: int = 0
 
 
 # 扫码会话的待落库上下文必须跨请求共享：接口每次请求都会新建用例实例，
 # 若存在实例属性上，下一次轮询就找不到会话。
-_QR_SESSION_TTL_SECONDS = 300
+_QR_SESSION_TTL_SECONDS = 900
 _PENDING: dict[str, _PendingLogin] = {}
 _PENDING_LOCK = threading.RLock()
 
@@ -165,6 +168,70 @@ class NetdiskLoginService:
             is_primary=is_primary,
         )
 
+    def send_sms_code(self, platform: object, phone: str) -> dict[str, Any]:
+        """
+        发送短信验证码。
+
+        :param platform: 平台标识
+        :param phone: 手机号
+        :return: 验证会话信息
+        """
+        resolved = self._require_platform(platform)
+        adapter = registry.get_adapter(resolved)
+        sender = getattr(adapter, "send_sms_code", None)
+        if sender is None:
+            raise NetdiskError(
+                NetdiskErrorCode.UNSUPPORTED,
+                "该平台不支持短信验证码登录",
+                platform=resolved,
+            )
+        return dict(sender(str(phone or "").strip()))
+
+    def sms_login(
+        self,
+        platform: object,
+        phone: str,
+        code: str,
+        verification_id: str,
+        *,
+        name: Optional[str] = None,
+        is_primary: bool = False,
+    ) -> NetdiskAccountView:
+        """
+        使用短信验证码登录并保存账号。
+
+        :param platform: 平台标识
+        :param phone: 手机号
+        :param code: 短信验证码
+        :param verification_id: 发码接口返回的验证会话
+        :param name: 账号名称
+        :param is_primary: 是否设为主账号
+        :return: 新账号的脱敏投影
+        """
+        resolved = self._require_platform(platform)
+        adapter = registry.get_adapter(resolved)
+        login = getattr(adapter, "sms_login", None)
+        if login is None:
+            raise NetdiskError(
+                NetdiskErrorCode.UNSUPPORTED,
+                "该平台不支持短信验证码登录",
+                platform=resolved,
+            )
+        credential = login(
+            str(phone or "").strip(),
+            str(code or "").strip(),
+            str(verification_id or "").strip(),
+        )
+        if not credential:
+            raise NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "短信验证码登录失败", platform=resolved)
+        return self._accounts.create(
+            resolved,
+            name or str(phone or "").strip() or self._default_name(resolved),
+            credential,
+            is_primary=is_primary,
+            validate=False,
+        )
+
     def start_qr(
         self,
         platform: object,
@@ -213,38 +280,83 @@ class NetdiskLoginService:
                 context = None
         if context is None:
             return LoginResult(status="failed", message="登录会话不存在或已过期")
+        if context.credential:
+            # 已经检测到登录态后不再重复调用平台接口，等待用户确认或取消。
+            return LoginResult(
+                status="detected",
+                message="已检测到登录态，请确认保存",
+                account_name=context.account_name,
+            )
         result = registry.get_login_adapter().poll(session_id)
         if result.status != "success" or not result.credential:
-            if result.status in {"failed", "expired"}:
+            if result.status == "expired":
                 with _PENDING_LOCK:
                     self._pending.pop(session_id, None)
             return result
+        adapter = registry.get_adapter(context.platform)
+        ready = getattr(adapter, "login_ready", None)
+        if ready is not None and not ready(result.credential):
+            return LoginResult(status="pending", message="正在等待登录完成")
+        probe = adapter.validate_credential(result.credential)
+        if probe.status != "active":
+            # 登录过程中 Cookie/凭据是分批下发的：百度先有 BDUSS 才可能有 STOKEN，
+            # 迅雷要等页面把 localStorage 写完。缺字段只代表还没登录完成，不能判失败。
+            if "缺少必填字段" in (probe.message or ""):
+                return LoginResult(status="pending", message="正在等待登录完成")
+            # 其他校验失败给一段宽限时间，避免网络抖动或页面跳转中途误判。
+            with _PENDING_LOCK:
+                context.validation_failures += 1
+                failures = context.validation_failures
+            if failures < 30:
+                return LoginResult(status="pending", message="正在等待登录完成")
+            with _PENDING_LOCK:
+                self._pending.pop(session_id, None)
+            return LoginResult(status="failed", message=probe.message or "登录态校验失败")
+        with _PENDING_LOCK:
+            context.validation_failures = 0
+        account_name = ""
+        name_getter = getattr(adapter, "login_account_name", None)
+        if name_getter is not None:
+            account_name = str(name_getter(result.credential) or "")
+        with _PENDING_LOCK:
+            context.credential = dict(result.credential)
+            context.account_name = account_name
+        return LoginResult(
+            status="detected",
+            message="已检测到登录态，请确认保存",
+            account_name=account_name,
+        )
+
+    def confirm_qr(self, session_id: str) -> NetdiskAccountView:
+        """
+        用户确认后保存已检测到的登录态。
+
+        :param session_id: 会话标识
+        :return: 新账号或更新后的账号
+        """
+        with _PENDING_LOCK:
+            context = self._pending.pop(session_id, None)
+        if context is None or not context.credential:
+            raise NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "没有待确认的登录态，请重新登录")
         try:
-            adapter = registry.get_adapter(context.platform)
-            probe = adapter.validate_credential(result.credential)
-            if probe.status != "active":
-                with _PENDING_LOCK:
-                    self._pending.pop(session_id, None)
-                return LoginResult(status="failed", message=probe.message or "登录态校验失败")
             if context.account_id:
-                self._accounts.update(
+                view = self._accounts.update(
                     context.account_id,
-                    credential=result.credential,
+                    credential=context.credential,
                     validate=False,
                 )
             else:
-                self._accounts.create(
+                view = self._accounts.create(
                     context.platform,
                     context.name,
-                    result.credential,
+                    context.credential,
                     is_primary=context.is_primary,
                     validate=False,
+                    nickname=context.account_name,
                 )
         finally:
-            with _PENDING_LOCK:
-                self._pending.pop(session_id, None)
             registry.get_login_adapter().cancel(session_id)
-        return LoginResult(status="success", message="登录成功")
+        return view
 
     def cancel_qr(self, session_id: str) -> None:
         """
@@ -255,6 +367,71 @@ class NetdiskLoginService:
         with _PENDING_LOCK:
             self._pending.pop(session_id, None)
         registry.get_login_adapter().cancel(session_id)
+
+    def qr_frame(self, session_id: str) -> dict[str, Any]:
+        """
+        读取网页登录当前画面。
+
+        :param session_id: 会话标识
+        :return: 图片与视口尺寸
+        """
+        adapter = registry.get_login_adapter()
+        frame = getattr(adapter, "frame", None)
+        if frame is None:
+            raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "当前登录方式不支持页面交互")
+        return dict(frame(session_id))
+
+    def qr_input(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
+        """
+        转发点击、输入、按键或滚动，并返回最新画面。
+
+        :param session_id: 会话标识
+        :param kwargs: 操作参数
+        :return: 最新画面
+        """
+        adapter = registry.get_login_adapter()
+        handler = getattr(adapter, "input", None)
+        if handler is None:
+            raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "当前登录方式不支持页面交互")
+        handler(session_id, **kwargs)
+        return self.qr_frame(session_id)
+
+    def qr_stream_start(self, session_id: str, on_frame: Any) -> None:
+        """
+        启动网页登录实时画面。
+
+        :param session_id: 会话标识
+        :param on_frame: 帧回调
+        """
+        adapter = registry.get_login_adapter()
+        starter = getattr(adapter, "start_stream", None)
+        if starter is None:
+            raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "当前登录方式不支持实时画面")
+        starter(session_id, on_frame)
+
+    def qr_stream_stop(self, session_id: str) -> None:
+        """
+        停止网页登录实时画面。
+
+        :param session_id: 会话标识
+        """
+        adapter = registry.get_login_adapter()
+        stopper = getattr(adapter, "stop_stream", None)
+        if stopper is not None:
+            stopper(session_id)
+
+    def qr_send_event(self, session_id: str, event: Mapping[str, Any]) -> None:
+        """
+        转发页面事件。
+
+        :param session_id: 会话标识
+        :param event: 事件描述
+        """
+        adapter = registry.get_login_adapter()
+        handler = getattr(adapter, "send_event", None)
+        if handler is None:
+            raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "当前登录方式不支持页面交互")
+        handler(session_id, event)
 
     def _credential_from_text(
         self,
