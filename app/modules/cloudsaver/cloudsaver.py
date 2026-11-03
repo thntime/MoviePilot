@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from app.adapters.network.http import RequestUtils
+from app.domain.netdisk import normalize_platform as _normalize_netdisk_platform
 
 # 部分频道会给标题加「名称：」前缀，清洗后才能被媒体识别正确解析。
 _TITLE_PREFIX_PATTERN = re.compile(r"^\s*(?:名称|标题|片名)\s*[:：]\s*")
@@ -61,7 +62,7 @@ _PLATFORM_DOMAIN_RULES: Tuple[Tuple[str, str], ...] = (
 _PLATFORM_ALIASES: Dict[str, str] = {
     "baidupan": "baiduPan",
     "baidu": "baiduPan",
-    "tianyi": "tianyi",
+    "tianyi": "c139",
     "aliyun": "aliyun",
     "pan115": "pan115",
     "115": "pan115",
@@ -193,12 +194,19 @@ def _empty_share_detail() -> Dict[str, Any]:
 
 def _normalize_platform(value: Any) -> str:
     """
-    归一网盘平台标识，未知标识保留原始文本。
+    归一网盘平台标识，已支持平台收敛为统一枚举值，未知标识保留原始文本。
+
+    统一枚举值用于前端展示网盘类型与筛选；未知标识保留原文以便排查接口新增平台。
+
+    :param value: 接口返回的平台标识
+    :return: 统一平台标识；无法识别时返回原始文本
     """
     text = _as_text(value)
     if not text:
         return ""
-    return _PLATFORM_ALIASES.get(text.lower(), text)
+    alias = _PLATFORM_ALIASES.get(text.lower(), text)
+    canonical = _normalize_netdisk_platform(alias)
+    return canonical.value if canonical else alias
 
 
 def _platform_from_url(url: str) -> str:
@@ -208,7 +216,7 @@ def _platform_from_url(url: str) -> str:
     lowered = _as_text(url).lower()
     for needle, platform in _PLATFORM_DOMAIN_RULES:
         if needle in lowered:
-            return platform
+            return _normalize_platform(platform)
     return ""
 
 

@@ -9,9 +9,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import pytest
 
 import app.modules.cloudsaver as netdisk_module
+from app.domain.netdisk import normalize_platform
 from app.modules.cloudsaver import CloudSaverModule
 from app.modules.cloudsaver import cloudsaver as cloudsaver_module
 from app.modules.cloudsaver.cloudsaver import CloudSaverClient
+
+# 139 平台标识由领域层决定：历史版本为 c139，后续版本迁移为 pan139。
+_C139_PLATFORM_ID = normalize_platform("c139").value
 
 
 @pytest.fixture(autouse=True)
@@ -372,7 +376,8 @@ def test_search_netdisk_torrents_builds_and_dedupes_candidates(monkeypatch: pyte
     assert torrent.page_url == share_url
     assert torrent.download_type == "netdisk"
     assert torrent.netdisk_platform == "quark"
-    assert torrent.labels == ["quark", "频道A"]
+    # 平台由 netdisk_platform 单独承载，标签只保留渠道名。
+    assert torrent.labels == ["频道A"]
     assert torrent.site == 7
     assert torrent.site_downloader == "qb"
 
@@ -1088,3 +1093,187 @@ def test_search_limits_alive_checks_to_newest_candidates(monkeypatch: pytest.Mon
     assert results is not None
     assert [strip_episode(item.title) for item in results] == ["最新资源", "次新资源"]
     assert server.share_check_count == 2
+
+
+def _install_fake_walk(monkeypatch: pytest.MonkeyPatch, files: List[Any], detail_size: int = 0) -> List[str]:
+    """
+    用假文件树替换统一取链服务的 walk，并返回调用记录。
+
+    :param monkeypatch: pytest 替换工具
+    :param files: walk 返回的文件条目
+    :param detail_size: 分享详情自带的总大小，0 表示根目录为文件夹
+    :return: 记录每次 walk 调用链接的列表
+    """
+    from app.application.netdisk.resolve import NetdiskResolveService, ResolvedShare
+    from app.domain.netdisk import NetdiskPlatform, ShareDetail, ShareFile, ShareRef
+
+    calls: List[str] = []
+
+    def fake_walk(self: Any, url: str, password: Any = None, platform: Any = None, **kwargs: Any) -> ResolvedShare:
+        """
+        记录调用并返回预设的分享详情与文件树。
+        """
+        calls.append(url)
+        root = ShareFile(file_id="dir", name="合集", size=0, is_dir=True)
+        return ResolvedShare(
+            ref=ShareRef(platform=NetdiskPlatform.PAN123, share_id="share-id"),
+            detail=ShareDetail(title="资源", size=detail_size, files=(root,)),
+            files=tuple(files),
+        )
+
+    monkeypatch.setattr(NetdiskResolveService, "walk", fake_walk)
+    return calls
+
+
+def test_netdisk_platform_is_canonical_and_not_duplicated_in_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    接口返回的平台别名收敛为统一枚举值，标签里不再重复平台原文。
+    """
+    server = FakeCloudSaverServer()
+    server.search_results = [(200, make_payload([
+        {
+            "title": "百度资源",
+            "content": "简介",
+            "cloudType": "baiduPan",
+            "cloudLinks": [{"link": "https://pan.baidu.com/s/1abcDEF", "cloudType": "baiduPan"}],
+        },
+    ]))]
+    install_server(monkeypatch, server)
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
+
+    assert results is not None
+    assert [item.netdisk_platform for item in results] == ["baidu"]
+    assert results[0].labels == ["频道A"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("baiduPan", "baidu"),
+        ("tianyi", _C139_PLATFORM_ID),
+        ("yidong", _C139_PLATFORM_ID),
+        ("ucdrive", "uc"),
+        ("pan115", "pan115"),
+        ("aliyun", "aliyun"),
+        ("", ""),
+    ],
+)
+def test_normalize_platform_maps_aliases_to_canonical_values(raw: str, expected: str) -> None:
+    """
+    平台别名统一收敛，未知平台保留原文以便排查。
+    """
+    assert cloudsaver_module._normalize_platform(raw) == expected
+
+
+def test_non_quark_share_size_falls_back_to_walked_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    分享根目录是文件夹时，用递归文件大小求和补齐候选大小。
+    """
+    from app.domain.netdisk import ShareFile
+
+    _install_fake_walk(monkeypatch, [
+        ShareFile(file_id="1", name="S01E01.mp4", size=500 * 1024 * 1024),
+        ShareFile(file_id="2", name="S01E02.mp4", size=600 * 1024 * 1024),
+    ])
+    server = FakeCloudSaverServer()
+    server.search_results = [(200, make_payload([
+        {
+            "title": "123资源",
+            "content": "简介",
+            "cloudType": "pan123",
+            "cloudLinks": [{"link": "https://www.123pan.com/s/abc-def", "cloudType": "pan123"}],
+        },
+    ]))]
+    install_server(monkeypatch, server)
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
+
+    assert results is not None
+    assert len(results) == 1
+    assert results[0].netdisk_platform == "pan123"
+    assert results[0].size == 1100 * 1024 * 1024
+
+
+def test_139_share_is_inspected_without_quark_share_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    139 分享链接没有夸克分享码，也要走统一取链检查而不是被跳过。
+    """
+    from app.domain.netdisk import ShareFile
+
+    calls = _install_fake_walk(monkeypatch, [
+        ShareFile(file_id="1", name="S01E01.mp4", size=800 * 1024 * 1024),
+    ])
+    server = FakeCloudSaverServer()
+    url = "https://yun.139.com/shareweb/#/w/i/abc123"
+    server.search_results = [(200, make_payload([
+        {
+            "title": "移动云盘资源",
+            "content": "简介",
+            "cloudType": "tianyi",
+            "cloudLinks": [{"link": url, "cloudType": "tianyi"}],
+        },
+    ]))]
+    install_server(monkeypatch, server)
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
+
+    assert results is not None
+    assert calls == [url]
+    assert results[0].netdisk_platform == _C139_PLATFORM_ID
+    assert results[0].size == 800 * 1024 * 1024
+
+
+def test_platform_inferred_from_url_is_canonical(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    接口未返回 cloudType 时，按链接域名推断的平台也要收敛为统一枚举值。
+    """
+    from app.domain.netdisk import ShareFile
+
+    _install_fake_walk(monkeypatch, [
+        ShareFile(file_id="1", name="S01E01.mp4", size=300 * 1024 * 1024),
+    ])
+    server = FakeCloudSaverServer()
+    server.search_results = [(200, make_payload([
+        {
+            "title": "域名推断资源",
+            "content": "简介",
+            "cloudLinks": ["https://yun.139.com/shareweb/#/w/i/xyz789"],
+        },
+    ]))]
+    install_server(monkeypatch, server)
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
+
+    assert results is not None
+    assert [item.netdisk_platform for item in results] == [_C139_PLATFORM_ID]
+
+
+def test_non_quark_cached_detail_skips_repeated_walk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    同一分享在缓存有效期内复用文件树，不重复遍历远端目录。
+    """
+    from app.domain.netdisk import ShareFile
+
+    calls = _install_fake_walk(monkeypatch, [
+        ShareFile(file_id="1", name="S01E01.mp4", size=400 * 1024 * 1024),
+    ])
+    payload = make_payload([
+        {
+            "title": "缓存资源",
+            "content": "简介",
+            "cloudType": "pan123",
+            "cloudLinks": [{"link": "https://www.123pan.com/s/cache-share", "cloudType": "pan123"}],
+        },
+    ])
+    server = FakeCloudSaverServer()
+    server.search_results = [(200, payload), (200, payload)]
+    install_server(monkeypatch, server)
+    module = CloudSaverModule()
+
+    first = module.search_netdisk_torrents(make_site(), "关键词")
+    second = module.search_netdisk_torrents(make_site(), "关键词")
+
+    assert first and second
+    assert len(calls) == 1
+    assert second[0].size == 400 * 1024 * 1024

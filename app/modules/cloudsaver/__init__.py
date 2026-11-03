@@ -15,6 +15,7 @@ from app.application.configuration import get_configured_system_config
 from app.application.site.observation import report_site_search_outcome, report_site_search_page
 from app.domain import episode as episode_rules
 from app.domain.context import TorrentInfo
+from app.domain.netdisk import parse_share_link
 from app.modules import _ModuleBase
 from app.modules.cloudsaver.cloudsaver import CloudSaverClient, CloudSaverError, parse_share_code
 from app.modules.cloudsaver.quark_share import MAX_PAGES, QuarkShareClient
@@ -234,9 +235,8 @@ class CloudSaverModule(_ModuleBase):
                 if dedup_key in seen:
                     continue
                 seen.add(dedup_key)
-                labels = [platform] if platform else []
-                if channel and channel not in labels:
-                    labels.append(channel)
+                # 平台由 netdisk_platform 单独承载，卡片用网盘类型徽标展示；标签只保留渠道名。
+                labels = [channel] if channel else []
                 torrents.append(TorrentInfo(
                     site=site.get("id"),
                     site_name=site_name,
@@ -505,7 +505,7 @@ class CloudSaverModule(_ModuleBase):
         """
         platform = str(torrent.netdisk_platform or "").strip()
         if platform and platform != "quark":
-            return self._inspect_remote_share(torrent, platform)
+            return self._inspect_remote_share(torrent, platform, cached_detail)
         detail = cached_detail or client.share_detail(share_code, torrent.share_password)
         if not detail or not detail.get("alive"):
             return detail, False
@@ -523,20 +523,28 @@ class CloudSaverModule(_ModuleBase):
         if marker not in description:
             torrent.description = f"{description}{marker}" if description else marker
 
-    def _inspect_remote_share(self, torrent: TorrentInfo, platform: str) -> Tuple[Optional[Dict[str, Any]], bool]:
+    def _inspect_remote_share(
+        self,
+        torrent: TorrentInfo,
+        platform: str,
+        cached_detail: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], bool]:
         """
         用统一取链适配器检查非夸克平台候选。
 
         明确失效返回 `alive=False`；鉴权、超时或网络异常返回未验证标记，
-        由调用方保留候选而不是直接丢弃。
+        由调用方保留候选而不是直接丢弃。缓存中已有完整文件树时直接复用，避免重复遍历。
 
         :param torrent: 待检查的网盘候选
         :param platform: 平台标识
+        :param cached_detail: 缓存中已有的分享详情，含 `_files` 时跳过网络请求
         :return: (分享详情, 是否通过质量检查)
         """
         from app.application.netdisk.resolve import NetdiskResolveService
         from app.domain.netdisk import NetdiskError, NetdiskErrorCode
 
+        if cached_detail and cached_detail.get("_files"):
+            return cached_detail, self._passes_quality(torrent, "", cached_detail, None)
         try:
             service = NetdiskResolveService()
             walked = service.walk(
@@ -551,14 +559,37 @@ class CloudSaverModule(_ModuleBase):
         except Exception:  # noqa: BLE001 - 网络与超时统一按未验证保留
             return {"alive": True, "unverified": True}, True
         files = [{"name": item.name, "size": item.size} for item in walked.files]
+        # 分享根目录是文件夹时详情大小为 0，用递归展开后的文件大小求和兜底。
+        file_size = int(walked.detail.size or 0) or sum(int(item.size or 0) for item in walked.files)
         detail = {
             "alive": True,
-            "file_size": walked.detail.size,
+            "file_size": file_size,
             "file_names": [item.name for item in walked.detail.files],
             "stoken": walked.detail.stoken,
             "_files": files,
         }
         return detail, self._passes_quality(torrent, walked.ref.share_id, detail, None)
+
+    @staticmethod
+    def _share_identity(torrent: TorrentInfo) -> Tuple[str, str]:
+        """
+        提取候选的分享标识与缓存键片段。
+
+        优先用统一解析规则读取平台分享码，覆盖 139、115 等非夸克链接；
+        无法解析时退回夸克分享码或去掉查询串的链接本身，保证候选仍参与有效性检查。
+
+        :param torrent: 网盘候选
+        :return: 分享标识与缓存键片段
+        """
+        url = str(torrent.enclosure or "")
+        ref = parse_share_link(url, torrent.share_password)
+        if ref is not None and ref.share_id:
+            return ref.share_id, f"{ref.platform.value}:{ref.share_id}"
+        share_code = parse_share_code(url)
+        if share_code:
+            return share_code, share_code
+        trimmed = url.split("?", 1)[0].rstrip("/")
+        return url, trimmed or url
 
     def _filter_alive_shares(
         self,
@@ -586,10 +617,8 @@ class CloudSaverModule(_ModuleBase):
         alive_flags: Dict[int, bool] = {}
         pending: List[Tuple[TorrentInfo, str, str, Optional[Dict[str, Any]]]] = []
         for torrent in ordered:
-            share_code = parse_share_code(torrent.enclosure or "")
-            if not share_code:
-                continue
-            cache_key = self._alive_cache_key(site, share_code)
+            share_code, identity = self._share_identity(torrent)
+            cache_key = self._alive_cache_key(site, identity)
             cached = self._cached_alive(cache_key)
             if cached is not None and not cached[0]:
                 alive_flags[id(torrent)] = False
