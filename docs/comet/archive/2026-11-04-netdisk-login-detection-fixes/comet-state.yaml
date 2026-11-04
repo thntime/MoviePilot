@@ -1,0 +1,429 @@
+schema: comet.native.v4
+name: netdisk-login-detection-fixes
+language: zh-CN
+phase: archive
+status: done
+state_version: 8
+brief: brief.md
+document_constraints_version: 3
+shape_confirmation_hash: 66dc75ac95f440102a91c3d581b1fd6e9abd64f9455c0e795814c834cbbb4697
+spec_changes:
+  - capability: netdisk-account-console
+    operation: modify
+    source: specs/netdisk-account-console/spec.md
+workspace:
+  isolation: current
+  change_branch: v3
+  target_branch: v3
+  finish: null
+loop:
+  stage: done
+  goal_cycle: 1
+  iteration: 1
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1 迅雷昵称：迅雷网页登录检测到登录态后，「当前登录用户」显示真实昵称（优先读取页面登录态，其次凭据字段与 about
+      接口），不再显示「未知」；全部来源都取不到时才显示明确回退文案。
+    result: passed
+    reason:
+      text: browser.py:95-107 迅雷凭据脚本读取 window.$nuxt.$store.state.users.curUser 的
+        nick_name/nickname 并优先作为 nickname 返回（pageNick 优先于 data.*
+        各字段）；browser.py:831-833 _xunlei_fields 把非空 nickname
+        写入凭据；xunlei.py:1112-1153 login_account_name 先取凭据
+        nickname/nick_name/nickName/user_name/userName/name，缺失时才带 access/device
+        调 /drive/v1/about，并在 data、data.user
+        与响应顶层按同序匹配；取不到时返回空串由前端回退文案兜底（netdisk.qr.unknownAccount）。测试覆盖：test_netdisk_xunlei_nickname.py::test_xunlei_credential_includes_page_nickname
+        验证页面昵称写入凭据，test_login_account_name_prefers_credential 验证凭据昵称优先不发请求，另有
+        about 三种嵌套结构用例。Verifier 复跑 pytest tests/test_netdisk_xunlei_nickname.py
+        → 12 passed, EXIT=0。
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: A2
+      百度弹窗：百度网页登录中，微信扫码弹窗在登录态校验通过之前不会被关闭，用户可正常扫码；校验通过后画面回到主页面，且默认只置前、不强制关闭弹窗，弹窗最终随确认或取消销毁。
+    result: passed
+    reason:
+      text: "browser.py:712-737 poll() 只读凭据并返回 success，不再调用 _focus_main_page（diff
+        确认原「if platform is BAIDU: self._focus_main_page(session)」已删除）；服务层
+        login.py:349-380 仅在 validate_credential 返回 active 后通过可选端口调用
+        focus_main_page(session_id)，切页失败仅记录不影响 detected；browser.py:1005
+        focus_main_page 默认 close_popups=False，只 bring_to_front 并 _switch_stream
+        切画面；browser.py:691-698 start() 在启动时记录 main_page 引用，:1062-1088 _main_page
+        优先用该引用（校验 is_closed 与 pages 成员资格），失效时按 pan.baidu.com
+        主域名回退、再取第一个非弹窗页，pages[0] 仅为最后兜底；弹窗最终随 confirm_qr/cancel_qr 的 cancel()
+        关闭整个浏览器会话销毁（login.py:417、428）。测试覆盖：test_netdisk_login_popup.py 匿名 BAIDID
+        下微信弹窗 0 次关闭、默认只置前、close_popups 只关微信域名、主页面引用优先、非百度
+        no-op；test_netdisk_login.py 新增 detected 后调用 focus 与 login_ready
+        未就绪不切页两用例。Verifier 复跑 → 45 passed（popup 12 + login/login_fixes
+        33），EXIT=0。"
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: A3 隔离与回归：匿名 Cookie
+      不再被判定为登录完成；关闭弹窗只针对明确的微信/百度登录域名且永不关闭主页面；夸克、UC、139、迅雷、光鸭的网页登录行为与现有测试保持不变。
+    result: passed
+    reason:
+      text: baidu.py:1238-1248 login_ready 要求 Cookie 头含 "BDUSS="（_credential_cookie 兼容
+        cookie/BDUSS 形态），匿名 BAIDUID 返回 False，login.py:346-348 未就绪时返回 pending
+        不判登录完成；browser.py:43-45 白名单 _AUTH_POPUP_HOSTS 仅
+        open/login.weixin.qq.com，_BAIDU_AUTH_HOSTS 仅 passport/wappass.baidu.com
+        且需 opener() 才视为弹窗，:1043-1050 关闭循环显式跳过
+        main，主页面永不关闭；focus_main_page:1016-1018 对非 BAIDU 平台直接
+        return（夸克/UC/139/光鸭/迅雷 no-op，测试 test_focus_main_page_ignores_non_baidu
+        验证）。139 与 base 的 login_ready 为既有实现未改动（c139.py:655、base.py:797 在本次 diff
+        之外）。Runtime 已绑定证据：39 个 tests/test_netdisk_*.py 全量 416 passed
+        EXIT=0（含夸克/UC/139/光鸭/迅雷既有登录测试），改动文件 pylint 10.00；Verifier 抽查 diff
+        确认改动仅触及 baidu/browser/login.py 与 3 个测试文件，与 brief 范围一致。
+      truncated: false
+builder_handoff:
+  candidate_id: d9f0177a-c8c8-48a8-aa58-88128d51dd35
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:ad650499-cd09-401c-9e98-0a696e441510
+  iteration: 1
+  summary:
+    text: 修复两个网页登录缺陷。① 迅雷昵称：在迅雷凭据脚本中增加从页面登录态（Nuxt store 的
+      users.curUser.nick_name）读取昵称，并写入凭据 nickname；login_account_name
+      优先使用凭据昵称，about 接口继续兜底。② 百度微信弹窗：poll() 不再关闭或切换页面，只返回凭据；百度新增 login_ready 要求
+      BDUSS，匿名 BAIDUID 不再进入校验；登录态校验通过后由服务层调用可选端口 focus_main_page，默认只
+      bring_to_front 不关弹窗，close_popups
+      仅作为可选开关且只关闭明确微信/百度登录域名、永不关闭主页面；主页面使用启动时记录的引用而非 pages[0]。新增 6 条弹窗生命周期测试与 2
+      条服务层时序测试、1 条迅雷页面昵称测试。全部 416 项网盘测试通过，改动文件 pylint 10.00；未提交 git，未启动服务。
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+  acceptance_review:
+    - id: A1
+      status: implemented-with-evidence
+      evidence:
+        - app/adapters/external/netdisk/login/browser.py:95-107 迅雷凭据脚本读取
+          window.$nuxt.$store.state.users.curUser.nick_name 并优先作为 nickname 返回
+        - app/adapters/external/netdisk/login/browser.py:786-805 _xunlei_fields
+          将 nickname 写入凭据
+        - app/adapters/external/netdisk/xunlei.py:1112 login_account_name
+          优先使用凭据昵称，about 接口兜底
+        - tests/test_netdisk_xunlei_nickname.py::test_xunlei_credential_includes_page_nickname（页面昵称写入凭据）
+      note: 迅雷网页登录检测到登录态后，页面登录态中的昵称会随凭据返回，登录确认直接显示真实昵称；页面取不到时回退凭据字段与 about 接口。
+    - id: A2
+      status: implemented-with-evidence
+      evidence:
+        - app/adapters/external/netdisk/login/browser.py:734-737 poll()
+          只返回凭据，不再调用 _focus_main_page
+        - app/adapters/external/netdisk/login/browser.py:1005
+          focus_main_page(session_id, close_popups=False)、:1021
+          _focus_main_page、:1062 _main_page、:1091 _is_auth_popup
+        - app/application/netdisk/login.py:375-380 仅在 validate_credential 返回
+          active 后调用 focus_main_page，失败不影响 detected
+        - tests/test_netdisk_login_popup.py 6 passed（匿名 Cookie
+          不关弹窗、默认只置前、只关登录域名、主页面引用、非百度 no-op、login_ready 过滤）
+        - tests/test_netdisk_login.py::test_qr_login_focuses_main_page_after_detected、test_qr_login_does_not_focus_until_login_ready
+      note: 微信弹窗在登录态校验通过前不会被关闭；通过后默认只把主页面置前，弹窗随确认/取消销毁。
+    - id: A3
+      status: implemented-with-evidence
+      evidence:
+        - app/adapters/external/netdisk/baidu.py:1238 login_ready 要求 BDUSS，匿名
+          BAIDUID 返回 False
+        - app/adapters/external/netdisk/login/browser.py:1091 _is_auth_popup 仅识别
+          open.weixin.qq.com / login.weixin.qq.com 与带 opener 的百度登录域名，主页面永不关闭
+        - app/adapters/external/netdisk/login/browser.py:1005 focus_main_page
+          对非百度平台直接 no-op
+        - tests/test_netdisk_login_popup.py::test_focus_main_page_ignores_non_baidu、test_focus_main_page_close_popups_only_auth_domains
+        - pytest tests/test_netdisk_*.py → 416 passed,
+          EXIT=0（含夸克/UC/139/光鸭/迅雷既有登录测试）
+      note: 匿名 Cookie 不再被判定为登录完成；关闭弹窗只针对明确登录域名且不关闭主页面；其他平台登录流程与既有测试保持不变。
+  checks:
+    - name:
+        text: 网盘后端全量测试
+        truncated: false
+      result: passed
+      note:
+        text: uv run --locked --no-sync python -m pytest tests/test_netdisk_*.py -q →
+          416 passed, EXIT=0
+        truncated: false
+    - name:
+        text: 登录相关聚焦测试
+        truncated: false
+      result: passed
+      note:
+        text: pytest tests/test_netdisk_login_popup.py tests/test_netdisk_login.py
+          tests/test_netdisk_login_fixes.py tests/test_netdisk_adapters_baidu.py
+          tests/test_netdisk_xunlei_nickname.py -q → 62 passed, EXIT=0
+        truncated: false
+    - name:
+        text: 后端改动文件 pylint
+        truncated: false
+      result: passed
+      note:
+        text: browser.py / baidu.py / login.py / 3 个测试文件 → 10.00/10
+        truncated: false
+    - name:
+        text: git diff --check
+        truncated: false
+      result: passed
+      note:
+        text: 无输出
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: 未接真实百度/迅雷账号，微信弹窗存活与迅雷昵称读取需在真实扫码流程中确认。
+      truncated: false
+    - text: 迅雷昵称依赖页面 Nuxt store 的 users.curUser.nick_name 路径；若迅雷前端改版该路径失效，会回退到凭据字段与
+        about 接口。
+      truncated: false
+    - text: bring_to_front 在 Xvfb/openbox 下的可见效果未实测；若主页面仍被弹窗遮挡，可启用
+        focus_main_page(..., close_popups=True)。
+      truncated: false
+    - text: 未启动前后端服务，未做浏览器视觉验收。
+      truncated: false
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-11-04T13:51:41.274Z
+blockers: []
+verification:
+  candidate_id: d9f0177a-c8c8-48a8-aa58-88128d51dd35
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:044601b9-7e3b-4820-8780-2839c3094dec
+  iteration: 1
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: netdisk-backend-tests
+      name:
+        text: 网盘后端测试
+        truncated: false
+      argv_display:
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: PATH=/home/zxl/.local/bin:/usr/local/bin:/usr/bin:/bin
+          truncated: false
+        - text: uv
+          truncated: false
+        - text: run
+          truncated: false
+        - text: --locked
+          truncated: false
+        - text: --no-sync
+          truncated: false
+        - text: python
+          truncated: false
+        - text: -m
+          truncated: false
+        - text: pytest
+          truncated: false
+        - text: tests/test_netdisk_account_edit.py
+          truncated: false
+        - text: tests/test_netdisk_account_refresh.py
+          truncated: false
+        - text: tests/test_netdisk_account_repository.py
+          truncated: false
+        - text: tests/test_netdisk_accounts.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_baidu.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_c139.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_guangya.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_pan115.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_pan123.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_quark.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_uc.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_xunlei.py
+          truncated: false
+        - text: tests/test_netdisk_baidu_drive.py
+          truncated: false
+        - text: tests/test_netdisk_c139_drive.py
+          truncated: false
+        - text: tests/test_netdisk_domain.py
+          truncated: false
+        - text: tests/test_netdisk_engine.py
+          truncated: false
+        - text: tests/test_netdisk_failure_reconcile.py
+          truncated: false
+        - text: tests/test_netdisk_guangya_drive.py
+          truncated: false
+        - text: tests/test_netdisk_hls.py
+          truncated: false
+        - text: tests/test_netdisk_keepalive.py
+          truncated: false
+        - text: tests/test_netdisk_lifecycle.py
+          truncated: false
+        - text: tests/test_netdisk_login_fixes.py
+          truncated: false
+        - text: tests/test_netdisk_login.py
+          truncated: false
+        - text: tests/test_netdisk_login_popup.py
+          truncated: false
+        - text: tests/test_netdisk_migration.py
+          truncated: false
+        - text: tests/test_netdisk_module_naming.py
+          truncated: false
+        - text: tests/test_netdisk_module.py
+          truncated: false
+        - text: tests/test_netdisk_nickname_flow.py
+          truncated: false
+        - text: tests/test_netdisk_pan115_drive.py
+          truncated: false
+        - text: tests/test_netdisk_pan123_drive.py
+          truncated: false
+        - text: tests/test_netdisk_quota_refresh.py
+          truncated: false
+        - text: tests/test_netdisk_resolve.py
+          truncated: false
+        - text: tests/test_netdisk_search_flow.py
+          truncated: false
+        - text: tests/test_netdisk_selection.py
+          truncated: false
+        - text: tests/test_netdisk_subscription_episodes.py
+          truncated: false
+        - text: tests/test_netdisk_uc_drive.py
+          truncated: false
+        - text: tests/test_netdisk_vnc.py
+          truncated: false
+        - text: tests/test_netdisk_xunlei_drive.py
+          truncated: false
+        - text: tests/test_netdisk_xunlei_nickname.py
+          truncated: false
+        - text: -q
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 15655
+    - id: backend-pylint
+      name:
+        text: 后端改动文件 pylint
+        truncated: false
+      argv_display:
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: PATH=/home/zxl/.local/bin:/usr/local/bin:/usr/bin:/bin
+          truncated: false
+        - text: uv
+          truncated: false
+        - text: run
+          truncated: false
+        - text: --locked
+          truncated: false
+        - text: --no-sync
+          truncated: false
+        - text: python
+          truncated: false
+        - text: -m
+          truncated: false
+        - text: pylint
+          truncated: false
+        - text: app/adapters/external/netdisk/login/browser.py
+          truncated: false
+        - text: app/adapters/external/netdisk/baidu.py
+          truncated: false
+        - text: app/application/netdisk/login.py
+          truncated: false
+        - text: tests/test_netdisk_login_popup.py
+          truncated: false
+        - text: tests/test_netdisk_login.py
+          truncated: false
+        - text: tests/test_netdisk_xunlei_nickname.py
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 3255
+  summary:
+    text: "逐项核对 A1–A3 的代码路径与测试证据并与 runtime 绑定证据交叉验证：迅雷页面昵称经 Nuxt store 读入凭据并优先于
+      about 接口；百度 poll 不再关窗、login_ready 要求
+      BDUSS、校验通过后才由服务层切回主页面且默认只置前；弹窗白名单只含微信/百度登录域名且永不关主页面，非百度平台 no-op。Verifier
+      独立复跑 45 项聚焦测试全部通过，接受 runtime 已绑定的 416 项全量与 pylint
+      证据，未重复全量回归。三项验收全部通过，verdict: pass。"
+    truncated: false
+  risks:
+    - text: 未接真实百度/迅雷账号做真实扫码验证（builder 已声明 known_limit，非本次验收阻塞项）；迅雷昵称依赖页面 Nuxt store
+        路径，前端改版时回退到凭据字段与 about 接口。
+      truncated: false
+    - text: bring_to_front 在 Xvfb/openbox 下的实际置前效果未实测；若弹窗遮挡主页面，可启用 close_popups=True
+        逃生开关。
+      truncated: false
+    - text: 百度 login_ready 只检查 BDUSS 不含 STOKEN（与 brief 关键决定一致，避免把可用账号判为过期），属有意取舍。
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-11-04T13:56:06.969Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "逐项核对 A1–A3 的代码路径与测试证据并与 runtime 绑定证据交叉验证：迅雷页面昵称经 Nuxt store 读入凭据并优先于
+        about 接口；百度 poll 不再关窗、login_ready 要求
+        BDUSS、校验通过后才由服务层切回主页面且默认只置前；弹窗白名单只含微信/百度登录域名且永不关主页面，非百度平台 no-op。Verifier
+        独立复跑 45 项聚焦测试全部通过，接受 runtime 已绑定的 416 项全量与 pylint
+        证据，未重复全量回归。三项验收全部通过，verdict: pass。"
+      truncated: false
+    completed_at: 2026-11-04T13:56:06.969Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-11-04T13:20:33.653Z
