@@ -259,6 +259,18 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
                     "site",
                     manual=True,
                 ),
+                JobSpec(
+                    "netdisk_cleanup",
+                    "网盘下载目录清理",
+                    services.cleanup_netdisk_artifacts,
+                    "module",
+                ),
+                JobSpec(
+                    "netdisk_failure_reconcile",
+                    "网盘下载失败对账",
+                    services.reconcile_netdisk_failures,
+                    "transfer",
+                ),
                 JobSpec("recommend_refresh", "推荐缓存", services.refresh_recommend, "recommend"),
                 JobSpec(
                     "plugin_market_refresh",

@@ -49,3 +49,8 @@ docs/superpowers/
 # 保留本地前端构建产物目录，目录内产物不纳入仓库
 frontend-dist/*
 !frontend-dist/.gitkeep
+# >>> Comet managed project state >>>
+!/.comet/
+/.comet/*
+!/.comet/config.yaml
+# <<< Comet managed project state <<<

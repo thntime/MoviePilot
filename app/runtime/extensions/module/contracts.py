@@ -1395,7 +1395,7 @@ _METHOD_CONTRACTS = {
         result_contract="DownloadTaskResult | None",
         aggregation=ModuleResultAggregation.FIRST_NON_EMPTY,
         required_parameters=("content", "download_dir", "cookie", "episodes", "category", "label", "downloader"),
-        optional_parameters=("custom_words", "download_type", "netdisk_platform", "share_password", "netdisk_share_token"),
+        optional_parameters=("custom_words", "download_type", "netdisk_platform", "share_password", "netdisk_share_token", "season"),
     ),
     "download_added": ModuleMethodContract(
         family="downloader",
@@ -1462,6 +1462,29 @@ _METHOD_CONTRACTS = {
         aggregation=ModuleResultAggregation.FAN_OUT,
         required_parameters=("hashs", "downloader"),
         plugin_short_circuit=False,
+    ),
+    "mark_reconciled": ModuleMethodContract(
+        family="downloader",
+        input_contract="NetdiskReconcileHook",
+        result_contract="None",
+        aggregation=ModuleResultAggregation.FAN_OUT,
+        required_parameters=("hashs",),
+        optional_parameters=("downloader",),
+        plugin_short_circuit=False,
+    ),
+    "cleanup_orphans": ModuleMethodContract(
+        family="downloader",
+        input_contract="NetdiskCleanupRequest",
+        result_contract="dict[str, int]",
+        aggregation=ModuleResultAggregation.FIRST_NON_EMPTY,
+        required_parameters=("download_dirs",),
+        optional_parameters=(
+            "active_paths",
+            "is_transferred",
+            "empty_grace_seconds",
+            "nonempty_grace_seconds",
+            "record_ttl_seconds",
+        ),
     ),
     "tmdb_cache_items": ModuleMethodContract(
         family="tmdb",

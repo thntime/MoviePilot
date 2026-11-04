@@ -33,6 +33,7 @@ class DownloaderTorrent(BaseModel):
     error: Optional[str] = Field(default=None, description="最近一次失败原因")
     netdisk_platform: Optional[str] = Field(default=None, description="网盘平台标识")
     share_code: Optional[str] = Field(default=None, description="网盘分享码")
+    reconciled: Optional[bool] = Field(default=None, description="网盘失败任务是否已完成对账")
     upspeed: Optional[str] = Field(default=None, description="当前上传速度的格式化展示文本")
     dlspeed: Optional[str] = Field(default=None, description="当前下载速度的格式化展示文本")
     tags: Optional[str] = Field(default=None, description="下载器返回的任务标签文本")

@@ -399,6 +399,15 @@ class ChunkedDownloader:
             self.links = tuple(url_provider())
         if not self.links:
             raise DownloadError("没有可用的下载直链")
+        if self.total > 0 and not self.plan_path.exists():
+            try:
+                if self.target.exists() and self.target.stat().st_size == self.total:
+                    # 上次已完成但计划已删除：保留文件，不重复下载。
+                    if self.on_progress:
+                        self.on_progress(100.0)
+                    return
+            except OSError:
+                pass
         self.target.parent.mkdir(parents=True, exist_ok=True)
         self._chunks = [
             _Chunk(index, start, end)
