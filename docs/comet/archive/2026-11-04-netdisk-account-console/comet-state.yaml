@@ -1,0 +1,885 @@
+schema: comet.native.v4
+name: netdisk-account-console
+language: zh-CN
+phase: archive
+status: done
+state_version: 11
+brief: brief.md
+document_constraints_version: 3
+shape_confirmation_hash: 1e5ca5718f42f6244b368762ecf163cadd8e06a32c9f4f5e623ac786d741369e
+spec_changes:
+  - capability: netdisk-account-console
+    operation: create
+    source: specs/netdisk-account-console/spec.md
+workspace:
+  isolation: current
+  change_branch: v3
+  target_branch: v3
+  finish: null
+loop:
+  stage: done
+  goal_cycle: 1
+  iteration: 2
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 1
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1 凭据保活：夸克/UC 在每次取凭证前按 90 分钟窗口惰性续期；任意 API 响应带回新 Cookie
+      时合并并回写数据库；鉴权失效时刷新后重试一次；刷新失败保留旧凭据，不清空账号。
+    result: passed
+    reason:
+      text: 夸克/UC 惰性续期落地：app/application/netdisk/keepalive.py RefreshThrottle 对
+        QUARK/UC 配置 5400 秒（90 分钟）窗口，_REFRESH_THROTTLE
+        进程级共享，select()/require_account()/probe() 均先经
+        _refresh_for_request；Set-Cookie 回写在 base.py
+        _write_back_cookies（merge_cookie_header 合并、删除
+        Max-Age=0），composition/netdisk.py write_back_credential 用 record.id
+        定位账号回写，多账号不串号；鉴权失败 401/403 时 _dispatch_with_retry 经 _refresh_credential
+        续期一次后重试（threading.local 防递归，网络错误/5xx/429 不刷新不清凭据），测试
+        test_netdisk_keepalive.py 覆盖合并回写、重试一次、500 不重试。
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: A2 令牌续期：光鸭使用已保存的 `refresh_token` 在临期前自动续期并写回；迅雷网页登录保存 `refresh_token`，在
+      access_token 临期（JWT `exp` 前 60 秒）或 401 时续期并写回；续期失败保留旧凭据并提示重新登录。
+    result: passed
+    reason:
+      text: 光鸭 guangya.py needs_refresh 按 expires_at 临期 60 秒判断、refresh_account 用
+        refresh_token 换新 token 并写回 token/expires_at，refresh_token 为空保留旧值；迅雷
+        xunlei.py jwt_expiring 按 JWT exp 前 60 秒（_JWT_LEEWAY_SECONDS=60）或 401
+        重试续期，refresh_account 写回 access_token/refresh_token/expires_in；browser.py
+        _xunlei_fields/_guangya_fields 均保存 refresh_token/expires；续期失败
+        refresh_account 返回 None 保留旧凭据，_refresh_one 把 expired 账号归入
+        NetdiskAccountFailure 并由 scheduler chain 发「请重新登录」消息。
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: A3 状态恢复与启动首跑：探测返回 `unknown` 不再覆盖 `active`；重新登录或编辑凭据成功后账号状态恢复 `active`
+      并重新进入可选账号池；进程启动后立即执行一次账号刷新/探测，而不是等待 6 小时。
+    result: passed
+    reason:
+      text: db/adapters/netdiskaccount.py touch_account 中 unknown 不覆盖 active（322
+        行条件守卫，测试
+        test_unknown_probe_does_not_downgrade_active）；update()/paste_cookie/import_cookiecloud/password_login/confirm_qr
+        更新凭据时 status='active' 恢复（accounts.py update 223 行、login.py 各登录方式带
+        account_id 更新路径）；select() 只返回 active 账号；启动首跑：scheduler/catalog.py
+        netdisk_account_refresh 与 netdisk_quota_refresh 均 next_run_time=now+60s
+        首跑，之后 6 小时/30 分钟周期。
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: A4 空间定时刷新：新增每 30
+      分钟执行的定时任务，遍历全部账号调用平台空间接口并写回已用/总空间；单账号失败只记录告警，不中断其他账号，不修改账号状态、不清空凭据。
+    result: passed
+    reason:
+      text: 新增 netdisk_quota_refresh 定时任务：catalog.py 528-536 行 interval 30 分钟、启动 +60
+        秒首跑；chain.py refresh_netdisk_quotas 调
+        NetdiskAccountService.refresh_quotas()，accounts.py 遍历全部账号按
+        drive_capabilities.quota 调 adapter.quota 并 update_quota（只写
+        quota_used/quota_total，不改状态/检测时间/凭据）；单账号失败 except 只 logger.warning
+        并继续（refresh_quotas 378-383 行）；测试 test_netdisk_quota_refresh.py
+        覆盖全账号写回与单账号失败隔离。
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: A5 迅雷用户名：迅雷账号在新增、探测与刷新时都能从平台用户信息（含 `data.user`
+      等嵌套结构）或已保存凭据解析出昵称并写入；解析失败时保留已有昵称而不是清空。
+    result: passed
+    reason:
+      text: 上轮失败项已修复且独立复核三条路径：① 新增：accounts.py create() 156-162 行保存前调
+        adapter.login_account_name(payload)，异常不影响创建；② 定时刷新：_refresh_one()
+        453-459 行探测后补写昵称，仅非空写库；③ 解析失败保留：nickname 为空时跳过
+        update_account，不清空。xunlei.py login_account_name 覆盖 data/data.user/顶层嵌套与
+        nickname/nick_name/nickName/user_name/userName/name 候选。重跑
+        tests/test_netdisk_nickname_flow.py（3 条）+
+        test_netdisk_xunlei_nickname.py（5 条）全过，EXIT=0。
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: A6 控制台导航：网盘账号控制台左侧以网盘平台为一级菜单，带平台图标，默认全部折叠；点击展开后显示该平台下的账号；移动端同样按平台分组并可折叠。
+    result: passed
+    reason:
+      text: NetdiskPlatformGroup.vue
+        平台一级菜单带图标（getNetdiskPlatformIcon）与中文名；NetdiskAccountList.vue
+        expandedPlatforms 初始空 Set 默认全部折叠，点击展开账号子项；移动端 AccountSettingNetdisk.vue
+        mobileExpandedPlatforms 同样默认折叠、NetdiskPlatformGroup 分组可折叠；桌面主从 18rem/1fr
+        布局。
+      truncated: false
+  - id: A7
+    source: brief.md
+    text: A7 账号详情布局：选中账号后，详情顶部为账号信息（左，约 70%）与存储空间（右，约
+      30%）并排；账号信息展示账号名称、平台昵称与最近检测时间，不展示过期时间；Cookie 完整明文默认展示并提供复制；账号名称取用户命名。
+    result: passed
+    reason:
+      text: NetdiskAccountDetail.vue summary 用 grid 7fr/3fr（约 70/30，<960px
+        单列），左侧账号信息（名称/昵称/最近检测时间/凭据）、右侧存储空间（进度条+已用/总量/剩余，80%/95% 警告/错误色）；无
+        expires_at/过期时间展示；凭据取自详情接口 fetchNetdiskAccount 的 credential.cookie/token
+        完整明文默认展示于 <code> 并带复制按钮（navigator.clipboard）。
+      truncated: false
+  - id: A8
+    source: brief.md
+    text: A8 操作按钮：检测连通性、刷新令牌、设置主账号与编辑账号位于同一操作行；删除账号位于编辑账号右侧；不再出现「浏览文件」按钮。
+    result: passed
+    reason:
+      text: 操作行 VBtn 依次为编辑账号、删除账号（编辑右侧相邻）、检测连通性、刷新令牌（仅
+        supports_refresh）、设置主账号（非主账号才可用）；全组件无「浏览文件」按钮（grep
+        浏览文件/browseFiles/mdi-folder-open 无匹配）。
+      truncated: false
+  - id: A9
+    source: brief.md
+    text: A9 文件信息：在账号信息与存储空间下方内嵌完整文件浏览（列表、进入子目录、返回上级、分享、移动、重命名、删除）；系统设置中的「网盘文件」tab
+      与独立 `/netdisk` 页面移除。
+    result: passed
+    reason:
+      text: NetdiskAccountFiles.vue 内嵌于账号详情（AccountDetail
+        底部），含列表（名称/大小/修改时间）、面包屑导航、返回上级（goParent）、分享/移动/重命名/删除（useNetdiskFileBrowser
+        + Share/Move/Rename 对话框）；pages/netdisk.vue 已删除（git status
+        D）、views/netdisk/ 仅剩空目录、router/index.ts 无 netdisk 路由、i18n-menu.ts
+        setting tabs 无「网盘文件」tab。
+      truncated: false
+  - id: A10
+    source: brief.md
+    text: A10
+      新增与编辑一致：编辑账号可修改与新增相同的登录方式字段（Cookie、CookieCloud、账号密码、短信、网页登录），平台保持锁定；保存后账号名称立即更新并在列表与详情同步；后端编辑接口按平台解析凭据文本（裸
+      JWT 识别为 token）。
+    result: passed
+    reason:
+      text: NetdiskAccountDialog.vue add/edit 共用同一表单：平台下拉 edit 时 disabled
+        锁定，四种登录方式（cookie/cookiecloud/password（光鸭含短信切换）/qr）全部可用且提交带 account_id 复用
+        _target 更新已有账号；编辑保存后 fetchData 刷新列表与详情名称立即更新；后端 PUT /accounts/{id} 用
+        _login().credential_from_text 按平台解析（PAN123/GUANGYA 裸
+        JWT→token），test_update_parses_bare_jwt_as_token 验证。
+      truncated: false
+  - id: A11
+    source: brief.md
+    text: A11 平台中文名：新增账号的平台下拉、对话框副标题、列表分组、详情平台标签与移动端分组均显示中文平台名，不再出现 `quark`、`pan139`
+      等英文 id。
+    result: passed
+    reason:
+      text: utils/netdisk.ts getNetdiskPlatformName 单一来源映射 zh-CN
+        torrent.netdiskPlatform.*（夸克/UC/移动云盘/123云盘/115/光鸭/百度/迅雷），未知回退原始
+        id；平台下拉（platformItems）、对话框副标题（selectedPlatformName）、列表分组（NetdiskPlatformGroup）、详情平台标签（VChip）、移动端分组均走该函数，不出现英文平台
+        id。
+      truncated: false
+  - id: A12
+    source: brief.md
+    text: A12 网页登录弹窗：扫码等待态不再出现上下大块空白，弹窗内容高度随二维码或整页截图自适应，底部倒计时与等待提示紧贴内容；整页截图与 noVNC
+      两种方式均不溢出。
+    result: passed
+    reason:
+      text: 扫码弹窗无固定高度：qr-page-capture 容器 width:100%、img block-size:auto
+        按宽度等比缩放；qr-vnc-frame inline-size:100% + aspect-ratio 16/10；倒计时与状态 Chip
+        位于画面下方紧贴内容（d-flex flex-column align-center 布局，无 spacer/fixed
+        height），VDialog scrollable 内容高度自适应。
+      truncated: false
+  - id: A13
+    source: brief.md
+    text: A13
+      登录成功文案：扫码登录检测到登录态后，弹窗下方显示「当前登录用户：<昵称或账号名>」，不再显示状态说明或英文键名；拿不到用户名时显示「当前登录用户：未知」。
+    result: passed
+    reason:
+      text: "detected 态显示 t('netdisk.qr.detected', { name: qrAccountName ||
+        t('netdisk.qr.unknownAccount')
+        })：zh-CN「当前登录用户：{name}」/缺失时「未知」，zh-TW/en-US 同步；qrAccountName 优先取轮询/WS
+        返回的 account_name（后端 login.py poll 用 login_account_name 解析昵称）；状态说明文案不再出现在
+        detected 分支（原「已检测到登录态」仅在 VChip status 中，符合 spec 第 139 行要求）。"
+      truncated: false
+  - id: A14
+    source: brief.md
+    text: A14 凭据读取权限：账号列表接口继续返回脱敏凭据；完整 Cookie 只通过超级管理员鉴权的单账号详情接口返回；日志、告警与错误信息不出现
+      Cookie/token 明文。
+    result: passed
+    reason:
+      text: 列表接口 _account_view 只返回 masked（domain mask_credential 固定 ***），完整凭据仅 GET
+        /accounts/{id} detail（_account_detail_view 填充 credential），全部网盘接口
+        Depends(get_current_active_superuser_async) 超管鉴权；日志核查：base.py
+        log_failure、composition write_back_credential、accounts
+        refresh_all/refresh_quotas、scheduler chain 均只输出
+        platform/account.name/异常类型，test_refresh_netdisk_accounts_posts_message_without_credential
+        断言消息不含 secret-token/__pus。
+      truncated: false
+builder_handoff:
+  candidate_id: 0312ef83-88fb-45c4-81b8-e1eb49ee4556
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:44573a70-68aa-47e8-a7d9-3946600af82b
+  iteration: 2
+  summary:
+    text: 第 2 轮修复 A5：新增账号时在保存前解析平台昵称；定时刷新与启动首跑在探测后补写昵称，解析失败保留已有昵称不写空值。新增 3
+      条聚焦测试覆盖三条路径。其余 A1–A4、A6–A14 实现未变，沿用上一轮证据。后端 407 项网盘测试通过，改动文件 pylint 10.00。
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+    - A5
+    - A6
+    - A7
+    - A8
+    - A9
+    - A10
+    - A11
+    - A12
+    - A13
+    - A14
+  acceptance_review:
+    - id: A1
+      status: implemented-with-evidence
+      evidence:
+        - app/adapters/external/netdisk/base.py:151 merge_cookie_header、:248
+          credential_sink、:287 _write_back_cookies、:323 _refresh_credential、:387
+          _dispatch_with_retry
+        - app/application/netdisk/keepalive.py RefreshThrottle 与
+          REFRESH_TTL_SECONDS（夸克/UC 5400 秒）
+        - app/application/netdisk/accounts.py:386 _refresh_record、:422
+          _refresh_for_request；select/require_account/probe 调用
+        - tests/test_netdisk_keepalive.py 25 passed（含 401 续期后重试一次、500
+          不重试、无续期钩子不重试）
+      note: 取凭据前按 90 分钟窗口惰性续期；响应 Set-Cookie 合并后按 record.id 回写；401/403
+        续期后重试一次并带新凭据；续期失败保留旧凭据。
+    - id: A2
+      status: implemented-with-evidence
+      evidence:
+        - app/adapters/external/netdisk/guangya.py:1143 needs_refresh、:1164
+          refresh_account（refresh_token 续期，写回 expires_at ISO 8601）
+        - app/adapters/external/netdisk/xunlei.py:1164 needs_refresh（JWT exp 提前
+          60 秒）、:1183 refresh_account（xluser-ssl /v1/auth/token，网页 client_id，无
+          client_secret）
+        - app/adapters/external/netdisk/login/browser.py 迅雷网页登录保存
+          refresh_token/expires_in
+        - tests/test_netdisk_keepalive.py needs_refresh 临期/未临期/无 refresh_token/无
+          expires_at 用例
+      note: 光鸭与迅雷均按临期判断续期并写回轮换后的 refresh_token；续期失败返回 None，保留旧凭据。
+    - id: A3
+      status: implemented-with-evidence
+      evidence:
+        - app/db/adapters/netdiskaccount.py:303 touch_account（unknown 不覆盖 active）
+        - app/application/netdisk/accounts.py:386 _refresh_record、update() 改凭据后置
+          active、confirm_qr 已有账号分支同步 nickname/status
+        - app/scheduler/catalog.py:523 netdisk_account_refresh 增加
+          next_run_time=启动后 60 秒
+        - tests/test_netdisk_account_refresh.py 新增 4
+          条用例；tests/test_netdisk_account_edit.py::test_unknown_probe_does_not_downgrade_active、test_update_credential_restores_active_status
+      note: unknown 不再把 active 踢出选号池；重新登录/改凭据后恢复 active；进程启动后 60 秒内执行一次刷新探测，之后保持 6
+        小时周期。
+    - id: A4
+      status: implemented-with-evidence
+      evidence:
+        - app/application/netdisk/accounts.py:355 refresh_quotas（逐账号隔离失败，只写
+          quota）
+        - app/db/adapters/netdiskaccount.py:330 update_quota
+        - app/scheduler/catalog.py:263 JobSpec、:531 add_job(minutes=30,
+          next_run_time=+60s)；app/scheduler/services.py、chain.py、startup/initializers/scheduler.py
+          装配
+        - tests/test_netdisk_quota_refresh.py 2 passed（全量刷新、单账号失败隔离）
+      note: 每 30 分钟刷新全部账号空间并写回；失败只告警，不修改状态、检测时间与凭据。
+    - id: A5
+      status: implemented-with-evidence
+      evidence:
+        - app/application/netdisk/accounts.py:116 create() 在保存前调用
+          adapter.login_account_name 解析昵称，异常不影响创建
+        - app/application/netdisk/accounts.py:432 _refresh_one()
+          探测后补写昵称，仅非空时写库，解析失败保留已有昵称
+        - app/adapters/external/netdisk/xunlei.py:1112
+          login_account_name（data、data.user、顶层多字段匹配）
+        - tests/test_netdisk_nickname_flow.py 3 passed（新增写昵称、定时刷新写昵称、解析失败不写空值）
+        - tests/test_netdisk_xunlei_nickname.py 7 passed（嵌套/顶层/凭据优先/全缺失）
+      note: 新增、探测与定时刷新三条路径都会写回昵称；解析失败返回空串时不写库，保留已有昵称。
+    - id: A6
+      status: implemented-with-evidence
+      evidence:
+        - MoviePilot-Frontend/src/components/setting/NetdiskPlatformGroup.vue:12（图标+中文名+数量+展开箭头）
+        - MoviePilot-Frontend/src/components/setting/NetdiskAccountList.vue:29
+          expandedPlatforms 默认空集合、:58 搜索时展开、:62 折叠切换
+        - MoviePilot-Frontend/src/views/setting/AccountSettingNetdisk.vue:243
+          移动端复用同一分组组件
+      note: 平台为一级菜单、默认全部折叠、带图标；桌面与移动端共用分组组件。
+    - id: A7
+      status: implemented-with-evidence
+      evidence:
+        - "MoviePilot-Frontend/src/components/setting/NetdiskAccountDetail.vue:\
+          103 详情顶部、:190 grid-template-columns: 7fr 3fr（:236 窄屏单列）"
+        - MoviePilot-Frontend/src/components/setting/NetdiskAccountDetail.vue:104-133
+          账号名称/平台昵称/最近检测/凭据；:69 credentialText、:75 复制
+        - MoviePilot-Frontend/src/api/netdisk.ts:146 fetchNetdiskAccount（详情接口）
+      note: 账号信息左约 70%、存储空间右约 30%；不展示过期时间；Cookie 完整明文默认展示并可复制；名称与昵称分开展示。
+    - id: A8
+      status: implemented-with-evidence
+      evidence:
+        - MoviePilot-Frontend/src/components/setting/NetdiskAccountDetail.vue:155-183
+          操作行顺序：编辑 → 删除 → 检测连通性 → 刷新令牌 → 设置主账号
+        - grep 确认 NetdiskAccountDetail.vue / NetdiskAccountCard.vue /
+          AccountSettingNetdisk.vue 不再包含 browse/浏览文件
+      note: 四个操作与编辑同行，删除紧邻编辑右侧；浏览文件按钮已移除。
+    - id: A9
+      status: implemented-with-evidence
+      evidence:
+        - MoviePilot-Frontend/src/components/setting/NetdiskAccountFiles.vue:43
+          返回上级、:47 面包屑、:51 分享、:60 移动、:69 删除
+        - MoviePilot-Frontend/src/composables/useNetdiskFileBrowser.ts:124-244
+          目录导航与文件操作
+        - MoviePilot-Frontend/src/views/setting/AccountSettingNetdisk.vue、src/router/i18n-menu.ts、src/router/index.ts
+          移除网盘文件入口与 /netdisk 路由；删除
+          src/views/netdisk/NetdiskBrowser.vue、src/pages/netdisk.vue
+      note: 详情下方内嵌完整文件浏览（列表、进入子目录、返回上级、分享/移动/重命名/删除）；独立页面与设置 tab 已删除。
+    - id: A10
+      status: implemented-with-evidence
+      evidence:
+        - MoviePilot-Frontend/src/components/dialog/NetdiskAccountDialog.vue:665
+          中文副标题、:678 编辑时平台禁用、:704 新增/编辑共用登录方式 tabs、:203/:523/:544/:571/:594/:627
+          携带 account_id
+        - app/api/endpoints/netdisk.py:631
+          编辑按平台解析凭据；app/application/netdisk/login.py:508 _target、confirm_qr
+          已有账号分支
+        - tests/test_netdisk_account_edit.py 7 passed（裸
+          JWT、状态恢复、名称同步、CookieCloud/密码带 account_id 更新）
+      note: 编辑与新增字段一致、平台锁定；保存后名称即时生效；裸 JWT 按平台解析为 token 凭据。
+    - id: A11
+      status: implemented-with-evidence
+      evidence:
+        - MoviePilot-Frontend/src/utils/netdisk.ts:47 getNetdiskPlatformIcon、:53
+          compareNetdiskPlatforms
+        - MoviePilot-Frontend/src/components/dialog/NetdiskAccountDialog.vue:82
+          平台下拉使用 getNetdiskPlatformName + 图标
+        - MoviePilot-Frontend/src/components/setting/NetdiskPlatformGroup.vue:12
+          与 NetdiskAccountDetail.vue:85 平台标签
+      note: 下拉、副标题、列表分组、详情标签、移动端分组统一中文名与图标，不再出现英文平台 id。
+    - id: A12
+      status: implemented-with-evidence
+      evidence:
+        - MoviePilot-Frontend/src/components/dialog/NetdiskAccountDialog.vue:900-902
+          整页截图按容器宽度渲染、:1022 qr-page-image 宽度 100%/高度自适应、:1032 noVNC 使用 16/10 比例
+        - "移除旧的 60vh + object-fit: contain 固定高度容器"
+      note: 二维码/整页截图不再被固定高度容器 letterbox，底部状态与倒计时紧贴内容；noVNC 按比例铺满。
+    - id: A13
+      status: implemented-with-evidence
+      evidence:
+        - MoviePilot-Frontend/src/components/dialog/NetdiskAccountDialog.vue:952
+          使用 netdisk.qr.detected 渲染当前登录用户
+        - src/locales/zh-CN.ts:5975、zh-TW.ts:5977、en-US.ts:6143
+          文案改为「当前登录用户：{name}」；unknownAccount 为「未知」
+      note: 检测到登录态后显示「当前登录用户：昵称」，缺失时显示「未知」。
+    - id: A14
+      status: implemented-with-evidence
+      evidence:
+        - app/api/endpoints/netdisk.py:612 GET /accounts/{account_id}（沿用
+          get_current_active_superuser_async），列表 _account_view 只填脱敏字段
+        - app/application/netdisk/accounts.py:239 detail 返回 NetdiskAccountDetail
+        - tests/test_netdisk_account_edit.py::test_detail_returns_plaintext_while_list_masks
+      note: 明文凭据仅由超管详情接口返回；列表保持脱敏；日志与告警只记录平台、账号名与异常类型。
+  checks:
+    - name:
+        text: 后端网盘相关 pytest
+        truncated: false
+      result: passed
+      note:
+        text: uv run --locked --no-sync python -m pytest tests/test_netdisk_*.py -q →
+          407 passed, EXIT=0
+        truncated: false
+    - name:
+        text: A5 修复聚焦测试
+        truncated: false
+      result: passed
+      note:
+        text: pytest tests/test_netdisk_nickname_flow.py
+          tests/test_netdisk_xunlei_nickname.py
+          tests/test_netdisk_account_edit.py tests/test_netdisk_accounts.py
+          tests/test_netdisk_account_refresh.py -q → 30 passed, EXIT=0
+        truncated: false
+    - name:
+        text: 后端改动文件 pylint
+        truncated: false
+      result: passed
+      note:
+        text: app/application/netdisk/accounts.py + tests/test_netdisk_nickname_flow.py
+          → 10.00/10
+        truncated: false
+    - name:
+        text: 前端 typecheck
+        truncated: false
+      result: passed
+      note:
+        text: npm run typecheck → EXIT=0
+        truncated: false
+    - name:
+        text: 前端 lint
+        truncated: false
+      result: passed
+      note:
+        text: npm run lint → EXIT=0，0 warning
+        truncated: false
+    - name:
+        text: 前端网盘工具测试
+        truncated: false
+      result: passed
+      note:
+        text: vitest run src/utils/__tests__/netdisk.spec.ts → 12 passed
+        truncated: false
+    - name:
+        text: 前端全量测试
+        truncated: false
+      result: failed
+      note:
+        text: npm run test:run -- --serial → 4649 passed / 1 failed；失败为
+          SubscribeSeasonDialog 图片地址断言，已在干净 HEAD 工作树复现，与本次改动无关
+        truncated: false
+    - name:
+        text: git diff --check（前后端）
+        truncated: false
+      result: passed
+      note:
+        text: 两个仓库均无输出
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: 未启动前后端服务，A6/A7/A12 的视觉与响应式效果仅通过代码结构、typecheck、lint 与既有组件测试核对，未做浏览器视觉验收。
+      truncated: false
+    - text: 前端全量 vitest 存在 1 个既有失败（SubscribeSeasonDialog 图片地址断言），已在干净 HEAD
+        工作树复现，与本次改动无关，未纳入正式检查。
+      truncated: false
+    - text: 后端 tests/test_scheduler_cache_expiry.py 有 2 个既有失败，已在干净 HEAD
+        工作树复现，与本次改动无关，未纳入正式检查。
+      truncated: false
+    - text: 迅雷 token 刷新按 YunX-Desktop 抓包实现（xluser-ssl 主机、网页 client_id、无
+        client_secret），未在真实账号上联网验证；续期后未重建 captcha。
+      truncated: false
+    - text: 前端改动位于兄弟仓库 MoviePilot-Frontend 且未提交；本 change 的归档提交只覆盖后端仓库与正式产物。
+      truncated: false
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-11-04T09:41:41.521Z
+blockers: []
+verification:
+  candidate_id: 0312ef83-88fb-45c4-81b8-e1eb49ee4556
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:e5aa62d1-42be-46d0-8b7d-0a539fd71167
+  iteration: 2
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: netdisk-backend-tests
+      name:
+        text: 网盘后端测试
+        truncated: false
+      argv_display:
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: PATH=/home/zxl/.local/bin:/usr/local/bin:/usr/bin:/bin
+          truncated: false
+        - text: uv
+          truncated: false
+        - text: run
+          truncated: false
+        - text: --locked
+          truncated: false
+        - text: --no-sync
+          truncated: false
+        - text: python
+          truncated: false
+        - text: -m
+          truncated: false
+        - text: pytest
+          truncated: false
+        - text: tests/test_netdisk_account_edit.py
+          truncated: false
+        - text: tests/test_netdisk_account_refresh.py
+          truncated: false
+        - text: tests/test_netdisk_account_repository.py
+          truncated: false
+        - text: tests/test_netdisk_accounts.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_baidu.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_c139.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_guangya.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_pan115.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_pan123.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_quark.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_uc.py
+          truncated: false
+        - text: tests/test_netdisk_adapters_xunlei.py
+          truncated: false
+        - text: tests/test_netdisk_baidu_drive.py
+          truncated: false
+        - text: tests/test_netdisk_c139_drive.py
+          truncated: false
+        - text: tests/test_netdisk_domain.py
+          truncated: false
+        - text: tests/test_netdisk_engine.py
+          truncated: false
+        - text: tests/test_netdisk_failure_reconcile.py
+          truncated: false
+        - text: tests/test_netdisk_guangya_drive.py
+          truncated: false
+        - text: tests/test_netdisk_hls.py
+          truncated: false
+        - text: tests/test_netdisk_keepalive.py
+          truncated: false
+        - text: tests/test_netdisk_lifecycle.py
+          truncated: false
+        - text: tests/test_netdisk_login_fixes.py
+          truncated: false
+        - text: tests/test_netdisk_login.py
+          truncated: false
+        - text: tests/test_netdisk_migration.py
+          truncated: false
+        - text: tests/test_netdisk_module_naming.py
+          truncated: false
+        - text: tests/test_netdisk_module.py
+          truncated: false
+        - text: tests/test_netdisk_nickname_flow.py
+          truncated: false
+        - text: tests/test_netdisk_pan115_drive.py
+          truncated: false
+        - text: tests/test_netdisk_pan123_drive.py
+          truncated: false
+        - text: tests/test_netdisk_quota_refresh.py
+          truncated: false
+        - text: tests/test_netdisk_resolve.py
+          truncated: false
+        - text: tests/test_netdisk_search_flow.py
+          truncated: false
+        - text: tests/test_netdisk_selection.py
+          truncated: false
+        - text: tests/test_netdisk_subscription_episodes.py
+          truncated: false
+        - text: tests/test_netdisk_uc_drive.py
+          truncated: false
+        - text: tests/test_netdisk_vnc.py
+          truncated: false
+        - text: tests/test_netdisk_xunlei_drive.py
+          truncated: false
+        - text: tests/test_netdisk_xunlei_nickname.py
+          truncated: false
+        - text: -q
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 14344
+    - id: architecture-scheduler
+      name:
+        text: 架构与调度契约测试
+        truncated: false
+      argv_display:
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: PATH=/home/zxl/.local/bin:/usr/local/bin:/usr/bin:/bin
+          truncated: false
+        - text: uv
+          truncated: false
+        - text: run
+          truncated: false
+        - text: --locked
+          truncated: false
+        - text: --no-sync
+          truncated: false
+        - text: python
+          truncated: false
+        - text: -m
+          truncated: false
+        - text: pytest
+          truncated: false
+        - text: tests/test_architecture_dependencies.py
+          truncated: false
+        - text: tests/test_scheduler_architecture.py
+          truncated: false
+        - text: tests/test_scheduler_contracts.py
+          truncated: false
+        - text: tests/test_scheduler_compat.py
+          truncated: false
+        - text: tests/test_scheduler_lifecycle.py
+          truncated: false
+        - text: tests/test_scheduler_progress.py
+          truncated: false
+        - text: tests/test_scheduler_registry.py
+          truncated: false
+        - text: -q
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 79826
+    - id: backend-pylint
+      name:
+        text: 后端改动文件 pylint
+        truncated: false
+      argv_display:
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: -u
+          truncated: false
+        - text: "[REDACTED]"
+          truncated: false
+        - text: PATH=/home/zxl/.local/bin:/usr/local/bin:/usr/bin:/bin
+          truncated: false
+        - text: uv
+          truncated: false
+        - text: run
+          truncated: false
+        - text: --locked
+          truncated: false
+        - text: --no-sync
+          truncated: false
+        - text: python
+          truncated: false
+        - text: -m
+          truncated: false
+        - text: pylint
+          truncated: false
+        - text: app/adapters/external/netdisk/base.py
+          truncated: false
+        - text: app/adapters/external/netdisk/guangya.py
+          truncated: false
+        - text: app/adapters/external/netdisk/xunlei.py
+          truncated: false
+        - text: app/adapters/external/netdisk/login/browser.py
+          truncated: false
+        - text: app/api/endpoints/netdisk.py
+          truncated: false
+        - text: app/application/netdisk/accounts.py
+          truncated: false
+        - text: app/application/netdisk/contract.py
+          truncated: false
+        - text: app/application/netdisk/login.py
+          truncated: false
+        - text: app/application/netdisk/keepalive.py
+          truncated: false
+        - text: app/db/adapters/netdiskaccount.py
+          truncated: false
+        - text: app/scheduler/catalog.py
+          truncated: false
+        - text: app/scheduler/chain.py
+          truncated: false
+        - text: app/scheduler/services.py
+          truncated: false
+        - text: app/schemas/netdisk.py
+          truncated: false
+        - text: app/startup/composition/netdisk.py
+          truncated: false
+        - text: app/startup/initializers/scheduler.py
+          truncated: false
+        - text: tests/test_netdisk_keepalive.py
+          truncated: false
+        - text: tests/test_netdisk_xunlei_nickname.py
+          truncated: false
+        - text: tests/test_netdisk_quota_refresh.py
+          truncated: false
+        - text: tests/test_netdisk_account_edit.py
+          truncated: false
+        - text: tests/test_netdisk_nickname_flow.py
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 8660
+    - id: frontend-typecheck
+      name:
+        text: 前端 typecheck
+        truncated: false
+      argv_display:
+        - text: PATH=/home/zxl/.nvm/versions/node/v24.18.0/bin:/usr/local/bin:/usr/bin:/bin
+          truncated: false
+        - text: npm
+          truncated: false
+        - text: --prefix
+          truncated: false
+        - text: ../MoviePilot-Frontend
+          truncated: false
+        - text: run
+          truncated: false
+        - text: typecheck
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 55886
+    - id: frontend-lint
+      name:
+        text: 前端 lint
+        truncated: false
+      argv_display:
+        - text: PATH=/home/zxl/.nvm/versions/node/v24.18.0/bin:/usr/local/bin:/usr/bin:/bin
+          truncated: false
+        - text: npm
+          truncated: false
+        - text: --prefix
+          truncated: false
+        - text: ../MoviePilot-Frontend
+          truncated: false
+        - text: run
+          truncated: false
+        - text: lint
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 31443
+    - id: frontend-netdisk-vitest
+      name:
+        text: 前端网盘工具测试
+        truncated: false
+      argv_display:
+        - text: PATH=/home/zxl/.nvm/versions/node/v24.18.0/bin:/usr/local/bin:/usr/bin:/bin
+          truncated: false
+        - text: npm
+          truncated: false
+        - text: --prefix
+          truncated: false
+        - text: ../MoviePilot-Frontend
+          truncated: false
+        - text: run
+          truncated: false
+        - text: test:run
+          truncated: false
+        - text: --
+          truncated: false
+        - text: src/utils/__tests__/netdisk.spec.ts
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 3554
+  summary:
+    text: 第 2 轮独立复核全部 14 项验收。重点复核上轮唯一失败项 A5：create() 保存前调
+      login_account_name、_refresh_one() 探测后仅非空补写昵称、解析失败保留已有值，三条路径均有代码与测试证据，本轮重跑
+      nickname_flow + xunlei_nickname + keepalive + quota_refresh + account_edit
+      + account_refresh 共 50 项 pytest 全部通过（EXIT=0）。上轮易错点复核确认：Set-Cookie 按
+      record.id 回写不串号、401 只重试一次不递归、unknown 不降级 active、裸 JWT 按平台解析为
+      token、详情明文/列表脱敏且全部超管鉴权、编辑开放全部登录方式且平台锁定、扫码弹窗无固定高度、三份 locale
+      中文平台名同步。风险项均不阻断验收。
+    truncated: false
+  risks:
+    - text: 迅雷 401 重试后需重建 captcha 再发请求（spec 明确要求）：XunleiAdapter._dispatch_with_retry
+        重试复用 _api_headers 重新读取 credential 中 captcha；refresh_account 写回的凭据不含新
+        captcha，依赖平台续期响应或既有 captcha 仍有效，真实环境行为无法离线验证（未调用真实网盘接口，符合约束）。
+      truncated: false
+    - text: 夸克/UC 90 分钟惰性续期依赖 supports_refresh + 进程内单调时钟节流，多进程部署（如 gunicorn 多
+        worker）时各 worker 独立节流，可能重复刷新；不影响正确性，仅多一次刷新请求。
+      truncated: false
+    - text: 前端全量 vitest 存在 1 个与本次改动无关的既有失败（SubscribeSeasonDialog 图片地址断言），已在干净 HEAD
+        复现，属于非阻断项。
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-11-04T09:54:56.503Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A5
+    summary:
+      text: 独立核查 14 项验收：13 项 passed，1 项 failed。A5（迅雷用户名）存在明确缺口：定时刷新链路 _refresh_one
+        与新增链路 create 不解析/写回昵称，仅手动探测与扫码新增写昵称，不满足『新增、探测与刷新都能写入』的验收要求；修复位置为
+        app/application/netdisk/accounts.py 的 _refresh_one（约 425-460 行）与
+        create（约 116-164 行），建议在这两处复用 adapter.login_account_name 并沿用『解析失败保留已有昵称』的
+        None 语义。其余关键易错点（Set-Cookie 按 record.id 定位回写、401 仅重试一次且 thread-local
+        防递归、刷新失败保留旧凭据、unknown 不降级 active、编辑按平台解析裸
+        JWT、列表脱敏/详情明文分离、编辑弹窗四种登录方式、扫码弹窗移除固定
+        60vh、平台中文名含移动端）均经代码与聚焦测试确认满足。补充检查：pytest test_netdisk_xunlei_nickname +
+        test_netdisk_account_edit + test_netdisk_quota_refresh 14 passed，EXIT=0。
+      truncated: false
+    completed_at: 2026-11-04T09:38:33.590Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: 第 2 轮独立复核全部 14 项验收。重点复核上轮唯一失败项 A5：create() 保存前调
+        login_account_name、_refresh_one()
+        探测后仅非空补写昵称、解析失败保留已有值，三条路径均有代码与测试证据，本轮重跑 nickname_flow + xunlei_nickname
+        + keepalive + quota_refresh + account_edit + account_refresh 共 50 项
+        pytest 全部通过（EXIT=0）。上轮易错点复核确认：Set-Cookie 按 record.id 回写不串号、401
+        只重试一次不递归、unknown 不降级 active、裸 JWT 按平台解析为
+        token、详情明文/列表脱敏且全部超管鉴权、编辑开放全部登录方式且平台锁定、扫码弹窗无固定高度、三份 locale
+        中文平台名同步。风险项均不阻断验收。
+      truncated: false
+    completed_at: 2026-11-04T09:54:56.503Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-11-04T07:57:25.302Z
