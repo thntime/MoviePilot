@@ -21,11 +21,11 @@ from app.api.principal import ApiPrincipal
 from app.api.response import ResponseAPIRouter
 from app.application.netdisk import registry
 from app.application.netdisk.accounts import NetdiskAccountService
-from app.application.netdisk.contract import NetdiskAccountView
+from app.application.netdisk.contract import NetdiskAccountDetail, NetdiskAccountView
 from app.application.netdisk.login import NetdiskLoginService
-from app.domain.netdisk import NetdiskError
+from app.domain.netdisk import NetdiskError, NetdiskErrorCode
 from app.schemas.netdisk import (
-    NetdiskAccountView as NetdiskAccountPayload,
+    NetdiskAccountDetailView,
     NetdiskData,
     NetdiskPlatformInfo,
     NetdiskAccountUpdateRequest,
@@ -42,14 +42,14 @@ from app.schemas.response import Response as _SchemaResponse
 router = ResponseAPIRouter()
 
 
-def _account_view(view: NetdiskAccountView) -> NetdiskAccountPayload:
+def _account_view(view: NetdiskAccountView) -> NetdiskAccountDetailView:
     """
-    把账号视图转换为接口响应。
+    把账号视图转换为接口响应；非详情接口不填充明文凭据。
 
     :param view: 账号脱敏视图
     :return: 接口响应模型
     """
-    return NetdiskAccountPayload(
+    return NetdiskAccountDetailView(
         id=view.id,
         platform=view.platform,
         name=view.name,
@@ -62,6 +62,18 @@ def _account_view(view: NetdiskAccountView) -> NetdiskAccountPayload:
         quota_used=view.quota_used,
         quota_total=view.quota_total,
     )
+
+
+def _account_detail_view(detail: NetdiskAccountDetail) -> NetdiskAccountDetailView:
+    """
+    把账号详情转换为接口响应，附带明文凭据。
+
+    :param detail: 账号投影与明文凭据
+    :return: 详情响应模型
+    """
+    payload = _account_view(detail.account)
+    payload.credential = dict(detail.credential)
+    return payload
 
 
 def _error_response(error: NetdiskError) -> _SchemaResponse[NetdiskData]:
@@ -152,6 +164,7 @@ async def create_cookie_account(
             payload.cookie,
             name=payload.name,
             is_primary=payload.is_primary,
+            account_id=payload.account_id,
         )
     except NetdiskError as error:
         return _error_response(error)
@@ -172,6 +185,7 @@ async def create_cookiecloud_account(
             payload.platform,
             name=payload.name,
             is_primary=payload.is_primary,
+            account_id=payload.account_id,
         )
     except NetdiskError as error:
         return _error_response(error)
@@ -194,6 +208,7 @@ async def create_password_account(
             payload.password,
             name=payload.name,
             is_primary=payload.is_primary,
+            account_id=payload.account_id,
         )
     except NetdiskError as error:
         return _error_response(error)
@@ -209,7 +224,12 @@ async def send_sms_code(
     发送光鸭等平台的短信验证码。
     """
     try:
-        result = await run_in_threadpool(_login().send_sms_code, payload.platform, payload.phone)
+        result = await run_in_threadpool(
+            _login().send_sms_code,
+            payload.platform,
+            payload.phone,
+            account_id=payload.account_id,
+        )
     except NetdiskError as error:
         return _error_response(error)
     return _SchemaResponse(
@@ -239,6 +259,7 @@ async def login_with_sms(
             payload.verification_id,
             name=payload.name,
             is_primary=payload.is_primary,
+            account_id=payload.account_id,
         )
     except NetdiskError as error:
         return _error_response(error)
@@ -588,6 +609,21 @@ async def cancel_qr_login(
     return _SchemaResponse(success=True, data=NetdiskData(status="cancelled"))
 
 
+@router.get("/accounts/{account_id}", summary="查询网盘账号详情")
+async def get_account_detail(
+    account_id: int,
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> _SchemaResponse[NetdiskData]:
+    """
+    返回单个账号详情，附带明文凭据供编辑回填；列表接口保持脱敏。
+    """
+    try:
+        detail = await run_in_threadpool(_accounts().detail, account_id)
+    except NetdiskError as error:
+        return _error_response(error)
+    return _SchemaResponse(success=True, data=NetdiskData(account=_account_detail_view(detail)))
+
+
 @router.put("/accounts/{account_id}", summary="更新网盘账号")
 async def update_account(
     account_id: int,
@@ -595,12 +631,22 @@ async def update_account(
     _: ApiPrincipal = Depends(get_current_active_superuser_async),
 ) -> _SchemaResponse[NetdiskData]:
     """
-    更新账号名称、主账号标记或凭据。
+    更新账号名称、主账号标记或凭据；凭据文本按平台解析。
     """
-    credential = {"cookie": payload.cookie} if payload.cookie else None
     try:
+        service = _accounts()
+        credential = None
+        if payload.cookie:
+            record = await run_in_threadpool(service.store.get_record, account_id)
+            if record is None:
+                raise NetdiskError(NetdiskErrorCode.UNKNOWN, "账号不存在")
+            credential = await run_in_threadpool(
+                _login().credential_from_text,
+                record.platform,
+                payload.cookie,
+            )
         view = await run_in_threadpool(
-            _accounts().update,
+            service.update,
             account_id,
             name=payload.name,
             credential=credential,

@@ -59,6 +59,21 @@ class NetdiskAccountView:
 
 
 @dataclass(frozen=True, slots=True)
+class NetdiskAccountDetail:
+    """
+    账号详情：脱敏投影与明文凭据。
+
+    仅由超级管理员鉴权的详情接口消费，调用方不得写入日志或告警。
+
+    :param account: 账号脱敏投影
+    :param credential: 解密后的明文凭据字段
+    """
+
+    account: NetdiskAccountView
+    credential: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class NetdiskAccountWrite:
     """
     账号写入载荷。
@@ -180,6 +195,16 @@ class NetdiskAccountStore(Protocol):
 
         :param account_id: 账号主键
         :param probe: 探测结果
+        """
+        ...
+
+    def update_quota(self, account_id: int, used: int, total: int) -> None:
+        """
+        只更新账号空间占用，不改变状态、检测时间与凭据。
+
+        :param account_id: 账号主键
+        :param used: 已用字节
+        :param total: 总字节
         """
         ...
 
@@ -457,6 +482,7 @@ __all__ = [
     "CredentialCipher",
     "LoginResult",
     "LoginSession",
+    "NetdiskAccountDetail",
     "NetdiskAccountRecord",
     "NetdiskAccountStore",
     "NetdiskAccountView",

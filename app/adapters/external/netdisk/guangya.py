@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 from urllib.parse import quote
 
@@ -46,6 +47,7 @@ _ACCOUNT_BASE = "https://account.guangyapan.com"
 _WEB_SITE = "https://www.guangyapan.com"
 
 _SIGNIN_URL = f"{_ACCOUNT_BASE}/v1/auth/signin"
+_REFRESH_URL = f"{_ACCOUNT_BASE}/v1/auth/token"
 _USER_ME_URL = f"{_ACCOUNT_BASE}/v1/user/me"
 _CAPTCHA_INIT_URL = f"{_ACCOUNT_BASE}/v1/shield/captcha/init"
 _VERIFICATION_URL = f"{_ACCOUNT_BASE}/v1/auth/verification"
@@ -93,6 +95,9 @@ _TRANSFER_POLL_INTERVAL = 0.75
 
 # 分享者未开启免登录下载时的业务码。
 _CODE_SHARE_RESTRICTED = "207"
+
+# access_token 距过期不足该秒数时视为临期，需要先续期。
+_REFRESH_LEEWAY_SECONDS = 60.0
 
 
 class _ShareRestrictedError(NetdiskError):
@@ -299,6 +304,7 @@ class GuangYaAdapter(BaseNetdiskAdapter):
     link_policy: LinkPolicy = LinkPolicy.DIRECT_WITH_FALLBACK
     requires_account: bool = True
     guest_supported: bool = True
+    supports_refresh: bool = True
     drive_capabilities: DriveCapabilities = DriveCapabilities(
         quota=True,
         browse=True,
@@ -1133,6 +1139,74 @@ class GuangYaAdapter(BaseNetdiskAdapter):
         except NetdiskError as error:
             return AccountProbe(status="expired", message=error.message)
         return self._probe_token(token)
+
+    def needs_refresh(self, account: NetdiskAccountRecord) -> bool:
+        """
+        判断已保存的 `expires_at` 是否已临期或过期。
+
+        缺少或无法解析 `expires_at` 时视为未知，不主动刷新。
+
+        :param account: 账号记录
+        :return: 需要在下次使用前续期时返回 True
+        """
+        credential = dict(account.credential or {})
+        expires_at = _first_non_blank(credential.get("expires_at"), credential.get("expiresAt"))
+        if not expires_at:
+            return False
+        try:
+            moment = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return (moment - datetime.now(timezone.utc)).total_seconds() <= _REFRESH_LEEWAY_SECONDS
+
+    def refresh_account(self, account: NetdiskAccountRecord) -> Optional[Mapping[str, str]]:
+        """
+        使用已保存的 `refresh_token` 换取新的访问令牌。
+
+        新令牌与新的过期时间写回完整凭据；`refresh_token` 为空时保留旧值。
+        刷新失败返回 None，不清空原凭据。
+
+        :param account: 账号记录
+        :return: 刷新后的完整凭据；缺少 refresh_token 或刷新失败时返回 None
+        """
+        credential = dict(account.credential or {})
+        refresh_token = _first_non_blank(credential.get("refresh_token"), credential.get("refreshToken"))
+        if not refresh_token:
+            return None
+        headers = self._account_headers()
+        headers["x-action"] = "401"
+        try:
+            payload = self.http.post_json(
+                _REFRESH_URL,
+                json={
+                    "client_id": _CLIENT_ID,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                },
+                headers=headers,
+            )
+        except NetdiskError as error:
+            self.log_failure("刷新登录态", error, account)
+            return None
+        if not _is_success(payload):
+            return None
+        data = (payload.get("data") if isinstance(payload.get("data"), dict) else payload) or {}
+        token = _first_non_blank(data.get("access_token"), data.get("accessToken"))
+        if not token:
+            return None
+        refreshed = dict(credential)
+        refreshed["token"] = token
+        new_refresh = _first_non_blank(data.get("refresh_token"), data.get("refreshToken"))
+        if new_refresh:
+            refreshed["refresh_token"] = new_refresh
+        expires_in = as_int(data.get("expires_in")) or as_int(data.get("expiresIn"))
+        if expires_in:
+            refreshed["expires_at"] = (
+                datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+            ).isoformat()
+        return refreshed
 
     def password_login(self, username: str, password: str) -> Mapping[str, str]:
         """

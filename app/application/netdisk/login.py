@@ -13,7 +13,12 @@ from typing import Any, Mapping, Optional
 
 from app.application.netdisk import registry
 from app.application.netdisk.accounts import NetdiskAccountService, parse_cookie_header
-from app.application.netdisk.contract import LoginResult, LoginSession, NetdiskAccountView
+from app.application.netdisk.contract import (
+    LoginResult,
+    LoginSession,
+    NetdiskAccountRecord,
+    NetdiskAccountView,
+)
 from app.domain.netdisk import NetdiskError, NetdiskErrorCode, NetdiskPlatform, normalize_platform
 
 
@@ -79,21 +84,30 @@ class NetdiskLoginService:
         *,
         name: Optional[str] = None,
         is_primary: bool = False,
+        account_id: Optional[int] = None,
     ) -> NetdiskAccountView:
         """
-        保存用户粘贴的 Cookie 或令牌。
+        保存用户粘贴的 Cookie 或令牌；指定账号时更新已有账号。
 
         :param platform: 平台标识
         :param cookie_text: Cookie 头或平台令牌
         :param name: 账号名称，缺省时使用平台名
         :param is_primary: 是否设为主账号
-        :return: 新账号的脱敏投影
+        :param account_id: 已有账号主键，传入时更新凭据而不新建
+        :return: 新账号或更新后账号的脱敏投影
         """
-        resolved = self._require_platform(platform)
+        resolved, existing = self._target(platform, account_id)
         text = str(cookie_text or "").strip()
         if not text:
             raise NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "请填写 Cookie 或令牌", platform=resolved)
-        credential = self._credential_from_text(resolved, text)
+        credential = self.credential_from_text(resolved, text)
+        if existing is not None:
+            return self._accounts.update(
+                existing.id,
+                name=name,
+                credential=credential,
+                is_primary=True if is_primary else None,
+            )
         return self._accounts.create(
             resolved,
             name or self._default_name(resolved),
@@ -107,16 +121,18 @@ class NetdiskLoginService:
         *,
         name: Optional[str] = None,
         is_primary: bool = False,
+        account_id: Optional[int] = None,
     ) -> NetdiskAccountView:
         """
-        从 CookieCloud 按平台域名导入 Cookie。
+        从 CookieCloud 按平台域名导入 Cookie；指定账号时更新已有账号。
 
         :param platform: 平台标识
         :param name: 账号名称
         :param is_primary: 是否设为主账号
-        :return: 新账号的脱敏投影
+        :param account_id: 已有账号主键，传入时更新凭据而不新建
+        :return: 新账号或更新后账号的脱敏投影
         """
-        resolved = self._require_platform(platform)
+        resolved, existing = self._target(platform, account_id)
         adapter = registry.get_adapter(resolved)
         cookies = registry.get_cookie_import().import_cookies(adapter.cookie_domains)
         if not cookies:
@@ -128,6 +144,13 @@ class NetdiskLoginService:
         credential = {str(key): str(value) for key, value in cookies.items() if str(value).strip()}
         if not credential:
             raise NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "CookieCloud 返回的 Cookie 为空", platform=resolved)
+        if existing is not None:
+            return self._accounts.update(
+                existing.id,
+                name=name,
+                credential=credential,
+                is_primary=True if is_primary else None,
+            )
         return self._accounts.create(
             resolved,
             name or self._default_name(resolved),
@@ -143,24 +166,33 @@ class NetdiskLoginService:
         *,
         name: Optional[str] = None,
         is_primary: bool = False,
+        account_id: Optional[int] = None,
     ) -> NetdiskAccountView:
         """
-        使用账号密码换取凭据并保存。
+        使用账号密码换取凭据并保存；指定账号时更新已有账号。
 
         :param platform: 平台标识
         :param username: 账号
         :param password: 密码
         :param name: 账号名称
         :param is_primary: 是否设为主账号
-        :return: 新账号的脱敏投影
+        :param account_id: 已有账号主键，传入时更新凭据而不新建
+        :return: 新账号或更新后账号的脱敏投影
         """
-        resolved = self._require_platform(platform)
+        resolved, existing = self._target(platform, account_id)
         adapter = registry.get_adapter(resolved)
         if not adapter.supports_password_login:
             raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "该平台不支持账号密码登录", platform=resolved)
         credential = adapter.password_login(str(username or "").strip(), str(password or ""))
         if not credential:
             raise NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "账号或密码错误", platform=resolved)
+        if existing is not None:
+            return self._accounts.update(
+                existing.id,
+                name=name,
+                credential=credential,
+                is_primary=True if is_primary else None,
+            )
         return self._accounts.create(
             resolved,
             name or str(username or "").strip() or self._default_name(resolved),
@@ -168,15 +200,22 @@ class NetdiskLoginService:
             is_primary=is_primary,
         )
 
-    def send_sms_code(self, platform: object, phone: str) -> dict[str, Any]:
+    def send_sms_code(
+        self,
+        platform: object,
+        phone: str,
+        *,
+        account_id: Optional[int] = None,
+    ) -> dict[str, Any]:
         """
         发送短信验证码。
 
         :param platform: 平台标识
         :param phone: 手机号
+        :param account_id: 已有账号主键，用于在省略平台时定位平台
         :return: 验证会话信息
         """
-        resolved = self._require_platform(platform)
+        resolved, _ = self._target(platform, account_id)
         adapter = registry.get_adapter(resolved)
         sender = getattr(adapter, "send_sms_code", None)
         if sender is None:
@@ -196,9 +235,10 @@ class NetdiskLoginService:
         *,
         name: Optional[str] = None,
         is_primary: bool = False,
+        account_id: Optional[int] = None,
     ) -> NetdiskAccountView:
         """
-        使用短信验证码登录并保存账号。
+        使用短信验证码登录并保存账号；指定账号时更新已有账号。
 
         :param platform: 平台标识
         :param phone: 手机号
@@ -206,9 +246,10 @@ class NetdiskLoginService:
         :param verification_id: 发码接口返回的验证会话
         :param name: 账号名称
         :param is_primary: 是否设为主账号
-        :return: 新账号的脱敏投影
+        :param account_id: 已有账号主键，传入时更新凭据而不新建
+        :return: 新账号或更新后账号的脱敏投影
         """
-        resolved = self._require_platform(platform)
+        resolved, existing = self._target(platform, account_id)
         adapter = registry.get_adapter(resolved)
         login = getattr(adapter, "sms_login", None)
         if login is None:
@@ -224,6 +265,14 @@ class NetdiskLoginService:
         )
         if not credential:
             raise NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "短信验证码登录失败", platform=resolved)
+        if existing is not None:
+            return self._accounts.update(
+                existing.id,
+                name=name,
+                credential=credential,
+                is_primary=True if is_primary else None,
+                validate=False,
+            )
         return self._accounts.create(
             resolved,
             name or str(phone or "").strip() or self._default_name(resolved),
@@ -249,7 +298,7 @@ class NetdiskLoginService:
         :param account_id: 已有账号主键，新增账号时为 None
         :return: 含二维码图片的会话
         """
-        resolved = self._require_platform(platform)
+        resolved, _ = self._target(platform, account_id)
         adapter = registry.get_adapter(resolved)
         session = registry.get_login_adapter().start(resolved, adapter.login_url, account_id)
         now = time.monotonic()
@@ -259,7 +308,7 @@ class NetdiskLoginService:
                 self._pending.pop(key, None)
             self._pending[session.session_id] = _PendingLogin(
                 platform=resolved,
-                name=name or self._default_name(resolved),
+                name=str(name or "").strip(),
                 is_primary=is_primary,
                 account_id=account_id,
                 expires_at=now + _QR_SESSION_TTL_SECONDS,
@@ -342,13 +391,15 @@ class NetdiskLoginService:
             if context.account_id:
                 view = self._accounts.update(
                     context.account_id,
+                    name=context.name or None,
                     credential=context.credential,
+                    nickname=context.account_name or None,
                     validate=False,
                 )
             else:
                 view = self._accounts.create(
                     context.platform,
-                    context.name,
+                    context.name or self._default_name(context.platform),
                     context.credential,
                     is_primary=context.is_primary,
                     validate=False,
@@ -433,7 +484,7 @@ class NetdiskLoginService:
             raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "当前登录方式不支持页面交互")
         handler(session_id, event)
 
-    def _credential_from_text(
+    def credential_from_text(
         self,
         platform: NetdiskPlatform,
         text: str,
@@ -441,16 +492,46 @@ class NetdiskLoginService:
         """
         按平台把粘贴文本转换为凭据字段。
 
+        123 与光鸭的裸 JWT 识别为 token，其余无 `=` 的文本同样按 token 处理。
+
         :param platform: 平台标识
         :param text: 用户输入
         :return: 凭据字段
         """
-        if platform is NetdiskPlatform.PAN123 and "=" not in text and text.startswith("eyJ"):
+        if platform in {NetdiskPlatform.PAN123, NetdiskPlatform.GUANGYA} and "=" not in text:
             return {"token": text}
         fields = parse_cookie_header(text)
         if not fields and text:
             return {"token": text}
         return {"cookie": text}
+
+    def _target(
+        self,
+        platform: object,
+        account_id: Optional[int],
+    ) -> tuple[NetdiskPlatform, Optional[NetdiskAccountRecord]]:
+        """
+        解析本次登录要写入的平台与已有账号。
+
+        :param platform: 平台标识，传入账号时可省略
+        :param account_id: 已有账号主键
+        :return: 平台枚举与已有账号记录；新建账号时记录为 None
+        :raises NetdiskError: 账号不存在或平台不匹配时抛出
+        """
+        if account_id is None:
+            return self._require_platform(platform), None
+        record = self._accounts.store.get_record(account_id)
+        if record is None:
+            raise NetdiskError(NetdiskErrorCode.UNKNOWN, "账号不存在")
+        if platform is not None and str(platform).strip():
+            resolved = normalize_platform(platform)
+            if resolved is not record.platform:
+                raise NetdiskError(
+                    NetdiskErrorCode.UNKNOWN,
+                    "账号与平台不匹配",
+                    platform=record.platform,
+                )
+        return record.platform, record
 
     @staticmethod
     def _require_platform(platform: object) -> NetdiskPlatform:

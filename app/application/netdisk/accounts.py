@@ -11,12 +11,14 @@ from typing import List, Mapping, Optional, Sequence
 
 from app.application.netdisk import registry, selection
 from app.application.netdisk.contract import (
+    NetdiskAccountDetail,
     NetdiskAccountRecord,
     NetdiskAccountStore,
     NetdiskAccountView,
     NetdiskAccountWrite,
     NetdiskAdapter,
 )
+from app.application.netdisk.keepalive import RefreshThrottle
 from app.domain.netdisk import (
     AccountProbe,
     NetdiskError,
@@ -26,6 +28,16 @@ from app.domain.netdisk import (
     normalize_platform,
 )
 from app.runtime.log import logger
+
+# 续期节流必须跨用例实例共享：取链与接口每次请求都会新建服务，90 分钟窗口才有效。
+_REFRESH_THROTTLE = RefreshThrottle()
+
+
+def reset_refresh_throttle() -> None:
+    """
+    清空进程级续期节流状态，供测试与生命周期重置使用。
+    """
+    _REFRESH_THROTTLE.reset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,13 +153,20 @@ class NetdiskAccountService:
                     platform=resolved,
                     account_name=clean_name,
                 )
+        resolved_nickname = nickname
+        if not resolved_nickname:
+            # 新增账号时尽量从平台侧解析昵称；失败不影响账号创建。
+            try:
+                resolved_nickname = adapter.login_account_name(payload) or ""
+            except Exception:  # noqa: BLE001 - 昵称解析失败不影响创建
+                resolved_nickname = ""
         return self.store.create_account(
             NetdiskAccountWrite(
                 platform=resolved,
                 name=clean_name,
                 credential=payload,
                 is_primary=is_primary,
-                nickname=nickname,
+                nickname=resolved_nickname,
             )
         )
 
@@ -159,19 +178,22 @@ class NetdiskAccountService:
         credential: Optional[Mapping[str, str]] = None,
         is_primary: Optional[bool] = None,
         validate: bool = True,
+        nickname: Optional[str] = None,
     ) -> NetdiskAccountView:
         """
-        更新账号；更换凭据时先校验。
+        更新账号；更换凭据时先校验并恢复为 active。
 
         :param account_id: 账号主键
         :param name: 新名称
         :param credential: 新凭据
         :param is_primary: 是否设为主账号
         :param validate: 是否调用平台接口校验
+        :param nickname: 新昵称；未提供时尝试从新凭据解析
         :return: 更新后的脱敏投影
         """
         record = self._require_record(account_id)
         payload = None
+        adapter: Optional[NetdiskAdapter] = None
         if credential is not None:
             payload = {str(key): str(value) for key, value in credential.items() if str(value).strip()}
             if not payload:
@@ -187,11 +209,19 @@ class NetdiskAccountService:
                         platform=record.platform,
                         account_name=record.name,
                     )
+        resolved_nickname = nickname
+        if resolved_nickname is None and adapter is not None and payload is not None:
+            try:
+                resolved_nickname = adapter.login_account_name(payload) or None
+            except Exception:  # noqa: BLE001 - 昵称解析失败不影响凭据更新
+                resolved_nickname = None
         updated = self.store.update_account(
             account_id,
             name=name,
             credential=payload,
             is_primary=is_primary,
+            status="active" if payload is not None else None,
+            nickname=resolved_nickname,
         )
         if updated is None:
             raise NetdiskError(NetdiskErrorCode.UNKNOWN, "账号不存在", platform=record.platform)
@@ -205,6 +235,28 @@ class NetdiskAccountService:
         :return: 删除成功返回 True
         """
         return bool(self.store.delete_account(account_id))
+
+    def detail(self, account_id: int) -> NetdiskAccountDetail:
+        """
+        读取单账号详情，附带明文凭据。
+
+        仅供超级管理员鉴权的详情接口使用；调用方不得写入日志。
+
+        :param account_id: 账号主键
+        :return: 账号投影与明文凭据
+        :raises NetdiskError: 账号不存在时抛出
+        """
+        record = self._require_record(account_id)
+        view = next(
+            (item for item in self.store.list_accounts(record.platform) if item.id == account_id),
+            None,
+        )
+        if view is None:
+            raise NetdiskError(NetdiskErrorCode.UNKNOWN, "账号不存在", platform=record.platform)
+        return NetdiskAccountDetail(
+            account=view,
+            credential={str(key): str(value) for key, value in (record.credential or {}).items()},
+        )
 
     def set_primary(self, account_id: int) -> NetdiskAccountView:
         """
@@ -226,7 +278,7 @@ class NetdiskAccountService:
         :param account_id: 账号主键
         :return: 探测结果
         """
-        record = self._require_record(account_id)
+        record = self._refresh_for_request(self._require_record(account_id))
         adapter = registry.get_adapter(record.platform)
         try:
             probe = adapter.probe_account(record)
@@ -269,6 +321,7 @@ class NetdiskAccountService:
         if not credential:
             return None
         self.store.update_account(account_id, credential=credential, status="active")
+        _REFRESH_THROTTLE.mark(account_id, record.platform)
         return self._require_record(account_id)
 
     def refresh_all(self) -> List[NetdiskAccountFailure]:
@@ -299,6 +352,83 @@ class NetdiskAccountService:
                 failures.append(failure)
         return failures
 
+    def refresh_quotas(self) -> dict[str, int]:
+        """
+        遍历全部账号刷新空间占用。
+
+        只写回已用与总空间；单账号失败只记录告警，不修改状态、检测时间与凭据。
+
+        :return: 检查、更新与失败账号数量
+        """
+        checked = 0
+        updated = 0
+        failed = 0
+        for view in self.store.list_accounts():
+            checked += 1
+            try:
+                record = self.store.get_record(view.id)
+                if record is None:
+                    continue
+                adapter = registry.get_adapter(record.platform)
+                if not adapter.drive_capabilities.quota:
+                    continue
+                quota = adapter.quota(record)
+                self.store.update_quota(record.id, quota.used, quota.total)
+                updated += 1
+            except Exception as error:  # noqa: BLE001 - 单账号空间刷新失败不影响其他账号
+                failed += 1
+                logger.warning(
+                    f"网盘账号空间刷新失败：platform={view.platform} "
+                    f"account={view.name} error={type(error).__name__}"
+                )
+        return {"checked": checked, "updated": updated, "failed": failed}
+
+    def _refresh_record(self, record: NetdiskAccountRecord) -> tuple[NetdiskAccountRecord, str]:
+        """
+        按平台 TTL 或适配器临期判断惰性续期。
+
+        临期判断不受 90 分钟节流限制；刷新失败保留旧凭据。
+
+        :param record: 账号记录
+        :return: 续期后的账号记录与失败原因；无需续期或成功时原因为空
+        """
+        try:
+            adapter = registry.get_adapter(record.platform)
+        except NetdiskError:
+            # 平台未注册时保持原记录，由真正发起请求的调用方给出明确错误。
+            return record, ""
+        if not getattr(adapter, "supports_refresh", False):
+            return record, ""
+        needs_refresh = getattr(adapter, "needs_refresh", None)
+        try:
+            expiring = bool(needs_refresh(record)) if callable(needs_refresh) else False
+        except Exception:  # noqa: BLE001 - 临期判断失败按未临期处理
+            expiring = False
+        if not expiring and not _REFRESH_THROTTLE.due(record.id, record.platform):
+            return record, ""
+        try:
+            credential = adapter.refresh_account(record)
+        except Exception as error:  # noqa: BLE001 - 续期失败保留旧凭据
+            message = str(error) or type(error).__name__
+            logger.warning(f"网盘账号 {record.platform.value} / {record.name} 续期失败：{message}")
+            return record, message
+        if not credential:
+            return record, ""
+        self.store.update_account(record.id, credential=credential, status="active")
+        _REFRESH_THROTTLE.mark(record.id, record.platform)
+        refreshed = self.store.get_record(record.id)
+        return refreshed or record, ""
+
+    def _refresh_for_request(self, record: NetdiskAccountRecord) -> NetdiskAccountRecord:
+        """
+        在把账号交给适配器发起真实请求前完成惰性续期。
+
+        :param record: 账号记录
+        :return: 可直接用于请求的账号记录
+        """
+        refreshed, _ = self._refresh_record(record)
+        return refreshed
+
     def _refresh_one(self, account_id: int) -> Optional[NetdiskAccountFailure]:
         """
         刷新并探测单个账号，返回失败项或 None。
@@ -310,20 +440,8 @@ class NetdiskAccountService:
         if record is None:
             logger.warning(f"网盘账号 {account_id} 不存在，跳过刷新")
             return None
+        record, refresh_error = self._refresh_record(record)
         adapter = registry.get_adapter(record.platform)
-        refresh_error = ""
-        if getattr(adapter, "supports_refresh", False):
-            try:
-                credential = adapter.refresh_account(record)
-            except Exception as error:  # noqa: BLE001 - 刷新失败继续探测并汇总
-                refresh_error = str(error) or type(error).__name__
-                logger.warning(f"网盘账号 {record.platform.value} / {record.name} 刷新失败：{refresh_error}")
-            else:
-                if credential:
-                    self.store.update_account(record.id, credential=credential, status="active")
-                    refreshed = self.store.get_record(record.id)
-                    if refreshed is not None:
-                        record = refreshed
         try:
             probe = adapter.probe_account(record)
         except NetdiskError as error:
@@ -332,6 +450,13 @@ class NetdiskAccountService:
             probe = AccountProbe(status="expired", message=str(error) or type(error).__name__)
             logger.warning(f"网盘账号 {record.platform.value} / {record.name} 探测异常：{probe.message}")
         self.store.touch_account(record.id, probe)
+        # 定时刷新与启动首跑同样补写平台昵称；解析失败保留已有昵称。
+        try:
+            nickname = adapter.login_account_name(record.credential or {})
+        except Exception:  # noqa: BLE001 - 昵称解析失败不影响刷新结果
+            nickname = ""
+        if nickname:
+            self.store.update_account(record.id, nickname=nickname)
         if probe.status == "expired":
             return NetdiskAccountFailure(
                 account_id=record.id,
@@ -384,7 +509,7 @@ class NetdiskAccountService:
                 continue
             record = self.store.get_record(view.id)
             if record is not None and record.status == "active":
-                return record
+                return self._refresh_for_request(record)
         raise NetdiskError(
             NetdiskErrorCode.AUTH_EXPIRED,
             f"{resolved.value} 平台没有可用账号，请先在网盘账号中添加并登录",
@@ -403,7 +528,7 @@ class NetdiskAccountService:
             record = self._require_record(account_id)
             if record.platform != self._require_platform(platform):
                 raise NetdiskError(NetdiskErrorCode.UNKNOWN, "账号与平台不匹配")
-            return record
+            return self._refresh_for_request(record)
         return self.select(platform)
 
     def _require_platform(self, platform: object) -> NetdiskPlatform:

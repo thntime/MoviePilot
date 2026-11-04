@@ -19,10 +19,11 @@ class NetdiskCookieRequest(BaseModel):
     粘贴 Cookie 或令牌的请求体。
     """
 
-    platform: str = Field(..., description="网盘平台标识，如 quark、uc、pan123")
+    platform: Optional[str] = Field(default=None, description="网盘平台标识；传入 account_id 时可省略")
     cookie: str = Field(..., description="浏览器复制的 Cookie 头或平台令牌")
     name: Optional[str] = Field(default=None, description="账号名称，缺省时使用平台默认名称")
     is_primary: bool = Field(False, description="是否设为该平台主账号")
+    account_id: Optional[int] = Field(default=None, description="已有账号主键，传入时更新凭据而不新建")
 
 
 class NetdiskCookieCloudRequest(BaseModel):
@@ -30,9 +31,10 @@ class NetdiskCookieCloudRequest(BaseModel):
     从 CookieCloud 导入 Cookie 的请求体。
     """
 
-    platform: str = Field(..., description="网盘平台标识")
+    platform: Optional[str] = Field(default=None, description="网盘平台标识；传入 account_id 时可省略")
     name: Optional[str] = Field(default=None, description="账号名称")
     is_primary: bool = Field(False, description="是否设为该平台主账号")
+    account_id: Optional[int] = Field(default=None, description="已有账号主键，传入时更新凭据而不新建")
 
 
 class NetdiskPasswordRequest(BaseModel):
@@ -40,11 +42,12 @@ class NetdiskPasswordRequest(BaseModel):
     账号密码登录的请求体。
     """
 
-    platform: str = Field(..., description="网盘平台标识，仅 123 与光鸭支持")
+    platform: Optional[str] = Field(default=None, description="网盘平台标识，仅 123 与光鸭支持；传入 account_id 时可省略")
     username: str = Field(..., description="登录账号")
     password: str = Field(..., description="登录密码，仅用于换取令牌")
     name: Optional[str] = Field(default=None, description="账号名称")
     is_primary: bool = Field(False, description="是否设为该平台主账号")
+    account_id: Optional[int] = Field(default=None, description="已有账号主键，传入时更新凭据而不新建")
 
 
 class NetdiskQrInputRequest(BaseModel):
@@ -72,8 +75,9 @@ class NetdiskSmsSendRequest(BaseModel):
     发送短信验证码的请求体。
     """
 
-    platform: str = Field(..., description="网盘平台标识，仅光鸭支持")
+    platform: Optional[str] = Field(default=None, description="网盘平台标识，仅光鸭支持；传入 account_id 时可省略")
     phone: str = Field(..., description="手机号")
+    account_id: Optional[int] = Field(default=None, description="已有账号主键，用于重新授权")
 
 
 class NetdiskSmsLoginRequest(BaseModel):
@@ -81,12 +85,13 @@ class NetdiskSmsLoginRequest(BaseModel):
     短信验证码登录的请求体。
     """
 
-    platform: str = Field(..., description="网盘平台标识，仅光鸭支持")
+    platform: Optional[str] = Field(default=None, description="网盘平台标识，仅光鸭支持；传入 account_id 时可省略")
     phone: str = Field(..., description="手机号")
     code: str = Field(..., description="短信验证码")
     verification_id: str = Field(..., description="发送验证码接口返回的验证会话")
     name: Optional[str] = Field(default=None, description="账号名称")
     is_primary: bool = Field(False, description="是否设为该平台主账号")
+    account_id: Optional[int] = Field(default=None, description="已有账号主键，传入时更新凭据而不新建")
 
 
 class NetdiskQrStartRequest(BaseModel):
@@ -144,6 +149,16 @@ class NetdiskAccountView(BaseModel):
     quota_total: int = Field(0, description="总空间")
 
 
+class NetdiskAccountDetailView(NetdiskAccountView):
+    """
+    网盘账号详情，附带明文凭据。
+
+    仅由超级管理员鉴权的单账号详情接口返回；列表接口继续使用脱敏视图。
+    """
+
+    credential: dict[str, str] = Field(default_factory=dict, description="明文凭据字段，仅详情接口返回")
+
+
 class NetdiskData(BaseModel):
     """
     网盘接口的统一数据体，按操作填充对应字段。
@@ -151,7 +166,7 @@ class NetdiskData(BaseModel):
 
     platforms: list[NetdiskPlatformInfo] = Field(default_factory=list, description="平台列表")
     accounts: list[NetdiskAccountView] = Field(default_factory=list, description="账号列表")
-    account: Optional[NetdiskAccountView] = Field(default=None, description="单个账号")
+    account: Optional[NetdiskAccountDetailView] = Field(default=None, description="单个账号；详情接口附带明文凭据")
     session_id: Optional[str] = Field(default=None, description="扫码会话标识")
     ticket: Optional[str] = Field(default=None, description="WebSocket 一次性票据")
     platform: Optional[str] = Field(default=None, description="相关平台")

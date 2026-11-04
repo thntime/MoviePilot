@@ -89,6 +89,7 @@ def configure_scheduler_services() -> None:
             refresh_site_data=site_chain.refresh_userdatas,
             refresh_netdisk_tokens=site_chain.refresh_netdisk_tokens,
             refresh_netdisk_accounts=scheduler_chain.refresh_netdisk_accounts,
+            refresh_netdisk_quotas=scheduler_chain.refresh_netdisk_quotas,
             cleanup_netdisk_artifacts=download_chain.cleanup_netdisk_artifacts,
             reconcile_netdisk_failures=download_chain.reconcile_netdisk_failures,
             refresh_recommend=recommend_chain.refresh_recommend,

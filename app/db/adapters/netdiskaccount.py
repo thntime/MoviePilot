@@ -309,17 +309,45 @@ class TransactionalNetdiskAccountRepository:
         """
         def touch(oper: NetdiskAccountOper) -> None:
             """
-            在事务内写入状态与时间。
+            在事务内写入状态与时间；探测未知不降级已有有效状态。
             """
             model = oper.get(account_id)
             if model is None:
                 return
+            status = probe.status or "unknown"
             fields: dict[str, Any] = {
                 "last_checked_at": datetime.now(),
-                "status": probe.status or "unknown",
             }
+            # 网络抖动等无法判定的探测结果不能把 active 账号踢出可选账号池。
+            if not (status == "unknown" and (model.status or "active") == "active"):
+                fields["status"] = status
             if probe.expires_at is not None:
                 fields["expires_at"] = probe.expires_at
             oper.update(model, fields)
 
         self._write(touch)
+
+    def update_quota(self, account_id: int, used: int, total: int) -> None:
+        """
+        只更新账号空间占用。
+
+        :param account_id: 账号主键
+        :param used: 已用字节
+        :param total: 总字节
+        """
+        def update(oper: NetdiskAccountOper) -> None:
+            """
+            在事务内写入已用与总空间。
+            """
+            model = oper.get(account_id)
+            if model is None:
+                return
+            oper.update(
+                model,
+                {
+                    "quota_used": max(int(used or 0), 0),
+                    "quota_total": max(int(total or 0), 0),
+                },
+            )
+
+        self._write(update)

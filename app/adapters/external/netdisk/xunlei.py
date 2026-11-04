@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import time
 import uuid
@@ -48,8 +49,19 @@ _SHARE_URL = f"{_PAN_BASE}/drive/v1/share"
 _SHARE_DETAIL_URL = f"{_PAN_BASE}/drive/v1/share/detail"
 _RESTORE_URL = f"{_PAN_BASE}/drive/v1/share/restore"
 _ABOUT_URL = f"{_PAN_BASE}/drive/v1/about"
+_AUTH_BASE = "https://xluser-ssl.xunlei.com"
+_AUTH_TOKEN_URL = f"{_AUTH_BASE}/v1/auth/token"
 _MOVE_URL = f"{_FILES_URL}:batchMove"
 _TRASH_URL = f"{_FILES_URL}:batchTrash"
+
+# 网页登录使用的 client_id；与 `login/browser.py` 的 `_XUNLEI_CLIENT_ID` 保持一致。
+_AUTH_CLIENT_ID = "Xqp0kJBXWhwaTpB6"
+# JWT 距过期不足该秒数时视为临期，需要先续期。
+_JWT_LEEWAY_SECONDS = 60.0
+# 与桌面 Chrome UA 匹配的客户端提示头。
+_SEC_CH_UA = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+_SEC_CH_UA_MOBILE = "?0"
+_SEC_CH_UA_PLATFORM = '"Windows"'
 
 # 网页客户端 UA 与请求头常量，与迅雷网页版抓包一致。
 _CLIENT_UA = (
@@ -140,6 +152,42 @@ def _identity_from(fields: Mapping[str, str]) -> tuple[str, str, str]:
     return access, device, captcha
 
 
+def jwt_expires_at(token: str) -> Optional[float]:
+    """
+    从 JWT 载荷中读取过期时间戳，不校验签名、不发起网络请求。
+
+    :param token: JWT 文本
+    :return: `exp` 对应的 Unix 时间戳；不是 JWT 或缺少 `exp` 时返回 None
+    """
+    segments = str(token or "").split(".")
+    if len(segments) < 2:
+        return None
+    payload = segments[1]
+    padding = "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(f"{payload}{padding}")
+        data = json.loads(decoded)
+        return float(data.get("exp"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def jwt_expiring(token: str, *, now: Optional[float] = None, leeway: float = _JWT_LEEWAY_SECONDS) -> bool:
+    """
+    判断 JWT 是否已进入临期窗口。
+
+    :param token: JWT 文本
+    :param now: 当前 Unix 时间戳；省略时取 `time.time()`
+    :param leeway: 提前视为临期的秒数
+    :return: 剩余时间不足 `leeway` 时返回 True；无法解析时返回 False
+    """
+    expires_at = jwt_expires_at(token)
+    if expires_at is None:
+        return False
+    current = time.time() if now is None else now
+    return expires_at - current <= leeway
+
+
 def _classify(error: str, message: str) -> NetdiskErrorCode:
     """
     把迅雷业务错误收敛为统一分类。
@@ -205,6 +253,7 @@ class XunleiAdapter(BaseNetdiskAdapter):
     link_policy = LinkPolicy.TRANSFER_REQUIRED
     requires_account = True
     guest_supported = False
+    supports_refresh = True
     drive_capabilities = DriveCapabilities(
         quota=True,
         browse=True,
@@ -1065,7 +1114,7 @@ class XunleiAdapter(BaseNetdiskAdapter):
         读取迅雷网页账号昵称。
 
         网页 localStorage 通常不写昵称，优先使用浏览器凭据里的字段，
-        缺失时再调用 `/drive/v1/about` 尝试读取。
+        缺失时再调用 `/drive/v1/about`，依次在 `data`、`data.user` 与响应顶层查找。
 
         :param credential: 浏览器抓到的凭据
         :return: 昵称；无法获取时为空串
@@ -1082,17 +1131,26 @@ class XunleiAdapter(BaseNetdiskAdapter):
         except NetdiskError:
             return ""
         data = payload.get("data")
-        if not isinstance(data, Mapping):
-            data = payload
-        return _pick(
-            {str(key): as_text(value) for key, value in data.items()},
-            "nickname",
-            "nick_name",
-            "nickName",
-            "user_name",
-            "userName",
-            "name",
-        )
+        candidates: list[Mapping[Any, Any]] = []
+        if isinstance(data, Mapping):
+            candidates.append(data)
+            user = data.get("user")
+            if isinstance(user, Mapping):
+                candidates.append(user)
+        candidates.append(payload)
+        for candidate in candidates:
+            nickname = _pick(
+                {str(key): as_text(value) for key, value in candidate.items()},
+                "nickname",
+                "nick_name",
+                "nickName",
+                "user_name",
+                "userName",
+                "name",
+            )
+            if nickname:
+                return nickname
+        return ""
 
     def probe_account(self, account: NetdiskAccountRecord) -> AccountProbe:
         """
@@ -1102,3 +1160,80 @@ class XunleiAdapter(BaseNetdiskAdapter):
         :return: 探测结果
         """
         return self.validate_credential(account.credential or {})
+
+    def needs_refresh(self, account: NetdiskAccountRecord) -> bool:
+        """
+        判断访问令牌是否已临期或无法解析。
+
+        没有 `refresh_token` 时无法续期，直接返回 False。
+
+        :param account: 账号记录
+        :return: 需要在下次使用前续期时返回 True
+        """
+        fields = _fields(account.credential or {})
+        refresh_token = _pick(fields, "refresh_token", "refreshToken")
+        if not refresh_token:
+            return False
+        access = _strip_bearer(_pick(fields, "access_token", "accessToken", "token"))
+        expires_at = jwt_expires_at(access)
+        if expires_at is None:
+            return True
+        return expires_at - time.time() <= _JWT_LEEWAY_SECONDS
+
+    def refresh_account(self, account: NetdiskAccountRecord) -> Optional[Mapping[str, str]]:
+        """
+        使用 `refresh_token` 换取新的访问令牌。
+
+        新令牌、轮换后的 `refresh_token` 与 `expires_in` 写回完整凭据；
+        刷新失败返回 None，保留旧凭据。
+
+        :param account: 账号记录
+        :return: 刷新后的完整凭据；缺少 refresh_token 或刷新失败时返回 None
+        """
+        fields = _fields(account.credential or {})
+        refresh_token = _pick(fields, "refresh_token", "refreshToken")
+        if not refresh_token:
+            return None
+        headers = {
+            "User-Agent": _CLIENT_UA,
+            "X-Client-Version": _CLIENT_VERSION,
+            "X-Client-Id": _AUTH_CLIENT_ID,
+            "Origin": _ORIGIN,
+            "Referer": _REFERER,
+            "Content-Type": "application/json",
+            "Sec-Ch-Ua": _SEC_CH_UA,
+            "Sec-Ch-Ua-Mobile": _SEC_CH_UA_MOBILE,
+            "Sec-Ch-Ua-Platform": _SEC_CH_UA_PLATFORM,
+        }
+        device = _pick(fields, "deviceid", "device_id", "deviceId")
+        if device:
+            headers["X-Device-Id"] = device
+        try:
+            payload = self.http.post_json(
+                _AUTH_TOKEN_URL,
+                json={
+                    "client_id": _AUTH_CLIENT_ID,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                },
+                headers=headers,
+            )
+        except NetdiskError as error:
+            self.log_failure("刷新登录态", error, account)
+            return None
+        if as_text(payload.get("error")):
+            return None
+        data = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
+        response_fields = {str(key): as_text(value) for key, value in data.items()}
+        access = _pick(response_fields, "access_token", "accessToken")
+        if not access:
+            return None
+        refreshed = dict(account.credential or {})
+        refreshed["access_token"] = access
+        new_refresh = _pick(response_fields, "refresh_token", "refreshToken")
+        if new_refresh:
+            refreshed["refresh_token"] = new_refresh
+        expires_in = as_int(response_fields.get("expires_in")) or as_int(response_fields.get("expiresIn"))
+        if expires_in:
+            refreshed["expires_in"] = str(expires_in)
+        return refreshed

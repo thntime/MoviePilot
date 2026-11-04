@@ -260,6 +260,13 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
                     manual=True,
                 ),
                 JobSpec(
+                    "netdisk_quota_refresh",
+                    "网盘账号空间刷新",
+                    services.refresh_netdisk_quotas,
+                    "module",
+                    manual=True,
+                ),
+                JobSpec(
                     "netdisk_cleanup",
                     "网盘下载目录清理",
                     services.cleanup_netdisk_artifacts,
@@ -506,14 +513,26 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
             kwargs={"job_id": "netdisk_token_refresh"},
         )
 
-        # 个人网盘账号登录态刷新与探测
+        # 个人网盘账号登录态刷新与探测；启动后首跑一次，之后每 6 小时
         self._scheduler.add_job(
             self.start,
             "interval",
             id="netdisk_account_refresh",
             name="网盘账号登录态刷新",
             hours=6,
+            next_run_time=datetime.now(pytz.timezone(config.timezone)) + timedelta(seconds=60),
             kwargs={"job_id": "netdisk_account_refresh"},
+        )
+
+        # 网盘账号空间刷新：每 30 分钟一次，启动后首跑一次
+        self._scheduler.add_job(
+            self.start,
+            "interval",
+            id="netdisk_quota_refresh",
+            name="网盘账号空间刷新",
+            minutes=30,
+            next_run_time=datetime.now(pytz.timezone(config.timezone)) + timedelta(seconds=60),
+            kwargs={"job_id": "netdisk_quota_refresh"},
         )
 
         # 网盘下载目录清理与后台失败对账

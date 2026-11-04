@@ -85,6 +85,8 @@ _XUNLEI_READ_JS = f"""
     }} catch (e) {{}}
     return JSON.stringify({{
       access_token: data.access_token || data.accessToken || '',
+      refresh_token: data.refresh_token || data.refreshToken || '',
+      expires_in: data.expires_in || data.expiresIn || '',
       deviceid: data.device_id || data.deviceId || device,
       captcha: captcha || data.captcha_token || data.captchaToken || '',
       nickname: data.nickname || data.nick_name || data.nickName || data.user_name || data.userName || data.name || ''
@@ -759,7 +761,7 @@ class BrowserQrLoginAdapter:
         从 pan.xunlei.com 的 localStorage 读取网页版 token。
 
         :param state: 浏览器会话状态
-        :return: 含 access_token/deviceid/captcha 的字段；未登录时为空字典
+        :return: 含 access_token/deviceid/captcha/refresh_token/expires_in 的字段；未登录时为空字典
         """
         page = self._page_for_host(state, "xunlei.com")
         if page is None:
@@ -782,6 +784,12 @@ class BrowserQrLoginAdapter:
         if not access or not device:
             return {}
         fields = {"access_token": access, "deviceid": device}
+        refresh = str(data.get("refresh_token") or data.get("refreshToken") or "").strip()
+        if refresh:
+            fields["refresh_token"] = refresh
+        expires_in = str(data.get("expires_in") or data.get("expiresIn") or "").strip()
+        if expires_in:
+            fields["expires_in"] = expires_in
         captcha = str(data.get("captcha") or "").strip()
         if captcha:
             fields["captcha"] = captcha

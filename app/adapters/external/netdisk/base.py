@@ -6,8 +6,12 @@
 
 from __future__ import annotations
 
+import threading
 import time
-from typing import Any, Mapping, Optional
+from dataclasses import replace
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from app.adapters.network.http import RequestUtils
 
@@ -95,6 +99,126 @@ def credential_value(account: Optional[NetdiskAccountRecord], *names: str) -> st
     return ""
 
 
+def _cookie_attributes(segments: Sequence[str]) -> dict[str, str]:
+    """
+    解析 `Set-Cookie` 中 Cookie 值之后的属性。
+
+    :param segments: 按 `;` 拆分的属性片段
+    :return: 小写属性名到属性值的映射
+    """
+    attributes: dict[str, str] = {}
+    for segment in segments:
+        item = str(segment).strip()
+        if not item:
+            continue
+        if "=" in item:
+            key, value = item.split("=", 1)
+            attributes[key.strip().lower()] = value.strip()
+        else:
+            attributes[item.lower()] = ""
+    return attributes
+
+
+def _cookie_deleted(attributes: Mapping[str, str]) -> bool:
+    """
+    判断 `Set-Cookie` 是否要求删除该 Cookie。
+
+    `Max-Age` 不大于 0 或 `Expires` 已过期时视为删除。
+
+    :param attributes: `Set-Cookie` 属性映射
+    :return: 是否删除
+    """
+    max_age = attributes.get("max-age")
+    if max_age is not None:
+        try:
+            return float(max_age) <= 0
+        except ValueError:
+            pass
+    expires = attributes.get("expires")
+    if not expires:
+        return False
+    try:
+        moment = parsedate_to_datetime(expires)
+    except (TypeError, ValueError):
+        return False
+    if moment is None:
+        return False
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment <= datetime.now(timezone.utc)
+
+
+def merge_cookie_header(cookie_header: str, set_cookies: Sequence[str]) -> str:
+    """
+    把响应下发的 `Set-Cookie` 合并进原始 Cookie 头。
+
+    同名 Cookie 以后下发的值为准；`Max-Age` 不大于 0 或 `Expires` 已过期的键会被删除。
+
+    :param cookie_header: 原始 Cookie 头
+    :param set_cookies: 响应下发的 `Set-Cookie` 行
+    :return: 合并后的 Cookie 头
+    """
+    pairs: list[tuple[str, str]] = []
+    for item in str(cookie_header or "").split(";"):
+        part = item.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        if name:
+            pairs.append((name, value.strip()))
+    order = [name for name, _value in pairs]
+    values = dict(pairs)
+    for header in set_cookies:
+        segments = str(header).split(";")
+        pair = segments[0].strip()
+        if "=" not in pair:
+            continue
+        name, value = pair.split("=", 1)
+        name = name.strip()
+        if not name:
+            continue
+        if _cookie_deleted(_cookie_attributes(segments[1:])):
+            values.pop(name, None)
+            if name in order:
+                order.remove(name)
+            continue
+        values[name] = value.strip()
+        if name not in order:
+            order.append(name)
+    return "; ".join(f"{name}={values[name]}" for name in order if name in values)
+
+
+def response_set_cookies(response: Any) -> list[str]:
+    """
+    读取响应下发的全部 `Set-Cookie` 行。
+
+    兼容 httpx2 的 `headers.get_list`、旧版 `getlist` 与单值 header。
+
+    :param response: HTTP 响应
+    :return: `Set-Cookie` 行列表
+    """
+    headers = getattr(response, "headers", None)
+    for getter_name in ("get_list", "getlist"):
+        getter = getattr(headers, getter_name, None)
+        if callable(getter):
+            values = getter("Set-Cookie")
+            if values:
+                return [str(item) for item in values]
+    raw_headers = getattr(getattr(response, "raw", None), "headers", None)
+    for getter_name in ("get_list", "getlist"):
+        getter = getattr(raw_headers, getter_name, None)
+        if callable(getter):
+            values = getter("Set-Cookie")
+            if values:
+                return [str(item) for item in values]
+    if headers is not None and hasattr(headers, "get"):
+        value = headers.get("Set-Cookie")
+        if value:
+            return [str(value)]
+    return []
+
+
 class NetdiskHttp:
     """
     按平台装配请求头的轻量 HTTP 客户端。
@@ -120,6 +244,14 @@ class NetdiskHttp:
         self.user_agent = user_agent
         self.referer = referer
         self.timeout = timeout
+        # 由装配层赋值的 Cookie 回写钩子；回调收到本次请求使用的账号与合并后的完整凭据。
+        self.credential_sink: Optional[Callable[[NetdiskAccountRecord, Mapping[str, str]], None]] = None
+        # 由装配层赋值的续期钩子；鉴权失败时换取新凭据后重试一次。
+        self.credential_refresher: Optional[
+            Callable[[NetdiskAccountRecord], Optional[Mapping[str, str]]]
+        ] = None
+        # 记录当前线程是否正在续期，避免续期请求自身再次触发续期。
+        self._refresh_state = threading.local()
 
     def headers(
         self,
@@ -152,6 +284,160 @@ class NetdiskHttp:
             headers.update({str(key): str(value) for key, value in extra.items()})
         return headers
 
+    def _write_back_cookies(self, account: Optional[NetdiskAccountRecord], response: Any) -> None:
+        """
+        把响应 `Set-Cookie` 合并回账号 Cookie 并交给回写钩子。
+
+        仅处理凭据中含 `cookie`/`cookie_header`/`cookies` 的账号；合并结果与原凭据
+        相同、或没有下发新 Cookie 时跳过。解析与回调异常只记录告警，不影响请求结果。
+
+        :param account: 本次请求使用的账号
+        :param response: HTTP 响应
+        """
+        if account is None or self.credential_sink is None:
+            return
+        credential = account.credential or {}
+        key = next(
+            (name for name in ("cookie", "cookie_header", "cookies") if credential.get(name)),
+            "",
+        )
+        if not key:
+            return
+        try:
+            set_cookies = response_set_cookies(response)
+            if not set_cookies:
+                return
+            original = str(credential.get(key) or "")
+            merged = merge_cookie_header(original, set_cookies)
+            if not merged or merged == original:
+                return
+            refreshed = dict(credential)
+            refreshed[key] = merged
+            self.credential_sink(account, refreshed)
+        except Exception as error:  # noqa: BLE001 - 回写失败不能影响原请求
+            logger.warning(
+                f"网盘响应 Cookie 回写失败：platform={self.platform.value} "
+                f"field={key} error={type(error).__name__}"
+            )
+
+    def _refresh_credential(self, account: NetdiskAccountRecord) -> Optional[NetdiskAccountRecord]:
+        """
+        鉴权失败后就地续期一次，返回使用新凭据的账号记录。
+
+        续期请求本身不再触发续期，避免递归；续期失败返回 None 并保留原凭据。
+
+        :param account: 本次请求使用的账号
+        :return: 使用新凭据的账号记录；无法续期时返回 None
+        """
+        if self.credential_refresher is None or getattr(self._refresh_state, "active", False):
+            return None
+        self._refresh_state.active = True
+        try:
+            credential = self.credential_refresher(account)
+        except Exception as error:  # noqa: BLE001 - 续期失败保留旧凭据
+            logger.warning(
+                f"网盘鉴权失败后自动续期失败：platform={self.platform.value} "
+                f"account={account.name} error={type(error).__name__}"
+            )
+            return None
+        finally:
+            self._refresh_state.active = False
+        if not credential:
+            return None
+        return replace(account, credential=dict(credential))
+
+    def _dispatch(
+        self,
+        method: str,
+        url: str,
+        *,
+        account: Optional[NetdiskAccountRecord],
+        params: Optional[Mapping[str, Any]] = None,
+        json_body: Optional[Mapping[str, Any]] = None,
+        data: Optional[Mapping[str, Any]] = None,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> Any:
+        """
+        使用指定账号发送一次请求。
+
+        :param method: 请求方法，`GET` 或 `POST`
+        :param url: 请求地址
+        :param account: 账号记录
+        :param params: 查询参数
+        :param json_body: JSON 请求体
+        :param data: 表单请求体
+        :param headers: 额外请求头
+        :return: HTTP 响应
+        """
+        request = RequestUtils(
+            headers=self.headers(account, extra=headers),
+            timeout=self.timeout,
+            proxies=_DIRECT_PROXIES,
+        )
+        if method == "GET":
+            return request.get_res(url, params=dict(params or {}), allow_redirects=True)
+        return request.post_res(
+            url,
+            data=dict(data) if data is not None else None,
+            json=dict(json_body) if json_body is not None else None,
+            params=dict(params or {}),
+            allow_redirects=True,
+        )
+
+    def _dispatch_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        account: Optional[NetdiskAccountRecord],
+        params: Optional[Mapping[str, Any]] = None,
+        json_body: Optional[Mapping[str, Any]] = None,
+        data: Optional[Mapping[str, Any]] = None,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> Any:
+        """
+        发送请求；鉴权失败时续期一次并重试原请求。
+
+        网络错误、限流与其他状态码不重试，也不修改凭据。
+
+        :param method: 请求方法
+        :param url: 请求地址
+        :param account: 账号记录
+        :param params: 查询参数
+        :param json_body: JSON 请求体
+        :param data: 表单请求体
+        :param headers: 额外请求头
+        :return: HTTP 响应
+        """
+        response = self._dispatch(
+            method,
+            url,
+            account=account,
+            params=params,
+            json_body=json_body,
+            data=data,
+            headers=headers,
+        )
+        self._write_back_cookies(account, response)
+        if response is None or account is None:
+            return response
+        if getattr(response, "status_code", 0) not in (401, 403):
+            return response
+        refreshed = self._refresh_credential(account)
+        if refreshed is None:
+            return response
+        retried = self._dispatch(
+            method,
+            url,
+            account=refreshed,
+            params=params,
+            json_body=json_body,
+            data=data,
+            headers=headers,
+        )
+        self._write_back_cookies(refreshed, retried)
+        return retried
+
     def get_json(
         self,
         url: str,
@@ -169,12 +455,13 @@ class NetdiskHttp:
         :param headers: 额外请求头
         :return: JSON 对象
         """
-        request = RequestUtils(
-            headers=self.headers(account, extra=headers),
-            timeout=self.timeout,
-            proxies=_DIRECT_PROXIES,
+        response = self._dispatch_with_retry(
+            "GET",
+            url,
+            account=account,
+            params=params,
+            headers=headers,
         )
-        response = request.get_res(url, params=dict(params or {}), allow_redirects=True)
         return self._json(response)
 
     def post_json(
@@ -198,17 +485,14 @@ class NetdiskHttp:
         :param headers: 额外请求头
         :return: JSON 对象
         """
-        request = RequestUtils(
-            headers=self.headers(account, extra=headers),
-            timeout=self.timeout,
-            proxies=_DIRECT_PROXIES,
-        )
-        response = request.post_res(
+        response = self._dispatch_with_retry(
+            "POST",
             url,
-            data=dict(data) if data is not None else None,
-            json=dict(json) if json is not None else None,
-            params=dict(params or {}),
-            allow_redirects=True,
+            account=account,
+            params=params,
+            json_body=json,
+            data=data,
+            headers=headers,
         )
         return self._json(response)
 
@@ -229,12 +513,13 @@ class NetdiskHttp:
         :param headers: 额外请求头
         :return: 响应文本
         """
-        request = RequestUtils(
-            headers=self.headers(account, extra=headers),
-            timeout=self.timeout,
-            proxies=_DIRECT_PROXIES,
+        response = self._dispatch_with_retry(
+            "GET",
+            url,
+            account=account,
+            params=params,
+            headers=headers,
         )
-        response = request.get_res(url, params=dict(params or {}), allow_redirects=True)
         if response is None:
             raise NetdiskError(NetdiskErrorCode.UNKNOWN, "网盘接口无响应", platform=self.platform)
         if response.status_code >= 400:
@@ -539,6 +824,18 @@ class BaseNetdiskAdapter:
         :return: 探测结果
         """
         return self.validate_credential(account.credential)
+
+    def needs_refresh(self, account: NetdiskAccountRecord) -> bool:
+        """
+        判断当前凭据是否已临期、需要在下次使用前续期。
+
+        默认平台没有可解析的过期信息，返回 False；由应用层按 TTL 决定是否刷新。
+
+        :param account: 账号记录
+        :return: 是否需要续期
+        """
+        del account
+        return False
 
     def refresh_account(self, account: NetdiskAccountRecord) -> Optional[Mapping[str, str]]:
         """

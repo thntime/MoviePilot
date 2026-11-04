@@ -53,6 +53,19 @@ class SchedulerChain(ChainBase):
         logger.info(f"网盘账号登录态刷新完成：检查 {checked} 个，异常 {len(failures)} 个")
         return {"checked": checked, "failed": len(failures)}
 
+    def refresh_netdisk_quotas(self) -> Dict[str, int]:
+        """
+        刷新全部个人网盘账号的已用与总空间。
+
+        :return: 检查、更新与失败账号数量
+        """
+        result = NetdiskAccountService().refresh_quotas()
+        logger.info(
+            f"网盘账号空间刷新完成：检查 {result['checked']} 个，"
+            f"更新 {result['updated']} 个，失败 {result['failed']} 个"
+        )
+        return result
+
 
 # 旧插件可能持久化或比较完整类路径，保持迁移前可观察身份。
 SchedulerChain.__module__ = "app.scheduler"
