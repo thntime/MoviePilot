@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Optional, Sequence, TypeVar
 
-from app.application.netdisk import registry
+from app.application.netdisk import registry, selection
 from app.application.netdisk.accounts import NetdiskAccountService
 from app.application.netdisk.contract import (
     NetdiskAccountRecord,
@@ -32,6 +32,7 @@ from app.domain.netdisk import (
     normalize_platform,
     parse_share_link,
 )
+from app.runtime.log import logger
 
 # 同一平台的两次取链调用之间的最小间隔，避免连续请求触发频控。
 _PLATFORM_MIN_INTERVAL = 0.3
@@ -80,6 +81,7 @@ class NetdiskResolveService:
         self._lock = threading.Lock()
         self._last_call: dict[NetdiskPlatform, float] = {}
         self._link_cache: dict[LinkCacheKey, DirectLink] = {}
+        self._quota_cache: dict[int, tuple[float, int, int]] = {}
 
     @property
     def tuning(self) -> NetdiskTuning:
@@ -271,8 +273,15 @@ class NetdiskResolveService:
         account = self._accounts.store.get_record(handle.account_id)
         try:
             adapter.cleanup(handle, account)
-        except NetdiskError:
-            return
+        except NetdiskError as error:
+            logger.warning(
+                f"清理网盘转存内容失败：{handle.platform.value} {handle.directory_id} - {error.message}"
+            )
+        except Exception as error:  # noqa: BLE001 - 清理失败不阻断下载主流程
+            logger.warning(
+                f"清理网盘转存内容异常：{handle.platform.value} {handle.directory_id} - "
+                f"{type(error).__name__}"
+            )
 
     def _resolve_one(
         self,
@@ -307,6 +316,8 @@ class NetdiskResolveService:
         current = account
         if force_refresh and current is not None:
             current = self._refresh_account(current)
+        if allow_transfer and current is not None:
+            self._ensure_space(adapter, file, current)
         try:
             link = self._call(
                 adapter,
@@ -333,6 +344,65 @@ class NetdiskResolveService:
         if not self.tuning.auto_transfer:
             return False
         return adapter.link_policy is not LinkPolicy.DIRECT
+
+    def _ensure_space(
+        self,
+        adapter: NetdiskAdapter,
+        file: ShareFile,
+        account: NetdiskAccountRecord,
+    ) -> None:
+        """
+        转存前检查账号剩余容量，避免把可预期的失败留到后台。
+
+        :param adapter: 平台适配器
+        :param file: 待转存文件
+        :param account: 取链账号
+        :raises NetdiskError: 剩余容量不足时抛出 `SPACE_INSUFFICIENT`
+        """
+        if not adapter.drive_capabilities.quota:
+            return
+        total, used = self._quota_for(adapter, account)
+        if total <= 0:
+            return
+        free = max(total - used, 0)
+        required = int(file.size or 0)
+        if required <= 0:
+            return
+        # 预留 20% 余量，避免转存后账号写满影响后续文件。
+        if free >= required * 1.2:
+            return
+        selection.cool_platform(adapter.platform)
+        raise NetdiskError(
+            NetdiskErrorCode.SPACE_INSUFFICIENT,
+            f"{adapter.platform.value} 剩余空间不足：需要 {required} 字节，当前可用 {free} 字节",
+            platform=adapter.platform,
+        )
+
+    def _quota_for(
+        self,
+        adapter: NetdiskAdapter,
+        account: NetdiskAccountRecord,
+    ) -> tuple[int, int]:
+        """
+        读取账号配额，并按短 TTL 缓存，避免逐文件调用平台接口。
+
+        :param adapter: 平台适配器
+        :param account: 账号记录
+        :return: (总容量, 已用容量)，单位字节
+        """
+        now = time.monotonic()
+        cached = self._quota_cache.get(account.id)
+        if cached is not None and now - cached[0] < 600:
+            return cached[1], cached[2]
+        try:
+            quota = adapter.quota(account)
+        except Exception as error:  # noqa: BLE001 - 配额失败不阻断取链
+            logger.debug(f"读取网盘配额失败：{adapter.platform.value} - {type(error).__name__}")
+            return 0, 0
+        total = max(int(quota.total or 0), 0)
+        used = max(int(quota.used or 0), 0)
+        self._quota_cache[account.id] = (now, total, used)
+        return total, used
 
     def _resolve_accounts(
         self,

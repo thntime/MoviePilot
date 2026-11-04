@@ -283,6 +283,47 @@ class SubscribeCompletionOwner(_SubscribeOwnerBase):
             return updated or subscribe
         return subscribe
 
+    def rollback_download_facts(self, subscribe_id: Any, episodes: Any) -> bool:
+        """
+        回滚订阅中尚未入库的已下载集数，供网盘后台失败对账使用。
+
+        :param subscribe_id: 订阅主键
+        :param episodes: 需要回滚的集号集合
+        :return: 实际发生变更返回 True
+        """
+        try:
+            subscribe = self.subscription_repository.get(int(subscribe_id))
+        except (TypeError, ValueError):
+            return False
+        if subscribe is None:
+            return False
+        remove = {
+            int(item) for item in episodes or ()
+            if str(item).isdigit()
+        }
+        if not remove:
+            return False
+        note = {
+            int(item) for item in subscribe.note or ()
+            if str(item).isdigit()
+        }
+        remaining = note - remove
+        if remaining == note:
+            return False
+        update_data: Dict[str, Any] = {"note": sorted(remaining)}
+        episode_priority = dict(subscribe.episode_priority or {})
+        for episode in remove:
+            episode_priority.pop(str(episode), None)
+        if episode_priority != (subscribe.episode_priority or {}):
+            update_data["episode_priority"] = episode_priority
+        self._SubscribeChain__apply_subscribe_update(
+            subscribe, update_data, scene="download_rollback",
+        )
+        logger.info(
+            f"订阅 {subscribe.id} 回滚网盘失败集数：{sorted(remove)}，剩余已下载 {sorted(remaining)}"
+        )
+        return True
+
     @staticmethod
     def _SubscribeChain__get_downloaded(subscribe: SubscriptionSnapshot) -> List[int]:
         """

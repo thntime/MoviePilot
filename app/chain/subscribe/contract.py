@@ -130,6 +130,7 @@ if TYPE_CHECKING:
         remote_list: Callable[..., Any]
         edit_message: Callable[..., bool]
         resolve_subscribe_missing: Callable[..., Any]
+        rollback_download_facts: Callable[..., Any]
         reconcile_subscription_completion: Callable[..., Any]
         resume_search_queue: Callable[..., Any]
 

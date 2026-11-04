@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Mapping, Optional, Sequence
 
-from app.application.netdisk import registry
+from app.application.netdisk import registry, selection
 from app.application.netdisk.contract import (
     NetdiskAccountRecord,
     NetdiskAccountStore,
@@ -350,7 +350,7 @@ class NetdiskAccountService:
 
     def select(self, platform: object, exclude_ids: Sequence[int] = ()) -> NetdiskAccountRecord:
         """
-        按主账号优先选择可用账号。
+        按状态、剩余容量、近期速度与主账号顺序选择可用账号。
 
         :param platform: 平台标识
         :param exclude_ids: 需要跳过的账号主键
@@ -360,7 +360,25 @@ class NetdiskAccountService:
         resolved = self._require_platform(platform)
         excluded = set(exclude_ids)
         views = self.store.list_accounts(resolved)
-        ordered = sorted(views, key=lambda item: (not item.is_primary, item.id))
+
+        def free_ratio(item: NetdiskAccountView) -> float:
+            """
+            计算账号剩余容量比例；平台未返回配额时使用中性值。
+            """
+            if item.quota_total <= 0:
+                return 0.5
+            return max(item.quota_total - item.quota_used, 0) / item.quota_total
+
+        ordered = sorted(
+            views,
+            key=lambda item: (
+                item.status != "active",
+                -free_ratio(item),
+                -selection.account_speed(item.id),
+                not item.is_primary,
+                item.id,
+            ),
+        )
         for view in ordered:
             if view.id in excluded:
                 continue

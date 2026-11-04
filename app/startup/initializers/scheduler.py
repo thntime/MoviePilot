@@ -13,6 +13,7 @@ from app.application.scheduling import (
     register_scheduler_class,
     reset_scheduler_class,
 )
+from app.chain.download.facade import DownloadChain
 from app.chain.mediaserver import MediaServerChain
 from app.chain.recommend import RecommendChain
 from app.chain.site import SiteChain
@@ -63,6 +64,7 @@ def configure_scheduler_services() -> None:
     构造一次调度任务能力，并在启动前注入 concrete Scheduler。
     """
     scheduler_chain = SchedulerChain()
+    download_chain = DownloadChain()
     site_chain = SiteChain()
     mediaserver_chain = MediaServerChain()
     subscribe_chain = SubscribeChain()
@@ -87,6 +89,8 @@ def configure_scheduler_services() -> None:
             refresh_site_data=site_chain.refresh_userdatas,
             refresh_netdisk_tokens=site_chain.refresh_netdisk_tokens,
             refresh_netdisk_accounts=scheduler_chain.refresh_netdisk_accounts,
+            cleanup_netdisk_artifacts=download_chain.cleanup_netdisk_artifacts,
+            reconcile_netdisk_failures=download_chain.reconcile_netdisk_failures,
             refresh_recommend=recommend_chain.refresh_recommend,
             cache_subscribe_calendar=subscribe_chain.cache_calendar,
             list_workflows=workflow_chain.get_timer_workflows,

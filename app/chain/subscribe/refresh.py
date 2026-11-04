@@ -363,6 +363,16 @@ class SubscribeRefreshOwner(SubscribeMetadataOwner):
         downloaded: List[int] = self._SubscribeChain__get_downloaded(subscribe)
         if self._SubscribeChain__is_full_best_version_enabled(subscribe):
             downloaded = []
+        if meta.type == MediaType.TV and downloaded:
+            # 后台失败但尚未被对账任务回滚的网盘任务不能计入已下载，否则订阅会被误判完成。
+            download_chain = DownloadChain()
+            failed_lookup = getattr(download_chain, "failed_netdisk_episodes", None)
+            failed_episodes = (
+                failed_lookup(subscribe.media_source, subscribe.media_id, subscribe.season)
+                if callable(failed_lookup) else set()
+            )
+            if failed_episodes:
+                downloaded = [episode for episode in downloaded if episode not in failed_episodes]
         if meta.type == MediaType.TV:
             return cast(
                 Tuple[bool, Dict[Union[int, str], Dict[int, _SchemaNotExistMediaInfo]]],

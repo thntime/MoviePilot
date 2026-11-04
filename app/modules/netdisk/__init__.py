@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shutil
 import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
+from app.application.netdisk import selection
 from app.application.netdisk.registry import find_adapter
 from app.application.netdisk.resolve import NetdiskResolveService
 from app.domain.episode import episode_numbers, is_special_name
@@ -24,6 +26,7 @@ from app.domain.netdisk import (
     NetdiskPlatform,
     NetdiskTuning,
     ShareFile,
+    TransferHandle,
     normalize_platform,
     parse_share_link,
 )
@@ -53,6 +56,15 @@ _DOWNLOAD_SUFFIXES = frozenset({
 # 平台硬上限：迅雷超过 8 路并发会被 CDN 降级为整文件响应。
 _PLATFORM_CONCURRENCY_CAP = {NetdiskPlatform.XUNLEI: 8}
 _MAX_WALK_DEPTH = 3
+# 任务目录标记文件：只有带该标记的目录才允许被定时孤儿清理删除，避免误删用户目录。
+_TASK_MARKER = ".netdisk-task"
+# 文件名中的明确季集标记，用于按目标季过滤，避免跨季误下。
+_SEASON_EPISODE_PATTERN = re.compile(r"[Ss](\d{1,3})\s*[Ee](\d{1,4})")
+# 全局同时在跑的网盘任务上限，避免批量订阅一次性打满连接与磁盘。
+_TASK_SLOTS = threading.BoundedSemaphore(3)
+# 进度写入最小间隔与最小百分比变化，避免每个网络分片都全量重写任务索引。
+_PROGRESS_INTERVAL_SECONDS = 1.0
+_PROGRESS_DELTA_PERCENT = 0.5
 
 
 def _as_text(value: Any) -> str:
@@ -84,6 +96,28 @@ def _task_hash(share_code: str, name: str) -> str:
     :return: 任务标识
     """
     return hashlib.sha1(f"{share_code}:{name}".encode("utf-8")).hexdigest()[:16]
+
+
+def _remove_empty_dir(path: Path) -> bool:
+    """
+    删除空目录；目录不存在、非空或只含标记文件时按需处理。
+
+    :param path: 待删除目录
+    :return: 实际删除返回 True
+    """
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        return False
+    if any(item.name != _TASK_MARKER for item in entries):
+        return False
+    marker = path / _TASK_MARKER
+    try:
+        marker.unlink(missing_ok=True)
+        path.rmdir()
+        return True
+    except OSError:
+        return False
 
 
 class NetdiskModule(_DownloaderModuleBase[Any]):
@@ -188,7 +222,8 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                  custom_words: Optional[str] = None, download_type: Optional[str] = None,
                  netdisk_platform: Optional[str] = None,
                  share_password: Optional[str] = None,
-                 netdisk_share_token: Optional[str] = None
+                 netdisk_share_token: Optional[str] = None,
+                 season: Optional[int] = None
                  ) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], str]]:
         """
         提交网盘下载任务，立即返回并在后台执行。
@@ -205,6 +240,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         :param netdisk_platform: 网盘平台标识
         :param share_password: 分享提取码
         :param netdisk_share_token: 候选透传的分享令牌，当前由适配器重新解析
+        :param season: 订阅目标季；为空时按文件名中的季集标记过滤
         :return: 下载器名称、任务标识、内容布局与说明；非网盘内容返回 None
         """
         if _as_text(download_type) != "netdisk":
@@ -219,6 +255,9 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             return None, None, None, f"暂不支持 {_as_text(netdisk_platform)} 网盘下载"
         if platform != ref.platform:
             return None, None, None, "分享链接与候选平台不一致"
+        if selection.is_platform_cooled(platform):
+            remaining = selection.platform_cooldown_remaining(platform)
+            return None, None, None, f"{platform.value} 平台容量冷却中，约 {int(remaining)} 秒后重试"
         if netdisk_share_token:
             # 令牌只在候选透传时存在，取链仍以适配器解析结果为准。
             logger.debug(f"收到候选分享令牌：{ref.share_id}")
@@ -254,6 +293,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         task_dir = self._task_dir(Path(download_dir), code)
         try:
             task_dir.mkdir(parents=True, exist_ok=True)
+            (task_dir / _TASK_MARKER).touch(exist_ok=True)
         except Exception as err:  # noqa: BLE001
             logger.warn(f"创建网盘下载目录失败：{task_dir} - {err}")
         store.upsert_task(task_key, {
@@ -276,12 +316,13 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             "passcode": passcode,
             "share_token": _as_text(netdisk_share_token),
             "episodes": sorted(target_episodes),
+            "season": season,
         })
         thread = threading.Thread(
             target=self._run_task,
             args=(task_key, platform, url, code, passcode, task_dir, label,
                   target_episodes or None, _as_text(netdisk_share_token),
-                  task_tuning),
+                  task_tuning, season),
             daemon=True,
             name=f"netdisk-download-{task_key}",
         )
@@ -360,7 +401,8 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                   label: Optional[str],
                   episodes: Optional[Set[int]] = None,
                   share_token: str = "",
-                  tuning: Optional[NetdiskTuning] = None) -> None:
+                  tuning: Optional[NetdiskTuning] = None,
+                  season: Optional[int] = None) -> None:
         """
         后台执行分享解析、取链与下载。
 
@@ -374,69 +416,103 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         :param episodes: 目标集数集合，为空表示整包下载
         :param share_token: 候选透传的分享令牌
         :param tuning: 下载器实例覆盖后的参数快照
+        :param season: 订阅目标季
         """
         task_dir = download_dir
         stop_event = self._stops.get(task_key) or threading.Event()
         resolver = NetdiskResolveService()
-        try:
-            resolved = resolver.walk(
-                share_url, passcode, platform, max_depth=_MAX_WALK_DEPTH,
-                share_token=share_token,
-            )
-            files = self._collect_files(resolved.files, episodes)
-            if resolved.detail.title:
-                store.upsert_task(task_key, {"title": resolved.detail.title})
-            if not files:
-                if episodes:
-                    raise DownloadError(
-                        f"分享内没有目标集数（{sorted(episodes)}）对应的文件"
-                    )
-                raise DownloadError("分享内没有可下载的视频文件")
-            total_size = sum(int(item.size or 0) for item in files)
-            store.upsert_task(task_key, {
-                "size": float(total_size),
-                "files": [
-                    {"name": item.name, "size": int(item.size or 0), "progress": 0.0}
-                    for item in files
-                ],
-            })
-            done_before = 0.0
-            for item in files:
-                if stop_event.is_set():
-                    raise DownloadError("下载已取消")
-                self._download_one(
-                    resolver, platform, share_url, passcode, item, task_dir,
-                    task_key, stop_event, total_size, done_before,
-                    share_token, tuning,
+        with _TASK_SLOTS:
+            try:
+                resolved = resolver.walk(
+                    share_url, passcode, platform, max_depth=_MAX_WALK_DEPTH,
+                    share_token=share_token,
                 )
-                done_before += float(item.size or 0)
-            if task_key not in self._discarded:
+                files = self._collect_files(resolved.files, episodes, season)
+                if resolved.detail.title:
+                    store.upsert_task(task_key, {"title": resolved.detail.title})
+                if not files:
+                    if episodes:
+                        raise DownloadError(
+                            f"分享内没有目标集数（{sorted(episodes)}）对应的文件"
+                        )
+                    raise DownloadError("分享内没有可下载的视频文件")
+                total_size = sum(int(item.size or 0) for item in files)
+                self._ensure_local_space(task_dir, total_size)
                 store.upsert_task(task_key, {
-                    "state": "completed", "progress": 100.0,
-                    "error": None, "dlspeed": None, "dlspeed_bytes": 0,
+                    "size": float(total_size),
+                    "files": [
+                        {"name": item.name, "size": int(item.size or 0), "progress": 0.0}
+                        for item in files
+                    ],
                 })
-            logger.info(f"网盘下载完成：{platform.value}:{share_code}")
-        except Exception as err:  # noqa: BLE001
-            # 只有外部停止信号置位才算用户暂停；内部异常中止一律按失败记录，
-            # 否则引擎的「下载已取消」会掩盖真实错误，前端表现为任务自动暂停。
-            if stop_event.is_set():
-                logger.info(f"网盘下载已暂停：{share_code}")
+                done_before = 0.0
+                for item in files:
+                    if stop_event.is_set():
+                        raise DownloadError("下载已取消")
+                    target = task_dir / item.name
+                    expected = int(item.size or 0)
+                    if expected > 0 and target.exists() and target.stat().st_size == expected:
+                        # 上次已完成但记录未收尾：保留文件，不重复下载与转存。
+                        logger.info(f"网盘文件已存在且大小匹配，跳过：{target}")
+                        done_before += float(expected)
+                        continue
+                    self._download_one(
+                        resolver, platform, share_url, passcode, item, task_dir,
+                        task_key, stop_event, total_size, done_before,
+                        share_token, tuning,
+                    )
+                    done_before += float(item.size or 0)
                 if task_key not in self._discarded:
                     store.upsert_task(task_key, {
-                        "state": "paused", "error": None,
-                        "dlspeed": None, "dlspeed_bytes": 0,
+                        "state": "completed", "progress": 100.0,
+                        "error": None, "dlspeed": None, "dlspeed_bytes": 0,
                     })
-            else:
-                logger.warn(f"网盘下载失败：{share_code} - {err}")
-                if task_key not in self._discarded:
-                    store.upsert_task(task_key, {
-                        "state": "error", "error": str(err),
-                        "dlspeed": None, "dlspeed_bytes": 0,
-                    })
-        finally:
-            with self._lock:
-                self._stops.pop(task_key, None)
-                self._tasks.pop(task_key, None)
+                logger.info(f"网盘下载完成：{platform.value}:{share_code}")
+            except Exception as err:  # noqa: BLE001
+                # 只有外部停止信号置位才算用户暂停；内部异常中止一律按失败记录，
+                # 否则引擎的「下载已取消」会掩盖真实错误，前端表现为任务自动暂停。
+                if stop_event.is_set():
+                    logger.info(f"网盘下载已暂停：{share_code}")
+                    if task_key not in self._discarded:
+                        store.upsert_task(task_key, {
+                            "state": "paused", "error": None,
+                            "dlspeed": None, "dlspeed_bytes": 0,
+                        })
+                else:
+                    logger.warn(f"网盘下载失败：{share_code} - {err}")
+                    if task_key not in self._discarded:
+                        store.upsert_task(task_key, {
+                            "state": "error", "error": str(err),
+                            "dlspeed": None, "dlspeed_bytes": 0,
+                        })
+            finally:
+                # 失败、取消或没有可下载文件时，任务目录可能为空；只回收空目录，
+                # 部分完成的文件保留给续传。
+                _remove_empty_dir(task_dir)
+                with self._lock:
+                    self._stops.pop(task_key, None)
+                    self._tasks.pop(task_key, None)
+
+    @staticmethod
+    def _ensure_local_space(directory: Path, total_size: int) -> None:
+        """
+        下载前检查本地磁盘余量，不足时直接失败并给出明确原因。
+
+        :param directory: 下载目录
+        :param total_size: 本次需要写入的字节数
+        :raises DownloadError: 余量不足时抛出
+        """
+        if total_size <= 0:
+            return
+        try:
+            free = shutil.disk_usage(directory).free
+        except OSError as error:
+            logger.debug(f"读取下载目录余量失败，跳过预检：{directory} - {error}")
+            return
+        if free < total_size * 1.05:
+            raise DownloadError(
+                f"本地磁盘余量不足：需要 {total_size} 字节，当前可用 {free} 字节"
+            )
 
     @staticmethod
     def _task_dir(download_dir: Path, share_code: str) -> Path:
@@ -452,47 +528,71 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         return download_dir / share_code
 
     def _collect_files(self, files: Sequence[ShareFile],
-                       episodes: Optional[Set[int]] = None) -> List[ShareFile]:
+                       episodes: Optional[Set[int]] = None,
+                       season: Optional[int] = None) -> List[ShareFile]:
         """
         过滤出待下载文件，并给不含季集标记的文件名补前缀。
 
         :param files: 分享内递归展开后的全部文件
         :param episodes: 目标集数集合；为空表示整包下载
+        :param season: 订阅目标季；为空时不做季过滤
         :return: 过滤后的文件条目
         """
         wanted = [item for item in files if not item.is_dir and self._wanted(item.name)]
-        wanted = self._filter_episodes(wanted, episodes)
-        return [replace(item, name=self._episode_name(item.name)) for item in wanted]
+        wanted = self._filter_episodes(wanted, episodes, season)
+        result: List[ShareFile] = []
+        used: Set[str] = set()
+        for item in wanted:
+            name = self._episode_name(item.name)
+            if name in used:
+                # 递归目录拍平后同名文件会互相覆盖；保留唯一前缀而不是静默丢弃。
+                prefix = _as_text(getattr(item, "file_id", ""))[:6] or "dup"
+                candidate = f"{prefix}_{name}"
+                while candidate in used:
+                    candidate = f"_{candidate}"
+                name = candidate
+            used.add(name)
+            result.append(replace(item, name=name))
+        return result
 
     @staticmethod
     def _filter_episodes(files: Sequence[ShareFile],
-                         episodes: Optional[Set[int]]) -> List[ShareFile]:
+                         episodes: Optional[Set[int]],
+                         season: Optional[int] = None) -> List[ShareFile]:
         """
-        只保留目标集数对应的文件。
+        只保留目标季与目标集数对应的文件。
 
         必须在补 `S01Exx` 前缀之前用原始文件名解析：补前缀会让原本解析不出的文件
         变得可解析，从而破坏「解析不确定就全下」的兜底语义。
 
         放行规则（任一命中即保留，宁可多下也不漏集）：
         没有目标集数、文件名解析不出唯一集数、集数在目标集合内则保留。
+        文件名带明确季号且与目标季不一致时，始终排除，避免 S02E05 被当作 S01E05。
 
         :param files: 分享内的文件条目
         :param episodes: 目标集数集合
+        :param season: 订阅目标季
         :return: 过滤后的文件条目
         """
         wanted = set(episodes or ())
-        if not wanted:
-            return list(files)
         kept: List[ShareFile] = []
         for item in files:
             if is_special_name(item.name):
                 continue
+            if season is not None:
+                matched = _SEASON_EPISODE_PATTERN.search(item.name)
+                if matched and int(matched.group(1)) != int(season):
+                    continue
+            if not wanted:
+                kept.append(item)
+                continue
             numbers = episode_numbers(item.name)
             if len(numbers) != 1 or numbers[0] in wanted:
                 kept.append(item)
-        logger.info(
-            f"目标集数 {sorted(wanted)}，分享内 {len(files)} 个文件，选中 {len(kept)} 个"
-        )
+        if wanted:
+            logger.info(
+                f"目标季 {season} 目标集数 {sorted(wanted)}，分享内 {len(files)} 个文件，选中 {len(kept)} 个"
+            )
         return kept
 
     @staticmethod
@@ -548,18 +648,11 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         """
         tuning = tuning or resolver.tuning
         multi_source = bool(tuning.multi_source)
-        links = tuple(resolver.resolve_file(
-            share_url, passcode, item, platform, multi_source=multi_source,
-            share_token=share_token,
-        ))
-        if not links:
-            raise DownloadError(f"无法获取下载直链：{item.name}")
-        size = int(item.size or links[0].size or 0)
-        is_hls = any(link.is_hls for link in links)
-        if not is_hls and size <= 0:
-            raise DownloadError(f"无法确定文件大小：{item.name}")
         target = download_dir / item.name
-        seen: List[DirectLink] = list(links)
+        seen: List[DirectLink] = []
+        size = int(item.size or 0)
+        started_at = time.monotonic()
+        links: Tuple[DirectLink, ...] = ()
 
         def url_provider(refresh: bool = False) -> Sequence[DirectLink]:
             """
@@ -579,12 +672,16 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             if fresh:
                 links = fresh
                 seen.extend(fresh)
+                store.add_cleanup_handles(
+                    task_key, self._handle_payloads(fresh),
+                )
             return links
 
         sample = {"at": time.monotonic(), "done": float(done_before)}
+        progress_state = {"at": 0.0, "percent": -100.0}
 
         def on_progress(percent: float) -> None:
-            """把单文件进度换算成整任务进度，并记录实时下载速度。"""
+            """把单文件进度换算成整任务进度，并按时间/百分比节流写入索引。"""
             done = done_before + size * max(min(float(percent), 100.0), 0.0) / 100.0
             now = time.monotonic()
             speed: Optional[float] = None
@@ -593,11 +690,29 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 speed = max(done - float(sample["done"]), 0.0) / elapsed
                 sample["at"], sample["done"] = now, done
             overall = (done / total_size * 100.0) if total_size > 0 else percent
+            if (
+                now - float(progress_state["at"]) < _PROGRESS_INTERVAL_SECONDS
+                and abs(overall - float(progress_state["percent"])) < _PROGRESS_DELTA_PERCENT
+            ):
+                return
+            progress_state["at"], progress_state["percent"] = now, overall
             store.update_progress(task_key, overall, dlspeed=speed)
 
         adapter = find_adapter(platform)
         max_concurrency = int(getattr(adapter, "max_concurrency", 0) or 0)
         try:
+            links = tuple(resolver.resolve_file(
+                share_url, passcode, item, platform, multi_source=multi_source,
+                share_token=share_token,
+            ))
+            if not links:
+                raise DownloadError(f"无法获取下载直链：{item.name}")
+            seen.extend(links)
+            store.add_cleanup_handles(task_key, self._handle_payloads(links))
+            size = int(item.size or links[0].size or 0)
+            is_hls = any(link.is_hls for link in links)
+            if not is_hls and size <= 0:
+                raise DownloadError(f"无法确定文件大小：{item.name}")
             if is_hls:
                 HlsDownloader(
                     target=target,
@@ -625,23 +740,64 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                     stop_event=stop_event,
                 ).run(url_provider)
         finally:
-            self._cleanup_links(resolver, seen)
+            self._cleanup_links(resolver, seen, task_key)
+            account_id = int(getattr(links[0], "account_id", 0) or 0) if links else 0
+            selection.record_account_speed(
+                account_id, size, max(time.monotonic() - started_at, 0.001),
+            )
 
     @staticmethod
-    def _cleanup_links(resolver: NetdiskResolveService, links: Sequence[DirectLink]) -> None:
+    def _handle_payloads(links: Sequence[DirectLink]) -> List[Dict[str, Any]]:
         """
-        清理下载过程中所有转存句柄，同一句柄只清理一次。
+        把直链上的转存句柄投影为可持久化字段。
+
+        :param links: 直链集合
+        :return: 句柄字段列表
+        """
+        payloads: List[Dict[str, Any]] = []
+        for link in links:
+            handle = link.cleanup_handle
+            if handle is None or not handle.directory_id:
+                continue
+            payloads.append({
+                "platform": handle.platform.value,
+                "account_id": int(handle.account_id or 0),
+                "directory_id": handle.directory_id,
+                "file_ids": list(handle.file_ids or ()),
+            })
+        return payloads
+
+    @staticmethod
+    def _cleanup_links(resolver: NetdiskResolveService, links: Sequence[DirectLink],
+                       task_key: str = "") -> None:
+        """
+        清理下载过程中所有转存句柄，同一目录只清理一次，单句柄失败不影响其余句柄。
 
         :param resolver: 取链服务
         :param links: 下载过程中使用过的直链
+        :param task_key: 任务标识，用于移除已完成的句柄登记
         """
-        handles = set()
+        handles: Dict[str, TransferHandle] = {}
         for link in links:
             handle = link.cleanup_handle
-            if handle is None or handle in handles:
+            if handle is None or not handle.directory_id:
                 continue
-            handles.add(handle)
-            resolver.cleanup(link)
+            handles.setdefault(handle.directory_id, handle)
+        for handle in handles.values():
+            try:
+                resolver.cleanup(DirectLink(
+                    url="",
+                    headers={},
+                    cleanup_handle=handle,
+                    account_id=handle.account_id,
+                ))
+            except Exception as err:  # noqa: BLE001 - 单个句柄失败不阻断其余清理
+                logger.warning(
+                    f"清理网盘转存句柄失败：{handle.platform.value} {handle.directory_id} - "
+                    f"{type(err).__name__}"
+                )
+        if task_key and handles:
+            store.remove_cleanup_handles(task_key, list(handles))
 
     # ---- 任务抽象 ----
 
@@ -684,6 +840,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 error=record.get("error"),
                 netdisk_platform=record.get("netdisk_platform"),
                 share_code=record.get("share_code"),
+                reconciled=bool(record.get("reconciled")),
                 save_path=record.get("save_path"),
                 content_path=record.get("path"),
                 category=record.get("category"),
@@ -743,9 +900,141 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                             candidate.unlink(missing_ok=True)
                         except Exception as err:  # noqa: BLE001
                             logger.warn(f"删除网盘下载文件失败：{candidate} - {err}")
+            self._cleanup_persisted_handles(task_hash, record)
+            task_dir = Path(record.get("path") or "")
+            if task_dir:
+                _remove_empty_dir(task_dir)
             self._discarded.add(task_hash)
             store.remove_task(task_hash)
         return True
+
+    def _cleanup_persisted_handles(self, task_hash: str, record: Dict[str, Any]) -> None:
+        """
+        清理任务记录中尚未完成的转存句柄，覆盖进程重启后的残留。
+
+        :param task_hash: 任务标识
+        :param record: 任务记录
+        """
+        handles = record.get("cleanup_handles") or []
+        if not handles:
+            return
+        links: List[DirectLink] = []
+        for item in handles:
+            if not isinstance(item, dict):
+                continue
+            platform = normalize_platform(item.get("platform"))
+            directory_id = _as_text(item.get("directory_id"))
+            if platform is None or not directory_id:
+                continue
+            links.append(DirectLink(
+                url="",
+                headers={},
+                cleanup_handle=TransferHandle(
+                    platform=platform,
+                    account_id=int(item.get("account_id") or 0),
+                    directory_id=directory_id,
+                    file_ids=tuple(item.get("file_ids") or ()),
+                ),
+                account_id=int(item.get("account_id") or 0),
+            ))
+        if links:
+            self._cleanup_links(NetdiskResolveService(), links, task_hash)
+
+    def cleanup_orphans(
+        self,
+        download_dirs: Sequence[str],
+        active_paths: Sequence[str] = (),
+        is_transferred: Optional[Callable[[str], bool]] = None,
+        empty_grace_seconds: float = 24 * 60 * 60,
+        nonempty_grace_seconds: float = 7 * 24 * 60 * 60,
+        record_ttl_seconds: float = 30 * 24 * 60 * 60,
+    ) -> Dict[str, int]:
+        """
+        清理孤儿下载目录、残留转存句柄与过期任务记录。
+
+        只处理不在活动任务引用中的直接子目录：空目录按较短宽限期删除；非空目录
+        必须全部文件都被 ``is_transferred`` 确认已整理后才删除。隐藏目录与回收站
+        目录始终跳过。
+
+        :param download_dirs: 下载根目录列表
+        :param active_paths: 活动任务占用的目录
+        :param is_transferred: 判断单个文件是否已整理的谓词；None 时只清空目录
+        :param empty_grace_seconds: 空目录宽限期，单位秒
+        :param nonempty_grace_seconds: 非空目录宽限期，单位秒
+        :param record_ttl_seconds: 终态任务记录保留时长，单位秒
+        :return: 各类清理数量统计
+        """
+        now = time.time()
+        active = {str(Path(item).resolve()) for item in active_paths if item}
+        stats = {
+            "empty_removed": 0,
+            "transferred_removed": 0,
+            "records_removed": 0,
+            "handles_cleaned": 0,
+        }
+        for root in download_dirs:
+            root_path = Path(root)
+            if not root_path.is_dir():
+                continue
+            try:
+                children = list(root_path.iterdir())
+            except OSError as error:
+                logger.warning(f"扫描网盘下载目录失败：{root_path} - {error}")
+                continue
+            for child in children:
+                if not child.is_dir() or child.is_symlink():
+                    continue
+                if child.name.startswith(".") or child.name in {"@Recycle", "#recycle", "@eaDir"}:
+                    continue
+                if str(child.resolve()) in active:
+                    continue
+                if not (child / _TASK_MARKER).exists():
+                    # 没有任务标记的目录可能是用户手动放置的内容，定时清理不处理。
+                    continue
+                try:
+                    age = now - child.stat().st_mtime
+                    files = [
+                        item for item in child.rglob("*")
+                        if item.is_file() and item.name != _TASK_MARKER
+                    ]
+                except OSError:
+                    continue
+                if not files:
+                    if age >= empty_grace_seconds and _remove_empty_dir(child):
+                        stats["empty_removed"] += 1
+                    continue
+                if is_transferred is None or age < nonempty_grace_seconds:
+                    continue
+                if not all(is_transferred(str(item)) for item in files):
+                    continue
+                try:
+                    shutil.rmtree(child)
+                    stats["transferred_removed"] += 1
+                except OSError as error:
+                    logger.warning(f"删除已整理网盘目录失败：{child} - {error}")
+        terminal_states = {"completed", "transferred", "error", "paused"}
+        for record in store.all_tasks():
+            task_hash = _as_text(record.get("hash"))
+            if not task_hash or str(record.get("state") or "") not in terminal_states:
+                continue
+            if record.get("cleanup_handles"):
+                self._cleanup_persisted_handles(task_hash, record)
+                stats["handles_cleaned"] += 1
+        stats["records_removed"] = store.prune_terminal_tasks(record_ttl_seconds)
+        return stats
+
+    def mark_reconciled(self, hashs: Union[str, list[str]],
+                        downloader: Optional[str] = None) -> None:
+        """
+        标记失败任务已完成对账，避免定时任务重复回滚订阅事实。
+
+        :param hashs: 任务标识或列表
+        :param downloader: 下载器实例名称，网盘任务忽略
+        """
+        targets = [hashs] if isinstance(hashs, str) else list(hashs or [])
+        for task_hash in targets:
+            if store.get_task(task_hash):
+                store.upsert_task(task_hash, {"reconciled": True})
 
     def transfer_completed(self, hashs: str, downloader: Optional[str] = None) -> None:
         """
@@ -805,7 +1094,8 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                       _as_text(record.get("passcode")), Path(download_dir),
                       record.get("category"),
                       set(record.get("episodes") or []) or None,
-                      _as_text(record.get("share_token")), None),
+                      _as_text(record.get("share_token")), None,
+                      record.get("season")),
                 daemon=True,
                 name=f"netdisk-download-{task_hash}",
             )

@@ -207,3 +207,95 @@ def remove_task(task_hash: str) -> None:
         tasks = _load()
         if tasks.pop(task_hash, None) is not None:
             _dump(tasks)
+
+
+def add_cleanup_handles(task_hash: str, handles: List[Dict[str, Any]]) -> None:
+    """
+    登记尚未清理的转存句柄，供进程重启后的补偿清理使用。
+
+    :param task_hash: 任务标识
+    :param handles: 句柄字段列表，按 directory_id 去重
+    """
+    if not handles:
+        return
+    with _STORE_LOCK:
+        tasks = _load()
+        record = tasks.get(task_hash)
+        if not record:
+            return
+        current = {
+            str(item.get("directory_id") or ""): item
+            for item in record.get("cleanup_handles") or []
+            if isinstance(item, dict)
+        }
+        for handle in handles:
+            directory_id = str(handle.get("directory_id") or "")
+            if directory_id:
+                current[directory_id] = handle
+        record["cleanup_handles"] = list(current.values())
+        record["updated_at"] = time.time()
+        _dump(tasks)
+
+
+def remove_cleanup_handles(task_hash: str, directory_ids: List[str]) -> None:
+    """
+    删除已经完成清理的转存句柄登记。
+
+    :param task_hash: 任务标识
+    :param directory_ids: 已清理的云端目录标识
+    """
+    removed = {str(item) for item in directory_ids if item}
+    if not removed:
+        return
+    with _STORE_LOCK:
+        tasks = _load()
+        record = tasks.get(task_hash)
+        if not record:
+            return
+        record["cleanup_handles"] = [
+            item for item in record.get("cleanup_handles") or []
+            if isinstance(item, dict) and str(item.get("directory_id") or "") not in removed
+        ]
+        record["updated_at"] = time.time()
+        _dump(tasks)
+
+
+def pending_cleanup_handles() -> List[Dict[str, Any]]:
+    """
+    返回全部任务中尚未清理的转存句柄快照。
+
+    :return: 含任务标识的句柄记录列表
+    """
+    with _STORE_LOCK:
+        result: List[Dict[str, Any]] = []
+        for task_hash, record in _load().items():
+            for handle in record.get("cleanup_handles") or []:
+                if isinstance(handle, dict):
+                    result.append({"task_hash": task_hash, **handle})
+        return result
+
+
+def prune_terminal_tasks(max_age_seconds: float) -> int:
+    """
+    裁剪超过保留期的终态任务记录。
+
+    :param max_age_seconds: 终态记录保留时长，单位秒
+    :return: 被删除的记录数
+    """
+    if max_age_seconds <= 0:
+        return 0
+    deadline = time.time() - float(max_age_seconds)
+    terminal_states = {"completed", "transferred", "error", "paused"}
+    removed = 0
+    with _STORE_LOCK:
+        tasks = _load()
+        for task_hash, record in list(tasks.items()):
+            if str(record.get("state") or "") not in terminal_states:
+                continue
+            if float(record.get("updated_at") or 0) >= deadline:
+                continue
+            tasks.pop(task_hash, None)
+            removed += 1
+        if removed:
+            _dump(tasks)
+    return removed
