@@ -35,6 +35,15 @@ _COOKIE_DOMAINS: dict[NetdiskPlatform, tuple[str, ...]] = {
     NetdiskPlatform.XUNLEI: (".xunlei.com",),
 }
 
+# 各平台网盘主页域名，用于登录后把画面切回主页面。
+_PRIMARY_HOSTS: dict[NetdiskPlatform, str] = {
+    NetdiskPlatform.BAIDU: "pan.baidu.com",
+}
+
+# 明确的登录弹窗域名：微信扫码与百度登录。
+_AUTH_POPUP_HOSTS: tuple[str, ...] = ("open.weixin.qq.com", "login.weixin.qq.com")
+_BAIDU_AUTH_HOSTS: tuple[str, ...] = ("passport.baidu.com", "wappass.baidu.com")
+
 # 扫码会话有效期，超时后关闭浏览器。
 _SESSION_TTL_SECONDS = 900
 # 页面加载等待上限。
@@ -83,13 +92,19 @@ _XUNLEI_READ_JS = f"""
         break;
       }}
     }} catch (e) {{}}
+    var pageNick = '';
+    try {{
+      var store = window.$nuxt && window.$nuxt.$store && window.$nuxt.$store.state;
+      var cur = store && store.users && store.users.curUser;
+      pageNick = (cur && (cur.nick_name || cur.nickname)) || '';
+    }} catch (e) {{}}
     return JSON.stringify({{
       access_token: data.access_token || data.accessToken || '',
       refresh_token: data.refresh_token || data.refreshToken || '',
       expires_in: data.expires_in || data.expiresIn || '',
       deviceid: data.device_id || data.deviceId || device,
       captcha: captcha || data.captcha_token || data.captchaToken || '',
-      nickname: data.nickname || data.nick_name || data.nickName || data.user_name || data.userName || data.name || ''
+      nickname: pageNick || data.nickname || data.nick_name || data.nickName || data.user_name || data.userName || data.name || ''
     }});
   }} catch (e) {{
     return '';
@@ -567,6 +582,19 @@ def _drag(
     )
 
 
+def _host_of(page: Any) -> str:
+    """
+    读取页面 URL 的主机名。
+
+    :param page: 页面对象
+    :return: 小写主机名；不可读时返回空串
+    """
+    try:
+        return (urlsplit(str(getattr(page, "url", "") or "")).hostname or "").lower()
+    except Exception:  # noqa: BLE001 - URL 不可读时按未知主机处理
+        return ""
+
+
 @dataclass(slots=True)
 class _QrSession:
     """
@@ -587,6 +615,8 @@ class _QrSession:
     expires_at: float
     helper: BrowserSessionHelper
     post_login_navigated: bool = False
+    # 会话启动时记录的主页面引用，避免用 pages[0] 盲猜。
+    main_page: Any = None
 
 
 class BrowserQrLoginAdapter:
@@ -644,6 +674,11 @@ class BrowserQrLoginAdapter:
                 lambda session: self._capture(session, login_url),
                 timeout=_PAGE_TIMEOUT_SECONDS,
             )
+            main_page = helper.with_session(
+                session_key,
+                lambda session: session.active_page,
+                timeout=_PAGE_TIMEOUT_SECONDS,
+            )
         except Exception as error:  # noqa: BLE001 - 浏览器启动失败统一归类
             vnc_bridge().release(session_id)
             logger.warning(f"网盘扫码登录启动失败：platform={platform.value} error={type(error).__name__}")
@@ -660,6 +695,7 @@ class BrowserQrLoginAdapter:
             created_at=now,
             expires_at=now + _SESSION_TTL_SECONDS,
             helper=helper,
+            main_page=main_page,
         )
         with self._lock:
             self._sessions[session_id] = session
@@ -697,8 +733,7 @@ class BrowserQrLoginAdapter:
             return LoginResult(status="pending", message="正在等待登录")
         if not credential:
             return LoginResult(status="pending", message="正在等待登录")
-        if session.platform is NetdiskPlatform.BAIDU:
-            self._focus_main_page(session)
+        # 只返回凭据；页面切换/关闭由服务层在凭据校验通过后显式触发。
         return LoginResult(status="success", credential=credential, message="登录成功")
 
     def _read_credential(
@@ -967,14 +1002,32 @@ class BrowserQrLoginAdapter:
         except Exception as error:  # noqa: BLE001 - 停止失败只记录
             logger.warning(f"停止网页登录画面推送失败：error={type(error).__name__}")
 
-    def _focus_main_page(self, session: _QrSession) -> None:
+    def focus_main_page(self, session_id: str, *, close_popups: bool = False) -> None:
         """
-        关闭登录弹窗并把实时画面切回主页面。
+        把网页登录画面切回主页面。
 
-        百度微信扫码会在新标签页完成，登录态写入 Cookie 后弹窗常停留在
-        「请稍后」页；检测到凭据后应回到父页面，让用户看到已登录的网盘。
+        服务层在凭据校验通过后调用。默认只把主页面置前并切换实时画面，
+        不关闭任何页面；`close_popups` 为真时只关闭明确的微信/百度登录弹窗，
+        且永远不会关闭主页面。
+
+        :param session_id: 会话标识
+        :param close_popups: 是否关闭明确的登录弹窗
+        """
+        session = self._sessions.get(session_id)
+        if session is None or session.platform is not NetdiskPlatform.BAIDU:
+            return
+        self._focus_main_page(session, close_popups=close_popups)
+
+    def _focus_main_page(self, session: _QrSession, *, close_popups: bool = False) -> None:
+        """
+        把实时画面切回主页面，可选关闭登录弹窗。
+
+        百度微信扫码会在新标签页完成，登录态确认后弹窗常停留在「请稍后」页；
+        回到主页面让用户看到已登录的网盘。关闭动作只针对明确的登录域名，
+        避免误关主页面或用户自己打开的标签页。
 
         :param session: 扫码会话
+        :param close_popups: 是否关闭明确的登录弹窗
         """
 
         def act(state: _BrowserSessionState) -> None:
@@ -982,14 +1035,19 @@ class BrowserQrLoginAdapter:
                 pages = list(cast(Any, state.context).pages)
             except Exception:  # noqa: BLE001 - 页面列表不可读时保持现状
                 return
-            if len(pages) <= 1:
+            if not pages:
                 return
-            main = pages[0]
-            for extra in pages[1:]:
-                try:
-                    extra.close()
-                except Exception:  # noqa: BLE001 - 弹窗可能已自行关闭
-                    continue
+            main = self._main_page(session, pages)
+            if main is None:
+                return
+            if close_popups:
+                for page in pages:
+                    if page is main or not self._is_auth_popup(page):
+                        continue
+                    try:
+                        page.close()
+                    except Exception:  # noqa: BLE001 - 弹窗可能已自行关闭
+                        continue
             try:
                 main.bring_to_front()
             except Exception:  # noqa: BLE001 - 部分页面不支持置前
@@ -1000,6 +1058,57 @@ class BrowserQrLoginAdapter:
             session.helper.with_session(session.session_key, act, timeout=_PAGE_TIMEOUT_SECONDS)
         except Exception as error:  # noqa: BLE001 - 切页失败不影响登录结果
             logger.warning(f"切换网页登录主页面失败：error={type(error).__name__}")
+
+    def _main_page(self, session: _QrSession, pages: list[Any]) -> Optional[Any]:
+        """
+        定位会话的主页面。
+
+        优先使用启动时记录的页面引用；失效时按平台主域名回退，
+        再回退到第一个非登录弹窗页面，最后才使用 `pages[0]`。
+
+        :param session: 扫码会话
+        :param pages: 当前页面列表
+        :return: 主页面；无法定位时返回 None
+        """
+        main = session.main_page
+        if main is not None:
+            try:
+                if not main.is_closed() and any(main is page for page in pages):
+                    return main
+            except Exception:  # noqa: BLE001 - 页面对象可能已失效
+                pass
+        primary_host = _PRIMARY_HOSTS.get(session.platform, "")
+        if primary_host:
+            for page in pages:
+                if _host_of(page) == primary_host:
+                    return page
+        for page in pages:
+            if not self._is_auth_popup(page):
+                return page
+        return pages[0]
+
+    @staticmethod
+    def _is_auth_popup(page: Any) -> bool:
+        """
+        判断页面是否为明确的登录弹窗。
+
+        只认微信扫码域名与百度登录域名的弹窗；其他页面一律视为非弹窗，
+        避免误关用户自己的标签页。
+
+        :param page: 页面对象
+        :return: 是否登录弹窗
+        """
+        host = _host_of(page)
+        if not host:
+            return False
+        if any(host == item or host.endswith("." + item) for item in _AUTH_POPUP_HOSTS):
+            return True
+        if any(host == item or host.endswith("." + item) for item in _BAIDU_AUTH_HOSTS):
+            try:
+                return page.opener() is not None
+            except Exception:  # noqa: BLE001 - opener 不可读时保守处理
+                return False
+        return False
 
     def _switch_stream(self, session_id: str, page: Any) -> None:
         """

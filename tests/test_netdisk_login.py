@@ -108,6 +108,7 @@ class _LoginAdapter:
     def __init__(self) -> None:
         self.started: list[tuple] = []
         self.cancelled: list[str] = []
+        self.focus_calls: list[str] = []
         self.result = LoginResult(status="success", credential={"token": "jwt-qr"})
 
     def start(self, platform, login_url, account_id=None):
@@ -121,6 +122,12 @@ class _LoginAdapter:
 
     def poll(self, session_id):
         return self.result
+
+    def focus_main_page(self, session_id):
+        """
+        记录登录态确认后切回主页面的调用。
+        """
+        self.focus_calls.append(session_id)
 
     def cancel(self, session_id):
         self.cancelled.append(session_id)
@@ -536,3 +543,30 @@ def test_qr_login_waits_until_login_ready(env, monkeypatch):
 
     assert result.status == "pending"
     assert store.records == {}
+
+
+def test_qr_login_focuses_main_page_after_detected(env):
+    """
+    登录态校验通过后调用网页登录适配器切回主页面。
+    """
+    service, _, login_adapter, _ = env
+    service.start_qr("pan123", name="扫码账号")
+
+    result = service.poll_qr("s-1")
+
+    assert result.status == "detected"
+    assert login_adapter.focus_calls == ["s-1"]
+
+
+def test_qr_login_does_not_focus_until_login_ready(env, monkeypatch):
+    """
+    登录态尚未就绪时不得触发切页，避免关闭平台登录弹窗。
+    """
+    service, _, login_adapter, _ = env
+    monkeypatch.setattr(_Adapter, "login_ready", lambda self, credential: False)
+    service.start_qr("pan123", name="扫码账号")
+
+    result = service.poll_qr("s-1")
+
+    assert result.status == "pending"
+    assert login_adapter.focus_calls == []

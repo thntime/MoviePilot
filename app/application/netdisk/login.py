@@ -370,6 +370,14 @@ class NetdiskLoginService:
         with _PENDING_LOCK:
             context.credential = dict(result.credential)
             context.account_name = account_name
+        # 登录态已由平台接口确认，再把画面切回主页面。
+        # 默认只置前、不关闭弹窗；弹窗由确认或取消时的会话销毁释放。
+        focus = getattr(registry.get_login_adapter(), "focus_main_page", None)
+        if focus is not None:
+            try:
+                focus(session_id)
+            except Exception:  # noqa: BLE001 - 切页失败不影响已检测到的登录态
+                pass
         return LoginResult(
             status="detected",
             message="已检测到登录态，请确认保存",

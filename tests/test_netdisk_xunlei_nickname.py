@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from app.adapters.external.netdisk import xunlei as xunlei_module
 from app.adapters.external.netdisk.base import NetdiskHttp
+from app.adapters.external.netdisk.login import browser as browser_module
+from app.domain.netdisk import NetdiskPlatform
 
 
 def _patch_about(monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any]) -> None:
@@ -83,3 +86,51 @@ def test_login_account_name_returns_empty(monkeypatch: pytest.MonkeyPatch) -> No
 
     adapter = xunlei_module.XunleiAdapter()
     assert adapter.login_account_name({"access_token": "a", "deviceid": "d"}) == ""
+
+
+class _FakePage:
+    """
+    返回预设脚本结果的页面替身。
+    """
+
+    def __init__(self, url: str, result: str) -> None:
+        self.url = url
+        self._result = result
+
+    def evaluate(self, script: str) -> str:
+        """
+        返回预置的脚本结果。
+        """
+        del script
+        return self._result
+
+
+class _FakeContext:
+    """
+    只提供 pages 的浏览器上下文替身。
+    """
+
+    def __init__(self, pages: list[_FakePage]) -> None:
+        self.pages = pages
+
+    def cookies(self) -> list[dict[str, str]]:
+        """
+        返回空 Cookie 列表。
+        """
+        return []
+
+
+def test_xunlei_credential_includes_page_nickname() -> None:
+    """
+    页面登录态读到的昵称写入凭据，供登录确认直接展示。
+    """
+    page = _FakePage(
+        "https://pan.xunlei.com/",
+        '{"access_token":"token","deviceid":"device","nickname":"像丫头"}',
+    )
+    state = SimpleNamespace(context=_FakeContext([page]), active_page=page)
+    adapter = browser_module.BrowserQrLoginAdapter()
+
+    credential = adapter._read_credential(state, NetdiskPlatform.XUNLEI)  # pylint: disable=protected-access
+
+    assert credential["nickname"] == "像丫头"

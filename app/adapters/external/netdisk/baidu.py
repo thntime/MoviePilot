@@ -1235,6 +1235,18 @@ class BaiduAdapter(BaseNetdiskAdapter):
         result = payload.get("result")
         return as_text(result.get("username")) if isinstance(result, Mapping) else ""
 
+    def login_ready(self, credential: Mapping[str, str]) -> bool:
+        """
+        判断百度网页登录是否已拿到可进入校验的登录态。
+
+        百度登录页一打开就会写入 `BAIDUID` 等匿名 Cookie，只有出现 `BDUSS`
+        才代表用户真正完成了登录。
+
+        :param credential: 浏览器抓到的凭据
+        :return: 是否已拿到 BDUSS
+        """
+        return "BDUSS=" in _credential_cookie(credential)
+
     def validate_credential(self, credential: Mapping[str, str]) -> AccountProbe:
         """
         校验凭据：先检查 BDUSS，再调用账号信息接口确认。
