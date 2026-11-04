@@ -335,7 +335,7 @@ class UCAdapter(BaseNetdiskAdapter):
                     headers=headers,
                     size=size or file.size,
                     account_id=account_id,
-                    is_hls=True,
+                    is_hls=False,
                 )
         url, size = self._download_link(ref, file, stoken, account)
         return DirectLink(

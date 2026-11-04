@@ -516,6 +516,24 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
             kwargs={"job_id": "netdisk_account_refresh"},
         )
 
+        # 网盘下载目录清理与后台失败对账
+        self._scheduler.add_job(
+            self.start,
+            "interval",
+            id="netdisk_cleanup",
+            name="网盘下载目录清理",
+            minutes=30,
+            kwargs={"job_id": "netdisk_cleanup"},
+        )
+        self._scheduler.add_job(
+            self.start,
+            "interval",
+            id="netdisk_failure_reconcile",
+            name="网盘下载失败对账",
+            minutes=5,
+            kwargs={"job_id": "netdisk_failure_reconcile"},
+        )
+
         # 推荐缓存
         self._scheduler.add_job(
             self.start,

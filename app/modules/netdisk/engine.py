@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from app.adapters.network.http import RequestUtils
 from app.domain.netdisk import DirectLink
@@ -53,6 +53,54 @@ RANGE_IGNORED_TOLERANCE = 3
 READ_BUFFER = 64 * 1024
 # 小于该大小不分片。
 MIN_SPLIT_SIZE = 5 * 1024 * 1024
+# 网盘 CDN 直链走直连，避免宿主代理按域名/协议分流导致下载失败或 IPv6 解析异常。
+_DIRECT_PROXIES = {"http": "", "https": ""}
+
+
+def _sanitize_url(url: str) -> str:
+    """
+    对直链中的方括号做最小转义，兼容 Python 3.14 更严格的 IPv6 URL 解析。
+
+    合法 IPv6 主机（``[::1]``）保留；路径或查询中的方括号按 RFC 3986 编码。
+    无法解析时方括号不可能是合法 IPv6 主机，直接编码后交给 HTTP 客户端重试。
+
+    :param url: 原始直链
+    :return: 可安全交给 requests 的直链
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        logger.warning(
+            f"网盘直链 URL 解析失败，按字面转义方括号后重试：{url.split('?', 1)[0][:120]}"
+        )
+        return url.replace("[", "%5B").replace("]", "%5D")
+    if (
+        "[" not in parts.path and "]" not in parts.path
+        and "[" not in parts.query and "]" not in parts.query
+    ):
+        return url
+    path = parts.path.replace("[", "%5B").replace("]", "%5D")
+    query = parts.query.replace("[", "%5B").replace("]", "%5D")
+    return urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
+
+
+def _safe_urljoin(base_url: str, target: str) -> str:
+    """
+    安全拼接 HLS 地址，避免 Python 3.14 对未编码方括号抛出 IPv6 解析错误。
+
+    :param base_url: 播放列表地址
+    :param target: 相对或绝对子地址
+    :return: 拼接后的地址
+    """
+    safe_base = _sanitize_url(base_url)
+    safe_target = _sanitize_url(target)
+    try:
+        return urljoin(safe_base, safe_target)
+    except ValueError:
+        return urljoin(
+            safe_base.replace("[", "%5B").replace("]", "%5D"),
+            safe_target.replace("[", "%5B").replace("]", "%5D"),
+        )
 
 
 class DownloadError(Exception):
@@ -76,6 +124,14 @@ class DownloadCancelled(Exception):
 class LinkExpired(Exception):
     """
     直链失效（403/412 或返回 HTML），需要刷新会话后重新取链。
+    """
+
+
+class NotHls(DownloadError):
+    """
+    直链被标记为 HLS，但返回内容不是 m3u8 播放列表。
+
+    常见于网盘把视频预览地址直接返回为 MP4；调用方应回退普通分片下载。
     """
 
 
@@ -613,7 +669,9 @@ class ChunkedDownloader:
             headers = dict(link.headers)
             headers["Range"] = f"bytes={chunk.position}-{chunk.end}"
             try:
-                with RequestUtils(timeout=30).get_stream(link.url, headers=headers) as response:
+                with RequestUtils(timeout=30, proxies=_DIRECT_PROXIES).get_stream(
+                    _sanitize_url(link.url), headers=headers
+                ) as response:
                     chunk.response = response
                     self._consume(chunk, response)
             except RangeIgnored:
@@ -700,7 +758,9 @@ class ChunkedDownloader:
             headers.pop("Range", None)
             position = 0
             try:
-                with RequestUtils(timeout=30).get_stream(link.url, headers=headers) as response:
+                with RequestUtils(timeout=30, proxies=_DIRECT_PROXIES).get_stream(
+                    _sanitize_url(link.url), headers=headers
+                ) as response:
                     if response is None or int(getattr(response, "status_code", 0) or 0) != 200:
                         raise DownloadError("单流回退失败：响应异常")
                     content_type = str(getattr(response, "headers", {}).get("Content-Type") or "")
@@ -854,11 +914,11 @@ def parse_m3u8(text: str, base_url: str) -> HlsPlaylist:
             continue
         map_match = _MAP_PATTERN.match(line)
         if map_match:
-            init_segments.append(urljoin(base_url, map_match.group(1)))
+            init_segments.append(_safe_urljoin(base_url, map_match.group(1)))
             continue
         if line.startswith("#"):
             continue
-        segments.append(urljoin(base_url, line))
+        segments.append(_safe_urljoin(base_url, line))
     return HlsPlaylist(
         segments=tuple(segments),
         init_segments=tuple(init_segments),
@@ -888,7 +948,7 @@ def _pick_variant(lines: Sequence[str], base_url: str) -> str:
             continue
         if bandwidth > best_bandwidth:
             best_bandwidth = bandwidth
-            best_url = urljoin(base_url, target)
+            best_url = _safe_urljoin(base_url, target)
     return best_url
 
 
@@ -967,9 +1027,13 @@ class HlsDownloader:
         """
         link = self.links[0]
         text = self._fetch_text(link, link.url, url_provider)
+        if not text.lstrip().startswith("#EXTM3U"):
+            raise NotHls("HLS 直链返回非 m3u8 内容")
         playlist = parse_m3u8(text, link.url)
         if playlist.variant_url:
             text = self._fetch_text(link, playlist.variant_url, url_provider)
+            if not text.lstrip().startswith("#EXTM3U"):
+                raise NotHls("HLS 子列表返回非 m3u8 内容")
             playlist = parse_m3u8(text, playlist.variant_url)
         return playlist
 
@@ -1040,7 +1104,9 @@ class HlsDownloader:
         """
         del url_provider
         headers = dict(link.headers)
-        with RequestUtils(timeout=30).get_stream(url, headers=headers) as response:
+        with RequestUtils(timeout=30, proxies=_DIRECT_PROXIES).get_stream(
+            _sanitize_url(url), headers=headers
+        ) as response:
             if response is None:
                 raise DownloadError("HLS 请求失败：网络不可达")
             status = int(getattr(response, "status_code", 0) or 0)

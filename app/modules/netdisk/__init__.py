@@ -36,6 +36,7 @@ from app.modules.netdisk.engine import (
     ChunkedDownloader,
     DownloadError,
     HlsDownloader,
+    NotHls,
 )
 from app.runtime.log import logger
 from app.schemas.dashboard import DownloaderInfo
@@ -714,15 +715,21 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             if not is_hls and size <= 0:
                 raise DownloadError(f"无法确定文件大小：{item.name}")
             if is_hls:
-                HlsDownloader(
-                    target=target,
-                    links=links,
-                    retries=tuning.retries,
-                    buffer_size=tuning.buffer_size,
-                    on_progress=on_progress,
-                    stop_event=stop_event,
-                ).run(url_provider)
-            else:
+                try:
+                    HlsDownloader(
+                        target=target,
+                        links=links,
+                        retries=tuning.retries,
+                        buffer_size=tuning.buffer_size,
+                        on_progress=on_progress,
+                        stop_event=stop_event,
+                    ).run(url_provider)
+                except NotHls:
+                    logger.warning(f"网盘直链不是 m3u8，回退普通下载：{item.name}")
+                    is_hls = False
+            if not is_hls:
+                if size <= 0:
+                    raise DownloadError(f"无法确定文件大小：{item.name}")
                 ChunkedDownloader(
                     target=target,
                     total=size,

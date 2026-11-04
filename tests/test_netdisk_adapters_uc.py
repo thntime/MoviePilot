@@ -283,17 +283,17 @@ def test_resolve_regular_file_returns_direct_link(
     assert link.headers["Referer"] == "https://drive.uc.cn/"
 
 
-def test_resolve_video_marks_hls(
+def test_resolve_video_prefers_direct_preview(
     adapter: UCAdapter,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    视频应走预览接口取播放地址，并标记为 HLS。
+    视频应走预览接口取原画直链，并按 YunX 语义标记为普通直链（非 HLS）。
     """
     preview_payload = {
         "status": 200,
         "code": 0,
-        "data": {"play_info": {"url": "https://cdn.uc.cn/v/index.m3u8", "size": 2048}},
+        "data": {"play_info": {"url": "https://cdn.uc.cn/v/index.mp4", "size": 2048}},
     }
     calls = _install(
         monkeypatch,
@@ -305,8 +305,8 @@ def test_resolve_video_marks_hls(
 
     link = adapter.resolve(REF, ShareFile(file_id="f9", name="影片.mp4", size=1024, token="tok-9"), ACCOUNT)
 
-    assert link.url == "https://cdn.uc.cn/v/index.m3u8"
-    assert link.is_hls is True
+    assert link.url == "https://cdn.uc.cn/v/index.mp4"
+    assert link.is_hls is False
     assert link.size == 2048
     assert not any("file/download" in call["url"] for call in calls)
 
