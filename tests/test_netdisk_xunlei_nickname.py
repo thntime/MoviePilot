@@ -31,6 +31,13 @@ def _patch_about(monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any]) -> No
         return payload
 
     monkeypatch.setattr(NetdiskHttp, "get_json", fake_get_json)
+    # captcha 现签需要真实网络；昵称测试只关心 about 解析。
+    xunlei_module.XunleiAdapter._captcha_cache.clear()
+    monkeypatch.setattr(
+        xunlei_module.XunleiAdapter,
+        "_init_captcha",
+        lambda self, device, access: ("fresh-captcha", 9e18),
+    )
 
 
 def test_login_account_name_from_data_user(monkeypatch: pytest.MonkeyPatch) -> None:

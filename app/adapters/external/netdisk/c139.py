@@ -525,6 +525,7 @@ class C139Adapter(BaseNetdiskAdapter):
         account: Optional[NetdiskAccountRecord],
         *,
         allow_transfer: bool = True,
+        transfer_first: bool = False,
     ) -> DirectLink:
         """
         换取分享文件的直链。
@@ -535,6 +536,7 @@ class C139Adapter(BaseNetdiskAdapter):
         :param file: 目标文件
         :param account: 取链账号
         :param allow_transfer: 是否允许转存兜底，本平台忽略
+        :param transfer_first: 是否优先转存；本平台免转存，参数仅对齐接口
         :return: 直链及其账号 Cookie 与 UA
         :raises NetdiskError: 登录态缺失、分享失效或接口失败时抛出
         """

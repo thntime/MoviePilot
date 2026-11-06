@@ -47,6 +47,10 @@ class _ReconcileChain(DownloadFailureReconcileOwner):
         """记录告警消息。"""
         self.marked.append(("message", message))
 
+    def _download_failure_ttl(self, error_msg):
+        """非容量失败按瞬时冷却处理。"""
+        return 3600
+
     def is_download_file_transferred(self, fullpath: str) -> bool:
         """复用真实实现。"""
         return DownloadFailureReconcileOwner.is_download_file_transferred(self, fullpath)
@@ -83,11 +87,12 @@ def test_is_download_file_transferred_requires_deleted_state() -> None:
 
 def test_reconcile_rolls_back_and_marks_task(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    对账任务回滚订阅集数、冷却平台、标记任务并触发重新搜索。
+    容量不足的任务回滚订阅集数、只冷却账号、标记任务并触发重新搜索。
     """
     torrent = SimpleNamespace(
         netdisk_platform="quark", state="error", hash="h1", reconciled=False,
-        error="", title="示例",
+        error="剩余空间不足：需要 100 字节，当前可用 1 字节", title="示例",
+        account_id=7,
     )
     history = SimpleNamespace(
         media_source="tmdb", media_id="100", seasons="S01", episodes="E05",
@@ -122,8 +127,49 @@ def test_reconcile_rolls_back_and_marks_task(monkeypatch: pytest.MonkeyPatch) ->
     assert rolled == [(7, [5])]
     assert finished.wait(1.0)
     assert searched == [7]
-    assert selection.is_platform_cooled(NetdiskPlatform.QUARK)
-    assert chain.marked == [("mark_reconciled", {"hashs": ["h1"]})]
+    assert selection.is_account_cooled(7)
+    assert not selection.is_platform_cooled(NetdiskPlatform.QUARK)
+    assert ("mark_reconciled", {"hashs": ["h1"]}) in chain.marked
+    assert any(item[0] == "message" for item in chain.marked)
+
+
+def test_reconcile_does_not_cool_platform_for_non_capacity_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    解析/网络类失败只标记对账，不能把整个平台冷却，否则一次代码异常会阻塞后续全部任务。
+    """
+    torrent = SimpleNamespace(
+        netdisk_platform="uc", state="error", hash="h2", reconciled=False,
+        error="分享文件解析失败，请检查文件名或分享内容", title="示例",
+    )
+    history = SimpleNamespace(
+        media_source="tmdb", media_id="100", seasons="S01", episodes="E05",
+        note={"source": 'Subscribe|{"id": 7}'},
+    )
+    chain = _ReconcileChain([torrent], history)
+
+    class FakeSubscribeChain:
+        """避免测试触发真实订阅搜索。"""
+
+        @staticmethod
+        def parse_subscribe_source_keyword(source: str):
+            """解析测试来源。"""
+            return {"id": 7} if source.startswith("Subscribe|") else None
+
+        def rollback_download_facts(self, subscribe_id, episodes):
+            """忽略回滚结果。"""
+            return True
+
+        def search(self, sid=None, **kwargs):
+            """忽略搜索。"""
+            return None
+
+    monkeypatch.setattr("app.chain.subscribe.facade.SubscribeChain", FakeSubscribeChain)
+
+    assert chain.reconcile_netdisk_failures() == 1
+    assert not selection.is_platform_cooled(NetdiskPlatform.UC)
+    assert chain.marked == [("mark_reconciled", {"hashs": ["h2"]})]
 
 
 class _CompletionChain(SubscribeCompletionOwner):
@@ -153,3 +199,35 @@ def test_rollback_download_facts_removes_note_and_priority() -> None:
     assert chain.rollback_download_facts(7, [5]) is True
     assert chain.updated["note"] == [1, 2]
     assert chain.updated["episode_priority"] == {"1": 80, "2": 90}
+
+
+def test_capacity_ttl_is_thirty_minutes() -> None:
+    """
+    容量类失败使用 30 分钟专用冷却，短于普通瞬时失败。
+    """
+    from app.chain.download.failure import (
+        DOWNLOAD_FAILURE_CAPACITY_TTL_SECONDS,
+        DownloadFailureOwner,
+    )
+
+    assert DOWNLOAD_FAILURE_CAPACITY_TTL_SECONDS == 30 * 60
+    assert DownloadFailureOwner._download_failure_ttl(
+        "网盘账号剩余空间不足：需要 100 字节，可用 1 字节"
+    ) == DOWNLOAD_FAILURE_CAPACITY_TTL_SECONDS
+
+
+def test_failed_episodes_skips_reconciled_tasks() -> None:
+    """
+    已对账的失败任务不能再污染订阅缺集计算，否则会反复重下。
+    """
+    torrent = SimpleNamespace(
+        netdisk_platform="quark", state="error", hash="h9", reconciled=True,
+        error="空间不足", title="示例",
+    )
+    history = SimpleNamespace(
+        media_source="tmdb", media_id="100", seasons="S01", episodes="E05",
+        note={"source": 'Subscribe|{"id": 7}'},
+    )
+    chain = _ReconcileChain([torrent], history)
+
+    assert chain.failed_netdisk_episodes("tmdb", "100", 1) == set()

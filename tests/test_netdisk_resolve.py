@@ -68,11 +68,12 @@ class _Adapter(BaseNetdiskAdapter):
         """
         return [ShareFile(file_id="f2", name="b.mp4", size=5)]
 
-    def resolve(self, ref, file, account, *, allow_transfer=True):
+    def resolve(self, ref, file, account, *, allow_transfer=True, transfer_first=False):
         """
         记录调用参数并按需失败。
         """
         self.resolve_calls.append((account.id if account else 0, allow_transfer))
+        self.last_transfer_first = transfer_first
         self.last_allow_transfer = allow_transfer
         if self.fail_times > 0:
             self.fail_times -= 1

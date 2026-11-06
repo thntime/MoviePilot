@@ -2,6 +2,7 @@
 订阅链路对网盘整包按缺失集拆包的测试。
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -96,6 +97,59 @@ def _patch_walk(monkeypatch, episode_numbers):
         )
 
     monkeypatch.setattr(NetdiskResolveService, "walk", fake_walk)
+
+
+def _patch_walk_paths(monkeypatch, paths):
+    """
+    让网盘取链服务返回带相对路径的文件清单。
+    """
+    files = tuple(
+        ShareFile(file_id=f"f{index}", name=Path(path).name, size=100, path=path)
+        for index, path in enumerate(paths)
+    )
+
+    def fake_walk(self, url, password=None, platform=None, account_id=None, **kwargs):
+        return ResolvedShare(
+            ref=ShareRef(platform=NetdiskPlatform.QUARK, share_id="abc123", url=url),
+            detail=ShareDetail(title="小城良方", size=len(files) * 100, files=files),
+            files=files,
+        )
+
+    monkeypatch.setattr(NetdiskResolveService, "walk", fake_walk)
+
+
+def _batch_run(chain):
+    """
+    构造只用于直接核对阶段内部判定的批量状态。
+    """
+    options = {
+        "save_path": None, "channel": None, "source": None, "userid": None,
+        "username": None, "downloader": None, "custom_words": None, "governance": None,
+    }
+    return download_batch._BatchDownloadRun(chain, [], {}, options, None)
+
+
+def test_netdisk_season_episodes_groups_files_by_season(batch, monkeypatch):
+    """
+    同一分享内按季归集集号，无法解析季号的文件归入 None。
+    """
+    _patch_walk_paths(monkeypatch, ["S01/01.mp4", "S01/02.mp4", "S02/05.mp4", "03.mp4"])
+    run = _batch_run(batch.chain)
+
+    assert run._netdisk_season_episodes(_context().torrent_info) == {
+        1: {1, 2}, 2: {5}, None: {3},
+    }
+    assert run._netdisk_episodes(_context().torrent_info) == [1, 2, 3, 5]
+
+
+def test_netdisk_season_episodes_ignores_non_video_files(batch, monkeypatch):
+    """
+    字幕和图片不参与季集统计，没有可解析集数时返回 None。
+    """
+    _patch_walk_paths(monkeypatch, ["S01/cover.jpg", "S01/01.ass"])
+    run = _batch_run(batch.chain)
+
+    assert run._netdisk_season_episodes(_context().torrent_info) is None
 
 
 def test_netdisk_full_pack_submits_only_missing_episodes(batch, monkeypatch):

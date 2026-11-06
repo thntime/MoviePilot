@@ -147,6 +147,7 @@ class NetdiskAccountView(BaseModel):
     nickname: str = Field("", description="账号昵称/手机号")
     quota_used: int = Field(0, description="已用空间")
     quota_total: int = Field(0, description="总空间")
+    speed: float = Field(0.0, description="账号平均下载速度，单位字节每秒")
 
 
 class NetdiskAccountDetailView(NetdiskAccountView):
@@ -167,6 +168,10 @@ class NetdiskData(BaseModel):
     platforms: list[NetdiskPlatformInfo] = Field(default_factory=list, description="平台列表")
     accounts: list[NetdiskAccountView] = Field(default_factory=list, description="账号列表")
     account: Optional[NetdiskAccountDetailView] = Field(default=None, description="单个账号；详情接口附带明文凭据")
+    checked: int = Field(0, description="本次检测的账号总数")
+    active: int = Field(0, description="检测为有效的账号数")
+    expired: int = Field(0, description="登录态失效的账号数")
+    failed: int = Field(0, description="检测失败或状态未知的账号数")
     session_id: Optional[str] = Field(default=None, description="扫码会话标识")
     ticket: Optional[str] = Field(default=None, description="WebSocket 一次性票据")
     platform: Optional[str] = Field(default=None, description="相关平台")

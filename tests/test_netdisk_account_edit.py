@@ -17,7 +17,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.adapters.external.netdisk.base import BaseNetdiskAdapter
 from app.api.endpoints import netdisk as netdisk_module
-from app.application.netdisk import registry
+from app.application.netdisk import registry, selection
 from app.application.netdisk.accounts import mask_credential
 from app.application.netdisk.contract import (
     LoginSession,
@@ -299,6 +299,23 @@ def test_detail_returns_plaintext_while_list_masks(api):
     account = listing.json()["data"]["accounts"][0]
     assert account["masked"] == {"token": "***"}
     assert "credential" not in account
+
+
+def test_listing_and_detail_include_average_speed(api):
+    """
+    列表与详情响应都返回账号平均下载速度。
+    """
+    view = api.store.seed({"token": "secret-token"})
+    selection.clear_selection_state()
+    selection.record_account_speed(view.id, 10 * 1024 * 1024, 1)
+    try:
+        listing = api.client.get("/api/v1/netdisk/accounts")
+        detail = api.client.get(f"/api/v1/netdisk/accounts/{view.id}")
+
+        assert listing.json()["data"]["accounts"][0]["speed"] == pytest.approx(10 * 1024 * 1024)
+        assert detail.json()["data"]["account"]["speed"] == pytest.approx(10 * 1024 * 1024)
+    finally:
+        selection.clear_selection_state()
 
 
 def test_cookiecloud_with_account_id_updates_existing(api):

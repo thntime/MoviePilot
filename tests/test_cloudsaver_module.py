@@ -9,7 +9,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import pytest
 
 import app.modules.cloudsaver as netdisk_module
-from app.domain.netdisk import normalize_platform
+from app.application.netdisk.resolve import NetdiskResolveService, ResolvedShare
+from app.domain.netdisk import (
+    NetdiskError,
+    NetdiskErrorCode,
+    NetdiskPlatform,
+    ShareDetail,
+    ShareFile,
+    ShareRef,
+    normalize_platform,
+)
 from app.modules.cloudsaver import CloudSaverModule
 from app.modules.cloudsaver import cloudsaver as cloudsaver_module
 from app.modules.cloudsaver.cloudsaver import CloudSaverClient
@@ -21,34 +30,29 @@ _C139_PLATFORM_ID = normalize_platform("c139").value
 @pytest.fixture(autouse=True)
 def _clear_alive_cache(monkeypatch: pytest.MonkeyPatch):
     """
-    每个用例前清空有效性缓存并把夸克客户端替换为替身，避免访问真实网络。
+    每个用例前清空有效性缓存并安装本机取链替身，避免访问真实网络。
     """
     from app.modules.cloudsaver import _alive_cache
 
     _alive_cache.clear()
-    FakeQuarkClient.reset()
-    monkeypatch.setattr(netdisk_module, "QuarkShareClient", FakeQuarkClient)
+    FakeWalk.reset()
+    install_fake_walk(monkeypatch)
     yield
     _alive_cache.clear()
-    FakeQuarkClient.reset()
+    FakeWalk.reset()
 
 
-class FakeQuarkClient:
+class FakeWalk:
     """
-    夸克分享客户端替身：按分享码返回预设文件树，并记录调用顺序。
+    本机统一取链服务替身：按分享码返回预设文件树、异常或延迟。
     """
 
-    files_by_code: Dict[str, Optional[List[dict]]] = {}
+    files_by_code: Dict[str, Optional[List[ShareFile]]] = {}
+    errors_by_code: Dict[str, Exception] = {}
+    delays_by_code: Dict[str, float] = {}
     calls: List[str] = []
-    default_files: List[dict] = [
-        {"fid": "f1", "name": "第01集.mp4", "size": 800 * 1024 * 1024, "duration": 1400, "is_dir": False},
-    ]
-
-    def __init__(self, timeout: int = 10) -> None:
-        """
-        保存超时配置，保持与真实客户端一致的构造签名。
-        """
-        self.timeout = timeout
+    detail_size: int = 0
+    default_files: List[ShareFile] = []
 
     @classmethod
     def reset(cls) -> None:
@@ -56,26 +60,57 @@ class FakeQuarkClient:
         清空用例之间共享的预设与调用记录。
         """
         cls.files_by_code = {}
+        cls.errors_by_code = {}
+        cls.delays_by_code = {}
         cls.calls = []
+        cls.detail_size = 0
         cls.default_files = [
-            {"fid": "f1", "name": "第01集.mp4", "size": 800 * 1024 * 1024, "duration": 1400, "is_dir": False},
+            ShareFile(file_id="f1", name="第01集.mp4", size=800 * 1024 * 1024),
         ]
 
-    def fetch_stoken(self, pwd_id: str, passcode: str = "") -> str:
-        """
-        记录换取令牌的调用并返回固定令牌。
-        """
-        FakeQuarkClient.calls.append(f"stoken:{pwd_id}")
-        return "fake-stoken"
 
-    def collect_files(self, pwd_id: str, stoken: str, max_pages: int = 3) -> Optional[List[dict]]:
+def _share_code_of(url: str) -> str:
+    """
+    从分享链接提取分享码，用于匹配替身预设。
+    """
+    from app.domain.netdisk import parse_share_link
+
+    ref = parse_share_link(url)
+    if ref is not None and ref.share_id:
+        return ref.share_id
+    return url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+
+
+def install_fake_walk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    把统一取链服务的 walk 替换为按分享码查预设的替身。
+    """
+    def fake_walk(
+        self: Any,
+        url: str,
+        password: Any = None,
+        platform: Any = None,
+        **kwargs: Any,
+    ) -> ResolvedShare:
         """
-        返回该分享预设的文件树，未预设时返回默认单集文件。
+        记录调用并按分享码返回文件树、抛出预设异常或延迟。
         """
-        FakeQuarkClient.calls.append(f"files:{pwd_id}")
-        if pwd_id in FakeQuarkClient.files_by_code:
-            return FakeQuarkClient.files_by_code[pwd_id]
-        return list(FakeQuarkClient.default_files)
+        FakeWalk.calls.append(url)
+        share_code = _share_code_of(url)
+        delay = FakeWalk.delays_by_code.get(share_code)
+        if delay:
+            time.sleep(delay)
+        error = FakeWalk.errors_by_code.get(share_code)
+        if error is not None:
+            raise error
+        files = FakeWalk.files_by_code.get(share_code, FakeWalk.default_files)
+        return ResolvedShare(
+            ref=ShareRef(platform=NetdiskPlatform.QUARK, share_id=share_code),
+            detail=ShareDetail(title="资源", size=FakeWalk.detail_size),
+            files=tuple(files or []),
+        )
+
+    monkeypatch.setattr(NetdiskResolveService, "walk", fake_walk)
 
 
 class FakeResponse:
@@ -545,10 +580,10 @@ def test_search_keeps_only_quark_and_marks_free(monkeypatch: pytest.MonkeyPatch)
 
 def test_search_drops_invalid_shares(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    有效性检查失败的分享不进入候选列表。
+    本机取链明确判定分享失效时不进入候选列表。
     """
+    FakeWalk.errors_by_code["deadshare"] = NetdiskError(NetdiskErrorCode.SHARE_INVALID, "分享已失效")
     server = FakeCloudSaverServer()
-    server.invalid_share_codes.add("deadshare")
     server.search_results = [(200, make_payload([
         {
             "title": "失效资源",
@@ -569,15 +604,16 @@ def test_search_drops_invalid_shares(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert results is not None
     assert [strip_episode(item.title) for item in results] == ["有效资源"]
-    assert server.share_check_count == 2
+    assert len(FakeWalk.calls) == 2
+    assert server.share_check_count == 0
 
 
 def test_search_keeps_undecidable_shares_marked_unverified(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    分享详情无法判定有效性时保留候选并标注未验证。
+    本机没有可用账号时保留候选并标注未验证。
     """
+    FakeWalk.errors_by_code["unknownshare"] = NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "未登录")
     server = FakeCloudSaverServer()
-    server.undecidable_share_codes.add("unknownshare")
     server.search_results = [(200, make_payload([
         {
             "title": "无法判定资源",
@@ -601,7 +637,8 @@ def test_search_keeps_undecidable_shares_marked_unverified(monkeypatch: pytest.M
     assert titles == ["无法判定资源", "有效资源"]
     undecided = next(item for item in results if strip_episode(item.title) == "无法判定资源")
     assert "（未验证）" in str(undecided.description or "")
-    assert server.share_check_count == 2
+    assert len(FakeWalk.calls) == 2
+    assert server.share_check_count == 0
     # 无法判定的分享不写入有效性缓存，下次搜索仍会重新检查。
     from app.modules.cloudsaver import _alive_cache
 
@@ -633,7 +670,8 @@ def test_search_dedupes_same_share_code_across_url_forms(monkeypatch: pytest.Mon
 
     assert results is not None
     assert len(results) == 1
-    assert server.share_check_count == 1
+    assert len(FakeWalk.calls) == 1
+    assert server.share_check_count == 0
 
 
 def test_clean_title_converts_chinese_episode_marker():
@@ -662,7 +700,8 @@ def test_search_fills_size_and_episode_from_share_detail(monkeypatch: pytest.Mon
             "cloudLinks": [{"link": "https://pan.quark.cn/s/liveshare", "cloudType": "quark"}],
         },
     ]))]
-    FakeQuarkClient.files_by_code["liveshare"] = make_episode_files([1, 12], duration=1400, size_mb=900)
+    FakeWalk.files_by_code["liveshare"] = make_walk_files([1, 12], size_mb=900)
+    FakeWalk.detail_size = 1024 * 1024 * 500
     install_server(monkeypatch, server)
 
     results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
@@ -719,13 +758,6 @@ def strip_episode(title: str) -> str:
     return title.split(" S01E")[0]
 
 
-def install_quark(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    用夸克客户端替身替换真实客户端，避免测试访问真实网络。
-    """
-    monkeypatch.setattr(netdisk_module, "QuarkShareClient", FakeQuarkClient)
-
-
 def make_share_payload(title: str, share_code: str = "foldershare") -> dict:
     """
     构造一条网盘搜索结果的响应体。
@@ -740,9 +772,24 @@ def make_share_payload(title: str, share_code: str = "foldershare") -> dict:
     ])
 
 
+def make_walk_files(episodes, size_mb: int = 900, duration: int = 0) -> List[ShareFile]:
+    """
+    构造指定集数的本机文件树条目。
+    """
+    return [
+        ShareFile(
+            file_id=f"f{number}",
+            name=f"仙逆.{number}.mp4",
+            size=size_mb * 1024 * 1024,
+            duration=duration,
+        )
+        for number in episodes
+    ]
+
+
 def make_episode_files(episodes, duration: int = 1400, size_mb: int = 900) -> List[dict]:
     """
-    构造指定集数的视频文件条目。
+    构造指定集数的视频文件条目，供质量闸门单元测试使用。
     """
     return [
         {
@@ -763,15 +810,14 @@ def test_quark_tree_replaces_title_inferred_episode(monkeypatch: pytest.MonkeyPa
     server = FakeCloudSaverServer()
     server.search_results = [(200, make_share_payload("仙逆 更新至164集"))]
     install_server(monkeypatch, server)
-    install_quark(monkeypatch)
-    FakeQuarkClient.files_by_code["foldershare"] = make_episode_files(range(153, 163))
+    FakeWalk.files_by_code["foldershare"] = make_walk_files(range(153, 163))
 
     results = CloudSaverModule().search_netdisk_torrents(make_site(), "仙逆")
 
     assert results is not None
     assert len(results) == 1
     assert results[0].title == "仙逆 S01E153-E162"
-    assert FakeQuarkClient.calls == ["files:foldershare"]
+    assert FakeWalk.calls == ["https://pan.quark.cn/s/foldershare"]
 
     from app.domain.metainfo import MetaInfo
     from app.schemas.types import MediaType
@@ -788,8 +834,7 @@ def test_share_tree_unavailable_drops_candidate(monkeypatch: pytest.MonkeyPatch)
     server = FakeCloudSaverServer()
     server.search_results = [(200, make_share_payload("仙逆 更新至164集"))]
     install_server(monkeypatch, server)
-    install_quark(monkeypatch)
-    FakeQuarkClient.files_by_code["foldershare"] = None
+    FakeWalk.files_by_code["foldershare"] = None
 
     results = CloudSaverModule().search_netdisk_torrents(make_site(), "仙逆")
 
@@ -803,11 +848,10 @@ def test_obfuscated_names_drop_candidate(monkeypatch: pytest.MonkeyPatch) -> Non
     server = FakeCloudSaverServer()
     server.search_results = [(200, make_share_payload("周默晚 仙逆"))]
     install_server(monkeypatch, server)
-    install_quark(monkeypatch)
-    FakeQuarkClient.files_by_code["foldershare"] = [
-        {"fid": "f1", "name": "164.mp4", "size": 1029 * 1024 * 1024, "duration": 1400, "is_dir": False},
-        {"fid": "f2", "name": "1#6@#2.mp4", "size": 900 * 1024 * 1024, "duration": 1400, "is_dir": False},
-        {"fid": "f3", "name": "1!6%1.mp4", "size": 900 * 1024 * 1024, "duration": 1400, "is_dir": False},
+    FakeWalk.files_by_code["foldershare"] = [
+        ShareFile(file_id="f1", name="164.mp4", size=1029 * 1024 * 1024),
+        ShareFile(file_id="f2", name="1#6@#2.mp4", size=900 * 1024 * 1024),
+        ShareFile(file_id="f3", name="1!6%1.mp4", size=900 * 1024 * 1024),
     ]
 
     results = CloudSaverModule().search_netdisk_torrents(make_site(), "仙逆")
@@ -844,9 +888,9 @@ def test_each_candidate_uses_its_own_share_tree(monkeypatch: pytest.MonkeyPatch)
         },
     ]))]
     install_server(monkeypatch, server)
-    FakeQuarkClient.files_by_code["shareA"] = make_episode_files([1, 2, 3])
-    FakeQuarkClient.files_by_code["shareB"] = make_episode_files([50, 51, 52])
-    FakeQuarkClient.files_by_code["shareC"] = make_episode_files([100, 101, 102])
+    FakeWalk.files_by_code["shareA"] = make_walk_files([1, 2, 3])
+    FakeWalk.files_by_code["shareB"] = make_walk_files([50, 51, 52])
+    FakeWalk.files_by_code["shareC"] = make_walk_files([100, 101, 102])
 
     results = CloudSaverModule().search_netdisk_torrents(make_site(), "仙逆")
 
@@ -879,8 +923,8 @@ def test_failed_share_tree_does_not_affect_others(monkeypatch: pytest.MonkeyPatc
         },
     ]))]
     install_server(monkeypatch, server)
-    FakeQuarkClient.files_by_code["brokenquark"] = None
-    FakeQuarkClient.files_by_code["goodquark"] = make_episode_files([1, 2, 3])
+    FakeWalk.errors_by_code["brokenquark"] = NetdiskError(NetdiskErrorCode.SHARE_INVALID, "分享已失效")
+    FakeWalk.files_by_code["goodquark"] = make_walk_files([1, 2, 3])
 
     results = CloudSaverModule().search_netdisk_torrents(make_site(), "仙逆")
 
@@ -889,45 +933,93 @@ def test_failed_share_tree_does_not_affect_others(monkeypatch: pytest.MonkeyPatc
     assert results[0].title.endswith("S01E01-E03")
 
 
-def test_short_drama_is_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_short_drama_is_dropped() -> None:
     """
     平均每集时长与大小同时低于阈值时判为短剧并丢弃。
     """
-    server = FakeCloudSaverServer()
-    server.search_results = [(200, make_share_payload("【短剧】仙逆（115集）"))]
-    install_server(monkeypatch, server)
-    install_quark(monkeypatch)
-    FakeQuarkClient.files_by_code["foldershare"] = make_episode_files(range(1, 6), duration=66, size_mb=10)
+    from app.domain.context import TorrentInfo
 
-    results = CloudSaverModule().search_netdisk_torrents(make_site(), "仙逆")
+    torrent = TorrentInfo(title="【短剧】仙逆（115集）", enclosure="https://pan.quark.cn/s/foldershare")
+    detail = {"alive": True, "_files": make_episode_files(range(1, 6), duration=66, size_mb=10)}
 
-    assert results == []
+    assert CloudSaverModule()._passes_quality(torrent, detail) is False
 
 
-def test_single_condition_keeps_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_single_condition_keeps_candidate() -> None:
     """
     时长与大小只有一个低于阈值时保留候选。
     """
-    server = FakeCloudSaverServer()
-    server.search_results = [(200, make_share_payload("仙逆 更新至164集"))]
-    install_server(monkeypatch, server)
-    install_quark(monkeypatch)
-    FakeQuarkClient.files_by_code["foldershare"] = make_episode_files(range(1, 6), duration=66, size_mb=900)
+    from app.domain.context import TorrentInfo
 
-    results = CloudSaverModule().search_netdisk_torrents(make_site(), "仙逆")
+    torrent = TorrentInfo(title="仙逆 更新至164集", enclosure="https://pan.quark.cn/s/foldershare")
+    detail = {"alive": True, "_files": make_episode_files(range(1, 6), duration=66, size_mb=900)}
 
-    assert results is not None
-    assert len(results) == 1
-    assert results[0].title.endswith("S01E01-E05")
+    assert CloudSaverModule()._passes_quality(torrent, detail) is True
+    assert torrent.title.endswith("S01E01-E05")
+
+
+def _archive_files(episodes) -> List[dict]:
+    """
+    构造指定集数范围的 ZIP 文件条目，供压缩包识别测试使用。
+    """
+    return [
+        {
+            "fid": f"z{number}",
+            "name": f"{number:03d}.zip",
+            "size": 100 * 1024 * 1024,
+            "is_dir": False,
+        }
+        for number in episodes
+    ]
+
+
+def test_archive_dominant_share_is_dropped() -> None:
+    """
+    只有 1 个视频、其余集数都在 ZIP 中时，候选应被丢弃。
+    """
+    from app.domain.context import TorrentInfo
+
+    torrent = TorrentInfo(title="仙逆 年番1 (2023) S01E01-E156", enclosure="https://pan.quark.cn/s/foldershare")
+    files = make_episode_files([154]) + _archive_files(range(1, 157))
+    detail = {"alive": True, "_files": files}
+
+    assert CloudSaverModule()._passes_quality(torrent, detail) is False
+
+
+def test_video_pack_with_few_archives_is_kept() -> None:
+    """
+    视频覆盖绝大部分集数、压缩包只含少量附加内容时，候选保留。
+    """
+    from app.domain.context import TorrentInfo
+
+    torrent = TorrentInfo(title="仙逆 更新至100集", enclosure="https://pan.quark.cn/s/foldershare")
+    files = make_episode_files(range(1, 101)) + _archive_files(range(101, 106))
+    detail = {"alive": True, "_files": files}
+
+    assert CloudSaverModule()._passes_quality(torrent, detail) is True
+
+
+def test_zip_names_do_not_create_episode_token() -> None:
+    """
+    ZIP 名称不参与集数标记，标题只反映真实媒体文件。
+    """
+    from app.domain.context import TorrentInfo
+
+    torrent = TorrentInfo(title="仙逆 年番1 (2023)", enclosure="https://pan.quark.cn/s/foldershare")
+    files = make_episode_files([154]) + _archive_files(range(1, 157))
+    detail = {"alive": True, "_files": files}
+
+    CloudSaverModule._apply_share_detail(torrent, detail, files)
+
+    assert torrent.title.endswith("S01E154")
+    assert "E156" not in torrent.title
 
 
 def test_short_drama_threshold_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    调整系统设置阈值后，同一分享的短剧判定结果随之改变（缓存不能短路重新判定）。
+    调整系统设置阈值后，同一分享的短剧判定结果随之改变。
     """
-    server = FakeCloudSaverServer()
-    install_server(monkeypatch, server)
-    FakeQuarkClient.files_by_code["foldershare"] = make_episode_files(range(1, 6), duration=400, size_mb=100)
+    from app.domain.context import TorrentInfo
 
     class _Config:
         """提供 get 接口的最小配置替身。"""
@@ -939,20 +1031,57 @@ def test_short_drama_threshold_is_configurable(monkeypatch: pytest.MonkeyPatch) 
             """返回预设值。"""
             return self.values.get(getattr(key, "value", key))
 
-    payload = make_share_payload("仙逆 更新至164集")
-    monkeypatch.setattr(netdisk_module, "get_configured_system_config", lambda: _Config({}))
-    server.search_results = [(200, payload)]
-    kept = CloudSaverModule().search_netdisk_torrents(make_site(), "仙逆")
-    assert kept is not None and len(kept) == 1
+    torrent = TorrentInfo(title="仙逆 更新至164集", enclosure="https://pan.quark.cn/s/foldershare")
+    detail = {"alive": True, "_files": make_episode_files(range(1, 6), duration=400, size_mb=100)}
 
-    # 第二次搜索命中有效性缓存，但短剧判定必须重新计算。
+    monkeypatch.setattr(netdisk_module, "get_configured_system_config", lambda: _Config({}))
+    assert CloudSaverModule()._passes_quality(torrent, detail) is True
+
+    # 放宽阈值后同一份文件树应改判为短剧。
     monkeypatch.setattr(netdisk_module, "get_configured_system_config", lambda: _Config({
         "NetdiskShortDramaMaxDuration": 500,
         "NetdiskShortDramaMaxSize": 150,
     }))
-    server.search_results = [(200, payload)]
+    assert CloudSaverModule()._passes_quality(torrent, detail) is False
+
+
+def test_short_drama_threshold_is_configurable_with_cached_share(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    命中有效性缓存时仍按新阈值重新执行短剧判定，不能因缓存而跳过。
+    """
+    class _Config:
+        """提供 get 接口的最小配置替身。"""
+
+        def __init__(self, values: dict) -> None:
+            self.values = values
+
+        def get(self, key: Any = None) -> Any:
+            """返回预设值。"""
+            return self.values.get(getattr(key, "value", key))
+
+    server = FakeCloudSaverServer()
+    server.search_results = [
+        (200, make_share_payload("仙逆 更新至164集")),
+        (200, make_share_payload("仙逆 更新至164集")),
+    ]
+    install_server(monkeypatch, server)
+    FakeWalk.files_by_code["foldershare"] = make_walk_files(
+        range(1, 6), size_mb=100, duration=400,
+    )
+
+    monkeypatch.setattr(netdisk_module, "get_configured_system_config", lambda: _Config({}))
+    kept = CloudSaverModule().search_netdisk_torrents(make_site(), "仙逆")
+    assert kept is not None and len(kept) == 1
+
+    # 第二次搜索命中有效性缓存，但放宽阈值后必须重新判定为短剧并丢弃。
+    monkeypatch.setattr(netdisk_module, "get_configured_system_config", lambda: _Config({
+        "NetdiskShortDramaMaxDuration": 500,
+        "NetdiskShortDramaMaxSize": 150,
+    }))
     dropped = CloudSaverModule().search_netdisk_torrents(make_site(), "仙逆")
     assert dropped == []
+    # 缓存命中时不再重复遍历远端目录。
+    assert len(FakeWalk.calls) == 1
 
 
 def test_cached_share_still_fills_size_and_episode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -961,7 +1090,8 @@ def test_cached_share_still_fills_size_and_episode(monkeypatch: pytest.MonkeyPat
     """
     server = FakeCloudSaverServer()
     install_server(monkeypatch, server)
-    FakeQuarkClient.files_by_code["foldershare"] = make_episode_files(range(1, 61))
+    FakeWalk.files_by_code["foldershare"] = make_walk_files(range(1, 61))
+    FakeWalk.detail_size = 1024 * 1024 * 500
     payload = make_share_payload("仙逆 更新至164集")
 
     server.search_results = [(200, payload)]
@@ -975,23 +1105,98 @@ def test_cached_share_still_fills_size_and_episode(monkeypatch: pytest.MonkeyPat
     assert second is not None and len(second) == 1
     assert second[0].title.endswith("S01E01-E60")
     assert second[0].size == 1024 * 1024 * 500
-    # 缓存命中时不再请求分享详情，但仍要拉文件树。
-    assert server.share_check_count == 1
+    # 缓存命中时不再重复遍历远端目录，也不请求 CloudSaver 分享详情。
+    assert len(FakeWalk.calls) == 1
+    assert server.share_check_count == 0
 
 
-def test_share_tree_uses_detail_stoken(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_quark_share_uses_local_walk(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    分享详情已带 stoken 时直接复用，不再额外换取令牌。
+    夸克候选完全走本机取链，不再请求 CloudSaver 分享详情接口。
     """
     server = FakeCloudSaverServer()
     server.search_results = [(200, make_share_payload("仙逆 更新至164集"))]
     install_server(monkeypatch, server)
-    install_quark(monkeypatch)
-    FakeQuarkClient.files_by_code["foldershare"] = make_episode_files(range(1, 3))
+    FakeWalk.files_by_code["foldershare"] = make_walk_files(range(1, 3))
 
     CloudSaverModule().search_netdisk_torrents(make_site(), "仙逆")
 
-    assert FakeQuarkClient.calls == ["files:foldershare"]
+    assert FakeWalk.calls == ["https://pan.quark.cn/s/foldershare"]
+    assert server.share_check_count == 0
+
+
+def test_quark_local_walk_keeps_valid_share(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    夸克候选由本机取链确认有效时保留，并回写真实大小。
+    """
+    server = FakeCloudSaverServer()
+    server.search_results = [(200, make_share_payload("本机校验资源", "localshare"))]
+    install_server(monkeypatch, server)
+    FakeWalk.files_by_code["localshare"] = [
+        ShareFile(file_id="f1", name="S01E01.mp4", size=800 * 1024 * 1024),
+    ]
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
+
+    assert results is not None
+    assert len(results) == 1
+    assert results[0].title == "本机校验资源 S01E01"
+    assert "（未验证）" not in str(results[0].description or "")
+    assert results[0].size == 800 * 1024 * 1024
+    assert FakeWalk.calls == ["https://pan.quark.cn/s/localshare"]
+    assert server.share_check_count == 0
+
+
+def test_quark_local_walk_drops_short_drama(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    本机文件树带时长且大小低于阈值时，夸克候选仍按短剧丢弃。
+    """
+    server = FakeCloudSaverServer()
+    server.search_results = [(200, make_share_payload("【短剧】仙逆（115集）", "shortshare"))]
+    install_server(monkeypatch, server)
+    FakeWalk.files_by_code["shortshare"] = make_walk_files(
+        range(1, 6), size_mb=10, duration=66,
+    )
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "仙逆")
+
+    assert results == []
+    assert FakeWalk.calls == ["https://pan.quark.cn/s/shortshare"]
+    assert server.share_check_count == 0
+
+
+def test_quark_local_walk_drops_invalid_share(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    本机取链明确判定分享失效时丢弃夸克候选。
+    """
+    FakeWalk.errors_by_code["localshare"] = NetdiskError(NetdiskErrorCode.SHARE_INVALID, "分享已失效")
+    server = FakeCloudSaverServer()
+    server.search_results = [(200, make_share_payload("本机校验资源", "localshare"))]
+    install_server(monkeypatch, server)
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
+
+    assert results == []
+    assert FakeWalk.calls == ["https://pan.quark.cn/s/localshare"]
+    assert server.share_check_count == 0
+
+
+def test_quark_local_walk_keeps_share_without_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    本机没有可用账号时保留夸克候选并标注未验证。
+    """
+    FakeWalk.errors_by_code["localshare"] = NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "未登录")
+    server = FakeCloudSaverServer()
+    server.search_results = [(200, make_share_payload("本机校验资源", "localshare"))]
+    install_server(monkeypatch, server)
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
+
+    assert results is not None
+    assert len(results) == 1
+    assert "（未验证）" in str(results[0].description or "")
+    assert FakeWalk.calls == ["https://pan.quark.cn/s/localshare"]
+    assert server.share_check_count == 0
 
 
 def test_clean_description_strips_markup_and_prompts() -> None:
@@ -1028,7 +1233,7 @@ def test_search_keeps_candidates_over_check_budget_marked_unverified(monkeypatch
     分享有效性检查超出总预算时，未完成的候选保留并标注未验证。
     """
     server = FakeCloudSaverServer()
-    server.share_delay_seconds["slowshare"] = 0.2
+    FakeWalk.delays_by_code["slowshare"] = 0.2
     server.search_results = [(200, make_payload([
         {
             "title": "慢响应资源",
@@ -1054,6 +1259,7 @@ def test_search_keeps_candidates_over_check_budget_marked_unverified(monkeypatch
     assert titles == ["慢响应资源", "快速响应资源"]
     slow = next(item for item in results if strip_episode(item.title) == "慢响应资源")
     assert "（未验证）" in str(slow.description or "")
+    assert server.share_check_count == 0
 
 
 def test_search_limits_alive_checks_to_newest_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1092,7 +1298,8 @@ def test_search_limits_alive_checks_to_newest_candidates(monkeypatch: pytest.Mon
 
     assert results is not None
     assert [strip_episode(item.title) for item in results] == ["最新资源", "次新资源"]
-    assert server.share_check_count == 2
+    assert len(FakeWalk.calls) == 2
+    assert server.share_check_count == 0
 
 
 def _install_fake_walk(monkeypatch: pytest.MonkeyPatch, files: List[Any], detail_size: int = 0) -> List[str]:

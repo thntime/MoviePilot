@@ -29,6 +29,9 @@ DOWNLOAD_FAILURE_RESOURCE_TTL_SECONDS = 24 * 60 * 60
 DOWNLOAD_FAILURE_TRANSIENT_TTL_SECONDS = 60 * 60
 # 重复提交退避只压制单个资源指纹，必须长于订阅重新选源的周期，否则同一个整包仍会被反复接受。
 DOWNLOAD_FAILURE_DUPLICATE_TTL_SECONDS = 7 * 24 * 60 * 60
+# 容量不足属于可恢复的账号/空间状态，冷却 30 分钟后再参与候选。
+DOWNLOAD_FAILURE_CAPACITY_TTL_SECONDS = 30 * 60
+DOWNLOAD_FAILURE_CAPACITY_KEYWORDS = ("空间不足", "容量不足", "SPACE_INSUFFICIENT")
 # 退避记录写入台账的成因说明，候选跳过日志直接引用它，不能再假设这是一次失败。
 DOWNLOAD_FAILURE_DUPLICATE_MESSAGE = "下载器已存在同一任务且本次无新增文件明细"
 DOWNLOAD_FAILURE_RESOURCE_ERROR_KEYWORDS = (
@@ -146,12 +149,15 @@ class DownloadFailureOwner(_DownloadOwnerBase):
     @staticmethod
     def _download_failure_ttl(error_msg: Optional[str]) -> int:
         """
-        限流按站点窗口冷却；泛化的空内容不能证明资源失效，使用瞬时冷却。
+        容量失败按账号空间恢复周期冷却；限流按站点窗口冷却；
+        泛化的空内容不能证明资源失效，使用瞬时冷却。
         """
+        error_text = str(error_msg or "").lower()
+        if any(keyword in error_text for keyword in DOWNLOAD_FAILURE_CAPACITY_KEYWORDS):
+            return DOWNLOAD_FAILURE_CAPACITY_TTL_SECONDS
         rate_limit_ttl = torrent_rules.rate_limit_cooldown(error_msg)
         if rate_limit_ttl is not None:
             return rate_limit_ttl
-        error_text = str(error_msg or "").lower()
         if any(keyword in error_text for keyword in DOWNLOAD_FAILURE_RESOURCE_ERROR_KEYWORDS):
             return DOWNLOAD_FAILURE_RESOURCE_TTL_SECONDS
         return DOWNLOAD_FAILURE_TRANSIENT_TTL_SECONDS

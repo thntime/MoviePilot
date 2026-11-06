@@ -77,9 +77,13 @@ _XUNLEI_READ_JS = f"""
     if (!data || typeof data !== 'object' || Array.isArray(data)) return '';
     if (sub && data.sub && String(data.sub) !== sub) return '';
     var captcha = '';
+    var captchaExpires = '';
     try {{
       var c = JSON.parse(localStorage.getItem('{_XUNLEI_CAPTCHA_KEY}') || '{{}}');
-      if (c && c.token && Date.parse(c.expires_at) > Date.now()) captcha = c.token;
+      if (c && c.token && Date.parse(c.expires_at) > Date.now()) {{
+        captcha = c.token;
+        captchaExpires = c.expires_at || '';
+      }}
     }} catch (e) {{}}
     var device = '';
     try {{
@@ -104,6 +108,7 @@ _XUNLEI_READ_JS = f"""
       expires_in: data.expires_in || data.expiresIn || '',
       deviceid: data.device_id || data.deviceId || device,
       captcha: captcha || data.captcha_token || data.captchaToken || '',
+      captcha_expires_at: captchaExpires,
       nickname: pageNick || data.nickname || data.nick_name || data.nickName || data.user_name || data.userName || data.name || ''
     }});
   }} catch (e) {{
@@ -631,6 +636,7 @@ class BrowserQrLoginAdapter:
         self._helper = BrowserSessionHelper(
             headless=True,
             viewport={"width": 1440, "height": 900},
+            args=["--no-proxy-server"],
         )
         # 139 使用有头浏览器 + noVNC，让用户用真实鼠标操作验证码。
         self._vnc_helper = BrowserSessionHelper(
@@ -640,6 +646,7 @@ class BrowserQrLoginAdapter:
                 "--window-size=1440,900",
                 "--window-position=0,0",
                 "--start-maximized",
+                "--no-proxy-server",
             ],
         )
         self._sessions: dict[str, _QrSession] = {}
@@ -796,7 +803,7 @@ class BrowserQrLoginAdapter:
         从 pan.xunlei.com 的 localStorage 读取网页版 token。
 
         :param state: 浏览器会话状态
-        :return: 含 access_token/deviceid/captcha/refresh_token/expires_in 的字段；未登录时为空字典
+        :return: 含 access_token/deviceid/captcha/captcha_expires_at/refresh_token/expires_in 的字段；未登录时为空字典
         """
         page = self._page_for_host(state, "xunlei.com")
         if page is None:
@@ -828,6 +835,9 @@ class BrowserQrLoginAdapter:
         captcha = str(data.get("captcha") or "").strip()
         if captcha:
             fields["captcha"] = captcha
+            captcha_expires_at = str(data.get("captcha_expires_at") or "").strip()
+            if captcha_expires_at:
+                fields["captcha_expires_at"] = captcha_expires_at
         nickname = str(data.get("nickname") or "").strip()
         if nickname:
             fields["nickname"] = nickname
@@ -1381,15 +1391,38 @@ class BrowserQrLoginAdapter:
         :return: Cookie 头
         """
         suffixes = _COOKIE_DOMAINS.get(platform, ())
-        pairs: list[str] = []
-        seen: set[str] = set()
+        if platform is NetdiskPlatform.BAIDU:
+            # 与 yunx 保持一致：百度原样拼接全部 .baidu.com Cookie（含同名），不做去重。
+            pairs: list[str] = []
+            for cookie in state.context.cookies():
+                domain = str(cookie.get("domain", "")).lower()
+                name = str(cookie.get("name", "")).strip()
+                if not name:
+                    continue
+                if suffixes and not any(domain.endswith(suffix) or domain == suffix.lstrip(".") for suffix in suffixes):
+                    continue
+                pairs.append(f"{name}={cookie.get('value', '')}")
+            return "; ".join(pairs)
+        primary = _PRIMARY_HOSTS.get(platform, "")
+        best: dict[str, tuple[int, str]] = {}
+        order: list[str] = []
         for cookie in state.context.cookies():
             domain = str(cookie.get("domain", "")).lower()
             name = str(cookie.get("name", "")).strip()
-            if not name or name in seen:
+            if not name:
                 continue
             if suffixes and not any(domain.endswith(suffix) or domain == suffix.lstrip(".") for suffix in suffixes):
                 continue
-            seen.add(name)
-            pairs.append(f"{name}={cookie.get('value', '')}")
-        return "; ".join(pairs)
+            score = 0
+            if primary:
+                if domain == primary:
+                    score = 2
+                elif primary.endswith(f".{domain.lstrip('.')}"):
+                    score = 1
+            current = best.get(name)
+            if current is None:
+                order.append(name)
+                best[name] = (score, str(cookie.get("value", "")))
+            elif score > current[0]:
+                best[name] = (score, str(cookie.get("value", "")))
+        return "; ".join(f"{name}={best[name][1]}" for name in order)

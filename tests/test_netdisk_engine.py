@@ -54,15 +54,23 @@ class FakeHttp:
 
     def __init__(self, payload: bytes, status_code: int = 206,
                  content_type: str = "video/mp4",
-                 status_by_url: Optional[Dict[str, int]] = None) -> None:
+                 status_by_url: Optional[Dict[str, int]] = None,
+                 truncate_first_full: int = 0,
+                 fail_status: int = 0, fail_times: int = 0) -> None:
         """
         保存完整内容与响应行为。
+
+        :param truncate_first_full: 首次 200 整文件响应只返回前 N 字节，模拟 CDN 提前断开；
+                                    之后的 Range 请求按 206 正常返回。
         """
         self.payload = payload
         self.status_code = status_code
         self.content_type = content_type
         self.status_by_url = dict(status_by_url or {})
         self.calls: List[Dict[str, Any]] = []
+        self._truncate = truncate_first_full
+        self._fail_status = fail_status
+        self._fail_times = fail_times
 
     def get_stream(self, url: str, headers: Optional[Dict[str, str]] = None, **_: Any):
         """
@@ -71,8 +79,37 @@ class FakeHttp:
         headers = dict(headers or {})
         range_header = str(headers.get("Range") or "")
         self.calls.append({"url": url, "headers": headers, "range": range_header})
+        if self._fail_times > 0:
+            self._fail_times -= 1
+            status = self._fail_status
+            data = b""
+            content_range = ""
+
+            class _FailCtx:
+                """返回失败状态的上下文。"""
+
+                def __enter__(self_inner):
+                    """返回响应对象。"""
+                    return FakeStreamResponse(data, status, content_range, "video/mp4")
+
+                def __exit__(self_inner, *args):
+                    """结束时不做额外处理。"""
+                    return False
+
+            return _FailCtx()
         status = self.status_by_url.get(url, self.status_code)
-        if status == 200:
+        if status == 200 and self._truncate:
+            data = self.payload[:self._truncate]
+            self._truncate = 0
+            content_range = ""
+        elif status == 200 and range_header:
+            start_text, end_text = range_header.replace("bytes=", "").split("-")
+            start = int(start_text)
+            end = int(end_text) if end_text else len(self.payload) - 1
+            data = self.payload[start:end + 1]
+            status = 206
+            content_range = f"bytes {start}-{end}/{len(self.payload)}"
+        elif status == 200:
             data = self.payload
             content_range = ""
         elif status in (401, 403, 412):
@@ -161,6 +198,29 @@ def test_download_writes_full_content(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert target.read_bytes() == payload
     assert not downloader.plan_path.exists()
     assert all(call["range"].startswith("bytes=") for call in http.calls)
+
+
+def test_download_requests_bypass_proxy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    网盘 CDN 直链必须显式直连，不能被宿主的 HTTP_PROXY/HTTPS_PROXY 接管。
+    """
+    payload = bytes(range(256)) * 4096  # 1MB
+    http = FakeHttp(payload)
+    seen: List[Dict[str, Any]] = []
+
+    def fake_request_utils(**kwargs: Any) -> FakeHttp:
+        """记录构造参数并返回假网络适配器。"""
+        seen.append(kwargs)
+        return http
+
+    monkeypatch.setattr(engine, "RequestUtils", fake_request_utils)
+    target = tmp_path / "video.mp4"
+
+    downloader = engine.ChunkedDownloader(target, len(payload), _links("https://cdn/file"), threads=2)
+    downloader.run(lambda refresh=False: _links("https://cdn/file"))
+
+    assert seen
+    assert all(call.get("proxies") == {"http": "", "https": ""} for call in seen)
 
 
 def test_multi_source_rotates_links_and_headers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -354,3 +414,103 @@ def test_verify_detects_corruption(tmp_path: Path) -> None:
 
     with pytest.raises(engine.DownloadError):
         downloader._verify()  # pylint: disable=protected-access
+
+
+def test_single_stream_short_read_resumes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    单流回退提前断开时应按已写字节续传，而不是从头重下或直接判失败。
+    """
+    import os
+
+    payload = b"x" * (6 * 1024 * 1024)
+    http = FakeHttp(payload, status_code=200, truncate_first_full=2 * 1024 * 1024)
+    install_http(monkeypatch, http)
+    target = tmp_path / "video.mp4"
+    downloader = engine.ChunkedDownloader(
+        target, len(payload), _links("https://cdn/file"), threads=1, retries=3,
+        refresh_seconds=0,
+    )
+    downloader.links = tuple(_links("https://cdn/file"))
+    downloader._fd = os.open(target, os.O_RDWR | os.O_CREAT, 0o644)  # pylint: disable=protected-access
+    try:
+        downloader._single_stream(  # pylint: disable=protected-access
+            lambda refresh=False: _links("https://cdn/file")
+        )
+    finally:
+        os.close(downloader._fd)  # pylint: disable=protected-access
+
+    assert target.read_bytes() == payload
+    assert any(call["range"] == "bytes=2097152-" for call in http.calls)
+
+
+def test_preallocated_file_without_marker_is_redownloaded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    中断后文件已被预分配到目标大小但没有完成标记时，必须重新下载。
+    """
+    payload = b"y" * (1024 * 1024)
+    target = tmp_path / "video.mp4"
+    target.write_bytes(b"\0" * len(payload))
+    http = FakeHttp(payload)
+    install_http(monkeypatch, http)
+
+    engine.ChunkedDownloader(
+        target, len(payload), _links("https://cdn/file"), threads=1, retries=2,
+    ).run(lambda refresh=False: _links("https://cdn/file"))
+
+    assert http.calls
+    assert target.read_bytes() == payload
+    assert target.with_name(target.name + ".done").exists()
+
+
+def test_completed_file_with_marker_skips_network(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    完成标记存在且大小匹配时不发起任何请求。
+    """
+    payload = b"z" * 1024
+    target = tmp_path / "video.mp4"
+    target.write_bytes(payload)
+    target.with_name(target.name + ".done").write_text(str(len(payload)), encoding="utf-8")
+    http = FakeHttp(payload)
+    install_http(monkeypatch, http)
+
+    engine.ChunkedDownloader(
+        target, len(payload), _links("https://cdn/file"), threads=1,
+    ).run(lambda refresh=False: _links("https://cdn/file"))
+
+    assert http.calls == []
+
+
+def test_chunk_retries_transient_5xx(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    CDN 返回 503 时退避重试，恢复后继续下载而不是整任务失败。
+    """
+    payload = b"q" * (1024 * 1024)
+    http = FakeHttp(payload, fail_status=503, fail_times=2)
+    install_http(monkeypatch, http)
+    target = tmp_path / "video.mp4"
+
+    engine.ChunkedDownloader(
+        target, len(payload), _links("https://cdn/file"), threads=1, retries=1,
+        refresh_seconds=0,
+    ).run(lambda refresh=False: _links("https://cdn/file"))
+
+    assert target.read_bytes() == payload
+    assert len(http.calls) >= 3
+
+
+def test_parse_m3u8_rejects_encrypted_playlist() -> None:
+    """
+    加密 HLS 无法保证产出可播放文件，必须明确失败。
+    """
+    text = (
+        "#EXTM3U\n"
+        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+        "#EXTINF:10,\nseg0.ts\n"
+    )
+
+    with pytest.raises(engine.DownloadError):
+        engine.parse_m3u8(text, "https://cdn/index.m3u8")

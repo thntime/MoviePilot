@@ -354,7 +354,7 @@ def test_password_login_returns_token(monkeypatch) -> None:
         return {
             "success": True,
             "code": "0",
-            "data": {"access_token": "at-1", "refresh_token": "rt-1"},
+            "data": {"access_token": "at-1", "refresh_token": "rt-1", "expires_in": 7200},
         }
 
     _patch_http(monkeypatch, handler)
@@ -362,7 +362,9 @@ def test_password_login_returns_token(monkeypatch) -> None:
 
     credential = adapter.password_login("13800138000", "secret")
 
-    assert credential == {"token": "at-1"}
+    assert credential["token"] == "at-1"
+    assert credential["refresh_token"] == "rt-1"
+    assert credential["expires_at"]
     assert sent["body"]["username"] == "+86 13800138000"
     assert sent["body"]["client_id"] == guangya_module._CLIENT_ID
     assert sent["headers"]["X-Client-Id"] == guangya_module._CLIENT_ID
@@ -615,12 +617,18 @@ def test_sms_login_returns_token(monkeypatch) -> None:
             return {"success": True, "code": "0", "verification_token": "vt-1"}
         assert url == guangya_module._SIGNIN_URL
         assert body["verification_token"] == "vt-1"
-        return {"success": True, "code": "0", "data": {"access_token": "at-sms"}}
+        return {
+            "success": True,
+            "code": "0",
+            "data": {"access_token": "at-sms", "refresh_token": "rt-sms", "expires_in": 7200},
+        }
 
     _patch_http(monkeypatch, handler)
     adapter = guangya_module.GuangYaAdapter()
 
     credential = adapter.sms_login("13800138000", "123456", "v-1")
 
-    assert credential == {"token": "at-sms"}
+    assert credential["token"] == "at-sms"
+    assert credential["refresh_token"] == "rt-sms"
+    assert credential["expires_at"]
     assert urls == [guangya_module._VERIFICATION_VERIFY_URL, guangya_module._SIGNIN_URL]

@@ -2,6 +2,7 @@
 保护批量下载各阶段之间的状态传递与副作用顺序。
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -9,9 +10,11 @@ import pytest
 
 import app.chain.download.batch as download_batch
 import app.chain.download.selection as download_selection
+from app.application.netdisk.resolve import NetdiskResolveService, ResolvedShare
 from app.chain.download import DownloadChain
 from app.domain.context import Context, MediaInfo, TorrentInfo
 from app.domain.metainfo import MetaInfo
+from app.domain.netdisk import NetdiskPlatform, ShareDetail, ShareFile, ShareRef
 from app.schemas.mediaserver import NotExistMediaInfo
 from app.schemas.types import MediaSource, MediaType, NotificationChannel
 
@@ -76,6 +79,36 @@ def _submitted(chain) -> list[Context]:
         call.args[0] if call.args else call.kwargs["context"]
         for call in chain.download_single.call_args_list
     ]
+
+
+def _batch_run(chain, contexts=(), missing=None):
+    """
+    构造单次批量状态，便于直接核对阶段内部判定。
+    """
+    options = {
+        "save_path": None, "channel": None, "source": None, "userid": None,
+        "username": None, "downloader": None, "custom_words": None, "governance": None,
+    }
+    return download_batch._BatchDownloadRun(chain, list(contexts), missing or {}, options, None)
+
+
+def _patch_netdisk_paths(monkeypatch, paths):
+    """
+    让网盘取链服务返回带相对路径的文件清单。
+    """
+    files = tuple(
+        ShareFile(file_id=f"f{index}", name=Path(path).name, size=100, path=path)
+        for index, path in enumerate(paths)
+    )
+
+    def fake_walk(self, url, password=None, platform=None, account_id=None, **kwargs):
+        return ResolvedShare(
+            ref=ShareRef(platform=NetdiskPlatform.QUARK, share_id="abc123", url=url),
+            detail=ShareDetail(title="multiseason", size=len(files) * 100, files=files),
+            files=files,
+        )
+
+    monkeypatch.setattr(NetdiskResolveService, "walk", fake_walk)
 
 
 def test_batch_preserves_phase_order_and_submission_options(batch):
@@ -444,3 +477,191 @@ def test_labelled_full_pack_magnet_falls_back_to_episode_pack_phase(batch):
     batch.chain.download_torrent.assert_called_once()
     assert "torrent_content" not in batch.chain.download_single.call_args.kwargs
     batch.chain._record_download_failure.assert_not_called()
+
+
+def test_whole_season_inspection_uses_only_target_season_episodes(batch, monkeypatch):
+    """
+    整季核对只统计目标季的文件，其他季的集号不能补齐目标季缺集。
+    """
+    candidate = _context("multiseason")
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing(total=2, complete=True)}}
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S02/02.mp4"])
+    run = _batch_run(batch.chain, [candidate], missing)
+
+    assert run._inspect_whole_season(candidate, "tmdb:1", 1) is None
+
+
+def test_multiseason_netdisk_pack_submits_target_season_episodes(batch, monkeypatch):
+    """
+    缺 S01 时允许包含 S02 的网盘整包，只按 S01 目标集提交。
+    """
+    candidate = _context("multiseason")
+    candidate.meta_info.end_season = 2
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing(total=1)}}
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S02/05.mp4"])
+
+    result, remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == [candidate]
+    assert remaining == {}
+    assert batch.chain.download_single.call_args.kwargs["episode_targets"] == {1: {1}}
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {1}
+    assert candidate.meta_info.episode_list == []
+    batch.chain.download_torrent.assert_not_called()
+
+
+def test_multiseason_netdisk_pack_keeps_same_number_across_seasons(batch, monkeypatch):
+    """
+    目标季与其他季存在同集号时，提交的季级目标不能把其他季集号并进来。
+    """
+    candidate = _context("multiseason")
+    candidate.meta_info.end_season = 2
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing(total=2, complete=True)}}
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S01/02.mp4", "S02/02.mp4"])
+
+    result, _remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == [candidate]
+    assert batch.chain.download_single.call_args.kwargs["episode_targets"] == {1: {1, 2}}
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {1, 2}
+    # 多季整包不得用跨季并集 min/max 改写候选原始识别范围。
+    assert candidate.meta_info.episode_list == []
+
+
+def test_single_season_netdisk_pack_submits_season_targets(batch, monkeypatch):
+    """
+    单季候选即使分享里混有其他季，也按目标季提交季级目标。
+    """
+    candidate = _context("multiseason")
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing(total=1)}}
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S02/01.mp4"])
+
+    result, _remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == [candidate]
+    assert batch.chain.download_single.call_args.kwargs["episode_targets"] == {1: {1}}
+
+
+def test_whole_season_candidate_allows_netdisk_extra_season(batch):
+    """
+    网盘候选只要覆盖任一缺失季即可进入整季阶段。
+    """
+    candidate = _context("multiseason")
+    candidate.meta_info.end_season = 2
+    candidate.torrent_info.download_type = "netdisk"
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing()}})
+
+    assert run._whole_season_candidate(candidate, "tmdb:1", [1]) == [1, 2]
+
+
+def test_whole_season_candidate_keeps_non_netdisk_subset_requirement(batch):
+    """
+    非网盘候选仍要求全部季都在缺失范围内。
+    """
+    candidate = _context("multiseason")
+    candidate.meta_info.end_season = 2
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing()}})
+
+    assert run._whole_season_candidate(candidate, "tmdb:1", [1]) == []
+
+
+def test_multiseason_netdisk_pack_keeps_partial_season_accounting(batch, monkeypatch):
+    """
+    整季阶段只结算整缺季，候选附带的部分缺集季必须保留原缺集记录。
+    """
+    candidate = _context("multiseason")
+    candidate.meta_info.end_season = 2
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {
+        "tmdb:1": {
+            1: _missing(total=1),
+            2: _missing((5,), total=10),
+        },
+    }
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S02/05.mp4"])
+
+    result, remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == [candidate]
+    assert batch.chain.download_single.call_args.kwargs["episode_targets"] == {1: {1}}
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {1}
+    assert 1 not in remaining["tmdb:1"]
+    assert remaining["tmdb:1"][2].episodes == [5]
+
+
+def test_single_season_netdisk_pack_without_season_markers_submits(batch, monkeypatch):
+    """
+    根目录平铺、无季标记的分享仍按目标季提交，不能因季号为 None 被整季阶段拒绝。
+    """
+    candidate = _context("flat")
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing(total=2)}}
+    _patch_netdisk_paths(monkeypatch, ["第01集.mp4", "第02集.mp4"])
+
+    result, _remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == [candidate]
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {1, 2}
+    assert batch.chain.download_single.call_args.kwargs["episode_targets"] == {1: {1, 2}}
+
+
+def test_netdisk_partial_pack_without_season_markers_submits(batch, monkeypatch):
+    """
+    无季标记分享的缺失集走拆包阶段时，仍能按目标季兜底提交。
+    """
+    candidate = _context("flat")
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing((27, 28, 29), total=29)}}
+    _patch_netdisk_paths(monkeypatch, ["第27集.mp4", "第28集.mp4", "第29集.mp4"])
+    run = _batch_run(batch.chain, [candidate], missing)
+
+    run._download_season_partial_packs("tmdb:1", 1, [27, 28, 29])  # pylint: disable=protected-access
+
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {27, 28, 29}
+
+
+def test_episode_pack_candidate_falls_back_for_flat_share(batch, monkeypatch):
+    """
+    无季标记分享在完整集阶段同样按目标季兜底取集，不再返回空集。
+    """
+    candidate = _context("flat")
+    candidate.torrent_info.download_type = "netdisk"
+    info = _missing((27, 28, 29), total=29)
+    _patch_netdisk_paths(monkeypatch, ["第27集.mp4", "第28集.mp4", "第29集.mp4"])
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: info}})
+
+    assert run._episode_pack_candidate(  # pylint: disable=protected-access
+        candidate, "tmdb:1", 1, [27, 28, 29], info,
+    ) == {27, 28, 29}
+
+
+def test_episode_pack_candidate_only_counts_target_season_episodes(batch, monkeypatch):
+    """
+    多季分享中的完整集包只按目标季集号结算，其他季同集号不计入。
+    """
+    candidate = _context("multiseason")
+    candidate.torrent_info.download_type = "netdisk"
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S02/02.mp4"])
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing((2,), total=2)}})
+
+    assert run._episode_pack_candidate(  # pylint: disable=protected-access
+        candidate, "tmdb:1", 1, [2], _missing((2,), total=2),
+    ) == set()
+
+
+def test_partial_pack_does_not_submit_other_season_episode(batch, monkeypatch):
+    """
+    拆包阶段只按目标季核对集号，其他季同集号不能触发提交。
+    """
+    candidate = _context("multiseason")
+    candidate.torrent_info.download_type = "netdisk"
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S02/02.mp4"])
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing((2,), total=2)}})
+
+    run._download_season_partial_packs("tmdb:1", 1, [2])  # pylint: disable=protected-access
+
+    batch.chain.download_single.assert_not_called()

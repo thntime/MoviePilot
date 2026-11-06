@@ -94,6 +94,10 @@ class DownloadHistoryOwner(_DownloadOwnerBase):
         save_path = download_dir if layout == "NoSubfolder" or not folder_name else download_path
         media_source, media_id = resolve_media_identity(media=media)
         classification = effective_classification_snapshot(media)
+        # 后台失败无法拿到提交时的上下文，这里持久化整包退避指纹供对账直接复用。
+        failure_fingerprint = self._build_download_failure_fingerprint(
+            context, resource_backoff=True,
+        )
         history = DownloadHistoryWrite(
             path=download_path.as_posix(),
             type=(media.type.value if media.type else ""),
@@ -122,6 +126,7 @@ class DownloadHistoryOwner(_DownloadOwnerBase):
             classification_source=classification.source,
             episode_group=media.episode_group,
             note={**self._build_download_note(source, media, meta),
+                  **({"failure_fingerprint": failure_fingerprint} if failure_fingerprint else {}),
                   **({"subscription_download": context.subscription_download} if context.subscription_download else {})},
             custom_words=custom_words,
         )

@@ -66,6 +66,9 @@ _TASK_POLL_INTERVAL = 1.0
 # 登录态失效与游客大小限制的服务端错误码。
 _CODE_LOGIN_REQUIRED = 31001
 _CODE_GUEST_LIMIT = 23018
+# 分享 stoken 的进程内缓存时长；任务开始时会强制换新，任务进行中复用同一 token，
+# 避免「新 stoken + 旧 share_fid_token」被取链接口拒绝。
+_STOKEN_TTL_SECONDS = 6 * 3600.0
 
 
 def _strip_puus(cookie: str) -> str:
@@ -220,6 +223,36 @@ class _QuarkHttp(NetdiskHttp):
         :return: 响应 JSON
         """
         self.last_set_cookie = _set_cookie_header(response)
+        if response is not None and getattr(response, "status_code", 0) == 404:
+            # 夸克分享被取消/过期时返回 HTTP 404 + 41011/41012，直接提示分享失效，
+            # 不要只显示「HTTP 404」让人误以为是代码或网络问题。
+            try:
+                payload = response.json()
+            except Exception:  # noqa: BLE001 - 非 JSON 响应交给基类处理
+                payload = {}
+            code = as_int(payload.get("code")) if isinstance(payload, dict) else 0
+            message = as_text(payload.get("message")) if isinstance(payload, dict) else ""
+            if code in (41011, 41012) or "分享" in message:
+                raise NetdiskError(
+                    NetdiskErrorCode.SHARE_INVALID,
+                    f"夸克分享已失效：{message or '分享地址已失效'}",
+                    platform=NetdiskPlatform.QUARK,
+                )
+        if response is not None and getattr(response, "status_code", 0) in (401, 403):
+            # 41020 是 share_fid_token 过期/不匹配，不是登录态失效；映射为 LINK_EXPIRED
+            # 才能让取链逻辑换新 token 重试，而不是让用户去重新登录。
+            try:
+                payload = response.json()
+            except Exception:  # noqa: BLE001 - 非 JSON 响应交给基类处理
+                payload = {}
+            code = as_int(payload.get("code")) if isinstance(payload, dict) else 0
+            message = as_text(payload.get("message")) if isinstance(payload, dict) else ""
+            if code == 41020 or "token校验" in message:
+                raise NetdiskError(
+                    NetdiskErrorCode.LINK_EXPIRED,
+                    f"夸克文件令牌校验失败：{message or 'token 已失效'}",
+                    platform=NetdiskPlatform.QUARK,
+                )
         return super()._json(response)
 
 
@@ -256,6 +289,8 @@ class QuarkAdapter(BaseNetdiskAdapter):
         """
         super().__init__()
         self.http = _QuarkHttp()
+        # share_id -> (过期时间, stoken, 标题)；避免同一轮取链反复换 token。
+        self._stoken_cache: dict[str, tuple[float, str, str]] = {}
 
     # ---- 请求封装 ----
 
@@ -307,35 +342,55 @@ class QuarkAdapter(BaseNetdiskAdapter):
 
     # ---- 分享与目录 ----
 
-    def _stoken(self, ref: ShareRef, account: Optional[NetdiskAccountRecord]) -> tuple[str, str]:
+    def _stoken(self, ref: ShareRef, account: Optional[NetdiskAccountRecord],
+                *, refresh: bool = False) -> tuple[str, str]:
         """
-        取得分享访问令牌；调用方已透传时直接复用。
+        取得分享访问令牌。
+
+        候选透传的 stoken 可能已过期，任务开始（share_detail）时强制换新；
+        任务进行中的 list_files/resolve 复用同一 token，保证 share_fid_token 与之一致。
 
         :param ref: 分享引用
         :param account: 取链账号
+        :param refresh: 是否强制换新
         :return: stoken 与分享标题
         """
-        if ref.share_token:
-            return ref.share_token, ""
-        payload = self._post_json(
-            _TOKEN_URL,
-            {
-                "pwd_id": ref.share_id,
-                "passcode": ref.password or "",
-                "support_visit_limit_private_share": True,
-            },
-            account=account,
-            action="获取分享令牌",
-        )
+        now = time.monotonic()
+        # stoken 与请求账号绑定，缓存键必须带上账号，避免多账号共用同一 token。
+        cache_key = f"{ref.share_id}:{account.id if account else 0}"
+        cached = self._stoken_cache.get(cache_key)
+        if cached and not refresh and cached[0] > now:
+            return cached[1], cached[2]
+        # 候选透传的 stoken 只用于「本次会话」；重试或补链可能发生在数小时后，
+        # 旧 token 已失效会让分享详情直接 404，因此每次都换新，失败才退回透传值。
+        try:
+            payload = self._post_json(
+                _TOKEN_URL,
+                {
+                    "pwd_id": ref.share_id,
+                    "passcode": ref.password or "",
+                    "support_visit_limit_private_share": True,
+                },
+                account=account,
+                action="获取分享令牌",
+            )
+        except NetdiskError:
+            if ref.share_token:
+                return ref.share_token, ""
+            raise
         data = payload.get("data") or {}
         stoken = as_text(data.get("stoken"))
         if not stoken:
+            if ref.share_token:
+                return ref.share_token, ""
             raise NetdiskError(
                 NetdiskErrorCode.SHARE_INVALID,
                 "获取分享令牌失败：响应缺少 stoken",
                 platform=self.platform,
             )
-        return stoken, as_text(data.get("title"))
+        title = as_text(data.get("title"))
+        self._stoken_cache[cache_key] = (now + _STOKEN_TTL_SECONDS, stoken, title)
+        return stoken, title
 
     def _list_share(
         self,
@@ -365,11 +420,16 @@ class QuarkAdapter(BaseNetdiskAdapter):
                     "pwd_id": share_id,
                     "stoken": stoken,
                     "pdir_fid": pdir_fid,
+                    # ver=2 决定 share_fid_token 的签名格式；缺失时 token 无法用于取链。
+                    "ver": "2",
                     "force": "0",
                     "_page": str(page),
                     "_size": str(_SHARE_PAGE_SIZE),
+                    "_fetch_banner": "0",
+                    "_fetch_share": "0",
+                    "fetch_relate_conversation": "0",
                     "_fetch_total": "1",
-                    "_sort": "file_type:asc,updated_at:desc",
+                    "_sort": "file_type:asc,file_name:asc",
                 },
                 action="读取分享目录",
             )
@@ -388,6 +448,7 @@ class QuarkAdapter(BaseNetdiskAdapter):
                         file_id=file_id,
                         name=name,
                         size=as_int(item.get("size")),
+                        duration=as_int(item.get("duration")),
                         is_dir=bool(item.get("dir")),
                         parent_id=as_text(item.get("pdir_fid")) or pdir_fid,
                         token=as_text(item.get("share_fid_token") or item.get("fid_token")),
@@ -405,7 +466,8 @@ class QuarkAdapter(BaseNetdiskAdapter):
         :param account: 取链账号
         :return: 分享详情
         """
-        stoken, title = self._stoken(ref, account)
+        # 任务开始：强制换新，避免复用候选透传的过期 token。
+        stoken, title = self._stoken(ref, account, refresh=True)
         files = self._list_share(ref.share_id, stoken, "0", account)
         size = sum(item.size for item in files if not item.is_dir)
         return ShareDetail(title=title, size=size, files=tuple(files), stoken=stoken)
@@ -716,20 +778,30 @@ class QuarkAdapter(BaseNetdiskAdapter):
         account: Optional[NetdiskAccountRecord],
         *,
         allow_transfer: bool = True,
+        transfer_first: bool = False,
     ) -> DirectLink:
         """
         获取单个文件的下载直链。
 
         优先免转存取链；失败且允许转存时，转存到唯一临时子目录后再取链，
-        并把临时目录标识放进清理句柄。
+        并把临时目录标识放进清理句柄。`transfer_first` 为真时先转存。
 
         :param ref: 分享引用
         :param file: 目标文件
         :param account: 取链账号
         :param allow_transfer: 是否允许转存兜底
+        :param transfer_first: 是否优先转存
         :return: 直链
         """
         stoken, _ = self._stoken(ref, account)
+        if transfer_first and account is not None:
+            try:
+                handle, link = self._transfer_link(ref.share_id, stoken, file, account)
+                return self._build_link(link, file, account, handle)
+            except NetdiskError as error:
+                if not allow_transfer:
+                    raise
+                self.log_failure("转存取链", error, account)
         try:
             link = self._share_link(ref.share_id, stoken, file, account)
             return self._build_link(link, file, account, None)
@@ -737,8 +809,43 @@ class QuarkAdapter(BaseNetdiskAdapter):
             if not allow_transfer or account is None:
                 raise
             self.log_failure("免转存取链", error, account)
+            if error.code in (
+                NetdiskErrorCode.AUTH_EXPIRED,
+                NetdiskErrorCode.LINK_EXPIRED,
+                NetdiskErrorCode.UNKNOWN,
+            ):
+                # 直链刷新可能发生在任务开始数小时后：换新 stoken 并重列目录拿新的
+                # share_fid_token，避免「新 stoken + 旧文件 token」被服务端拒绝。
+                stoken, file = self._refresh_share_file(ref, file, account)
+                try:
+                    link = self._share_link(ref.share_id, stoken, file, account)
+                    return self._build_link(link, file, account, None)
+                except NetdiskError as retry_error:
+                    self.log_failure("免转存取链", retry_error, account)
         handle, link = self._transfer_link(ref.share_id, stoken, file, account)
         return self._build_link(link, file, account, handle)
+
+    def _refresh_share_file(
+        self,
+        ref: ShareRef,
+        file: ShareFile,
+        account: NetdiskAccountRecord,
+    ) -> tuple[str, ShareFile]:
+        """
+        换新 stoken 后重新列出文件所在目录，返回新的分享文件令牌。
+
+        :param ref: 分享引用
+        :param file: 目标文件
+        :param account: 取链账号
+        :return: `(stoken, 刷新后的文件条目)`；找不到时返回原条目
+        """
+        stoken, _ = self._stoken(ref, account, refresh=True)
+        try:
+            files = self._list_share(ref.share_id, stoken, file.parent_id or "0", account)
+        except NetdiskError:
+            return stoken, file
+        matched = next((item for item in files if item.file_id == file.file_id), None)
+        return stoken, matched or file
 
     def cleanup(self, handle: TransferHandle, account: Optional[NetdiskAccountRecord]) -> None:
         """

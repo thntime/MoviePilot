@@ -210,6 +210,29 @@ class NetdiskAccountStore(Protocol):
 
 
 @runtime_checkable
+class NetdiskSpeedStore(Protocol):
+    """
+    账号平均速度的持久化端口。
+    """
+
+    def load(self) -> Mapping[int, float]:
+        """
+        读取全部账号的平均速度。
+
+        :return: 账号主键到字节每秒的映射；无数据时返回空映射
+        """
+        ...
+
+    def save(self, speeds: Mapping[int, float]) -> None:
+        """
+        覆盖写入全部账号的平均速度。
+
+        :param speeds: 账号主键到字节每秒的映射
+        """
+        ...
+
+
+@runtime_checkable
 class NetdiskAdapter(Protocol):
     """
     单个网盘的协议适配器。
@@ -347,6 +370,7 @@ class NetdiskAdapter(Protocol):
         account: Optional[NetdiskAccountRecord],
         *,
         allow_transfer: bool = True,
+        transfer_first: bool = False,
     ) -> DirectLink:
         """
         获取单个文件的下载直链。
@@ -358,6 +382,7 @@ class NetdiskAdapter(Protocol):
         :param file: 目标文件
         :param account: 取链账号
         :param allow_transfer: 是否允许转存兜底
+        :param transfer_first: 是否优先转存；False 时保持免转存优先
         :return: 直链及其请求条件
         """
         ...
@@ -490,5 +515,6 @@ __all__ = [
     "NetdiskAdapter",
     "NetdiskLoginAdapter",
     "NetdiskSettingsPort",
+    "NetdiskSpeedStore",
     "NetdiskTuning",
 ]

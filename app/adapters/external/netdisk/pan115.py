@@ -1249,20 +1249,30 @@ class Pan115Adapter(BaseNetdiskAdapter):
         account: Optional[NetdiskAccountRecord],
         *,
         allow_transfer: bool = True,
+        transfer_first: bool = False,
     ) -> DirectLink:
         """
         获取单个文件的下载直链。
 
         优先走网页端免转存；仅当网页端以「文件过大」拒绝下发直链且允许转存时，
-        才转存到唯一临时目录并改走客户端通道。
+        才转存到唯一临时目录并改走客户端通道。`transfer_first` 为真时先转存。
 
         :param ref: 分享引用
         :param file: 目标文件
         :param account: 取链账号
         :param allow_transfer: 是否允许转存兜底
+        :param transfer_first: 是否优先转存
         :return: 直链
         """
         receive_code, user_id, _, _ = self._share_root(ref, account)
+        if transfer_first and account is not None:
+            try:
+                handle, saved_link = self._transfer_link(ref, receive_code, file, account)
+                return self._build_link(saved_link, file, account, handle)
+            except NetdiskError as error:
+                if not allow_transfer:
+                    raise
+                self.log_failure("转存取链", error, account)
         try:
             link = self._share_link(ref, file, receive_code, user_id, account)
         except _WebLinkDenied as error:

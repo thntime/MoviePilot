@@ -9,7 +9,7 @@ import traceback
 from abc import ABCMeta
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from app.application.chain.context import ChainRuntimeContext, get_chain_runtime_context
 from app.application.configuration import (
@@ -911,6 +911,7 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
         download_dir: Path,
         cookie: Optional[str],
         episodes: Optional[Set[int]] = None,
+        episode_targets: Optional[Dict[int, Set[int]]] = None,
         category: Optional[str] = None,
         label: Optional[str] = None,
         downloader: Optional[str] = None,
@@ -919,7 +920,7 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
         netdisk_platform: Optional[str] = None,
         share_password: Optional[str] = None,
         netdisk_share_token: Optional[str] = None,
-        season: Optional[int] = None,
+        season: Optional[Union[int, str, Sequence[int]]] = None,
     ) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], str]]:
         """
         根据种子文件，选择并添加下载任务
@@ -928,6 +929,7 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
         :param download_dir:  下载目录
         :param cookie: 下载种子所需的站点 Cookie
         :param episodes:  需要下载的集数
+        :param episode_targets:  按季划分的目标集数，网盘按季过滤时优先于 episodes
         :param category:  种子分类
         :param label:  标签
         :param downloader:  下载器
@@ -945,6 +947,7 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
             download_dir=download_dir,
             cookie=cookie,
             episodes=episodes,
+            episode_targets=episode_targets,
             category=category,
             label=label,
             downloader=downloader,

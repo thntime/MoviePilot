@@ -163,6 +163,34 @@ def _is_success(payload: Mapping[str, Any]) -> bool:
     return code in ("", "0")
 
 
+def _token_fields(data: Mapping[str, Any]) -> dict[str, str]:
+    """
+    把登录/刷新响应转换为可保存的凭据字段。
+
+    除 access_token 外必须保留 refresh_token 与过期时间，否则 token 到期后无法续期。
+
+    :param data: 响应中的业务数据
+    :return: 凭据字段；缺少 access_token 时为空字典
+    """
+    token = _first_non_blank(data.get("access_token"), data.get("accessToken"))
+    if not token:
+        return {}
+    fields: dict[str, str] = {"token": token}
+    refresh = _first_non_blank(data.get("refresh_token"), data.get("refreshToken"))
+    if refresh:
+        fields["refresh_token"] = refresh
+    expires_in = as_int(data.get("expires_in")) or as_int(data.get("expiresIn"))
+    if expires_in:
+        fields["expires_at"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        ).isoformat()
+    else:
+        absolute = _first_non_blank(data.get("expire_time"), data.get("expires_at"))
+        if absolute:
+            fields["expires_at"] = absolute
+    return fields
+
+
 def _classify(code: str, message: str) -> NetdiskErrorCode:
     """
     把光鸭业务码与提示收敛为统一错误分类。
@@ -814,20 +842,30 @@ class GuangYaAdapter(BaseNetdiskAdapter):
         account: Optional[NetdiskAccountRecord],
         *,
         allow_transfer: bool = True,
+        transfer_first: bool = False,
     ) -> DirectLink:
         """
         获取单个文件的下载直链。
 
         优先免登录取链；分享者未开启免登录下载时，若允许转存则转存到唯一临时目录
-        再从个人盘取链，并返回清理句柄。
+        再从个人盘取链，并返回清理句柄。`transfer_first` 为真时先转存。
 
         :param ref: 分享引用
         :param file: 目标文件
         :param account: 取链账号
         :param allow_transfer: 是否允许转存兜底
+        :param transfer_first: 是否优先转存
         :return: 直链
         """
         share_token = self._share_token(ref)
+        if transfer_first and account is not None:
+            try:
+                handle, saved_link = self._transfer_link(file, share_token, account)
+                return self._build_link(saved_link, file, account, handle)
+            except NetdiskError as error:
+                if not allow_transfer:
+                    raise
+                self.log_failure("转存取链", error, account)
         try:
             link = self._share_link(file, share_token)
         except _ShareRestrictedError as error:
@@ -1156,7 +1194,13 @@ class GuangYaAdapter(BaseNetdiskAdapter):
         try:
             moment = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
         except ValueError:
-            return False
+            try:
+                stamp = float(expires_at)
+            except ValueError:
+                return False
+            if stamp > 1e12:
+                stamp /= 1000
+            return stamp - time.time() <= _REFRESH_LEEWAY_SECONDS
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=timezone.utc)
         return (moment - datetime.now(timezone.utc)).total_seconds() <= _REFRESH_LEEWAY_SECONDS
@@ -1267,15 +1311,15 @@ class GuangYaAdapter(BaseNetdiskAdapter):
                 account_name=account_name,
             )
         data = (payload.get("data") if isinstance(payload.get("data"), dict) else payload) or {}
-        token = _first_non_blank(data.get("access_token"), data.get("accessToken"))
-        if not token:
+        fields = _token_fields(data)
+        if not fields:
             raise NetdiskError(
                 NetdiskErrorCode.AUTH_EXPIRED,
                 "光鸭登录失败：响应缺少 access_token",
                 platform=self.platform,
                 account_name=account_name,
             )
-        return {"token": token}
+        return fields
 
     def _captcha_init(self, action: str, meta: Mapping[str, Any]) -> Optional[str]:
         """
@@ -1425,15 +1469,15 @@ class GuangYaAdapter(BaseNetdiskAdapter):
                 account_name=phone_number,
             )
         data = (payload.get("data") if isinstance(payload.get("data"), dict) else payload) or {}
-        token = _first_non_blank(data.get("access_token"), data.get("accessToken"))
-        if not token:
+        fields = _token_fields(data)
+        if not fields:
             raise NetdiskError(
                 NetdiskErrorCode.AUTH_EXPIRED,
                 "光鸭登录失败：响应缺少 access_token",
                 platform=self.platform,
                 account_name=phone_number,
             )
-        return {"token": token}
+        return fields
 
 
 def _signin_error_code(code: str, message: str) -> NetdiskErrorCode:

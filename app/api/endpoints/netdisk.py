@@ -19,7 +19,7 @@ from app.runtime.log import logger
 from app.api.dependencies.auth import get_current_active_superuser_async
 from app.api.principal import ApiPrincipal
 from app.api.response import ResponseAPIRouter
-from app.application.netdisk import registry
+from app.application.netdisk import registry, selection
 from app.application.netdisk.accounts import NetdiskAccountService
 from app.application.netdisk.contract import NetdiskAccountDetail, NetdiskAccountView
 from app.application.netdisk.login import NetdiskLoginService
@@ -61,6 +61,7 @@ def _account_view(view: NetdiskAccountView) -> NetdiskAccountDetailView:
         nickname=view.nickname,
         quota_used=view.quota_used,
         quota_total=view.quota_total,
+        speed=selection.account_speed(view.id),
     )
 
 
@@ -607,6 +608,29 @@ async def cancel_qr_login(
     """
     await run_in_threadpool(_login().cancel_qr, session_id)
     return _SchemaResponse(success=True, data=NetdiskData(status="cancelled"))
+
+
+@router.post("/accounts/check", summary="检查全部网盘账号")
+async def check_all_accounts(
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> _SchemaResponse[NetdiskData]:
+    """
+    逐个检测全部网盘账号的登录态，并刷新空间占用与昵称。
+
+    单账号异常只计入失败数量，不中断整轮检测。
+    """
+    result = await run_in_threadpool(_accounts().check_all)
+    views = await run_in_threadpool(_accounts().list)
+    return _SchemaResponse(
+        success=True,
+        data=NetdiskData(
+            accounts=[_account_view(view) for view in views],
+            checked=result.get("checked", 0),
+            active=result.get("active", 0),
+            expired=result.get("expired", 0),
+            failed=result.get("failed", 0),
+        ),
+    )
 
 
 @router.get("/accounts/{account_id}", summary="查询网盘账号详情")

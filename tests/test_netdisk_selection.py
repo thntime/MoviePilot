@@ -98,7 +98,7 @@ def test_select_uses_speed_when_capacity_equal() -> None:
 
 def test_ensure_space_raises_when_quota_insufficient() -> None:
     """
-    转存前发现剩余容量不足时抛出 SPACE_INSUFFICIENT。
+    转存前发现剩余容量不足时抛出 SPACE_INSUFFICIENT，并只冷却该账号。
     """
     adapter = SimpleNamespace(
         platform=NetdiskPlatform.QUARK,
@@ -109,7 +109,8 @@ def test_ensure_space_raises_when_quota_insufficient() -> None:
     with pytest.raises(NetdiskError) as error:
         service._ensure_space(adapter, ShareFile(file_id="f", name="a.mkv", size=10), SimpleNamespace(id=1))
     assert error.value.code is NetdiskErrorCode.SPACE_INSUFFICIENT
-    assert selection.is_platform_cooled(NetdiskPlatform.QUARK)
+    assert selection.is_account_cooled(1)
+    assert not selection.is_platform_cooled(NetdiskPlatform.QUARK)
 
 
 def test_alert_is_deduplicated_within_window() -> None:
@@ -118,3 +119,60 @@ def test_alert_is_deduplicated_within_window() -> None:
     """
     assert selection.should_alert("quark") is True
     assert selection.should_alert("quark") is False
+
+
+def test_speed_survives_restart(tmp_path) -> None:
+    """速度写入持久化端口后，重新装配仍可读回。"""
+    from app.adapters.system.netdisk_speed import JsonNetdiskSpeedStore
+
+    path = tmp_path / "speeds.json"
+    selection.configure_speed_store(JsonNetdiskSpeedStore(path))
+    selection.record_account_speed(7, 10 * 1024 * 1024, 1)
+    selection.clear_selection_state()
+    selection.configure_speed_store(JsonNetdiskSpeedStore(path))
+    assert selection.account_speed(7) == pytest.approx(10 * 1024 * 1024)
+
+
+def test_record_speed_uses_ewma_alpha_on_second_sample() -> None:
+    """第二次采样按 0.7 旧值 + 0.3 新值混合，而不是直接覆盖。"""
+    selection.record_account_speed(1, 10 * 1024 * 1024, 1)
+    selection.record_account_speed(1, 20 * 1024 * 1024, 1)
+    assert selection.account_speed(1) == pytest.approx(
+        10 * 1024 * 1024 * 0.7 + 20 * 1024 * 1024 * 0.3
+    )
+
+
+def test_save_failure_does_not_raise() -> None:
+    """持久化失败只降级为告警，内存速度仍然生效。"""
+
+    class BrokenStore:
+        """写入必定失败的存储替身。"""
+
+        def load(self):
+            """返回空映射。"""
+            return {}
+
+        def save(self, speeds):
+            """模拟磁盘写入失败。"""
+            raise OSError("disk full")
+
+    selection.configure_speed_store(BrokenStore())
+    selection.record_account_speed(3, 1024, 1)
+    assert selection.account_speed(3) == pytest.approx(1024)
+
+
+def test_load_failure_returns_zero() -> None:
+    """加载失败时按无样本处理，不向上抛出。"""
+
+    class BrokenStore:
+        """读取必定失败的存储替身。"""
+
+        def load(self):
+            """模拟损坏文件。"""
+            raise ValueError("bad file")
+
+        def save(self, speeds):
+            """忽略写入。"""
+
+    selection.configure_speed_store(BrokenStore())
+    assert selection.account_speed(5) == 0.0

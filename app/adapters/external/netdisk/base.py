@@ -244,6 +244,8 @@ class NetdiskHttp:
         self.user_agent = user_agent
         self.referer = referer
         self.timeout = timeout
+        # 默认直连国内网盘域名；需要与登录浏览器保持同一出口 IP 的平台可改为 None（沿用环境代理）。
+        self.proxies: Optional[dict[str, str]] = _DIRECT_PROXIES
         # 由装配层赋值的 Cookie 回写钩子；回调收到本次请求使用的账号与合并后的完整凭据。
         self.credential_sink: Optional[Callable[[NetdiskAccountRecord, Mapping[str, str]], None]] = None
         # 由装配层赋值的续期钩子；鉴权失败时换取新凭据后重试一次。
@@ -372,7 +374,7 @@ class NetdiskHttp:
         request = RequestUtils(
             headers=self.headers(account, extra=headers),
             timeout=self.timeout,
-            proxies=_DIRECT_PROXIES,
+            proxies=self.proxies,
         )
         if method == "GET":
             return request.get_res(url, params=dict(params or {}), allow_redirects=True)
@@ -536,7 +538,26 @@ class NetdiskHttp:
         if response is None:
             raise NetdiskError(NetdiskErrorCode.UNKNOWN, "网盘接口无响应", platform=self.platform)
         if response.status_code in (401, 403):
-            raise NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "网盘登录态已失效", platform=self.platform)
+            # 403 不一定代表登录态失效：夸克等平台会用 403 返回业务错误（如文件 token 校验失败）。
+            # 优先透出服务端 message，避免把账号正常的情况误报成「登录态已失效」。
+            message = ""
+            try:
+                payload = response.json()
+                if isinstance(payload, dict):
+                    message = str(
+                        payload.get("message")
+                        or payload.get("error_description")
+                        or payload.get("error")
+                        or ""
+                    ).strip()
+            except Exception:  # noqa: BLE001 - 非 JSON 响应保持通用提示
+                message = ""
+            detail = f"：{message}" if message else ""
+            raise NetdiskError(
+                NetdiskErrorCode.AUTH_EXPIRED,
+                f"网盘接口拒绝（HTTP {response.status_code}）{detail}",
+                platform=self.platform,
+            )
         if response.status_code == 429:
             raise NetdiskError(NetdiskErrorCode.RATE_LIMITED, "网盘接口请求过于频繁", platform=self.platform)
         if response.status_code >= 500:
@@ -660,6 +681,7 @@ class BaseNetdiskAdapter:
         account: Optional[NetdiskAccountRecord],
         *,
         allow_transfer: bool = True,
+        transfer_first: bool = False,
     ) -> DirectLink:
         """
         获取直链；子类必须实现。
@@ -668,6 +690,7 @@ class BaseNetdiskAdapter:
         :param file: 目标文件
         :param account: 取链账号
         :param allow_transfer: 是否允许转存兜底
+        :param transfer_first: 是否优先转存；False 时保持免转存优先
         :return: 直链
         """
         raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "该平台暂不支持取链", platform=self.platform)

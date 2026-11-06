@@ -511,6 +511,7 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
                         torrent_file: Optional[Path] = None,
                         torrent_content: Optional[Union[str, bytes]] = None,
                         episodes: Optional[Set[int]] = None,
+                        episode_targets: Optional[Dict[int, Set[int]]] = None,
                         channel: Optional[NotificationChannel] = None,
                         source: Optional[str] = None,
                         downloader: Optional[str] = None,
@@ -532,6 +533,7 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             torrent_file=torrent_file,
             torrent_content=torrent_content,
             episodes=episodes,
+            episode_targets=episode_targets,
             channel=channel,
             source=source,
             downloader=downloader,
@@ -550,6 +552,7 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
         torrent_file: Optional[Path] = None,
         torrent_content: Optional[Union[str, bytes]] = None,
         episodes: Optional[Set[int]] = None,
+        episode_targets: Optional[Dict[int, Set[int]]] = None,
         channel: Optional[NotificationChannel] = None,
         source: Optional[str] = None,
         downloader: Optional[str] = None,
@@ -590,6 +593,7 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             prepared=prepared,
             context=context,
             episodes=episodes,
+            episode_targets=episode_targets,
             channel=channel,
             source=source,
             downloader=downloader,
@@ -750,6 +754,9 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             media_info=media,
             save_path=save_path,
         )
+        if is_netdisk and storage != "local":
+            # 网盘模块直接按本地 Path 写入，远程目录（smb:/u115:）会写错位置。
+            return None, "网盘下载仅支持本地下载目录"
         if not download_dir or not storage:
             if error_msg == "未找到下载目录":
                 self.messagehelper.put(
@@ -779,6 +786,7 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
         prepared: _PreparedDownload,
         context: Context,
         episodes: Optional[Set[int]],
+        episode_targets: Optional[Dict[int, Set[int]]] = None,
         channel: Optional[NotificationChannel],
         source: Optional[str],
         downloader: Optional[str],
@@ -810,6 +818,7 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             content=prepared.torrent_content,
             cookie=prepared.torrent.site_cookie,
             episodes=cast(Set[int], episodes),
+            episode_targets=episode_targets,
             download_dir=prepared.download_dir,
             category=category,
             label=label,
@@ -819,7 +828,7 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             netdisk_platform=getattr(prepared.torrent, "netdisk_platform", None),
             share_password=getattr(prepared.torrent, "share_password", None),
             netdisk_share_token=getattr(prepared.torrent, "netdisk_share_token", None),
-            season=getattr(getattr(prepared, "meta", None), "season", None),
+            season=getattr(getattr(prepared, "meta", None), "season_list", None),
         )
         actual_downloader, download_hash, layout, error_msg = (
             result if result else (None, None, None, "未找到下载器")

@@ -127,7 +127,7 @@ class NetdiskAccountService:
         创建账号并在保存前校验凭据。
 
         :param platform: 平台标识
-        :param name: 账号名称
+        :param name: 账号名称；为空时按平台昵称自动生成唯一名称
         :param credential: 明文凭据字段
         :param is_primary: 是否设为主账号
         :param validate: 是否调用平台接口校验
@@ -137,13 +137,22 @@ class NetdiskAccountService:
         """
         resolved = self._require_platform(platform)
         clean_name = str(name or "").strip()
-        if not clean_name:
-            raise NetdiskError(NetdiskErrorCode.UNKNOWN, "账号名称不能为空", platform=resolved)
         payload = {str(key): str(value) for key, value in credential.items() if str(value).strip()}
         if not payload:
             raise NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "凭据不能为空", platform=resolved)
         adapter = registry.get_adapter(resolved)
         self._require_keys(adapter, payload)
+        resolved_nickname = nickname
+        if not resolved_nickname:
+            # 新增账号时尽量从平台侧解析昵称；失败不影响账号创建。
+            try:
+                resolved_nickname = adapter.login_account_name(payload) or ""
+            except Exception:  # noqa: BLE001 - 昵称解析失败不影响创建
+                resolved_nickname = ""
+        if not clean_name:
+            # 前端不再提交名称：优先用平台昵称，缺失时回退到「平台 账号」，并保证同平台唯一。
+            base = str(resolved_nickname or "").strip() or f"{resolved.value} 账号"
+            clean_name = self._unique_name(resolved, base)
         if validate:
             probe = adapter.validate_credential(payload)
             if probe.status != "active":
@@ -153,14 +162,7 @@ class NetdiskAccountService:
                     platform=resolved,
                     account_name=clean_name,
                 )
-        resolved_nickname = nickname
-        if not resolved_nickname:
-            # 新增账号时尽量从平台侧解析昵称；失败不影响账号创建。
-            try:
-                resolved_nickname = adapter.login_account_name(payload) or ""
-            except Exception:  # noqa: BLE001 - 昵称解析失败不影响创建
-                resolved_nickname = ""
-        return self.store.create_account(
+        created = self.store.create_account(
             NetdiskAccountWrite(
                 platform=resolved,
                 name=clean_name,
@@ -169,6 +171,50 @@ class NetdiskAccountService:
                 nickname=resolved_nickname,
             )
         )
+        # 登录成功即拉取一次空间，避免用户必须再点「检测连通性」才能看到容量。
+        self._refresh_quota(created.id, adapter)
+        return created
+
+    def _refresh_quota(self, account_id: int, adapter: NetdiskAdapter) -> None:
+        """
+        登录或重新授权后立即刷新一次空间占用。
+
+        失败只记录告警，不影响账号创建/更新结果；前端随后刷新列表即可看到容量。
+
+        :param account_id: 账号主键
+        :param adapter: 平台适配器
+        """
+        if not adapter.drive_capabilities.quota:
+            return
+        record = self.store.get_record(account_id)
+        if record is None:
+            return
+        try:
+            quota = adapter.quota(record)
+        except Exception as error:  # noqa: BLE001 - 空间刷新失败不影响登录
+            logger.warning(
+                f"网盘账号空间刷新失败：account_id={account_id} error={type(error).__name__}"
+            )
+            return
+        self.store.update_quota(account_id, quota.used, quota.total)
+
+    def _unique_name(self, platform: NetdiskPlatform, base: str) -> str:
+        """
+        生成同平台内未被占用的账号名称。
+
+        基础名称未被占用时直接返回；否则依次尝试「基础名称 (2)」「基础名称 (3)」……
+
+        :param platform: 平台枚举
+        :param base: 基础名称
+        :return: 同平台内唯一的账号名称
+        """
+        existing = {view.name for view in self.store.list_accounts(platform)}
+        if base not in existing:
+            return base
+        index = 2
+        while f"{base} ({index})" in existing:
+            index += 1
+        return f"{base} ({index})"
 
     def update(
         self,
@@ -225,6 +271,8 @@ class NetdiskAccountService:
         )
         if updated is None:
             raise NetdiskError(NetdiskErrorCode.UNKNOWN, "账号不存在", platform=record.platform)
+        # 重新授权/更新凭据后同步刷新空间。
+        self._refresh_quota(account_id, adapter or registry.get_adapter(record.platform))
         return updated
 
     def delete(self, account_id: int) -> bool:
@@ -307,6 +355,37 @@ class NetdiskAccountService:
                 quota_total=quota_total,
             )
         return probe
+
+    def check_all(self) -> dict[str, int]:
+        """
+        批量检测全部账号的登录态，并刷新空间占用与昵称。
+
+        逐账号复用 :meth:`probe`；单个账号异常只记录告警，不中断整轮检测。
+
+        :return: 检测、有效、失效与失败账号数量
+        """
+        checked = 0
+        active = 0
+        expired = 0
+        failed = 0
+        for view in self.store.list_accounts():
+            checked += 1
+            try:
+                probe = self.probe(view.id)
+            except Exception as error:  # noqa: BLE001 - 单账号异常不中断整轮
+                failed += 1
+                logger.warning(
+                    f"网盘账号检测失败：platform={view.platform} "
+                    f"account={view.name} error={type(error).__name__}"
+                )
+                continue
+            if probe.status == "active":
+                active += 1
+            elif probe.status == "expired":
+                expired += 1
+            else:
+                failed += 1
+        return {"checked": checked, "active": active, "expired": expired, "failed": failed}
 
     def refresh(self, account_id: int) -> Optional[NetdiskAccountRecord]:
         """
@@ -473,18 +552,28 @@ class NetdiskAccountService:
             )
         return None
 
-    def select(self, platform: object, exclude_ids: Sequence[int] = ()) -> NetdiskAccountRecord:
+    def select(
+        self,
+        platform: object,
+        exclude_ids: Sequence[int] = (),
+        required_bytes: int = 0,
+    ) -> NetdiskAccountRecord:
         """
         按状态、剩余容量、近期速度与主账号顺序选择可用账号。
 
+        提供 ``required_bytes`` 时优先返回剩余空间足以容纳该需求的账号；
+        配额未知的账号无法判断容量，仍参与选择。冷却中的账号直接跳过。
+
         :param platform: 平台标识
         :param exclude_ids: 需要跳过的账号主键
+        :param required_bytes: 本次操作预计需要的字节数；0 表示不限制
         :return: 可用账号记录
-        :raises NetdiskError: 没有可用账号时抛出 AUTH_EXPIRED
+        :raises NetdiskError: 没有可用账号时抛出 AUTH_EXPIRED；账号存在但都放不下时抛出 SPACE_INSUFFICIENT
         """
         resolved = self._require_platform(platform)
         excluded = set(exclude_ids)
         views = self.store.list_accounts(resolved)
+        required = max(int(required_bytes or 0), 0)
 
         def free_ratio(item: NetdiskAccountView) -> float:
             """
@@ -494,22 +583,52 @@ class NetdiskAccountService:
                 return 0.5
             return max(item.quota_total - item.quota_used, 0) / item.quota_total
 
+        def free_bytes(item: NetdiskAccountView) -> Optional[int]:
+            """
+            计算账号剩余字节数；平台未返回配额时返回 None。
+            """
+            if item.quota_total <= 0:
+                return None
+            return max(item.quota_total - item.quota_used, 0)
+
+        def fits(item: NetdiskAccountView) -> bool:
+            """
+            判断账号剩余空间是否满足本次需求；配额未知时视为满足。
+            """
+            if required <= 0:
+                return True
+            available = free_bytes(item)
+            return available is None or available >= required
+
         ordered = sorted(
             views,
             key=lambda item: (
                 item.status != "active",
+                not fits(item),
                 -free_ratio(item),
                 -selection.account_speed(item.id),
                 not item.is_primary,
                 item.id,
             ),
         )
-        for view in ordered:
-            if view.id in excluded:
+        candidates = [
+            view for view in ordered
+            if view.id not in excluded and not selection.is_account_cooled(view.id)
+        ]
+        for view in candidates:
+            if view.status != "active" or not fits(view):
                 continue
             record = self.store.get_record(view.id)
             if record is not None and record.status == "active":
                 return self._refresh_for_request(record)
+        active_views = [view for view in views if view.status == "active"]
+        if active_views and not any(fits(view) for view in active_views):
+            available = max((free_bytes(view) or 0) for view in active_views)
+            raise NetdiskError(
+                NetdiskErrorCode.SPACE_INSUFFICIENT,
+                f"{resolved.value} 账号剩余空间不足：需要 {required} 字节，可用 {available} 字节",
+                platform=resolved,
+            )
         raise NetdiskError(
             NetdiskErrorCode.AUTH_EXPIRED,
             f"{resolved.value} 平台没有可用账号，请先在网盘账号中添加并登录",

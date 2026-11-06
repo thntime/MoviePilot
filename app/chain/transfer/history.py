@@ -482,8 +482,12 @@ class TransferHistoryOwner(_TransferOwnerBase):
             if not isinstance(torrent_files, list):
                 torrent_files = torrent_files.data
 
-            # 检查是否有媒体文件未被屏蔽且存在
-            save_path = torrents[0].path.parent
+            # 检查是否有媒体文件未被屏蔽且存在。
+            # 网盘任务的 path 是任务目录（文件在目录内），种子任务的 path 是内容路径。
+            torrent_path = torrents[0].path
+            if torrent_path is None:
+                return False
+            save_path = torrent_path if torrent_path.is_dir() else torrent_path.parent
             for file in torrent_files:
                 file_path = save_path / file.name
                 # 如果存在未被屏蔽的媒体文件，则不删除种子

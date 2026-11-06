@@ -208,10 +208,11 @@ def test_focus_main_page_ignores_non_baidu() -> None:
 
 def test_baidu_login_ready_rejects_anonymous_cookie() -> None:
     """
-    匿名 Cookie 不算登录完成，出现 BDUSS 才可进入校验。
+    匿名 Cookie 或只有 BDUSS 的半截会话不算登录完成，必须同时有 STOKEN。
     """
     adapter = baidu_module.BaiduAdapter()
 
     assert adapter.login_ready({"cookie": "BAIDUID=anonymous"}) is False
-    assert adapter.login_ready({"cookie": "BDUSS=token"}) is True
-    assert adapter.login_ready({"BDUSS": "token"}) is True
+    assert adapter.login_ready({"cookie": "BDUSS=token"}) is False
+    assert adapter.login_ready({"BDUSS": "token"}) is False
+    assert adapter.login_ready({"cookie": "BDUSS=token; STOKEN=web"}) is True

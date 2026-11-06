@@ -92,12 +92,12 @@ def test_guangya_login_account_name(monkeypatch) -> None:
 
 def test_baidu_login_account_name(monkeypatch) -> None:
     """
-    百度从模板变量接口读取用户名。
+    百度从账号信息接口读取用户名。
     """
     _patch_get_json(
         monkeypatch,
-        {"errno": 0, "result": {"username": "百度用户"}},
-        baidu_module._TEMPLATE_URL,
+        {"errno": 0, "netdisk_name": "百度用户"},
+        baidu_module._UINFO_URL,
     )
 
     adapter = baidu_module.BaiduAdapter()
@@ -121,6 +121,12 @@ def test_xunlei_login_account_name_falls_back_to_about(monkeypatch) -> None:
         monkeypatch,
         {"kind": "drive#about", "nickname": "雷友"},
         xunlei_module._ABOUT_URL,
+    )
+    xunlei_module.XunleiAdapter._captcha_cache.clear()
+    monkeypatch.setattr(
+        xunlei_module.XunleiAdapter,
+        "_init_captcha",
+        lambda self, device, access: ("fresh-captcha", 9e18),
     )
 
     adapter = xunlei_module.XunleiAdapter()

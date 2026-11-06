@@ -6,12 +6,13 @@
 
 from __future__ import annotations
 
+from app.application.netdisk import selection
+from app.application.netdisk.credentials import FernetCredentialCipher
 from app.application.netdisk.registry import (
     configure_netdisk_adapters,
     configure_netdisk_services,
     reset_netdisk_services,
 )
-from app.application.netdisk.credentials import FernetCredentialCipher
 from app.application.netdisk.settings import SystemNetdiskSettings
 from app.runtime.log import logger
 
@@ -30,6 +31,7 @@ def configure_netdisk_composition() -> None:
     from app.adapters.external.netdisk.quark import QuarkAdapter
     from app.adapters.external.netdisk.uc import UCAdapter
     from app.adapters.external.netdisk.xunlei import XunleiAdapter
+    from app.adapters.system.netdisk_speed import JsonNetdiskSpeedStore
     from app.application.configuration import get_token_runtime_config
     from app.db.adapters.netdiskaccount import TransactionalNetdiskAccountRepository
     from app.db.session import SessionFactory
@@ -97,6 +99,7 @@ def configure_netdisk_composition() -> None:
             http.credential_refresher = refresh_credential
 
     configure_netdisk_adapters(cast(dict[NetdiskPlatform, NetdiskAdapter], adapters))
+    selection.configure_speed_store(JsonNetdiskSpeedStore())
     configure_netdisk_services(
         account_store=store,
         settings=SystemNetdiskSettings(),
@@ -110,4 +113,5 @@ def reset_netdisk_composition() -> None:
     """
     释放网盘端口，支持重复 lifespan 与失败回滚。
     """
+    selection.configure_speed_store(None)
     reset_netdisk_services()

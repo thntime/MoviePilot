@@ -9,7 +9,8 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.application.configuration import get_configured_system_config
 from app.application.site.observation import report_site_search_outcome, report_site_search_page
@@ -18,7 +19,6 @@ from app.domain.context import TorrentInfo
 from app.domain.netdisk import parse_share_link
 from app.modules import _ModuleBase
 from app.modules.cloudsaver.cloudsaver import CloudSaverClient, CloudSaverError, parse_share_code
-from app.modules.cloudsaver.quark_share import MAX_PAGES, QuarkShareClient
 from app.runtime.log import logger
 from app.schemas.types import ModuleType, OtherModulesType, SystemConfigKey
 
@@ -60,6 +60,23 @@ def _platform_supported(platform: str) -> bool:
     if registered_platforms():
         return False
     return normalize_platform(platform) is not None
+
+
+# 集数标记只统计视频文件，避免字幕/图片把候选标题改错。
+_VIDEO_SUFFIXES = {
+    ".mp4", ".mkv", ".avi", ".ts", ".mov", ".flv", ".wmv", ".m4v", ".rmvb", ".webm", ".mpg", ".mpeg",
+}
+# 音乐文件参与媒体集数识别；压缩包不参与。
+_AUDIO_SUFFIXES = {
+    ".mp3", ".flac", ".wav", ".aac", ".m4a", ".ogg", ".ape", ".wma", ".opus", ".dsf", ".dff",
+}
+_MEDIA_SUFFIXES = _VIDEO_SUFFIXES | _AUDIO_SUFFIXES
+# 压缩包后缀：只用于判断资源是否主要依赖压缩包，不参与集数映射。
+_ARCHIVE_SUFFIXES = {
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso",
+}
+# 媒体文件覆盖压缩包集数的下限；低于该比例视为压缩包主导资源。
+_MEDIA_COVERAGE_THRESHOLD = 0.8
 
 
 class CloudSaverModule(_ModuleBase):
@@ -354,6 +371,32 @@ class CloudSaverModule(_ModuleBase):
         return videos
 
     @staticmethod
+    def _media_files(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        只保留视频与音乐文件，压缩包不参与集数识别。
+
+        :param files: 分享文件树中的文件条目
+        :return: 媒体文件条目列表
+        """
+        return [
+            entry for entry in files or []
+            if Path(str(entry.get("name") or "")).suffix.lower() in _MEDIA_SUFFIXES
+        ]
+
+    @staticmethod
+    def _archive_files(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        只保留压缩包文件，用于判断资源是否主要依赖压缩包。
+
+        :param files: 分享文件树中的文件条目
+        :return: 压缩包文件条目列表
+        """
+        return [
+            entry for entry in files or []
+            if Path(str(entry.get("name") or "")).suffix.lower() in _ARCHIVE_SUFFIXES
+        ]
+
+    @staticmethod
     def _is_episode_clear(videos: List[Dict[str, Any]]) -> bool:
         """
         判断文件树的集数是否清晰：能解析出集数的视频占比达到下限。
@@ -428,54 +471,59 @@ class CloudSaverModule(_ModuleBase):
             description = str(torrent.description or "")
             if marker not in description:
                 torrent.description = f"{description}{marker}" if description else marker
-        token = CloudSaverModule._episode_token([str(entry.get("name") or "") for entry in files or []])
+        media_names = [
+            str(entry.get("name") or "")
+            for entry in files or []
+            if Path(str(entry.get("name") or "")).suffix.lower() in _MEDIA_SUFFIXES
+        ]
+        token = CloudSaverModule._episode_token(media_names)
         if not token:
             return
         title = _STANDARD_EPISODE.sub(" ", torrent.title or "")
         torrent.title = " ".join(f"{title} {token}".split())
 
-    def _share_files(self, client: QuarkShareClient, share_code: str, detail: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
-        """
-        读取分享内的完整文件树，优先复用分享详情返回的访问令牌。
-
-        :param client: 夸克分享客户端
-        :param share_code: 分享码
-        :param detail: share_detail 返回的分享详情
-        :return: 文件条目列表；无法获取时返回 None
-        """
-        stoken = self._as_text(detail.get("stoken"))
-        if not stoken:
-            stoken = client.fetch_stoken(share_code)
-        if not stoken:
-            return None
-        return client.collect_files(share_code, stoken, max_pages=MAX_PAGES)
-
     def _passes_quality(
         self,
         torrent: TorrentInfo,
-        share_code: str,
         detail: Dict[str, Any],
-        quark: Optional[QuarkShareClient],
     ) -> bool:
         """
-        判断候选是否通过质量检查：文件树完整、集数清晰、不是短剧。
+        判断候选是否通过质量检查：文件树完整、媒体集数清晰、不是短剧、压缩包不主导。
+
+        集数识别只使用视频与音乐文件；压缩包名称不参与集数映射。压缩包覆盖的集数
+        占主导、媒体文件覆盖不足时，候选应丢弃，避免误报「符合条件」。
 
         检查通过时把真实大小与集数写回候选；不通过时候选应被丢弃。
 
         :param torrent: 待检查的网盘候选
-        :param share_code: 分享码
-        :param detail: share_detail 返回的分享详情
-        :param quark: 夸克分享客户端
+        :param detail: 分享详情，含 `_files` 文件树
         :return: 通过返回 True
         """
-        preloaded = detail.get("_files")
-        files = preloaded if isinstance(preloaded, list) else (
-            self._share_files(quark, share_code, detail) if quark is not None else None
-        )
-        videos = self._video_files(files or [])
-        if files is None or not self._is_episode_clear(videos):
-            # 拿不到完整文件树或集数不清晰：丢弃，避免展示错误集数。
+        files = detail.get("_files")
+        if not isinstance(files, list):
+            # 拿不到完整文件树：丢弃，避免展示错误集数。
             return False
+        videos = self._video_files(files)
+        media_files = self._media_files(files)
+        clarity_files = videos or media_files
+        if not self._is_episode_clear(clarity_files):
+            # 集数不清晰：丢弃，避免展示错误集数。
+            return False
+        media_episodes: Set[int] = set()
+        for entry in media_files:
+            media_episodes.update(self._episode_numbers(entry.get("name") or ""))
+        archive_episodes: Set[int] = set()
+        for entry in self._archive_files(files):
+            archive_episodes.update(self._episode_numbers(entry.get("name") or ""))
+        if archive_episodes:
+            union = media_episodes | archive_episodes
+            coverage = len(media_episodes) / len(union) if union else 1.0
+            if coverage < _MEDIA_COVERAGE_THRESHOLD:
+                logger.info(
+                    f"{torrent.title} 压缩包资源暂不支持，已丢弃"
+                    f"（媒体覆盖 {len(media_episodes)}/{len(union)} 集）"
+                )
+                return False
         duration_limit, size_limit = self._quality_limits()
         if self._is_short_drama(videos, duration_limit, size_limit):
             # 短剧判定依赖可调阈值，结论不写入缓存，阈值调整后下次搜索即可生效。
@@ -485,31 +533,20 @@ class CloudSaverModule(_ModuleBase):
 
     def _inspect_share(
         self,
-        client: CloudSaverClient,
-        quark: QuarkShareClient,
-        share_code: str,
         torrent: TorrentInfo,
         cached_detail: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], bool]:
         """
-        检查单个候选：读取分享详情（可复用缓存）并执行质量检查。
+        检查单个候选：统一走本机取链，可复用缓存并执行质量检查。
 
         在线程池中执行，避免逐个候选串行请求。
 
-        :param client: CloudSaver 客户端
-        :param quark: 夸克分享客户端
-        :param share_code: 分享码
         :param torrent: 待检查的网盘候选
-        :param cached_detail: 缓存中已有的分享详情，可跳过详情请求
+        :param cached_detail: 缓存中已有的分享详情，含 `_files` 时跳过网络请求
         :return: (分享详情, 是否通过质量检查)；无法判定时详情为 None
         """
         platform = str(torrent.netdisk_platform or "").strip()
-        if platform and platform != "quark":
-            return self._inspect_remote_share(torrent, platform, cached_detail)
-        detail = cached_detail or client.share_detail(share_code, torrent.share_password)
-        if not detail or not detail.get("alive"):
-            return detail, False
-        return detail, self._passes_quality(torrent, share_code, detail, quark)
+        return self._inspect_remote_share(torrent, platform, cached_detail)
 
     @staticmethod
     def _mark_unverified(torrent: TorrentInfo) -> None:
@@ -530,7 +567,7 @@ class CloudSaverModule(_ModuleBase):
         cached_detail: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], bool]:
         """
-        用统一取链适配器检查非夸克平台候选。
+        用本机统一取链适配器检查网盘候选。
 
         明确失效返回 `alive=False`；鉴权、超时或网络异常返回未验证标记，
         由调用方保留候选而不是直接丢弃。缓存中已有完整文件树时直接复用，避免重复遍历。
@@ -544,7 +581,7 @@ class CloudSaverModule(_ModuleBase):
         from app.domain.netdisk import NetdiskError, NetdiskErrorCode
 
         if cached_detail and cached_detail.get("_files"):
-            return cached_detail, self._passes_quality(torrent, "", cached_detail, None)
+            return cached_detail, self._passes_quality(torrent, cached_detail)
         try:
             service = NetdiskResolveService()
             walked = service.walk(
@@ -558,7 +595,14 @@ class CloudSaverModule(_ModuleBase):
             return {"alive": True, "unverified": True}, True
         except Exception:  # noqa: BLE001 - 网络与超时统一按未验证保留
             return {"alive": True, "unverified": True}, True
-        files = [{"name": item.name, "size": item.size} for item in walked.files]
+        files = [
+            {
+                "name": item.name,
+                "size": item.size,
+                "duration": int(getattr(item, "duration", 0) or 0),
+            }
+            for item in walked.files
+        ]
         # 分享根目录是文件夹时详情大小为 0，用递归展开后的文件大小求和兜底。
         file_size = int(walked.detail.size or 0) or sum(int(item.size or 0) for item in walked.files)
         detail = {
@@ -568,7 +612,7 @@ class CloudSaverModule(_ModuleBase):
             "stoken": walked.detail.stoken,
             "_files": files,
         }
-        return detail, self._passes_quality(torrent, walked.ref.share_id, detail, None)
+        return detail, self._passes_quality(torrent, detail)
 
     @staticmethod
     def _share_identity(torrent: TorrentInfo) -> Tuple[str, str]:
@@ -607,34 +651,30 @@ class CloudSaverModule(_ModuleBase):
         """
         if not torrents:
             return []
-        client = self._get_client(site)
-        quark = QuarkShareClient()
         ordered = sorted(
             torrents,
             key=lambda torrent: torrent.pubdate or "",
             reverse=True,
         )[:_MAX_ALIVE_CHECKS]
         alive_flags: Dict[int, bool] = {}
-        pending: List[Tuple[TorrentInfo, str, str, Optional[Dict[str, Any]]]] = []
+        pending: List[Tuple[TorrentInfo, str, Optional[Dict[str, Any]]]] = []
         for torrent in ordered:
-            share_code, identity = self._share_identity(torrent)
+            _, identity = self._share_identity(torrent)
             cache_key = self._alive_cache_key(site, identity)
             cached = self._cached_alive(cache_key)
             if cached is not None and not cached[0]:
                 alive_flags[id(torrent)] = False
                 continue
-            pending.append((torrent, share_code, cache_key, cached[1] if cached else None))
+            pending.append((torrent, cache_key, cached[1] if cached else None))
         if pending:
             executor = ThreadPoolExecutor(max_workers=_ALIVE_WORKERS)
             try:
                 futures = {
-                    executor.submit(
-                        self._inspect_share, client, quark, share_code, torrent, cached_detail
-                    ): (torrent, share_code, cache_key)
-                    for torrent, share_code, cache_key, cached_detail in pending
+                    executor.submit(self._inspect_share, torrent, cached_detail): (torrent, cache_key)
+                    for torrent, cache_key, cached_detail in pending
                 }
                 for future in as_completed(futures, timeout=_ALIVE_BUDGET_SECONDS):
-                    torrent, share_code, cache_key = futures[future]
+                    torrent, cache_key = futures[future]
                     try:
                         detail, passed = future.result()
                     except Exception:  # noqa: BLE001 - 无法判定按未验证保留

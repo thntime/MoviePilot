@@ -570,3 +570,27 @@ def test_qr_login_does_not_focus_until_login_ready(env, monkeypatch):
 
     assert result.status == "pending"
     assert login_adapter.focus_calls == []
+
+
+def test_baidu_cookie_header_keeps_duplicate_names_like_yunx() -> None:
+    """
+    百度原样拼接全部 .baidu.com Cookie（含同名），与 yunx 的采集方式一致。
+    """
+    from types import SimpleNamespace
+    from app.adapters.external.netdisk.login.browser import BrowserQrLoginAdapter
+    from app.domain.netdisk import NetdiskPlatform
+
+    context = _FakeCookieContext(
+        [
+            {"name": "STOKEN", "value": "passport", "domain": ".baidu.com"},
+            {"name": "STOKEN", "value": "pan", "domain": "pan.baidu.com"},
+            {"name": "BDUSS", "value": "bduss", "domain": ".baidu.com"},
+        ]
+    )
+    state = SimpleNamespace(context=context, active_page=None)
+
+    cookie = BrowserQrLoginAdapter()._cookie_header(state, NetdiskPlatform.BAIDU)  # pylint: disable=protected-access
+
+    assert "STOKEN=passport" in cookie
+    assert "STOKEN=pan" in cookie
+    assert "BDUSS=bduss" in cookie

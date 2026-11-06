@@ -2,6 +2,7 @@
 整理终态结算、历史事件与失败通知。
 """
 
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
@@ -536,6 +537,7 @@ class TransferSettlementOwner(_TransferOwnerBase):
                     file_modify_time=task.fileitem.modify_time if task.fileitem else None,
                     fileid=task.fileitem.fileid if task.fileitem else None,
                 )
+                self._rollback_subscribe_on_transfer_failure(task)
 
                 self.queue_failed_transfer_notification(
                     task=task,
@@ -631,6 +633,41 @@ class TransferSettlementOwner(_TransferOwnerBase):
         )
 
         return ret_status, ret_message
+
+    def _rollback_subscribe_on_transfer_failure(self, task: TransferTask) -> None:
+        """
+        整理失败时回滚订阅已下载事实并触发重搜，避免订阅假完成。
+
+        :param task: 产生失败回执的整理任务
+        """
+        download_hash = getattr(task, "download_hash", None)
+        if not download_hash:
+            return
+        try:
+            from app.chain.subscribe.facade import SubscribeChain
+
+            history = self.download_history_repository.get_by_hash(str(download_hash))
+            if history is None:
+                return
+            note = getattr(history, "note", None)
+            source = note.get("source") if isinstance(note, dict) else None
+            parsed = SubscribeChain.parse_subscribe_source_keyword(str(source or ""))
+            episodes = episode_rules.parse_episode_selection(
+                str(getattr(history, "episodes", "") or "")
+            )
+            if not parsed or not episodes:
+                return
+            subscribe_id = parsed.get("id")
+            SubscribeChain().rollback_download_facts(subscribe_id, episodes)
+            threading.Thread(
+                target=SubscribeChain().search,
+                kwargs={"sid": subscribe_id},
+                daemon=True,
+                name=f"transfer-failed-search-{subscribe_id}",
+            ).start()
+            logger.info(f"整理失败已回滚订阅 #{subscribe_id} 的集数并触发重搜")
+        except Exception as err:  # noqa: BLE001 - 回滚失败不阻断整理失败结算
+            logger.warning(f"整理失败回滚订阅异常：{type(err).__name__} - {err}")
 
     def _schedule_automatic_ai_takeover(
             self, *, task: TransferTask, transferinfo: TransferInfo,

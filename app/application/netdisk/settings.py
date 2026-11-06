@@ -100,6 +100,8 @@ class SystemNetdiskSettings:
             preempt_age_seconds=_clamp(value(SystemConfigKey.NetdiskSlowPreemptMinAge), 15, 1, 300),
             multi_source=_flag(value(SystemConfigKey.NetdiskMultiSourceEnabled), False),
             auto_transfer=_flag(value(SystemConfigKey.NetdiskAutoTransferEnabled), True),
+            # 转存优先是下载器实例级配置，系统设置只提供默认值。
+            transfer_first=False,
             refresh_seconds=_clamp(value(SystemConfigKey.NetdiskLinkRefreshSeconds), 30, 5, 3600),
             probe_concurrency=_clamp(value(SystemConfigKey.NetdiskProbeConcurrency), 16, 1, 64),
             probe_budget_seconds=_clamp(value(SystemConfigKey.NetdiskProbeBudgetSeconds), 30, 5, 300),

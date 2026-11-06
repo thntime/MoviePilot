@@ -12,9 +12,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
 from app.adapters.external.netdisk.base import (
@@ -56,6 +59,26 @@ _TRASH_URL = f"{_FILES_URL}:batchTrash"
 
 # 网页登录使用的 client_id；与 `login/browser.py` 的 `_XUNLEI_CLIENT_ID` 保持一致。
 _AUTH_CLIENT_ID = "Xqp0kJBXWhwaTpB6"
+# 网页版 captcha 现签：client_version 与 9 条盐随网页 bundle 轮换，需整组更新。
+_CAPTCHA_INIT_URL = f"{_AUTH_BASE}/v1/shield/captcha/init"
+_CAPTCHA_CLIENT_VERSION = "1.93.10"
+_CAPTCHA_PACKAGE_NAME = "pan.xunlei.com"
+_CAPTCHA_SIGN_HOST = "pan.xunlei.com"
+_CAPTCHA_ALG_VERSION = "1"
+_CAPTCHA_ACTION = "GET:/drive/v1/about"
+# 服务端 captcha_token 有效期 300s，保守提前 30s 视为过期。
+_CAPTCHA_TTL_SECONDS = 270
+_CAPTCHA_SALTS = (
+    "DVM8BRQfJWDsIE0JbH5GCUM0z0jU1yGymBTj4Eyloazv1F+w0G7ig",
+    "T",
+    "a1fUxfjOO1/dW++DpGupRgw9P93L",
+    "aktKbp+/lQc3MvlMHIupt65LjAgJOL6ttMFvTKK+7+WKubSf9rT",
+    "SB/ne9FQUnQmWz4Wuv9KqKfGOBOCUubpHpECxOHfD4hNoMclYA2Yq",
+    "sOZFBQ8IMFy3OFjAIf/eA65iqFvS9TIKzLyrhiT6",
+    "ZhJdLgL7MGh2GanboB0yk",
+    "Osf",
+    "v",
+)
 # JWT 距过期不足该秒数时视为临期，需要先续期。
 _JWT_LEEWAY_SECONDS = 60.0
 # 与桌面 Chrome UA 匹配的客户端提示头。
@@ -188,6 +211,82 @@ def jwt_expiring(token: str, *, now: Optional[float] = None, leeway: float = _JW
     return expires_at - current <= leeway
 
 
+def _jwt_claim(token: str, name: str) -> str:
+    """
+    读取 JWT 载荷中的字符串声明，不校验签名。
+
+    :param token: JWT 文本
+    :param name: 声明名
+    :return: 声明值；缺失或无法解析时为空串
+    """
+    segments = str(token or "").split(".")
+    if len(segments) < 2:
+        return ""
+    payload = segments[1]
+    padding = "=" * (-len(payload) % 4)
+    try:
+        data = json.loads(base64.urlsafe_b64decode(f"{payload}{padding}"))
+    except (AttributeError, TypeError, ValueError):
+        return ""
+    value = data.get(name) if isinstance(data, Mapping) else None
+    return as_text(value)
+
+
+def _expiry_epoch(value: Any) -> float:
+    """
+    把秒/毫秒时间戳或 ISO 时间文本换算为 Unix 时间戳。
+
+    :param value: 时间戳或 ISO 文本
+    :return: Unix 时间戳；无法解析时返回 0
+    """
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        number = float(text)
+    except ValueError:
+        number = 0.0
+    if number:
+        return number / 1000 if number > 1e12 else number
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def _captcha_sign(device: str, timestamp_ms: int) -> str:
+    """
+    按网页版算法现签 captcha：client_id + version + host + device + 时间戳，再依次套 9 条盐做 MD5。
+
+    :param device: 设备标识
+    :param timestamp_ms: 毫秒时间戳
+    :return: 带算法版本前缀的签名
+    """
+    digest = f"{_AUTH_CLIENT_ID}{_CAPTCHA_CLIENT_VERSION}{_CAPTCHA_SIGN_HOST}{device}{timestamp_ms}"
+    for salt in _CAPTCHA_SALTS:
+        digest = hashlib.md5(f"{digest}{salt}".encode()).hexdigest()
+    return f"{_CAPTCHA_ALG_VERSION}.{digest}"
+
+
+def _stored_captcha(fields: Mapping[str, str]) -> str:
+    """
+    读取仍在有效期内的已保存 captcha。
+
+    :param fields: 展开后的凭据字段
+    :return: 有效 captcha；缺失或已过期时为空串
+    """
+    captcha = _pick(fields, "captcha", "captcha_token", "captchaToken")
+    if not captcha:
+        return ""
+    expires_at = _pick(fields, "captcha_expires_at", "captchaExpiresAt")
+    if not expires_at:
+        return ""
+    return captcha if _expiry_epoch(expires_at) > time.time() else ""
+
+
 def _classify(error: str, message: str) -> NetdiskErrorCode:
     """
     把迅雷业务错误收敛为统一分类。
@@ -254,6 +353,9 @@ class XunleiAdapter(BaseNetdiskAdapter):
     requires_account = True
     guest_supported = False
     supports_refresh = True
+    # 设备标识 -> (captcha_token, 过期时间戳)；captcha 只有 300s，进程内缓存即可。
+    _captcha_cache: dict[str, tuple[str, float]] = {}
+    _captcha_lock = threading.Lock()
     drive_capabilities = DriveCapabilities(
         quota=True,
         browse=True,
@@ -273,10 +375,12 @@ class XunleiAdapter(BaseNetdiskAdapter):
 
     # ---- 凭据与请求头 ----
 
-    @staticmethod
-    def _identity(account: Optional[NetdiskAccountRecord]) -> tuple[str, str, str]:
+    def _identity(self, account: Optional[NetdiskAccountRecord]) -> tuple[str, str, str]:
         """
         读取账号的访问令牌、设备标识与验证码令牌。
+
+        迅雷网页版 captcha 只有 300s 有效期，已保存的 token 过期后继续使用会被风控
+        判为 `captcha_required`；这里优先使用未过期的已保存 token，否则本地现签一个。
 
         :param account: 账号记录
         :return: `(access_token, deviceid, captcha)`
@@ -288,7 +392,8 @@ class XunleiAdapter(BaseNetdiskAdapter):
                 "迅雷云盘取链需要登录账号",
                 platform=NetdiskPlatform.XUNLEI,
             )
-        access, device, captcha = _identity_from(_fields(account.credential or {}))
+        fields = _fields(account.credential or {})
+        access, device, _captcha = _identity_from(fields)
         if not access:
             raise NetdiskError(
                 NetdiskErrorCode.AUTH_EXPIRED,
@@ -303,7 +408,74 @@ class XunleiAdapter(BaseNetdiskAdapter):
                 platform=NetdiskPlatform.XUNLEI,
                 account_name=account.name,
             )
-        return access, device, captcha
+        return access, device, self._fresh_captcha(device, access, _stored_captcha(fields))
+
+    def _init_captcha(self, device: str, access: str) -> tuple[str, float]:
+        """
+        本地现签 captcha 并换取新 token。
+
+        :param device: 设备标识
+        :param access: 访问令牌，用于读取 `user_id`
+        :return: `(captcha_token, 过期时间戳)`；失败时返回空串与 0
+        """
+        if not device:
+            return "", 0.0
+        timestamp_ms = int(time.time() * 1000)
+        body = {
+            "client_id": _AUTH_CLIENT_ID,
+            "action": _CAPTCHA_ACTION,
+            "device_id": device,
+            "meta": {
+                "username": "",
+                "phone_number": "",
+                "email": "",
+                "package_name": _CAPTCHA_PACKAGE_NAME,
+                "client_version": _CAPTCHA_CLIENT_VERSION,
+                "captcha_sign": _captcha_sign(device, timestamp_ms),
+                "timestamp": str(timestamp_ms),
+                "user_id": _jwt_claim(access, "sub"),
+            },
+        }
+        headers = {
+            "Accept": "*/*",
+            "Origin": _ORIGIN,
+            "Referer": _REFERER,
+            "User-Agent": _CLIENT_UA,
+        }
+        try:
+            payload = self.http.post_json(_CAPTCHA_INIT_URL, json=body, headers=headers)
+        except NetdiskError:
+            return "", 0.0
+        token = as_text(payload.get("captcha_token"))
+        if not token:
+            return "", 0.0
+        expires_in = as_int(payload.get("expires_in")) or _CAPTCHA_TTL_SECONDS
+        return token, time.time() + min(expires_in, _CAPTCHA_TTL_SECONDS)
+
+    def _fresh_captcha(self, device: str, access: str, stored: str = "") -> str:
+        """
+        取得当前可用的 captcha：内存缓存 → 未过期的已保存 token → 本地现签。
+
+        :param device: 设备标识
+        :param access: 访问令牌
+        :param stored: 凭据里仍在有效期内的 captcha
+        :return: captcha token；现签失败时退回已保存值
+        """
+        now = time.time()
+        with self._captcha_lock:
+            cached = self._captcha_cache.get(device)
+            if cached and cached[1] > now:
+                return cached[0]
+        if stored:
+            with self._captcha_lock:
+                self._captcha_cache[device] = (stored, now + _CAPTCHA_TTL_SECONDS)
+            return stored
+        token, expires_at = self._init_captcha(device, access)
+        if token:
+            with self._captcha_lock:
+                self._captcha_cache[device] = (token, expires_at)
+            return token
+        return stored
 
     def _api_headers(
         self,
@@ -563,7 +735,12 @@ class XunleiAdapter(BaseNetdiskAdapter):
             headers=self._api_headers(account, extra={"Content-Type": "application/json"}),
         )
         self._check_payload(payload, "创建迅雷云盘临时目录")
-        folder_id = as_text(self._data(payload).get("id"))
+        data = self._data(payload)
+        # 当前迅雷接口把新建目录放在 `file` 对象里；旧版接口直接返回顶层 `id`。
+        folder = data.get("file")
+        folder_id = as_text(data.get("id"))
+        if not folder_id and isinstance(folder, Mapping):
+            folder_id = as_text(folder.get("id"))
         if not folder_id:
             raise NetdiskError(
                 NetdiskErrorCode.UNKNOWN,
@@ -708,6 +885,7 @@ class XunleiAdapter(BaseNetdiskAdapter):
         account: Optional[NetdiskAccountRecord],
         *,
         allow_transfer: bool = True,
+        transfer_first: bool = False,
     ) -> DirectLink:
         """
         转存分享文件并换取下载直链。
@@ -718,6 +896,7 @@ class XunleiAdapter(BaseNetdiskAdapter):
         :param file: 目标文件
         :param account: 取链账号
         :param allow_transfer: 是否允许转存
+        :param transfer_first: 是否优先转存；本平台始终转存，参数仅对齐接口
         :return: 直链及其访问令牌、设备标识、验证码与清理句柄
         :raises NetdiskError: 空间不足、登录态失效或接口失败时抛出
         """
@@ -1073,8 +1252,12 @@ class XunleiAdapter(BaseNetdiskAdapter):
         :param fields: 展开后的凭据字段
         :return: 探测结果
         """
-        access, device, captcha = _identity_from(fields)
-        headers = self._about_headers(access, device, captcha)
+        access, device, _captcha = _identity_from(fields)
+        headers = self._about_headers(
+            access,
+            device,
+            self._fresh_captcha(device, access, _stored_captcha(fields)),
+        )
         try:
             payload = self.http.get_json(_ABOUT_URL, headers=headers)
         except NetdiskError as error:
@@ -1123,9 +1306,10 @@ class XunleiAdapter(BaseNetdiskAdapter):
         nickname = _pick(fields, "nickname", "nick_name", "nickName", "user_name", "userName", "name")
         if nickname:
             return nickname
-        access, device, captcha = _identity_from(fields)
+        access, device, _captcha = _identity_from(fields)
         if not access or not device:
             return ""
+        captcha = self._fresh_captcha(device, access, _stored_captcha(fields))
         try:
             payload = self.http.get_json(_ABOUT_URL, headers=self._about_headers(access, device, captcha))
         except NetdiskError:

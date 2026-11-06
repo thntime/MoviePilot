@@ -306,6 +306,7 @@ class UCAdapter(BaseNetdiskAdapter):
         account: Optional[NetdiskAccountRecord],
         *,
         allow_transfer: bool = True,
+        transfer_first: bool = False,
     ) -> DirectLink:
         """
         获取文件直链；视频走原画预览，UC 不实现转存。
@@ -314,6 +315,7 @@ class UCAdapter(BaseNetdiskAdapter):
         :param file: 目标文件
         :param account: 取链账号
         :param allow_transfer: 是否允许转存兜底，UC 始终忽略
+        :param transfer_first: 是否优先转存；UC 始终免转存，参数仅对齐接口
         :return: 直链及其请求头
         """
         del allow_transfer  # UC 全程免转存，从不写个人网盘

@@ -103,6 +103,13 @@ def _install(monkeypatch: pytest.MonkeyPatch) -> tuple[xunlei.XunleiAdapter, lis
     monkeypatch.setattr(NetdiskHttp, "get_json", get_json)
     monkeypatch.setattr(NetdiskHttp, "post_json", post_json)
     monkeypatch.setattr(NetdiskHttp, "get_text", get_text)
+    # captcha 现签需要真实网络；单测统一返回固定 token，避免额外请求。
+    xunlei.XunleiAdapter._captcha_cache.clear()
+    monkeypatch.setattr(
+        xunlei.XunleiAdapter,
+        "_init_captcha",
+        lambda self, device, access: ("fresh-captcha", 9e18),
+    )
     return xunlei.XunleiAdapter(), calls, responses
 
 
@@ -120,6 +127,7 @@ def _account() -> NetdiskAccountRecord:
             "access_token": "fake-access-token-1234567890",
             "deviceid": "fake-device-id",
             "captcha": "fake-captcha-token",
+            "captcha_expires_at": "2099-01-01T00:00:00+00:00",
         },
     )
 
@@ -317,6 +325,35 @@ def test_resolve_restores_and_cleans(monkeypatch: pytest.MonkeyPatch) -> None:
     assert set(delete["json"]["ids"]) == {"new-1", "dir-1"}
 
 
+def test_resolve_accepts_file_object_temp_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    当前迅雷接口把新目录放在 `file` 对象里，仍应取到目录标识并继续转存。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    responses[("GET", xunlei._ABOUT_URL)] = [{"quota": {"limit": 10_000_000, "usage": 0}}]
+    responses[("POST", xunlei._FILES_URL)] = [
+        {"file": {"id": "dir-file"}, "task": None, "upload_type": "UPLOAD_TYPE_UNKNOWN"}
+    ]
+    responses[("POST", xunlei._RESTORE_URL)] = [
+        {"params": {"trace_file_ids": json.dumps({"f1": "new-1"})}}
+    ]
+    responses[("GET", f"{xunlei._FILES_URL}/new-1")] = [
+        {
+            "id": "new-1",
+            "name": "a.mkv",
+            "size": 2048,
+            "links": {"application/octet-stream": {"url": "https://cdn.xunlei.com/a.mkv"}},
+        }
+    ]
+    responses[("POST", xunlei._BATCH_DELETE_URL)] = [{"id": "ok"}]
+
+    link = adapter.resolve(_ref(), _file(), _account())
+
+    assert link.url == "https://cdn.xunlei.com/a.mkv"
+    restore = next(call for call in calls if call["url"] == xunlei._RESTORE_URL)
+    assert restore["json"]["parent_id"] == "dir-file"
+
+
 def test_resolve_failure_cleans_temp_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     取链失败时删除已创建的临时目录并保留原始错误。
@@ -437,3 +474,41 @@ def test_validate_credential_expired(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     assert probe.status == "expired"
+
+
+def test_captcha_sign_is_stable_and_versioned() -> None:
+    """
+    网页版 captcha 签名按 9 条盐链固定计算，并带算法版本前缀。
+    """
+    signature = xunlei._captcha_sign("device-1", 1700000000000)
+
+    assert signature.startswith("1.")
+    assert len(signature) == 34
+    assert signature == xunlei._captcha_sign("device-1", 1700000000000)
+
+
+def test_stored_captcha_rejects_expired_value() -> None:
+    """
+    已保存的 captcha 过期后不再复用。
+    """
+    assert xunlei._stored_captcha({"captcha": "old", "captcha_expires_at": "2000-01-01T00:00:00+00:00"}) == ""
+    assert xunlei._stored_captcha({"captcha": "new", "captcha_expires_at": "2099-01-01T00:00:00+00:00"}) == "new"
+    assert xunlei._stored_captcha({"captcha": "unknown-expiry"}) == ""
+
+
+def test_fresh_captcha_reinitializes_when_stored_expired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    captcha 过期或缺少有效期时现签新 token，并写入进程内缓存。
+    """
+    adapter, _calls, _responses = _install(monkeypatch)
+    monkeypatch.setattr(
+        xunlei.XunleiAdapter,
+        "_init_captcha",
+        lambda self, device, access: ("fresh-captcha", 9e18),
+    )
+
+    first = adapter._fresh_captcha("device-1", "token-1", "")
+    second = adapter._fresh_captcha("device-1", "token-1", "")
+
+    assert first == "fresh-captcha"
+    assert second == "fresh-captcha"

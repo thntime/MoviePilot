@@ -134,17 +134,21 @@ class ShareFile:
     :param file_id: 平台文件标识
     :param name: 文件或目录名称
     :param size: 文件大小，单位字节；目录为 0
+    :param duration: 视频时长，单位秒；未知为 0
     :param is_dir: 是否为目录
     :param parent_id: 父目录标识
     :param token: 平台返回的条目令牌，部分平台取链需要
+    :param path: 相对分享根的路径（含文件名），用于保留目录季号
     """
 
     file_id: str
     name: str
     size: int = 0
+    duration: int = 0
     is_dir: bool = False
     parent_id: str = ""
     token: str = ""
+    path: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +197,7 @@ class DirectLink:
     :param cleanup_handle: 下载完成后需要清理的转存句柄
     :param account_id: 取链使用的账号主键
     :param is_hls: 是否为 HLS（m3u8）分片流
+    :param strategy: 实际取链策略：`transfer`、`direct` 或 `direct_fallback`
     """
 
     url: str
@@ -202,6 +207,7 @@ class DirectLink:
     cleanup_handle: Optional[TransferHandle] = None
     account_id: int = 0
     is_hls: bool = False
+    strategy: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +225,7 @@ class NetdiskTuning:
     :param preempt_age_seconds: 慢连接判定时长，单位秒
     :param multi_source: 是否启用多账号多源
     :param auto_transfer: 是否允许自动转存
+    :param transfer_first: 是否优先转存；False 时保持免转存优先
     :param refresh_seconds: 直链刷新节流，单位秒
     :param probe_concurrency: 有效性检查并发数
     :param probe_budget_seconds: 有效性检查总预算，单位秒
@@ -235,6 +242,7 @@ class NetdiskTuning:
     preempt_age_seconds: int = 15
     multi_source: bool = False
     auto_transfer: bool = True
+    transfer_first: bool = False
     refresh_seconds: int = 30
     probe_concurrency: int = 16
     probe_budget_seconds: int = 30

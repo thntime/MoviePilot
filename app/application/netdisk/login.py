@@ -91,7 +91,7 @@ class NetdiskLoginService:
 
         :param platform: 平台标识
         :param cookie_text: Cookie 头或平台令牌
-        :param name: 账号名称，缺省时使用平台名
+        :param name: 账号名称；缺省时按平台昵称自动生成
         :param is_primary: 是否设为主账号
         :param account_id: 已有账号主键，传入时更新凭据而不新建
         :return: 新账号或更新后账号的脱敏投影
@@ -110,7 +110,7 @@ class NetdiskLoginService:
             )
         return self._accounts.create(
             resolved,
-            name or self._default_name(resolved),
+            name or "",
             credential,
             is_primary=is_primary,
         )
@@ -153,7 +153,7 @@ class NetdiskLoginService:
             )
         return self._accounts.create(
             resolved,
-            name or self._default_name(resolved),
+            name or "",
             credential,
             is_primary=is_primary,
         )
@@ -195,7 +195,7 @@ class NetdiskLoginService:
             )
         return self._accounts.create(
             resolved,
-            name or str(username or "").strip() or self._default_name(resolved),
+            name or "",
             credential,
             is_primary=is_primary,
         )
@@ -275,7 +275,7 @@ class NetdiskLoginService:
             )
         return self._accounts.create(
             resolved,
-            name or str(phone or "").strip() or self._default_name(resolved),
+            name or "",
             credential,
             is_primary=is_primary,
             validate=False,
@@ -407,7 +407,7 @@ class NetdiskLoginService:
             else:
                 view = self._accounts.create(
                     context.platform,
-                    context.name or self._default_name(context.platform),
+                    context.name or "",
                     context.credential,
                     is_primary=context.is_primary,
                     validate=False,
@@ -553,13 +553,3 @@ class NetdiskLoginService:
         if resolved is None:
             raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "未知的网盘平台")
         return resolved
-
-    @staticmethod
-    def _default_name(platform: NetdiskPlatform) -> str:
-        """
-        生成默认账号名称。
-
-        :param platform: 平台标识
-        :return: 账号名称
-        """
-        return f"{platform.value} 账号"

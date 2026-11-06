@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Callable, Optional, Sequence, TypeVar
+from typing import Callable, Collection, Optional, Sequence, TypeVar
 
 from app.application.netdisk import registry, selection
 from app.application.netdisk.accounts import NetdiskAccountService
@@ -43,6 +43,8 @@ LinkCacheKey = tuple[NetdiskPlatform, str, str, int]
 _LINK_CACHE_LIMIT = 256
 # 直链剩余有效期低于该值时不再复用缓存。
 _LINK_CACHE_MARGIN = timedelta(minutes=1)
+# 本应用创建的临时转存目录前缀；清理时只删除这些目录，绝不触碰用户文件。
+_TEMP_DIR_PREFIXES = ("mp_tr_", "MoviePilot临时转存")
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,9 +204,9 @@ class NetdiskResolveService:
         account = self._optional_account(adapter, account_id)
         detail = self._call(adapter, lambda: adapter.share_detail(ref, account))
         files: list[ShareFile] = []
-        pending = [(item, 1) for item in detail.files]
+        pending = [(item, 1, "") for item in detail.files]
         while pending:
-            item, depth = pending.pop(0)
+            item, depth, prefix = pending.pop(0)
             if item.is_dir:
                 if depth >= max_depth:
                     continue
@@ -215,9 +217,11 @@ class NetdiskResolveService:
                     return adapter.list_files(ref, parent.file_id, account)
 
                 children = self._call(adapter, load_children)
-                pending.extend((child, depth + 1) for child in children)
+                child_prefix = f"{prefix}{item.name}/"
+                pending.extend((child, depth + 1, child_prefix) for child in children)
                 continue
-            files.append(item)
+            # 保留相对路径，目录名里的季号（第二季/Season 2）不能丢。
+            files.append(replace(item, path=f"{prefix}{item.name}"))
         return ResolvedShare(ref=ref, detail=detail, files=tuple(files))
 
     def resolve_file(
@@ -231,6 +235,8 @@ class NetdiskResolveService:
         multi_source: bool = False,
         force_refresh: bool = False,
         share_token: str = "",
+        concurrency: int = 1,
+        exclude_directories: Optional[Callable[[], Collection[str]]] = None,
     ) -> tuple[DirectLink, ...]:
         """
         获取一个文件的直链；多源模式下每个账号返回一条。
@@ -243,6 +249,8 @@ class NetdiskResolveService:
         :param multi_source: 是否启用多账号多源
         :param force_refresh: 是否跳过缓存并刷新账号
         :param share_token: 候选透传的分享令牌
+        :param concurrency: 同时转存的文件数，用于计算峰值空间
+        :param exclude_directories: 惰性返回正在被其他任务使用的临时目录标识
         :return: 直链元组
         """
         adapter, ref = self.parse(url, password, platform, share_token)
@@ -256,32 +264,40 @@ class NetdiskResolveService:
                     file,
                     account,
                     force_refresh=force_refresh,
+                    concurrency=concurrency,
+                    exclude_directories=exclude_directories,
                 )
             )
         return tuple(links)
 
-    def cleanup(self, link: DirectLink) -> None:
+    def cleanup(self, link: DirectLink) -> bool:
         """
         清理直链关联的转存内容。
 
         :param link: 已下载完成的直链
+        :return: 已清理或无需清理返回 True；失败返回 False，供调用方保留补偿句柄
         """
         handle: Optional[TransferHandle] = link.cleanup_handle
         if handle is None:
-            return
+            return True
         adapter = registry.get_adapter(handle.platform)
         account = self._accounts.store.get_record(handle.account_id)
         try:
             adapter.cleanup(handle, account)
+            # 转存目录已删除，配额缓存必须失效，否则后续文件会按旧的已用空间误判。
+            self._quota_cache.pop(int(handle.account_id or 0), None)
+            return True
         except NetdiskError as error:
             logger.warning(
                 f"清理网盘转存内容失败：{handle.platform.value} {handle.directory_id} - {error.message}"
             )
+            return False
         except Exception as error:  # noqa: BLE001 - 清理失败不阻断下载主流程
             logger.warning(
                 f"清理网盘转存内容异常：{handle.platform.value} {handle.directory_id} - "
                 f"{type(error).__name__}"
             )
+            return False
 
     def _resolve_one(
         self,
@@ -291,15 +307,19 @@ class NetdiskResolveService:
         account: Optional[NetdiskAccountRecord],
         *,
         force_refresh: bool,
+        concurrency: int = 1,
+        exclude_directories: Optional[Callable[[], Collection[str]]] = None,
     ) -> DirectLink:
         """
-        按策略为单个文件取链，并处理缓存与刷新。
+        按策略为单个文件取链，并处理缓存、刷新与容量回退。
 
         :param adapter: 平台适配器
         :param ref: 分享引用
         :param file: 目标文件
         :param account: 取链账号
         :param force_refresh: 是否跳过缓存并刷新账号
+        :param concurrency: 同时转存的文件数，用于计算峰值需求
+        :param exclude_directories: 惰性返回正在被其他任务使用的临时目录标识，清理时跳过
         :return: 直链
         """
         cache_key = (
@@ -312,27 +332,239 @@ class NetdiskResolveService:
             cached = self._cached_link(cache_key)
             if cached is not None:
                 return cached
-        allow_transfer = self._allow_transfer(adapter)
         current = account
         if force_refresh and current is not None:
             current = self._refresh_account(current)
-        if allow_transfer and current is not None:
-            self._ensure_space(adapter, file, current)
-        try:
-            link = self._call(
-                adapter,
-                lambda: adapter.resolve(ref, file, current, allow_transfer=allow_transfer),
+        allow_transfer = self._allow_transfer(adapter)
+        transfer_first = bool(self.tuning.transfer_first) and allow_transfer
+        required = self._required_bytes(file, concurrency)
+        strategy = "direct"
+        if transfer_first and current is not None:
+            current, allow_transfer, strategy = self._select_transfer_target(
+                adapter, file, current, required, concurrency, exclude_directories,
             )
-        except NetdiskError as error:
-            if error.code is not NetdiskErrorCode.AUTH_EXPIRED or current is None:
+        recovered = False
+        for attempt in range(3):
+            try:
+                link = self._call(
+                    adapter,
+                    lambda: adapter.resolve(
+                        ref,
+                        file,
+                        current,
+                        allow_transfer=allow_transfer,
+                        transfer_first=transfer_first and allow_transfer,
+                    ),
+                )
+                break
+            except NetdiskError as error:
+                if (
+                    error.code is NetdiskErrorCode.AUTH_EXPIRED
+                    and current is not None
+                    and attempt == 0
+                ):
+                    current = self._refresh_account(current)
+                    continue
+                if (
+                    error.code is NetdiskErrorCode.SPACE_INSUFFICIENT
+                    and allow_transfer
+                    and current is not None
+                    and not recovered
+                ):
+                    recovered = True
+                    current = self._recover_runtime_capacity(
+                        adapter, current, required, exclude_directories,
+                    )
+                    continue
                 raise
-            current = self._refresh_account(current)
-            link = self._call(
-                adapter,
-                lambda: adapter.resolve(ref, file, current, allow_transfer=allow_transfer),
-            )
+        else:  # pragma: no cover - 循环内已 raise 或 break
+            raise NetdiskError(NetdiskErrorCode.UNKNOWN, "网盘取链重试次数耗尽")
+        if strategy:
+            link = replace(link, strategy=strategy)
         self._remember_link(cache_key, link)
         return link
+
+    @staticmethod
+    def _required_bytes(file: ShareFile, concurrency: int) -> int:
+        """
+        计算转存峰值需求：单文件大小 × 并发数，并预留 20% 余量。
+
+        :param file: 目标文件
+        :param concurrency: 并发文件数
+        :return: 需要的字节数
+        """
+        size = int(file.size or 0)
+        if size <= 0:
+            return 0
+        return int(size * max(int(concurrency or 1), 1) * 1.2)
+
+    def _select_transfer_target(
+        self,
+        adapter: NetdiskAdapter,
+        file: ShareFile,
+        account: NetdiskAccountRecord,
+        required: int,
+        concurrency: int,
+        exclude_directories: Optional[Callable[[], Collection[str]]] = None,
+    ) -> tuple[NetdiskAccountRecord, bool, str]:
+        """
+        转存优先时选出放得下的账号；都放不下时按回退链处理。
+
+        :param adapter: 平台适配器
+        :param file: 目标文件
+        :param account: 首选账号
+        :param required: 峰值需求字节数
+        :param concurrency: 并发文件数
+        :param exclude_directories: 惰性返回正在被其他任务使用的临时目录标识
+        :return: (账号, 是否允许转存, 策略标签)
+        """
+        tried: set[int] = set()
+        current = account
+        purged = False
+        while True:
+            try:
+                self._ensure_space(adapter, file, current, concurrency=concurrency)
+                return current, True, "transfer"
+            except NetdiskError as error:
+                if error.code is not NetdiskErrorCode.SPACE_INSUFFICIENT:
+                    raise
+                tried.add(current.id)
+                next_account = self._select_fitting(adapter.platform, required, tried)
+                if next_account is not None:
+                    current = next_account
+                    continue
+                if adapter.link_policy is not LinkPolicy.TRANSFER_REQUIRED:
+                    return current, False, "direct_fallback"
+                if purged or not self._can_ever_fit(adapter.platform, required):
+                    raise
+                purged = True
+                self._purge_temp_dirs(
+                    adapter, adapter.platform, current, exclude_directories,
+                )
+                continue
+
+    def _recover_runtime_capacity(
+        self,
+        adapter: NetdiskAdapter,
+        account: NetdiskAccountRecord,
+        required: int,
+        exclude_directories: Optional[Callable[[], Collection[str]]] = None,
+    ) -> NetdiskAccountRecord:
+        """
+        取链时才撞上容量不足：先换账号，其次清理临时目录后重试原账号。
+
+        :param adapter: 平台适配器
+        :param account: 当前账号
+        :param required: 峰值需求字节数
+        :param exclude_directories: 惰性返回正在被其他任务使用的临时目录标识
+        :return: 下一次尝试使用的账号
+        """
+        selection.cool_account(account.id)
+        next_account = self._select_fitting(adapter.platform, required, {account.id})
+        if next_account is not None:
+            return next_account
+        self._purge_temp_dirs(adapter, adapter.platform, account, exclude_directories)
+        return account
+
+    def _select_fitting(
+        self,
+        platform: NetdiskPlatform,
+        required: int,
+        exclude: set[int],
+    ) -> Optional[NetdiskAccountRecord]:
+        """
+        选择剩余空间满足需求的账号；没有时返回 None。
+
+        :param platform: 平台标识
+        :param required: 峰值需求字节数
+        :param exclude: 已尝试过的账号主键
+        :return: 账号记录或 None
+        """
+        try:
+            return self._accounts.select(
+                platform, exclude_ids=tuple(exclude), required_bytes=required,
+            )
+        except NetdiskError:
+            return None
+
+    def _can_ever_fit(self, platform: NetdiskPlatform, required: int) -> bool:
+        """
+        判断所需空间是否可能被任一账号容纳；用于避免无意义的清理与重试。
+
+        :param platform: 平台标识
+        :param required: 峰值需求字节数
+        :return: 可能容纳时返回 True
+        """
+        if required <= 0:
+            return True
+        try:
+            views = self._accounts.list(platform)
+        except NetdiskError:
+            return True
+        totals = [int(view.quota_total) for view in views if int(view.quota_total or 0) > 0]
+        if not totals:
+            return True
+        return required <= max(totals)
+
+    def _purge_temp_dirs(
+        self,
+        adapter: NetdiskAdapter,
+        platform: NetdiskPlatform,
+        current: Optional[NetdiskAccountRecord] = None,
+        exclude: Optional[Callable[[], Collection[str]]] = None,
+    ) -> int:
+        """
+        删除本应用创建的临时转存目录，并清空相关配额缓存。
+
+        只匹配 `mp_tr_` 与 `MoviePilot临时转存` 前缀；缺少浏览或删除能力时跳过。
+        正在被其他任务使用的目录通过 `exclude` 跳过，避免删掉 in-flight 转存。
+        删除是否释放配额由平台决定，调用方必须重读配额再判断。
+
+        :param adapter: 平台适配器
+        :param platform: 平台标识
+        :param current: 额外纳入清理的账号
+        :param exclude: 惰性返回需要跳过的目录标识
+        :return: 删除的目录数量
+        """
+        capabilities = adapter.drive_capabilities
+        if not (capabilities.browse and capabilities.delete):
+            return 0
+        accounts: list[NetdiskAccountRecord] = []
+        try:
+            for view in self._accounts.list(platform):
+                record = self._accounts.store.get_record(view.id)
+                if record is not None:
+                    accounts.append(record)
+        except NetdiskError:
+            pass
+        if current is not None and all(item.id != current.id for item in accounts):
+            accounts.append(current)
+        removed = 0
+        excluded = set(exclude() if callable(exclude) else (exclude or ()))
+        for account in accounts:
+            try:
+                entries = adapter.list_dir(account, "")
+            except Exception as error:  # noqa: BLE001 - 清理失败不阻断取链
+                logger.debug(f"读取网盘根目录失败：{platform.value} - {type(error).__name__}")
+                continue
+            targets = [
+                item for item in entries
+                if item.is_dir
+                and item.name.startswith(_TEMP_DIR_PREFIXES)
+                and item.file_id not in excluded
+            ]
+            if not targets:
+                continue
+            try:
+                adapter.delete_files(account, targets)
+            except Exception as error:  # noqa: BLE001 - 清理失败不阻断取链
+                logger.warning(f"清理临时转存目录失败：{platform.value} - {type(error).__name__}")
+                continue
+            self._quota_cache.pop(account.id, None)
+            removed += len(targets)
+        if removed:
+            logger.info(f"已清理 {removed} 个网盘临时转存目录：{platform.value}")
+        return removed
 
     def _allow_transfer(self, adapter: NetdiskAdapter) -> bool:
         """
@@ -350,13 +582,19 @@ class NetdiskResolveService:
         adapter: NetdiskAdapter,
         file: ShareFile,
         account: NetdiskAccountRecord,
+        *,
+        concurrency: int = 1,
     ) -> None:
         """
         转存前检查账号剩余容量，避免把可预期的失败留到后台。
 
+        需求按「单文件大小 × 并发文件数」估算峰值，并预留 20% 余量。
+        容量不足只冷却当前账号，不牵连整个平台。
+
         :param adapter: 平台适配器
         :param file: 待转存文件
         :param account: 取链账号
+        :param concurrency: 同时转存的文件数，用于计算峰值需求
         :raises NetdiskError: 剩余容量不足时抛出 `SPACE_INSUFFICIENT`
         """
         if not adapter.drive_capabilities.quota:
@@ -365,16 +603,16 @@ class NetdiskResolveService:
         if total <= 0:
             return
         free = max(total - used, 0)
-        required = int(file.size or 0)
+        required = int(file.size or 0) * max(int(concurrency or 1), 1)
         if required <= 0:
             return
         # 预留 20% 余量，避免转存后账号写满影响后续文件。
         if free >= required * 1.2:
             return
-        selection.cool_platform(adapter.platform)
+        selection.cool_account(account.id)
         raise NetdiskError(
             NetdiskErrorCode.SPACE_INSUFFICIENT,
-            f"{adapter.platform.value} 剩余空间不足：需要 {required} 字节，当前可用 {free} 字节",
+            f"{adapter.platform.value} 账号剩余空间不足：需要 {required} 字节，可用 {free} 字节",
             platform=adapter.platform,
         )
 

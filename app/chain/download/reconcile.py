@@ -8,10 +8,13 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Optional, Set
 
+from app.application.download.failures import DownloadFailureWrite
 from app.application.netdisk import selection
 from app.chain.download.contract import _DownloadOwnerBase
+from app.chain.download.failure import DOWNLOAD_FAILURE_CAPACITY_TTL_SECONDS
 from app.domain import episode as episode_rules
 from app.domain.netdisk import NetdiskPlatform, normalize_platform
 from app.runtime.log import logger
@@ -48,6 +51,8 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
             if not getattr(torrent, "netdisk_platform", None):
                 continue
             if str(getattr(torrent, "state", "")) != "error":
+                continue
+            if getattr(torrent, "reconciled", False):
                 continue
             history = self.download_history_repository.get_by_hash(str(torrent.hash))
             if history is None:
@@ -89,19 +94,26 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         from app.application.directory import DirectoryHelper
 
         directories = [
-            str(path) for path in DirectoryHelper().get_download_dirs()
-            if str(path).strip()
+            str(conf.download_path)
+            for conf in DirectoryHelper().get_download_dirs()
+            if str(getattr(conf, "download_path", "") or "").strip()
+        ]
+        active_paths = [
+            str(torrent.path)
+            for torrent in (self.list_torrents() or [])
+            if getattr(torrent, "path", None)
         ]
         result = self.run_module(
             "cleanup_orphans",
             download_dirs=directories,
+            active_paths=active_paths,
             is_transferred=self.is_download_file_transferred,
         )
         return result if isinstance(result, dict) else {}
 
     def reconcile_netdisk_failures(self) -> int:
         """
-        对账网盘失败任务：回滚订阅集数、冷却平台、发送容量告警并触发重新搜索。
+        对账网盘失败任务：回滚订阅集数、冷却账号、发送容量告警并触发重新搜索。
 
         :return: 本次处理的失败任务数
         """
@@ -117,8 +129,15 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
                 continue
             task_hash = str(getattr(torrent, "hash", "") or "")
             platform = normalize_platform(getattr(torrent, "netdisk_platform", None))
-            if platform is not None:
-                selection.cool_platform(platform)
+            # 容量不足只冷却实际使用的账号；解析、网络或鉴权失败不冷却任何对象，
+            # 让一次代码异常演变成整个平台在冷却期内全部无法提交是不可接受的。
+            account_id = int(getattr(torrent, "account_id", 0) or 0)
+            if (
+                platform is not None
+                and account_id > 0
+                and self._is_capacity_error(getattr(torrent, "error", ""))
+            ):
+                selection.cool_account(account_id)
             history = self.download_history_repository.get_by_hash(task_hash) if task_hash else None
             if history is not None:
                 note = getattr(history, "note", None)
@@ -130,7 +149,17 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
                 if parsed and episodes:
                     subscribe_id = parsed.get("id")
                     SubscribeChain().rollback_download_facts(subscribe_id, episodes)
-                    self._alert_netdisk_capacity(torrent, platform)
+                    capacity_error = self._is_capacity_error(getattr(torrent, "error", ""))
+                    if capacity_error:
+                        self._record_capacity_failure(history, torrent, source)
+                    else:
+                        # 分享失效、鉴权/解析失败也要冷却，避免重搜反复选中同一失效资源。
+                        self._record_capacity_failure(
+                            history, torrent, source,
+                            self._download_failure_ttl(getattr(torrent, "error", "")),
+                        )
+                    if capacity_error:
+                        self._alert_netdisk_capacity(torrent, platform)
                     threading.Thread(
                         target=SubscribeChain().search,
                         kwargs={"sid": subscribe_id},
@@ -144,6 +173,72 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
             logger.info(f"网盘失败任务对账完成：{processed} 个")
         return processed
 
+    def _record_capacity_failure(
+        self,
+        history: Any,
+        torrent: Any,
+        source: Any,
+        ttl_seconds: Optional[int] = None,
+    ) -> None:
+        """
+        把订阅容量失败写入下载失败台账，冷却期内跳过同一资源。
+
+        资源指纹在提交成功时随下载历史持久化，避免对账阶段重建出的媒体身份、
+        站点或资源标识与提交时不一致。
+
+        :param history: 下载历史快照
+        :param torrent: 下载器任务投影
+        :param source: 下载来源关键字
+        :param ttl_seconds: 冷却秒数；缺省按容量失败处理
+        """
+        note = getattr(history, "note", None)
+        fingerprint = note.get("failure_fingerprint") if isinstance(note, dict) else None
+        repository = getattr(self, "download_failure_repository", None)
+        if not fingerprint or repository is None:
+            logger.debug("下载历史缺少资源指纹，跳过容量失败台账写入")
+            return
+        now = time.time()
+        failed_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        ttl = (
+            ttl_seconds if ttl_seconds is not None
+            else DOWNLOAD_FAILURE_CAPACITY_TTL_SECONDS
+        )
+        next_retry_at = time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.localtime(now + ttl),
+        )
+        try:
+            repository.record_failure(DownloadFailureWrite(
+                fingerprint=str(fingerprint),
+                failed_at=failed_at,
+                next_retry_at=next_retry_at,
+                media_type=getattr(history, "type", None),
+                title=getattr(history, "title", None),
+                year=getattr(history, "year", None),
+                media_source=getattr(history, "media_source", None),
+                media_id=getattr(history, "media_id", None),
+                seasons=getattr(history, "seasons", None),
+                episodes=getattr(history, "episodes", None),
+                site_name=getattr(history, "torrent_site", None),
+                torrent_name=getattr(history, "torrent_name", None),
+                downloader=getattr(torrent, "downloader", None),
+                source=str(source)[:1000] if source else None,
+                error_message=str(getattr(torrent, "error", "") or "")[:1000],
+            ))
+        except Exception as error:  # noqa: BLE001 - 台账写入失败不阻断对账
+            logger.error(f"记录网盘容量失败台账失败：{type(error).__name__}")
+
+    @staticmethod
+    def _is_capacity_error(error: Any) -> bool:
+        """
+        判断失败原因是否属于容量/空间不足。
+
+        :param error: 下载器返回的失败原因
+        :return: 属于容量问题返回 True
+        """
+        text = str(error or "")
+        return "空间不足" in text or "容量不足" in text or "SPACE_INSUFFICIENT" in text
+
     def _alert_netdisk_capacity(self, torrent: Any, platform: Optional[NetdiskPlatform]) -> None:
         """
         为容量不足的网盘任务发送去重告警。
@@ -152,7 +247,11 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         :param platform: 网盘平台
         """
         error = str(getattr(torrent, "error", "") or "")
-        if "空间不足" not in error and "SPACE_INSUFFICIENT" not in error:
+        if (
+            "空间不足" not in error
+            and "容量不足" not in error
+            and "SPACE_INSUFFICIENT" not in error
+        ):
             return
         key = platform.value if platform is not None else "unknown"
         if not selection.should_alert(key):
@@ -161,7 +260,7 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
             mtype=MessageType.Manual,
             title="网盘容量不足",
             text=(
-                f"{key} 剩余空间不足，已冷却该平台并尝试其他平台资源。\n"
+                f"{key} 剩余空间不足，已冷却相关账号并尝试其他账号或平台资源。\n"
                 f"任务：{getattr(torrent, 'title', None) or getattr(torrent, 'name', '')}\n"
                 f"原因：{error}"
             ),

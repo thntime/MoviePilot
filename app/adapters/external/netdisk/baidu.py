@@ -45,7 +45,7 @@ _APP_ID = "250528"
 # PC 网页 UA：分享校验、目录列表、账号信息接口使用。
 _WEB_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 )
 # 手机端客户端 UA：locatedownload 与直链下载必须使用，否则拿不到高速链。
 _CLIENT_UA = "netdisk;12.24.6;piano;android-android;16;JSbridge4.4.0;jointBridge;1.1.0"
@@ -56,8 +56,10 @@ _TEMP_DIR_PREFIX = "MoviePilot临时转存"
 _VERIFY_URL = "https://pan.baidu.com/share/verify"
 # 分享目录列表。
 _SHARE_LIST_URL = "https://pan.baidu.com/rest/2.0/xpan/share"
-# bdstoken 与账号昵称模板变量。
+# bdstoken 模板变量。
 _TEMPLATE_URL = "https://pan.baidu.com/api/gettemplatevariable"
+# 账号信息（登录态与昵称）：xpan 接口只认 BDUSS，网页模板接口在部分会话下会返回 -6。
+_UINFO_URL = "https://pan.baidu.com/rest/2.0/xpan/nas"
 # 新建目录。
 _CREATE_URL = "https://pan.baidu.com/api/create"
 # 分享转存。
@@ -346,6 +348,19 @@ class BaiduAdapter(BaseNetdiskAdapter):
             data={"pwd": password, "vcode_str": "", "vcode": ""},
             headers=headers,
         )
+        if _errno(payload) in (-12, 200025):
+            # 带账号 Cookie 校验可能被风控拒绝（同一提取码公开校验可通过），
+            # 去掉 Cookie 重试一次；分享密码本身正确时仍能拿到 randsk。
+            retry_headers = {
+                key: value for key, value in headers.items() if key.lower() != "cookie"
+            }
+            payload = self._post_json(
+                _VERIFY_URL,
+                account=None,
+                params={"surl": ref.share_id},
+                data={"pwd": password, "vcode_str": "", "vcode": ""},
+                headers=retry_headers,
+            )
         if _errno(payload) == -12:
             raise NetdiskError(
                 NetdiskErrorCode.SHARE_INVALID,
@@ -809,6 +824,7 @@ class BaiduAdapter(BaseNetdiskAdapter):
         account: Optional[NetdiskAccountRecord],
         *,
         allow_transfer: bool = True,
+        transfer_first: bool = False,
     ) -> DirectLink:
         """
         转存分享文件并换取下载直链。
@@ -819,6 +835,7 @@ class BaiduAdapter(BaseNetdiskAdapter):
         :param file: 目标文件
         :param account: 取链账号
         :param allow_transfer: 是否允许转存
+        :param transfer_first: 是否优先转存；本平台始终转存，参数仅对齐接口
         :return: 直链及其 BDUSS Cookie、手机端 UA 与清理句柄
         :raises NetdiskError: 空间不足、登录态失效或接口失败时抛出
         """
@@ -1213,16 +1230,21 @@ class BaiduAdapter(BaseNetdiskAdapter):
 
     # ---- 账号 ----
 
-    def _username(self, cookie: str) -> str:
+    def _username(self, cookie: str, account: Optional[NetdiskAccountRecord] = None) -> str:
         """
-        调用模板变量接口读取账号昵称，用于确认登录态。
+        调用模板变量接口读取账号昵称，用于确认网页会话是否可用。
+
+        传入账号时把响应 `Set-Cookie`（百度会轮换 `PANPSC`/`STOKEN`）回写，
+        否则探测一次就会让已保存的会话过期。
 
         :param cookie: Cookie 头
+        :param account: 账号记录；探测已保存账号时传入以启用 Cookie 回写
         :return: 昵称；接口未返回时为空串
         :raises NetdiskError: 登录态失效或接口失败时抛出
         """
         payload = self.http.get_json(
             _TEMPLATE_URL,
+            account=account,
             params={
                 "clienttype": 0,
                 "app_id": _APP_ID,
@@ -1235,30 +1257,58 @@ class BaiduAdapter(BaseNetdiskAdapter):
         result = payload.get("result")
         return as_text(result.get("username")) if isinstance(result, Mapping) else ""
 
+    def _nickname(self, cookie: str, account: Optional[NetdiskAccountRecord] = None) -> str:
+        """
+        调用 xpan 账号信息接口读取昵称。
+
+        `xpan/nas?method=uinfo` 只依赖 BDUSS，即使网页会话（STOKEN/bdstoken）已失效
+        也能返回昵称，适合作为展示名来源。
+
+        :param cookie: Cookie 头
+        :param account: 账号记录；传入时允许回写响应 Cookie
+        :return: 昵称；接口未返回时为空串
+        :raises NetdiskError: 接口失败时抛出
+        """
+        payload = self.http.get_json(
+            _UINFO_URL,
+            account=account,
+            params={"method": "uinfo"},
+            headers={"Cookie": cookie, "User-Agent": _WEB_UA},
+        )
+        self._check(payload, "读取百度网盘昵称")
+        return as_text(payload.get("netdisk_name")) or as_text(payload.get("baidu_name"))
+
     def login_ready(self, credential: Mapping[str, str]) -> bool:
         """
         判断百度网页登录是否已拿到可进入校验的登录态。
 
-        百度登录页一打开就会写入 `BAIDUID` 等匿名 Cookie，只有出现 `BDUSS`
-        才代表用户真正完成了登录。
+        百度登录页一打开就会写入 `BAIDUID` 等匿名 Cookie，只有 `BDUSS` 与
+        `STOKEN` 同时出现才代表网页会话完整；只抓 BDUSS 会得到只能调 xpan、
+        无法调网页接口（bdstoken/目录/配额）的半截会话。
 
         :param credential: 浏览器抓到的凭据
-        :return: 是否已拿到 BDUSS
+        :return: 是否已拿到完整的网页登录态
         """
-        return "BDUSS=" in _credential_cookie(credential)
+        cookie = _credential_cookie(credential)
+        return "BDUSS=" in cookie and "STOKEN=" in cookie
 
-    def validate_credential(self, credential: Mapping[str, str]) -> AccountProbe:
+    def validate_credential(
+        self,
+        credential: Mapping[str, str],
+        account: Optional[NetdiskAccountRecord] = None,
+    ) -> AccountProbe:
         """
         校验凭据：先检查 BDUSS，再调用账号信息接口确认。
 
         :param credential: 明文凭据字段，支持 `{"cookie": ...}` 或 `{"BDUSS": ...}`
+        :param account: 账号记录；探测已保存账号时传入以回写轮换后的 Cookie
         :return: 探测结果；接口不可用时返回 `unknown`
         """
         cookie = _credential_cookie(credential)
         if "BDUSS=" not in cookie:
             return AccountProbe(status="expired", message="凭据缺少必填字段：BDUSS")
         try:
-            nickname = self._username(cookie)
+            nickname = self._username(cookie, account)
         except NetdiskError as error:
             if error.code is NetdiskErrorCode.AUTH_EXPIRED:
                 return AccountProbe(status="expired", message="百度网盘登录态已失效")
@@ -1268,7 +1318,7 @@ class BaiduAdapter(BaseNetdiskAdapter):
 
     def login_account_name(self, credential: Mapping[str, str]) -> str:
         """
-        从百度模板变量接口读取账号昵称。
+        从百度账号信息接口读取账号昵称。
 
         :param credential: 浏览器抓到的凭据
         :return: 昵称；接口不可用时为空串
@@ -1277,7 +1327,7 @@ class BaiduAdapter(BaseNetdiskAdapter):
         if "BDUSS=" not in cookie:
             return ""
         try:
-            return self._username(cookie)
+            return self._nickname(cookie)
         except NetdiskError:
             return ""
 
@@ -1288,4 +1338,4 @@ class BaiduAdapter(BaseNetdiskAdapter):
         :param account: 账号记录
         :return: 探测结果
         """
-        return self.validate_credential(account.credential or {})
+        return self.validate_credential(account.credential or {}, account)

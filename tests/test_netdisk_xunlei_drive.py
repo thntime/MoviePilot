@@ -117,6 +117,13 @@ def _install(monkeypatch: pytest.MonkeyPatch) -> tuple[xunlei.XunleiAdapter, lis
     monkeypatch.setattr(NetdiskHttp, "get_json", get_json)
     monkeypatch.setattr(NetdiskHttp, "post_json", post_json)
     monkeypatch.setattr(NetdiskHttp, "get_text", get_text)
+    # captcha 现签需要真实网络；单测统一返回固定 token，避免额外请求。
+    xunlei.XunleiAdapter._captcha_cache.clear()
+    monkeypatch.setattr(
+        xunlei.XunleiAdapter,
+        "_init_captcha",
+        lambda self, device, access: ("fresh-captcha", 9e18),
+    )
     return xunlei.XunleiAdapter(), calls, responses
 
 

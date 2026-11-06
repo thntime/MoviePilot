@@ -126,6 +126,38 @@ def test_download_accepts_share_token(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert record["share_token"] == "token"
 
 
+def test_download_accepts_episode_targets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    季级目标应被下载入口接受并透传给后台任务。
+    """
+    module = NetdiskModule()
+    config = SimpleNamespace(name="网盘", default=True, config={})
+    monkeypatch.setattr(module, "get_configs", lambda: {"网盘": config})
+    started = threading.Event()
+    recorded: Dict[str, Any] = {}
+
+    def fake_run_task(*args: Any) -> None:
+        """记录后台任务参数并立即结束。"""
+        recorded["args"] = args
+        started.set()
+
+    monkeypatch.setattr(module, "_run_task", fake_run_task)
+
+    result = module.download(
+        "https://pan.quark.cn/s/abc", tmp_path, "", download_type="netdisk",
+        netdisk_platform="quark", episode_targets={1: {1}},
+    )
+
+    assert result is not None
+    assert result[1]
+    assert started.wait(2)
+    assert recorded["args"][-1] == {1: {1}}
+    record = store.get_task(result[1])
+    assert record is not None
+    assert record["episodes"] == [1]
+    assert record["episode_targets"] == {"1": [1]}
+
+
 def test_task_store_and_list_torrents() -> None:
     """
     任务写入后应能被任务列表与文件清单读到，删除后消失。
@@ -153,6 +185,8 @@ def test_task_store_and_list_torrents() -> None:
 
     module.transfer_completed("t1")
     assert store.get_task("t1")["state"] == "transferred"
+    assert module.list_torrents() == []
+    assert [item.hash for item in module.list_torrents(hashs="t1")] == ["t1"]
 
     assert module.remove_torrents("t1") is True
     assert store.get_task("t1") is None
@@ -215,7 +249,10 @@ class FakeResolver:
                      platform: NetdiskPlatform = None, *,
                      multi_source: bool = False,
                      force_refresh: bool = False,
-                     share_token: str = "") -> tuple[DirectLink, ...]:
+                     share_token: str = "",
+                     concurrency: int = 1,
+                     exclude_directories: tuple[str, ...] = (),
+                     account_id: Optional[int] = None) -> tuple[DirectLink, ...]:
         """
         记录多源与刷新参数并返回固定直链。
         """
@@ -224,6 +261,9 @@ class FakeResolver:
             "name": file.name,
             "multi_source": multi_source,
             "force_refresh": force_refresh,
+            "concurrency": concurrency,
+            "exclude_directories": exclude_directories,
+            "account_id": account_id,
         })
         return self._links
 
@@ -253,7 +293,9 @@ class FakeChunkedDownloader:
         写出指定长度的内容并回报完成。
         """
         target = self.kwargs["target"]
-        target.write_bytes(b"d" * int(self.kwargs["total"]))
+        total = int(self.kwargs["total"])
+        target.write_bytes(b"d" * total)
+        target.with_name(target.name + ".done").write_text(str(total), encoding="utf-8")
         callback = self.kwargs.get("on_progress")
         if callback:
             callback(100.0)
@@ -277,7 +319,9 @@ class FakeHlsDownloader:
         """
         写出固定内容并回报完成。
         """
-        self.kwargs["target"].write_bytes(b"hls")
+        target = self.kwargs["target"]
+        target.write_bytes(b"hls")
+        target.with_name(target.name + ".done").write_text("0", encoding="utf-8")
         callback = self.kwargs.get("on_progress")
         if callback:
             callback(100.0)
@@ -298,14 +342,14 @@ def test_run_task_filters_episodes_and_cleans_up(
     links = (DirectLink(url="https://cdn/x", headers={"Cookie": "c"}, size=4,
                         cleanup_handle=handle),)
     resolver = FakeResolver(files, links)
-    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda: resolver)
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda **kwargs: resolver)
     monkeypatch.setattr(netdisk_module, "ChunkedDownloader", FakeChunkedDownloader)
     FakeChunkedDownloader.calls = []
     module = NetdiskModule()
 
     module._run_task(  # pylint: disable=protected-access
         "t1", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
-        tmp_path, None, {1},
+        tmp_path, None, {1}, "", None, 1,
     )
 
     record = store.get_task("t1")
@@ -326,7 +370,7 @@ def test_run_task_uses_hls_downloader(
     files = [ShareFile(file_id="1", name="video.mp4", size=0)]
     links = (DirectLink(url="https://cdn/index.m3u8", headers={}, size=0, is_hls=True),)
     resolver = FakeResolver(files, links)
-    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda: resolver)
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda **kwargs: resolver)
     monkeypatch.setattr(netdisk_module, "HlsDownloader", FakeHlsDownloader)
     FakeHlsDownloader.calls = []
     module = NetdiskModule()
@@ -350,7 +394,7 @@ def test_run_task_applies_instance_tuning(
     files = [ShareFile(file_id="1", name="video.mp4", size=4)]
     links = (DirectLink(url="https://cdn/x", headers={}, size=4),)
     resolver = FakeResolver(files, links)
-    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda: resolver)
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda **kwargs: resolver)
     monkeypatch.setattr(netdisk_module, "ChunkedDownloader", FakeChunkedDownloader)
     FakeChunkedDownloader.calls = []
     module = NetdiskModule()
@@ -451,3 +495,563 @@ def test_run_task_reports_stop_signal_as_paused(
     assert record is not None
     assert record["state"] == "paused"
     assert record["error"] is None
+
+
+def test_filter_episodes_accepts_display_season_text() -> None:
+    """
+    订阅链路传入的展示季文本（S01/S01-S02）不能触发 int() 异常。
+    """
+    files = [
+        ShareFile(file_id="1", name="剧名.S01E01.mp4", size=1),
+        ShareFile(file_id="2", name="剧名.S02E01.mp4", size=1),
+    ]
+
+    kept = NetdiskModule._filter_episodes(files, None, "S01")  # pylint: disable=protected-access
+    assert [item.name for item in kept] == ["剧名.S01E01.mp4"]
+
+    kept = NetdiskModule._filter_episodes(files, None, ["S01", "S02"])  # pylint: disable=protected-access
+    assert len(kept) == 2
+
+    # 无法识别的季参数按「不做季过滤」处理，不能中断整包下载。
+    kept = NetdiskModule._filter_episodes(files, None, "无法识别")  # pylint: disable=protected-access
+    assert len(kept) == 2
+
+
+def test_filter_episodes_episode_targets_keeps_only_target_season() -> None:
+    """
+    季级目标优先于扁平集数并集，S02 同集号不能随 S01 一起下载。
+    """
+    files = [
+        ShareFile(file_id="1", name="剧名.S01E01.mp4", size=1),
+        ShareFile(file_id="2", name="剧名.S02E01.mp4", size=1),
+    ]
+
+    kept = NetdiskModule._filter_episodes(  # pylint: disable=protected-access
+        files, {1}, episode_targets={1: {1}},
+    )
+
+    assert [item.name for item in kept] == ["剧名.S01E01.mp4"]
+
+
+def test_filter_episodes_episode_targets_skips_unknown_season_for_multiseason() -> None:
+    """
+    多季目标下无法识别季号的文件不保留，单季目标仍按该季集号兜底。
+    """
+    files = [ShareFile(file_id="1", name="01.mp4", size=1)]
+
+    multi = NetdiskModule._filter_episodes(  # pylint: disable=protected-access
+        files, None, episode_targets={1: {1}, 2: {1}},
+    )
+    single = NetdiskModule._filter_episodes(  # pylint: disable=protected-access
+        files, None, episode_targets={1: {1}},
+    )
+
+    assert multi == []
+    assert [item.name for item in single] == ["01.mp4"]
+
+
+def test_filter_episodes_without_episode_targets_keeps_old_behavior() -> None:
+    """
+    未传季级目标时保持原有的扁平集数过滤语义。
+    """
+    files = [
+        ShareFile(file_id="1", name="剧名.S01E01.mp4", size=1),
+        ShareFile(file_id="2", name="剧名.S02E01.mp4", size=1),
+    ]
+
+    kept = NetdiskModule._filter_episodes(files, {1})  # pylint: disable=protected-access
+
+    assert len(kept) == 2
+
+
+def test_run_task_translates_unexpected_parse_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    未预期的解析异常应转换成可展示原因，而不是把 Python 原文暴露给前端。
+    """
+
+    class _BrokenResolver:
+        """walk 抛出未预期异常的取链服务替身。"""
+
+        tuning = NetdiskTuning()
+
+        def walk(self, *args: Any, **kwargs: Any) -> Any:
+            """模拟季集解析失败。"""
+            raise ValueError("invalid literal for int() with base 10: 'S01'")
+
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda: _BrokenResolver())
+    module = NetdiskModule()
+    store.upsert_task("t9", {"state": "downloading"})
+
+    module._run_task(  # pylint: disable=protected-access
+        "t9", NetdiskPlatform.UC, "https://drive.uc.cn/s/abc", "abc", "",
+        tmp_path, None,
+    )
+
+    record = store.get_task("t9")
+    assert record is not None
+    assert record["state"] == "error"
+    assert record["error"] == "分享文件解析失败，请检查文件名或分享内容"
+
+
+def test_list_torrents_exposes_share_url() -> None:
+    """
+    下载管理卡片需要分享地址把分享码渲染成可点击链接。
+    """
+    store.upsert_task("t10", {
+        "state": "downloading",
+        "netdisk_platform": "uc",
+        "share_code": "abc123",
+        "share_url": "https://drive.uc.cn/s/abc123",
+    })
+
+    torrents = NetdiskModule().list_torrents()
+    assert torrents is not None
+    assert torrents[0].share_url == "https://drive.uc.cn/s/abc123"
+
+
+def test_run_task_downloads_files_in_parallel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    合集内的文件应按 max_tasks 并发下载，而不是一个文件下完再下一个。
+    """
+    files = tuple(
+        ShareFile(file_id=str(index), name=f"{index:02d}.mkv", size=1)
+        for index in range(3)
+    )
+
+    class _Resolver:
+        """返回三个小文件的取链服务替身。"""
+
+        tuning = NetdiskTuning(max_tasks=3, threads=6)
+
+        def walk(self, *args: Any, **kwargs: Any) -> ResolvedShare:
+            """返回固定文件列表。"""
+            return ResolvedShare(
+                ref=ShareRef(
+                    platform=NetdiskPlatform.QUARK, share_id="abc", url="https://pan.quark.cn/s/abc"
+                ),
+                detail=ShareDetail(title="合集", size=3, files=files),
+                files=files,
+            )
+
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda: _Resolver())
+    module = NetdiskModule()
+    store.upsert_task("t-parallel", {"state": "downloading"})
+
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+    barrier = threading.Barrier(3)
+
+    def fake_download(*args: Any, **kwargs: Any) -> None:
+        """写出文件与完成标记，并等待三个文件同时进入下载。"""
+        nonlocal active, peak
+        item = args[4]
+        target = Path(args[5]) / item.name
+        target.write_bytes(b"x" * int(item.size or 0))
+        target.with_name(target.name + ".done").write_text(
+            str(item.size or 0), encoding="utf-8"
+        )
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        barrier.wait(timeout=3)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr(module, "_download_one", fake_download)
+
+    module._run_task(  # pylint: disable=protected-access
+        "t-parallel", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None,
+    )
+
+    assert peak == 3
+    record = store.get_task("t-parallel")
+    assert record is not None
+    assert record["state"] == "completed"
+
+
+def test_run_task_records_account_and_strategy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    任务记录保存实际取链账号、策略与容量失败原因。
+    """
+    files = [ShareFile(file_id="1", name="video.mp4", size=4)]
+    links = (
+        DirectLink(
+            url="https://cdn/x", headers={}, size=4, account_id=9, strategy="transfer",
+        ),
+    )
+    resolver = FakeResolver(files, links)
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda **kwargs: resolver)
+    monkeypatch.setattr(netdisk_module, "ChunkedDownloader", FakeChunkedDownloader)
+    FakeChunkedDownloader.calls = []
+    module = NetdiskModule()
+
+    module._run_task(  # pylint: disable=protected-access
+        "t9", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None, None,
+    )
+
+    record = store.get_task("t9")
+    assert record is not None
+    assert record["account_id"] == 9
+    assert record["strategy"] == "transfer"
+
+
+def test_download_blocks_episode_request_when_whole_pack_active(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    整包任务进行中时，针对单集的重复提交必须复用原任务，
+    不能在同一个分享目录上再开一个任务并发写文件。
+    """
+    module = NetdiskModule()
+    config = SimpleNamespace(name="网盘", default=True, config={})
+    monkeypatch.setattr(module, "get_configs", lambda: {"网盘": config})
+    monkeypatch.setattr(NetdiskModule, "_run_task", lambda *args, **kwargs: None)
+    store.upsert_task("whole", {
+        "hash": "whole",
+        "share_code": "abc",
+        "state": "downloading",
+        "episodes": [],
+        "progress": 10.0,
+    })
+
+    result = module.download(
+        "https://drive.uc.cn/s/abc", tmp_path, "", download_type="netdisk",
+        netdisk_platform="uc", episodes={5},
+    )
+
+    assert result is not None
+    assert result[1] == "whole"
+    assert result[3] == netdisk_module.DOWNLOAD_TASK_ALREADY_EXISTS
+
+
+def test_download_does_not_treat_other_season_targets_as_covered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    活跃任务只覆盖 S01E01 时，S02E01 请求不能被当成已覆盖而静默复用。
+    """
+    module = NetdiskModule()
+    config = SimpleNamespace(name="网盘", default=True, config={})
+    monkeypatch.setattr(module, "get_configs", lambda: {"网盘": config})
+    monkeypatch.setattr(NetdiskModule, "_run_task", lambda *args, **kwargs: None)
+    store.upsert_task("season1", {
+        "hash": "season1",
+        "share_code": "abc",
+        "state": "downloading",
+        "episodes": [1],
+        "episode_targets": {"1": [1]},
+        "progress": 10.0,
+    })
+
+    result = module.download(
+        "https://drive.uc.cn/s/abc", tmp_path, "", download_type="netdisk",
+        netdisk_platform="uc", episode_targets={2: {1}},
+    )
+
+    assert result is not None
+    assert result[1] is None
+    assert result[3] == "同一分享已有任务在下载其他集数，请等待其完成后再试"
+
+
+def test_collect_files_keeps_single_version_per_episode() -> None:
+    """
+    同一集同时存在 mkv 与 mp4 时只保留一个版本，避免重复下载与识别冲突。
+    """
+    module = NetdiskModule()
+    files = [
+        ShareFile(file_id="1", name="04.mkv", size=100),
+        ShareFile(file_id="2", name="04.mp4", size=300),
+        ShareFile(file_id="3", name="05.mkv", size=200),
+    ]
+
+    collected = module._collect_files(files, season=1)  # pylint: disable=protected-access
+
+    names = [item.name for item in collected]
+    assert names == ["S01E004 04.mp4", "S01E005 05.mkv"]
+
+
+def test_collect_files_keeps_multipart_episode_parts() -> None:
+    """
+    同一集的分片文件（Part1/Part2）文件名不同，不能被当成重复版本丢弃。
+    """
+    module = NetdiskModule()
+    files = [
+        ShareFile(file_id="1", name="S01E01 Part1.mkv", size=100),
+        ShareFile(file_id="2", name="S01E01 Part2.mkv", size=100),
+    ]
+
+    collected = module._collect_files(files)  # pylint: disable=protected-access
+
+    assert len(collected) == 2
+
+
+def test_reconcile_store_resumes_downloading_and_keeps_paused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    重启后仍在下载的任务应自动恢复；用户暂停的任务保持暂停。
+    """
+    module = NetdiskModule()
+    config = SimpleNamespace(name="网盘", default=True, config={})
+    monkeypatch.setattr(module, "get_configs", lambda: {"网盘": config})
+    monkeypatch.setattr(NetdiskModule, "_instance_tuning", lambda *args: NetdiskTuning())
+    started: List[tuple] = []
+    monkeypatch.setattr(module, "_run_task", lambda *args, **kwargs: started.append(args))
+    store.upsert_task("run", {
+        "hash": "run", "state": "downloading", "netdisk_platform": "uc",
+        "share_url": "https://drive.uc.cn/s/abc", "share_code": "abc",
+        "save_path": str(tmp_path / "abc"), "passcode": "", "episodes": [5],
+        "downloader": "网盘", "category": None,
+    })
+    store.upsert_task("paused", {
+        "hash": "paused", "state": "paused", "netdisk_platform": "uc",
+        "share_url": "https://drive.uc.cn/s/def", "share_code": "def",
+        "save_path": str(tmp_path / "def"),
+    })
+
+    module._reconcile_store_state()  # pylint: disable=protected-access
+
+    assert len(started) == 1
+    assert started[0][0] == "run"
+    assert started[0][3] == "abc"
+    assert store.get_task("run")["state"] == "downloading"
+    assert store.get_task("paused")["state"] == "paused"
+
+
+def test_reconcile_store_pauses_task_without_resume_info(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    缺少分享地址或目录的下载中记录无法恢复，应回落为暂停。
+    """
+    module = NetdiskModule()
+    monkeypatch.setattr(module, "get_configs", lambda: {})
+    store.upsert_task("broken", {
+        "hash": "broken", "state": "downloading", "netdisk_platform": "uc",
+        "share_code": "abc",
+    })
+
+    module._reconcile_store_state()  # pylint: disable=protected-access
+
+    assert store.get_task("broken")["state"] == "paused"
+
+
+def test_run_task_passes_instance_tuning_to_resolver(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    下载器实例配置（transfer_first / auto_transfer）必须传给取链服务，
+    否则界面开了「转存优先」也不会生效。
+    """
+    captured: Dict[str, Any] = {}
+    files = [ShareFile(file_id="1", name="video.mp4", size=4)]
+    links = (DirectLink(url="https://cdn/x", headers={}, size=4),)
+    resolver = FakeResolver(files, links)
+
+    def factory(*args, **kwargs):
+        """记录取链服务构造参数。"""
+        captured.update(kwargs)
+        return resolver
+
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", factory)
+    monkeypatch.setattr(netdisk_module, "ChunkedDownloader", FakeChunkedDownloader)
+    FakeChunkedDownloader.calls = []
+    module = NetdiskModule()
+
+    module._run_task(  # pylint: disable=protected-access
+        "t10", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None, None, "", NetdiskTuning(transfer_first=True),
+    )
+
+    assert captured.get("settings") is not None
+    assert captured["settings"].transfer_first is True
+
+
+def _views(*frees):
+    """
+    按剩余空间构造账号视图。
+    """
+    return [
+        SimpleNamespace(
+            id=index + 1, status="active", quota_total=100 * 1024 ** 3,
+            quota_used=100 * 1024 ** 3 - free,
+        )
+        for index, free in enumerate(frees)
+    ]
+
+
+def test_assign_accounts_distributes_files_across_accounts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    多账号时按剩余容量把文件分给不同账号，3 个文件应分到 3 个账号。
+    """
+    module = NetdiskModule()
+    monkeypatch.setattr(
+        netdisk_module, "NetdiskAccountService",
+        lambda *args, **kwargs: SimpleNamespace(list=lambda platform: _views(50, 50, 50)),
+    )
+    size = 6 * 1024 ** 3
+    files = [ShareFile(file_id=str(i), name=f"0{i}.mp4", size=size) for i in range(1, 4)]
+
+    assignment = module._assign_accounts(NetdiskPlatform.UC, files)  # pylint: disable=protected-access
+
+    assert len(assignment) == 3
+    assert len(set(assignment.values())) == 3
+
+
+def test_assign_accounts_skips_single_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    单文件任务不分配账号，保留多源/自动选号逻辑。
+    """
+    module = NetdiskModule()
+    monkeypatch.setattr(
+        netdisk_module, "NetdiskAccountService",
+        lambda *args, **kwargs: SimpleNamespace(list=lambda platform: _views(50, 50)),
+    )
+    files = [ShareFile(file_id="1", name="01.mp4", size=1024)]
+
+    assert module._assign_accounts(NetdiskPlatform.UC, files) == {}  # pylint: disable=protected-access
+
+
+def test_filter_episodes_drops_unparseable_when_episodes_matched() -> None:
+    """
+    订阅目标集数已被文件命中时，无法解析集数的电影/合集文件必须排除。
+    """
+    module = NetdiskModule()
+    files = [
+        ShareFile(file_id="1", name="221 4K.mp4", size=100),
+        ShareFile(file_id="2", name="253 4K.mp4", size=100),
+        ShareFile(file_id="3", name="Perfect.World.Movie.2026.mp4", size=100),
+        ShareFile(file_id="4", name="三合一完整版.mp4", size=100),
+    ]
+
+    kept = module._filter_episodes(files, {221, 253})  # pylint: disable=protected-access
+
+    assert [item.name for item in kept] == ["221 4K.mp4", "253 4K.mp4"]
+
+
+def test_filter_episodes_keeps_unparseable_when_nothing_matches() -> None:
+    """
+    分享内文件名都无法解析集数时，保留原有兜底行为，避免漏集。
+    """
+    module = NetdiskModule()
+    files = [
+        ShareFile(file_id="1", name="第一集.mkv", size=100),
+        ShareFile(file_id="2", name="第二集.mkv", size=100),
+    ]
+
+    kept = module._filter_episodes(files, {5})  # pylint: disable=protected-access
+
+    assert len(kept) == 2
+
+
+def test_transfer_completed_marks_transferred_and_hides_task() -> None:
+    """
+    整理完成后任务标记为 transferred 并从列表隐藏，但记录保留给清理流程。
+    """
+    module = NetdiskModule()
+    store.upsert_task("done", {
+        "hash": "done", "state": "completed", "progress": 100.0,
+        "path": "/tmp/done", "files": [],
+    })
+
+    module.transfer_completed("done")
+
+    assert store.get_task("done")["state"] == "transferred"
+    assert module.list_torrents() == []
+    assert [item.hash for item in module.list_torrents(hashs="done")] == ["done"]
+
+
+def test_completed_file_requires_done_marker(tmp_path: Path) -> None:
+    """
+    仅大小匹配不能证明下载完成：必须没有计划文件且存在完成标记。
+    """
+    target = tmp_path / "video.mp4"
+    target.write_bytes(b"x" * 8)
+
+    assert netdisk_module._is_completed_file(target, 8) is False
+
+    target.with_name(target.name + ".done").write_text("8", encoding="utf-8")
+    assert netdisk_module._is_completed_file(target, 8) is True
+
+    target.with_suffix(target.suffix + ".plan.json").write_text("{}", encoding="utf-8")
+    assert netdisk_module._is_completed_file(target, 8) is False
+
+
+def test_collect_files_dedupes_episode_across_directories() -> None:
+    """
+    同一集的 mkv 与 mp4 位于不同子目录时，仍只保留体积更大的一个。
+    """
+    module = NetdiskModule()
+    files = [
+        ShareFile(file_id="1", name="04 4K.mkv", size=100, parent_id="dir-mkv"),
+        ShareFile(file_id="2", name="04 4K.mp4", size=300, parent_id="dir-mp4"),
+    ]
+
+    collected = module._collect_files(files, season=1)  # pylint: disable=protected-access
+
+    assert [item.name for item in collected] == ["S01E004 04 4K.mp4"]
+
+
+def test_cleanup_orphans_removes_sidecar_only_dir(tmp_path: Path) -> None:
+    """
+    只剩 .done/.plan 等附属文件的目录应被视为空目录并清理。
+    """
+    module = NetdiskModule()
+    root = tmp_path / "downloads"
+    task_dir = root / "abc123"
+    task_dir.mkdir(parents=True)
+    (task_dir / ".netdisk-task").touch()
+    (task_dir / "a.mp4.done").write_text("1", encoding="utf-8")
+    (task_dir / "a.mp4.plan.json").write_text("{}", encoding="utf-8")
+
+    stats = module.cleanup_orphans([str(root)], empty_grace_seconds=0)
+
+    assert stats["empty_removed"] == 1
+    assert not task_dir.exists()
+
+
+def test_collect_files_uses_directory_season() -> None:
+    """
+    目录名带季号时按目录补季，不能把第二季文件标成 S01。
+    """
+    module = NetdiskModule()
+    files = [
+        ShareFile(file_id="1", name="05.mkv", size=100, path="第二季/05.mkv"),
+    ]
+
+    collected = module._collect_files(files, season=2)  # pylint: disable=protected-access
+
+    assert [item.name for item in collected] == ["S02E005 05.mkv"]
+
+
+def test_collect_files_without_season_keeps_name() -> None:
+    """
+    完全无季信息时不再硬编码 S01 前缀。
+    """
+    module = NetdiskModule()
+    files = [ShareFile(file_id="1", name="05.mkv", size=100)]
+
+    collected = module._collect_files(files)  # pylint: disable=protected-access
+
+    assert [item.name for item in collected] == ["05.mkv"]
+
+
+def test_collect_files_strips_path_traversal() -> None:
+    """
+    远端文件名不得带目录成分，避免写出任务目录。
+    """
+    module = NetdiskModule()
+    files = [ShareFile(file_id="1", name="../../evil.mkv", size=100)]
+
+    collected = module._collect_files(files, season=1)  # pylint: disable=protected-access
+
+    assert [item.name for item in collected] == ["evil.mkv"]

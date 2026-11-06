@@ -3,7 +3,9 @@
 """
 
 import copy
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, TypedDict, cast
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, TypedDict, Union, cast
 
 from app.application.download import selection as _selection
 from app.application.download.admission import SubscriptionDownloadGovernance
@@ -24,6 +26,17 @@ from app.schemas.types import (
 
 if TYPE_CHECKING:
     from app.application.download.failures import DownloadFailureSnapshot
+
+
+# 只有视频文件参与集数统计，字幕/图片/归档不能制造「已下载」假象。
+_VIDEO_SUFFIXES = {
+    ".mp4", ".mkv", ".avi", ".ts", ".mov", ".flv", ".wmv", ".m4v", ".rmvb", ".webm", ".mpg", ".mpeg",
+}
+
+# 文件名或目录名中的显式季号；裸数字只用于目录名兜底，避免把 03.mp4 当成第 3 季。
+_EXPLICIT_SEASON_PATTERN = re.compile(
+    r"[Ss]\d{1,3}|第\s*\d{1,3}\s*季|[Ss]eason\s*\d{1,3}", re.IGNORECASE,
+)
 
 
 def _new_torrent_helper() -> TorrentHelper:
@@ -210,10 +223,30 @@ class _BatchDownloadRun:
 
     def _netdisk_episodes(self, torrent: TorrentInfo) -> Optional[List[int]]:
         """
-        从网盘分享的文件清单解析覆盖集数。
+        从网盘分享的文件清单解析覆盖集数（兼容接口，返回所有季集号的并集）。
 
         :param torrent: 网盘候选
         :return: 升序集数列表；分享不可读或没有可解析集数时返回 None
+        """
+        season_episodes = self._netdisk_season_episodes(torrent)
+        if not season_episodes:
+            return None
+        episodes: Set[int] = set()
+        for numbers in season_episodes.values():
+            episodes.update(numbers)
+        return sorted(episodes) or None
+
+    def _netdisk_season_episodes(
+            self, torrent: TorrentInfo,
+    ) -> Optional[Dict[Optional[int], Set[int]]]:
+        """
+        从网盘分享的文件清单按季归集覆盖集数。
+
+        季号优先取文件名中的 `Sxx`/`第N季`，其次取相对路径目录名；无法解析季号的
+        文件归入 None 键。只有视频文件参与统计。
+
+        :param torrent: 网盘候选
+        :return: 季号到集号集合的映射；分享不可读或没有可解析集数时返回 None
         """
         from app.application.netdisk.resolve import NetdiskResolveService
         from app.domain.netdisk import NetdiskError
@@ -231,10 +264,58 @@ class _BatchDownloadRun:
         except Exception as error:  # noqa: BLE001 - 网络异常按不可读处理
             logger.warn(f"网盘分享读取异常：{type(error).__name__}")
             return None
-        episodes: Set[int] = set()
+        seasons: Dict[Optional[int], Set[int]] = {}
         for item in walked.files:
-            episodes.update(episode_rules.episode_numbers(item.name))
-        return sorted(episodes) or None
+            relative = str(getattr(item, "path", "") or getattr(item, "name", "") or "")
+            name = Path(relative).name
+            if Path(name).suffix.lower() not in _VIDEO_SUFFIXES:
+                continue
+            episodes = episode_rules.episode_numbers(name)
+            if not episodes:
+                continue
+            seasons.setdefault(self._netdisk_season_of(relative), set()).update(episodes)
+        return seasons or None
+
+    @staticmethod
+    def _netdisk_season_of(relative: str) -> Optional[int]:
+        """
+        从相对路径解析季号，文件名中的显式季号优先于目录名。
+
+        :param relative: 分享内的相对路径（含文件名）
+        :return: 解析出的季号；无法确定时返回 None
+        """
+        path = Path(relative)
+        matched = _EXPLICIT_SEASON_PATTERN.search(path.name)
+        if matched:
+            return episode_rules.parse_season_number(matched.group(0))
+        for part in reversed(path.parent.parts):
+            matched = _EXPLICIT_SEASON_PATTERN.search(part)
+            if matched:
+                return episode_rules.parse_season_number(matched.group(0))
+            if part.isdigit() and 0 < int(part) <= 99:
+                return int(part)
+        return None
+
+    @staticmethod
+    def _netdisk_target_season_episodes(
+            season_episodes: Dict[Optional[int], Set[int]], season: int,
+    ) -> Set[int]:
+        """
+        取目标季集数；整棵分享树没有任何显式季号时，用无季号文件的集号兜底。
+
+        平铺根目录的 `第01集.mp4`/`01.mp4` 会被归入 None 键。仅当不存在任何显式
+        季键时才兜底，避免把真实多季分享里的无季号文件误算进目标季。
+
+        :param season_episodes: 季号到集号的映射
+        :param season: 目标季
+        :return: 目标季集号；无法确定时为空集合
+        """
+        episodes = set(season_episodes.get(season, set()))
+        if episodes:
+            return episodes
+        if set(season_episodes) - {None}:
+            return set()
+        return set(season_episodes.get(None, set()))
 
     def _read_torrent(
             self, context: Context, *, partial: bool = False,
@@ -296,11 +377,19 @@ class _BatchDownloadRun:
                 if runtime_stop_state.is_system_stopped:
                     break
                 seasons = self._whole_season_candidate(context, media_key, need_seasons)
-                if not seasons or not self._submit_whole_season(context, media_key, seasons):
+                if not seasons or not self._submit_whole_season(
+                        context, media_key, seasons, need_seasons,
+                ):
                     continue
-                need_seasons = _selection.update_no_exists_seasons(
-                    self.no_exists, media_key, need_seasons, seasons,
+                # 只结算本阶段实际提交的整缺季，候选附带的部分缺集季不能一并清空。
+                submitted = [season for season in seasons if season in set(need_seasons)]
+                # 该 helper 会删除不在剩余 need 中的季，因此把当前全部缺失季一并传入，
+                # 避免候选附带的部分缺集季被误删。
+                remaining = _selection.update_no_exists_seasons(
+                    self.no_exists, media_key,
+                    list(self.no_exists.get(media_key, {})), submitted,
                 )
+                need_seasons = [season for season in need_seasons if season in set(remaining)]
                 logger.info(f"{media_key} 剩余需要季：{need_seasons}")
                 if not need_seasons:
                     break
@@ -310,6 +399,9 @@ class _BatchDownloadRun:
     ) -> List[int]:
         """
         筛选身份、季范围及完整覆盖要求都满足的整季候选。
+
+        网盘分享可以包含多余季，只要覆盖任一缺失季即可由真实文件按目标季裁剪；
+        非网盘种子仍要求候选季全部位于缺失范围内。
         """
         media, meta = context.media_info, context.meta_info
         if media is None or meta is None or media.type != MediaType.TV:
@@ -319,15 +411,21 @@ class _BatchDownloadRun:
             return []
         if context in self.downloaded or self._in_failure_cooldown(context):
             return []
-        if not set(seasons).issubset(set(needed)):
+        torrent = context.torrent_info
+        is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
+        if is_netdisk:
+            if not set(seasons).intersection(needed):
+                return []
+        elif not set(seasons).issubset(set(needed)):
             return []
         required = _selection.get_required_episodes(self.no_exists, media_key, seasons[0])
         # 标注集数的单季包只在完整覆盖目标范围时与无集数整季包同轮按优先级竞争，
         # 否则低优先级整季包会先清空缺季，使高优先级完整包失去下载机会。
         # 准入后同样解析种子文件核对真实集数；未知总集数或部分范围仍交给后续阶段。
+        # 网盘多季分享由真实文件核对覆盖范围，不依赖标题里的集数标注。
         if meta.episode_list and (
                 len(seasons) != 1 or not required or not required.issubset(set(meta.episode_list))
-        ):
+        ) and not (is_netdisk and len(seasons) > 1):
             return []
         if not _selection.allows_full_season(seasons, required, context):
             return []
@@ -341,6 +439,17 @@ class _BatchDownloadRun:
 
         :return: (下载内容, 是否完整覆盖, 网盘目标集数)；非网盘资源目标集数为 None
         """
+        torrent = context.torrent_info
+        assert torrent is not None
+        is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
+        if is_netdisk:
+            season_episodes = self._netdisk_season_episodes(torrent)
+            if not season_episodes:
+                meta = context.meta_info
+                assert meta is not None
+                logger.info(f"{meta.org_string} 网盘分享内未解析到可用集数")
+                return None
+            return self._inspect_netdisk_season(context, media_key, season, season_episodes)
         parsed = self._read_torrent(context)
         if parsed is None:
             return None
@@ -354,25 +463,6 @@ class _BatchDownloadRun:
         required = _selection.get_required_episodes(self.no_exists, media_key, season) \
             if _selection.requires_complete_coverage(info) else set()
         total = _selection.get_season_episodes(self.no_exists, media_key, season)
-        torrent = context.torrent_info
-        is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
-        if is_netdisk:
-            pack = set(episodes)
-            target = set(required).intersection(pack) if required else pack
-            if not target:
-                reason = "分享内没有目标集" if required else "分享内没有可下载集数"
-                logger.info(
-                    f"{meta.org_string} {reason}，目标 "
-                    f"{episode_rules.format_ranges(sorted(required)) or '全部'}")
-                governance = self.options.get("governance")
-                if governance:
-                    governance.report(context, "failed", f"网盘分享内没有目标集：{reason}")
-                return None
-            logger.info(
-                f"{meta.org_string} 目标集数 {episode_rules.format_ranges(sorted(target))}，"
-                f"分享内 {len(episodes)} 个文件")
-            complete = bool(required) and set(required).issubset(set(episodes))
-            return content, complete, target
         complete = bool(required) and required.issubset(set(episodes))
         if complete:
             logger.info(
@@ -389,35 +479,146 @@ class _BatchDownloadRun:
             return None
         return content, complete, None
 
+    def _inspect_netdisk_season(
+            self, context: Context, media_key: str, season: int,
+            season_episodes: Dict[Optional[int], Set[int]], *,
+            update_meta: bool = True,
+    ) -> Optional[Tuple[bytes, bool, Set[int]]]:
+        """
+        核对网盘分享中目标季的覆盖范围，不把其他季的集号计入目标季。
+
+        :param season_episodes: 季号到集号的映射
+        :param update_meta: 是否按目标季集数改写元数据；多季整包需要保留原始识别范围
+        :return: (下载内容, 是否完整覆盖, 目标集数)；目标季没有目标集时返回 None
+        """
+        meta = context.meta_info
+        assert meta is not None
+        episodes = self._netdisk_target_season_episodes(season_episodes, season)
+        if not episodes:
+            logger.info(f"{meta.org_string} 网盘分享内没有目标季 {season} 的集数")
+            governance = self.options.get("governance")
+            if governance:
+                governance.report(context, "failed", f"网盘分享内没有目标季 {season} 的集数")
+            return None
+        if not _selection.allows_full_pack(episodes, context):
+            return None
+        if update_meta:
+            meta.set_episodes(begin=min(episodes), end=max(episodes))
+        info = _selection.get_no_exist_media(self.no_exists, media_key, season)
+        required = _selection.get_required_episodes(self.no_exists, media_key, season) \
+            if _selection.requires_complete_coverage(info) else set()
+        target = set(required).intersection(episodes) if required else set(episodes)
+        if not target:
+            reason = "分享内没有目标集" if required else "分享内没有可下载集数"
+            logger.info(
+                f"{meta.org_string} {reason}，目标 "
+                f"{episode_rules.format_ranges(sorted(required)) or '全部'}")
+            governance = self.options.get("governance")
+            if governance:
+                governance.report(context, "failed", f"网盘分享内没有目标集：{reason}")
+            return None
+        logger.info(
+            f"{meta.org_string} 目标集数 {episode_rules.format_ranges(sorted(target))}，"
+            f"分享内 {len(episodes)} 个文件")
+        complete = bool(required) and required.issubset(episodes)
+        if required and not complete:
+            # 整季缺集不能按整季提交并清空缺季，否则缺失集数永远不会再补。
+            missing = sorted(required.difference(episodes))
+            logger.info(
+                f"{meta.org_string} 网盘分享未完整覆盖目标范围，"
+                f"缺少 {episode_rules.format_ranges(missing)}，交给后续拆包阶段")
+            return None
+        return b"", complete, target
+
+    def _inspect_whole_season_pack(
+            self, context: Context, media_key: str, seasons: List[int], needed: List[int],
+    ) -> Optional[Tuple[bytes, bool, Dict[int, Set[int]]]]:
+        """
+        逐季核对网盘整包对缺失季的覆盖，返回各目标季可提交的集数。
+
+        :param context: 候选上下文
+        :param media_key: 缺失记账的媒体键
+        :param seasons: 候选覆盖的季列表
+        :param needed: 本阶段需要整季补齐的季列表，部分缺集季不在其中
+        :return: (下载内容, 是否完整覆盖全部目标季, 目标季到集数的映射)；
+            任一目标季没有目标集时返回 None
+        """
+        torrent = context.torrent_info
+        assert torrent is not None
+        meta = context.meta_info
+        assert meta is not None
+        season_episodes = self._netdisk_season_episodes(torrent)
+        if not season_episodes:
+            logger.info(f"{meta.org_string} 网盘分享内未解析到可用集数")
+            return None
+        needed_seasons = set(needed)
+        target_seasons = [season for season in seasons if season in needed_seasons]
+        if not target_seasons:
+            return None
+        targets: Dict[int, Set[int]] = {}
+        complete = True
+        for season in target_seasons:
+            inspected = self._inspect_netdisk_season(
+                context, media_key, season, season_episodes, update_meta=False,
+            )
+            if inspected is None:
+                return None
+            _, season_complete, target = inspected
+            targets[season] = target
+            complete = complete and season_complete
+        return b"", complete, targets
+
     def _submit_whole_season(
-            self, context: Context, media_key: str, seasons: List[int],
+            self, context: Context, media_key: str, seasons: List[int], needed: List[int],
     ) -> bool:
         """
-        单季核对真实文件后提交，多季沿用整包提交；成功后标记下载。
+        单季核对真实文件后提交；网盘多季按目标季核对并裁剪后提交；成功后标记下载。
+
+        :param context: 候选上下文
+        :param media_key: 缺失记账的媒体键
+        :param seasons: 候选覆盖的季列表
+        :param needed: 本阶段需要整季补齐的季列表
         """
-        assert context.torrent_info is not None
+        torrent = context.torrent_info
+        assert torrent is not None
+        is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
         complete = False
         if len(seasons) == 1:
-            inspected = self._inspect_whole_season(context, media_key, seasons[0])
-            if inspected is None:
+            single = self._inspect_whole_season(context, media_key, seasons[0])
+            if single is None:
                 return False
-            content, complete, target_episodes = inspected
-            logger.info(f"开始下载 {context.torrent_info.title} ...")
+            content, complete, target_episodes = single
+            logger.info(f"开始下载 {torrent.title} ...")
             options = dict(self.options)
             if target_episodes:
                 options["episodes"] = set(target_episodes)
+                options["episode_targets"] = {seasons[0]: set(target_episodes)}
+            download_id = self.owner.download_single(
+                context=context, torrent_content=content, **options,
+            )
+        elif is_netdisk:
+            pack = self._inspect_whole_season_pack(context, media_key, seasons, needed)
+            if pack is None:
+                return False
+            content, complete, targets = pack
+            logger.info(f"开始下载 {torrent.title} ...")
+            options = dict(self.options)
+            if targets:
+                # 多季分享按季提交目标集，扁平并集会让其他季的同集号被误下。
+                options["episode_targets"] = targets
+                options["episodes"] = set().union(*targets.values())
             download_id = self.owner.download_single(
                 context=context, torrent_content=content, **options,
             )
         else:
-            logger.info(f"开始下载 {context.torrent_info.title} ...")
+            logger.info(f"开始下载 {torrent.title} ...")
             download_id = self.owner.download_single(context, **self.options)
         if not download_id:
             self._remember_failure(context)
             return False
         if complete:
             context.confirmed_full_coverage = True
-        logger.info(f"{context.torrent_info.title} 添加下载成功")
+        logger.info(f"{torrent.title} 添加下载成功")
         self.downloaded.append(context)
         return True
 
@@ -490,9 +691,10 @@ class _BatchDownloadRun:
         if not effective:
             return set()
         if is_netdisk and torrent is not None:
-            share_episodes = set(self._netdisk_episodes(torrent) or [])
+            season_episodes = self._netdisk_season_episodes(torrent) or {}
+            share_episodes = self._netdisk_target_season_episodes(season_episodes, season)
             if not share_episodes:
-                logger.info(f"{meta.org_string} 网盘分享内未解析到可用集数")
+                logger.info(f"{meta.org_string} 网盘分享内没有目标季 {season} 的集数")
                 return set()
             target = share_episodes.intersection(effective)
             if not target:
@@ -553,7 +755,7 @@ class _BatchDownloadRun:
             effective = _selection.apply_allowed_episodes(set(needed), context)
             if not effective or not self._matches_partial_pack(context, media_key, season, effective):
                 continue
-            selected = self._submit_partial_pack(context, effective)
+            selected = self._submit_partial_pack(context, effective, season)
             if selected:
                 needed = _selection.update_no_exists_episodes(
                     self.no_exists, media_key, season, needed, selected,
@@ -572,16 +774,39 @@ class _BatchDownloadRun:
             and (not meta.episode_list or bool(set(meta.episode_list).intersection(effective))) \
             and len(meta.season_list) == 1 and meta.season_list[0] == season
 
-    def _submit_partial_pack(self, context: Context, effective: Set[int]) -> Set[int]:
+    def _submit_partial_pack(
+            self, context: Context, effective: Set[int], season: Optional[int] = None,
+    ) -> Set[int]:
         """
         只在成功提交选中文件后更新识别集数，失败时保留原候选供换源记账。
+
+        :param context: 候选上下文
+        :param effective: 本批允许下载的目标集数
+        :param season: 目标季；网盘分享按该季集号核对，避免其他季同集号被误选
         """
         assert context.torrent_info is not None
-        parsed = self._read_torrent(context, partial=True)
-        if parsed is None:
-            return set()
-        content, episodes = parsed
         torrent = context.torrent_info
+        is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
+        if is_netdisk:
+            if season is None:
+                episodes = set(self._netdisk_episodes(torrent) or [])
+            else:
+                season_episodes = self._netdisk_season_episodes(torrent) or {}
+                episodes = self._netdisk_target_season_episodes(season_episodes, season)
+            if not episodes:
+                logger.info(
+                    f"{torrent.site_name} - {torrent.title} 网盘分享内没有目标季 {season} 的集数"
+                    if season is not None
+                    else f"{torrent.site_name} - {torrent.title} 网盘分享内未解析到可用集数"
+                )
+                return set()
+            content: Union[bytes, str] = b""
+        else:
+            parsed = self._read_torrent(context, partial=True)
+            if parsed is None:
+                return set()
+            content, parsed_episodes = parsed
+            episodes = set(parsed_episodes)
         selected = set(episodes).intersection(effective)
         if not selected:
             logger.info(f"{torrent.site_name} - {torrent.title} 没有需要的集，跳过...")

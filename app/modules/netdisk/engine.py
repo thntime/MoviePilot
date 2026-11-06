@@ -17,6 +17,7 @@ import os
 import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
@@ -55,6 +56,8 @@ READ_BUFFER = 64 * 1024
 MIN_SPLIT_SIZE = 5 * 1024 * 1024
 # 网盘 CDN 直链走直连，避免宿主代理按域名/协议分流导致下载失败或 IPv6 解析异常。
 _DIRECT_PROXIES = {"http": "", "https": ""}
+# 全进程在飞分片上限：多任务、多文件各自开线程时，真正同时在飞的请求不超过该值。
+_CHUNK_SLOTS = threading.BoundedSemaphore(512)
 
 
 def _sanitize_url(url: str) -> str:
@@ -106,6 +109,12 @@ def _safe_urljoin(base_url: str, target: str) -> str:
 class DownloadError(Exception):
     """
     下载失败，异常消息为可直接展示的中文原因。
+    """
+
+
+class TransientFailure(Exception):
+    """
+    分片请求遇到可恢复的服务端错误（5xx / 429），应退避并刷新直链后重试。
     """
 
 
@@ -264,6 +273,22 @@ class _RateLimiter:
             time.sleep(min(expected - actual, 1.0))
 
 
+@contextmanager
+def _open_direct_stream(url: str, headers: Dict[str, str]):
+    """
+    在全局分片配额内打开直连流式响应。
+
+    :param url: 直链地址
+    :param headers: 请求头
+    :return: 流式响应上下文
+    """
+    with _CHUNK_SLOTS:
+        with RequestUtils(timeout=30, proxies=_DIRECT_PROXIES).get_stream(
+            _sanitize_url(url), headers=headers
+        ) as response:
+            yield response
+
+
 class ChunkedDownloader:
     """
     单文件分片下载器。
@@ -318,6 +343,8 @@ class ChunkedDownloader:
         # 内部异常中止信号：只用于让本文件其余分片停下，不能传给任务级暂停判断。
         self._abort = threading.Event()
         self.plan_path = target.with_suffix(target.suffix + ".plan.json")
+        # 完成标记：预分配会让中断文件也等于目标大小，只有标记能证明真正下完。
+        self.done_path = target.with_name(target.name + ".done")
         self.limiter = _RateLimiter(rate_limit_bytes)
         self._lock = threading.Lock()
         self._refresh_lock = threading.Lock()
@@ -350,13 +377,20 @@ class ChunkedDownloader:
         写回分片计划与已完成区间（含分片摘要，供恢复时校验）。
         """
         done = [
-            [chunk.start, chunk.position - 1, chunk.digest.hexdigest()]
+            [
+                chunk.start,
+                chunk.position - 1,
+                chunk.expected_digest or chunk.digest.hexdigest(),
+            ]
             for chunk in self._chunks
-            if chunk.position > chunk.start and chunk.digest.digest()
+            if chunk.position > chunk.start
         ]
         payload = {"total": self.total, "chunks": len(self._chunks), "done": done}
         try:
-            self.plan_path.write_text(json.dumps(payload), encoding="utf-8")
+            # 原子写：进程被杀时不会留下半截 JSON，避免恢复时把已下载数据清零。
+            temp = self.plan_path.with_suffix(".tmp")
+            temp.write_text(json.dumps(payload), encoding="utf-8")
+            temp.replace(self.plan_path)
         except Exception as err:  # noqa: BLE001
             logger.warn(f"写入下载计划失败：{err}")
 
@@ -455,10 +489,10 @@ class ChunkedDownloader:
             self.links = tuple(url_provider())
         if not self.links:
             raise DownloadError("没有可用的下载直链")
-        if self.total > 0 and not self.plan_path.exists():
+        if self.total > 0 and not self.plan_path.exists() and self.done_path.exists():
             try:
                 if self.target.exists() and self.target.stat().st_size == self.total:
-                    # 上次已完成但计划已删除：保留文件，不重复下载。
+                    # 只有完成标记存在时才信任现有文件；预分配的中断文件不能跳过。
                     if self.on_progress:
                         self.on_progress(100.0)
                     return
@@ -504,6 +538,7 @@ class ChunkedDownloader:
                 self._verify()
             finally:
                 self._done_event.set()
+            self.done_path.write_text(str(self.total), encoding="utf-8")
             self._save_plan()
             self.plan_path.unlink(missing_ok=True)
         finally:
@@ -550,30 +585,32 @@ class ChunkedDownloader:
         :param url_provider: 直链回调
         :param cursor: 弹性区起点
         """
-        if cursor >= self.total or self._halted:
-            return
-        remaining = self.total - cursor
-        block = self._elastic_block()
-        workers = min(self.threads, max(remaining // max(block, 1), 1))
-        threads: List[threading.Thread] = []
         position = cursor
-        for _ in range(workers):
-            left = self.total - position
-            if left <= 0:
-                break
-            size = min(block, left)
-            if left < block * workers:
-                size = max(left // workers, TAIL_MIN)
-            chunk = _Chunk(len(self._chunks), position, min(position + size - 1, self.total - 1))
-            self._chunks.append(chunk)
-            position = chunk.end + 1
-            thread = threading.Thread(target=self._worker, args=(chunk, url_provider), daemon=True)
-            threads.append(thread)
-            thread.start()
-        for thread in threads:
-            thread.join()
-        if position < self.total and not self._halted:
-            self._run_elastic(url_provider, position)
+        while position < self.total and not self._halted:
+            remaining = self.total - position
+            block = self._elastic_block()
+            workers = min(self.threads, max(remaining // max(block, 1), 1))
+            threads: List[threading.Thread] = []
+            for _ in range(workers):
+                left = self.total - position
+                if left <= 0:
+                    break
+                size = min(block, left)
+                if left < block * workers:
+                    size = max(left // workers, TAIL_MIN)
+                chunk = _Chunk(
+                    len(self._chunks), position,
+                    min(position + size - 1, self.total - 1),
+                )
+                self._chunks.append(chunk)
+                position = chunk.end + 1
+                thread = threading.Thread(
+                    target=self._worker, args=(chunk, url_provider), daemon=True,
+                )
+                threads.append(thread)
+                thread.start()
+            for thread in threads:
+                thread.join()
 
     def _elastic_block(self) -> int:
         """
@@ -669,9 +706,7 @@ class ChunkedDownloader:
             headers = dict(link.headers)
             headers["Range"] = f"bytes={chunk.position}-{chunk.end}"
             try:
-                with RequestUtils(timeout=30, proxies=_DIRECT_PROXIES).get_stream(
-                    _sanitize_url(link.url), headers=headers
-                ) as response:
+                with _open_direct_stream(link.url, headers) as response:
                     chunk.response = response
                     self._consume(chunk, response)
             except RangeIgnored:
@@ -682,6 +717,15 @@ class ChunkedDownloader:
                     raise DownloadError(f"分片 {chunk.index} 直链多次失效：{err}")
                 # 直链与会话绑定，失效后必须刷新会话并重新取链，而不是重试旧 URL。
                 self._refresh_links(url_provider, force=True, seen_generation=generation)
+            except TransientFailure as err:
+                retries += 1
+                limit = max(self.retries * 2, self.retries + 2)
+                if retries > limit:
+                    raise DownloadError(f"分片 {chunk.index} 重试次数超限：{err}")
+                # 5xx/429 多为 CDN 节点或风控问题：退避并周期性换一条直链。
+                if retries % 2 == 0:
+                    self._refresh_links(url_provider, force=True, seen_generation=generation)
+                time.sleep(min(0.5 * retries, 5.0))
             except Exception as err:  # noqa: BLE001
                 retries += 1
                 if self._halted:
@@ -710,6 +754,8 @@ class ChunkedDownloader:
             raise LinkExpired(f"直链返回 HTTP {status}")
         if status == 200:
             raise RangeIgnored()
+        if status == 429 or 500 <= status < 600:
+            raise TransientFailure(f"分片请求失败：HTTP {status}")
         if status != 206:
             raise DownloadError(f"分片请求失败：HTTP {status}")
         headers = cast(Dict[str, Any], getattr(response, "headers", {}) or {})
@@ -747,25 +793,41 @@ class ChunkedDownloader:
         """
         服务端忽略 Range 时回退单流下载。
 
+        连接提前断开时按已写字节续传（带 Range），避免整文件重下；只有重试次数
+        耗尽仍不足目标大小时才判失败。
+
         :param url_provider: 直链回调
         """
         retries = 0
+        position = 0
         while True:
             link = self.links[0] if self.links else None
             if link is None:
                 raise DownloadError("单流回退失败：没有可用直链")
             headers = dict(link.headers)
             headers.pop("Range", None)
-            position = 0
+            if position > 0:
+                headers["Range"] = f"bytes={position}-"
             try:
-                with RequestUtils(timeout=30, proxies=_DIRECT_PROXIES).get_stream(
-                    _sanitize_url(link.url), headers=headers
-                ) as response:
-                    if response is None or int(getattr(response, "status_code", 0) or 0) != 200:
+                with _open_direct_stream(link.url, headers) as response:
+                    if response is None:
+                        raise DownloadError("单流回退失败：响应异常")
+                    status = int(getattr(response, "status_code", 0) or 0)
+                    if position > 0 and status == 200:
+                        # 服务端忽略 Range，只能从头覆盖写；必须截断旧尾部，
+                        # 否则会得到「新前半 + 旧后半」的损坏文件。
+                        logger.info("单流续传被忽略 Range，截断后从头下载")
+                        fd = self._fd
+                        if fd is None:
+                            raise DownloadError("下载文件句柄已关闭")
+                        os.ftruncate(fd, 0)
+                        position = 0
+                    elif status not in (200, 206):
                         raise DownloadError("单流回退失败：响应异常")
                     content_type = str(getattr(response, "headers", {}).get("Content-Type") or "")
                     if "text/html" in content_type.lower():
                         raise DownloadError("单流回退失败：直链返回 HTML 页面")
+                    self._written = position
                     for data in response.iter_content(chunk_size=self.buffer_size):
                         if self._halted:
                             if self.stop_event.is_set():
@@ -779,19 +841,28 @@ class ChunkedDownloader:
                         os.pwrite(fd, data, position)
                         position += len(data)
                         with self._lock:
-                            self._written += len(data)
+                            self._written = position
                         self.limiter.consume(len(data))
                         self._report()
-                break
+                if position >= self.total:
+                    break
+                retries += 1
+                if retries > self.retries:
+                    raise DownloadError("单流回退下载长度不足")
+                logger.warn(
+                    f"单流回退提前结束：已写 {position}/{self.total} 字节，准备续传"
+                )
+                self._refresh_links(url_provider)
+            except DownloadCancelled:
+                raise
             except DownloadError:
                 raise
             except Exception as err:  # noqa: BLE001
                 retries += 1
                 if retries > self.retries:
                     raise DownloadError(f"单流回退失败：{err}")
+                logger.warn(f"单流回退异常，准备续传：{type(err).__name__}")
                 self._refresh_links(url_provider)
-        if position < self.total:
-            raise DownloadError("单流回退下载长度不足")
         for chunk in self._chunks:
             chunk.position = chunk.end + 1
             chunk.expected_digest = self._digest_range(chunk.start, chunk.end)
@@ -916,6 +987,8 @@ def parse_m3u8(text: str, base_url: str) -> HlsPlaylist:
         if map_match:
             init_segments.append(_safe_urljoin(base_url, map_match.group(1)))
             continue
+        if line.startswith("#EXT-X-KEY"):
+            raise DownloadError("暂不支持加密 HLS（EXT-X-KEY），请改用其他分享")
         if line.startswith("#"):
             continue
         segments.append(_safe_urljoin(base_url, line))
@@ -982,6 +1055,7 @@ class HlsDownloader:
         self.stop_event = stop_event or threading.Event()
         self.plan_path = target.with_suffix(target.suffix + ".hls.json")
         self.part_path = target.with_suffix(target.suffix + ".hls.part")
+        self.done_path = target.with_name(target.name + ".done")
 
     def run(self, url_provider: Optional[Callable[..., Sequence[DirectLink]]] = None) -> None:
         """
@@ -1016,6 +1090,7 @@ class HlsDownloader:
                 self._save_plan(len(segments), done, sizes)
                 self._report(done, len(segments))
         os.replace(self.part_path, self.target)
+        self.done_path.write_text(str(self.target.stat().st_size), encoding="utf-8")
         self.plan_path.unlink(missing_ok=True)
 
     def _load_playlist(self, url_provider: Optional[Callable[..., Sequence[DirectLink]]]) -> HlsPlaylist:

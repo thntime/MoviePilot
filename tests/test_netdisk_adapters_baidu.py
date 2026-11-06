@@ -418,3 +418,48 @@ def test_validate_credential_expired(monkeypatch: pytest.MonkeyPatch) -> None:
     probe = adapter.validate_credential({"cookie": "BDUSS=fake-bduss"})
 
     assert probe.status == "expired"
+
+
+def test_probe_account_passes_account_for_cookie_writeback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    探测已保存账号时必须带上账号记录，才能把百度轮换后的 Cookie 回写。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    responses[("GET", baidu._TEMPLATE_URL)] = [{"errno": 0, "result": {"username": "阿度"}}]
+    account = _account()
+
+    probe = adapter.probe_account(account)
+
+    assert probe.status == "active"
+    assert calls[0]["account"] is account
+
+
+def test_baidu_http_uses_direct_connection_like_login_browser() -> None:
+    """
+    百度 API 与登录浏览器都走直连，保持同一出口 IP。
+    """
+    assert baidu.BaiduAdapter().http.proxies == {"http": "", "https": ""}
+
+
+def test_verify_retries_without_cookie_on_risk_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    带账号 Cookie 校验被风控拒绝时，去掉 Cookie 重试并接受公开校验结果。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    responses[("POST", baidu._VERIFY_URL)] = [
+        {"errno": 200025, "err_msg": "提取码输入错误，请重试"},
+        {"errno": 0, "randsk": "sekey-1"},
+    ]
+    ref = ShareRef(platform=NetdiskPlatform.BAIDU, share_id="-o-abc", password="nhf3")
+    account = NetdiskAccountRecord(
+        id=1, platform=NetdiskPlatform.BAIDU, name="百度测试账号",
+        credential={"cookie": "BDUSS=fake"},
+    )
+
+    sekey = adapter._secret(ref, account)  # pylint: disable=protected-access
+
+    assert sekey == "sekey-1"
+    assert "Cookie" in calls[0]["headers"]
+    assert "Cookie" not in calls[1]["headers"]

@@ -193,7 +193,11 @@ def test_list_files_paginates_until_page_without_new_entries(monkeypatch) -> Non
         """
         记录翻页参数并返回对应页数据。
         """
+        if url == quark_module._TOKEN_URL:
+            return {"status": 200, "data": {"stoken": "st-1", "title": "示例剧集"}}
         assert url == quark_module._DETAIL_URL
+        # ver=2 是 share_fid_token 可用于取链的前提，不能被精简掉。
+        assert (params or {}).get("ver") == "2"
         page = int((params or {}).get("_page", 1))
         seen_pages.append(page)
         return {"status": 200, "data": {"list": pages.get(page, [])}}
@@ -218,6 +222,8 @@ def test_resolve_returns_direct_link_without_transfer(monkeypatch) -> None:
         """
         下载接口直接返回直链。
         """
+        if url == quark_module._TOKEN_URL:
+            return {"status": 200, "data": {"stoken": "st-1", "title": "示例剧集"}}
         calls.append((url, body))
         assert url == quark_module._DOWNLOAD_URL
         return {
@@ -242,6 +248,70 @@ def test_resolve_returns_direct_link_without_transfer(monkeypatch) -> None:
     assert calls[0][1]["fids_token"] == ["ft1"]
 
 
+class _ErrorResponse:
+    """带状态码与 JSON 体的最小响应替身。"""
+
+    def __init__(self, status_code: int, payload: dict) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.headers = {}
+
+    def json(self) -> dict:
+        """返回预设 JSON。"""
+        return self._payload
+
+
+def test_404_cancelled_share_is_reported_as_share_invalid() -> None:
+    """
+    夸克分享被取消/过期时返回 404 + 41012/41011，应提示分享失效而不是裸 HTTP 404。
+    """
+    http = quark_module._QuarkHttp()
+
+    with pytest.raises(NetdiskError) as error:
+        http._json(_ErrorResponse(404, {"status": 404, "code": 41012, "message": "好友已取消了分享"}))
+
+    assert error.value.code is NetdiskErrorCode.SHARE_INVALID
+    assert "分享已失效" in error.value.message
+
+
+def test_403_token_error_is_not_reported_as_login_expired() -> None:
+    """
+    夸克用 HTTP 403 + 41020 表示文件 token 失效，不能误报成账号登录态失效。
+    """
+    http = quark_module._QuarkHttp()
+
+    with pytest.raises(NetdiskError) as error:
+        http._json(_ErrorResponse(403, {"status": 403, "code": 41020, "message": "转存文件token校验异常"}))
+
+    assert error.value.code is NetdiskErrorCode.LINK_EXPIRED
+    assert "令牌" in error.value.message
+    assert "登录态" not in error.value.message
+
+
+def test_stale_share_token_is_refreshed(monkeypatch) -> None:
+    """
+    候选透传的 stoken 可能已过期；重试时必须换新，不能继续用旧 token 打详情接口。
+    """
+    token_calls = []
+
+    def handler(method, http, url, account, params, body):
+        """记录令牌请求并返回新 stoken。"""
+        if url == quark_module._TOKEN_URL:
+            token_calls.append(body)
+            return {"status": 200, "data": {"stoken": "fresh", "title": "示例剧集"}}
+        assert url == quark_module._DETAIL_URL
+        assert (params or {}).get("stoken") == "fresh"
+        return {"status": 200, "data": {"list": []}}
+
+    _patch_http(monkeypatch, handler)
+    adapter = quark_module.QuarkAdapter()
+
+    files = adapter.list_files(_ref(share_token="stale"), "0", _account())
+
+    assert files == []
+    assert len(token_calls) == 1
+
+
 def test_resolve_falls_back_to_transfer_with_cleanup_handle(monkeypatch) -> None:
     """
     免转存失败时转存到唯一临时子目录再取链，并返回清理句柄。
@@ -254,6 +324,8 @@ def test_resolve_falls_back_to_transfer_with_cleanup_handle(monkeypatch) -> None
         首次分享取链失败，随后完成建目录、转存、轮询与文件取链。
         """
         calls.append((method, url, body))
+        if url == quark_module._TOKEN_URL:
+            return {"status": 200, "data": {"stoken": "st-1", "title": "示例剧集"}}
         if url == quark_module._DOWNLOAD_URL:
             if body and "pwd_id" in body:
                 return {"status": 400, "code": 23018, "message": "超出游客大小限制"}
@@ -460,3 +532,63 @@ def test_validate_credential_accepts_complete_cookie(monkeypatch) -> None:
     probe = adapter.validate_credential({"cookie": _COOKIE})
 
     assert probe.status == "active"
+
+
+def test_resolve_protocol_accepts_transfer_first() -> None:
+    """
+    协议层声明 transfer_first 关键字，默认 False 保持免转存优先。
+    """
+    import inspect
+
+    from app.application.netdisk.contract import NetdiskAdapter
+
+    signature = inspect.signature(NetdiskAdapter.resolve)
+    parameter = signature.parameters.get("transfer_first")
+
+    assert parameter is not None
+    assert parameter.default is False
+
+
+def test_resolve_transfer_first_saves_before_direct(monkeypatch) -> None:
+    """
+    transfer_first=True 时先转存再取链，即使免转存本可用。
+    """
+    urls = []
+
+    def handler(method, http, url, account, params, body):
+        """
+        记录请求顺序，转存与免转存都返回可用直链。
+        """
+        urls.append(url)
+        if url == quark_module._TOKEN_URL:
+            return {"status": 200, "data": {"stoken": "st-1", "title": "示例剧集"}}
+        if url == quark_module._FILE_URL:
+            return {"status": 200, "data": {"fid": "dir-1"}}
+        if url == quark_module._SAVE_URL:
+            return {"status": 200, "data": {"task_id": "task-1"}}
+        if url == quark_module._TASK_URL:
+            return {
+                "status": 200,
+                "data": {"status": 2, "finished_at": 1, "save_as": {"save_as_top_fids": ["new-1"]}},
+            }
+        if url == quark_module._DOWNLOAD_URL:
+            if body and "pwd_id" in body:
+                return {
+                    "status": 200,
+                    "data": [{"download_url": "https://dl.quark.cn/saved.mkv", "file_name": "01.mkv", "size": 2048}],
+                }
+            return {
+                "status": 200,
+                "data": [{"download_url": "https://dl.quark.cn/direct.mkv", "file_name": "01.mkv", "size": 2048}],
+            }
+        raise AssertionError(url)
+
+    _patch_http(monkeypatch, handler)
+    adapter = quark_module.QuarkAdapter()
+
+    link = adapter.resolve(_ref(), _file(), _account(), transfer_first=True)
+
+    assert quark_module._SAVE_URL in urls
+    assert urls.index(quark_module._SAVE_URL) < urls.index(quark_module._DOWNLOAD_URL)
+    assert link.cleanup_handle is not None
+    assert link.cleanup_handle.file_ids == ("new-1",)
