@@ -106,6 +106,15 @@ class _Adapter(BaseNetdiskAdapter):
         return AccountProbe(status="active")
 
 
+class _UcAdapter(_Adapter):
+    """
+    UC 适配器替身：声明支持游客，但按规格无账号时仍必须登录。
+    """
+
+    platform = NetdiskPlatform.UC
+    guest_supported = True
+
+
 class _Store:
     """
     内存账号仓储替身。
@@ -448,3 +457,22 @@ def test_account_space_error_is_not_treated_as_guest(env, monkeypatch):
 
     assert error.value.code is NetdiskErrorCode.SPACE_INSUFFICIENT
     assert adapter.resolve_calls == []
+
+
+def test_non_quark_guest_supported_platform_still_requires_account(env):
+    """
+    只有夸克放开游客取链；UC 等声明 guest_supported 的平台无账号仍抛 AUTH_EXPIRED。
+    """
+    service, adapter, store, settings = env
+    uc_adapter = _UcAdapter()
+    registry.configure_netdisk_adapters({
+        NetdiskPlatform.QUARK: adapter,
+        NetdiskPlatform.UC: uc_adapter,
+    })
+    file = ShareFile(file_id="f1", name="a.mp4", size=10)
+
+    with pytest.raises(NetdiskError) as error:
+        service.resolve_file("https://drive.uc.cn/s/xyz789", None, file)
+
+    assert error.value.code is NetdiskErrorCode.AUTH_EXPIRED
+    assert uc_adapter.resolve_calls == []

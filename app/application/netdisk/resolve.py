@@ -255,7 +255,8 @@ class NetdiskResolveService:
         """
         adapter, ref = self.parse(url, password, platform, share_token)
         accounts = self._resolve_accounts(
-            adapter, account_id, multi_source, allow_guest=adapter.guest_supported,
+            adapter, account_id, multi_source,
+            allow_guest=adapter.platform is NetdiskPlatform.QUARK,
         )
         links: list[DirectLink] = []
         for account in accounts:

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import replace
 from typing import Any, Mapping, Optional
@@ -314,6 +315,9 @@ class QuarkAdapter(BaseNetdiskAdapter):
         """
         super().__init__()
         self.http = _QuarkHttp()
+        # 游客取链要「POST 后读 last_set_cookie」，实例级共享状态必须串行化，
+        # 否则并发取链可能读到其他线程的响应头。
+        self._guest_lock = threading.Lock()
         # share_id -> (过期时间, stoken, 标题)；避免同一轮取链反复换 token。
         self._stoken_cache: dict[str, tuple[float, str, str]] = {}
 
@@ -563,22 +567,25 @@ class QuarkAdapter(BaseNetdiskAdapter):
                 "游客取链仅支持 50MB 以内文件",
                 platform=self.platform,
             )
-        payload = self._post_json(
-            _DOWNLOAD_URL,
-            {
-                "fids": [file.file_id],
-                "fids_token": [file.token],
-                "pwd_id": share_id,
-                "stoken": stoken,
-                "speedup_session": "",
-                "token": "",
-            },
-            account=None,
-            action="游客获取分享直链",
-        )
+        with self._guest_lock:
+            payload = self._post_json(
+                _DOWNLOAD_URL,
+                {
+                    "fids": [file.file_id],
+                    "fids_token": [file.token],
+                    "pwd_id": share_id,
+                    "stoken": stoken,
+                    "speedup_session": "",
+                    "token": "",
+                },
+                account=None,
+                action="游客获取分享直链",
+            )
+            # 只锁「请求 + 读取响应头」，解析与组装不占用锁。
+            set_cookie = getattr(self.http, "last_set_cookie", "")
         link = self._first_link(payload, "游客获取分享直链")
         built = self._build_link(link, file, None, None)
-        pugs = _cookie_token(getattr(self.http, "last_set_cookie", ""), "__pugs")
+        pugs = _cookie_token(set_cookie, "__pugs")
         if not pugs:
             logger.warning(
                 f"游客取链未获得 __pugs：platform={self.platform.value} share={share_id}"
