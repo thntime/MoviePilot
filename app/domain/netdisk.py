@@ -215,7 +215,7 @@ class NetdiskTuning:
     """
     下载与取链的可调参数快照。
 
-    :param threads: 单任务默认并发连接数
+    :param threads: 单文件默认并发连接数
     :param max_tasks: 单任务最大并发下载文件数
     :param rate_limit: 全局限速，单位字节/秒；0 表示不限
     :param retries: 分片重试次数
@@ -232,7 +232,7 @@ class NetdiskTuning:
     :param probe_limit: 单次搜索最多检查的候选数
     """
 
-    threads: int = 8
+    threads: int = 32
     max_tasks: int = 3
     rate_limit: int = 0
     retries: int = 3

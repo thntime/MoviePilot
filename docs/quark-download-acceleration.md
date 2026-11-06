@@ -46,7 +46,15 @@ YunX 源码里记录得很具体：
 3. **固定 Referer。** `Referer: https://pan.quark.cn/`（`QuarkConstants.kt:84`、`ResolveViewModel.kt:1969-1977`）。
 4. **直链自身有时效，且签名绑定取链时刻的 Cookie。** 用 A 账号的 Cookie 去下 B 账号的直链会直接 412/403（`ResolveViewModel.kt:1890-1905` 注释）。
 
-游客链路（`getGuestShareDownloadLink()`）用响应下发的 `__pugs`，实测只对约 50MB 以内小文件可用，缺 `__pugs` 时 CDN 直接 412（`QuarkApi.kt:74-78`、`:446-500`），不建议作为主路径。
+游客链路（YunX 的 `getGuestShareDownloadLink()`）用响应下发的 `__pugs`，实测只对约 50MB 以内小文件可用，缺 `__pugs` 时 CDN 直接 412（`QuarkApi.kt:74-78`、`:446-500`），不建议作为主路径。
+
+MoviePilot 的本机实现（`app/adapters/external/netdisk/quark.py`）：
+
+- **触发条件**：仅当没有可用账号时，`resolve()` 才走 `_guest_link()`；有账号时完全不进入游客分支，仍走 `__puus` 的正常取链。
+- **`__pugs` 来源**：从游客取链请求响应的 `Set-Cookie` 中取 `__pugs`，写入直链下载头 `Cookie: __pugs=...`；客户端 UA、`Referer: https://pan.quark.cn/` 等其余请求头与账号取链一致。
+- **大小限制**：`_GUEST_MAX_BYTES = 50MB`，超过即抛 `UNSUPPORTED`（「游客取链仅支持 50MB 以内文件」）。
+- **错误分类**：服务端 `23018` 统一归为 `UNSUPPORTED`，不再当作未知错误。
+- **探测不变**：无账号时 `inspect` 仍抛 `AUTH_EXPIRED`，不会因为支持游客取链而放开目录探测。
 
 ### 3.3 下载请求本身
 
@@ -147,7 +155,7 @@ YunX 源码里记录得很具体：
 
 | 参数 | YunX 取值 | 说明 |
 | ---- | --------- | ---- |
-| 线程数 | 默认 32，上限 512，迅雷固定 8 | 按平台设置（`SettingsRepository.kt:519-521`） |
+| 每文件连接数（`threads`） | 默认 32，上限 512，迅雷固定 8 | 按平台设置（`SettingsRepository.kt:519-521`） |
 | 单片下限 | 256KB | 片数公式的分母 |
 | 片数上限 | 512 | 同时是用户可选的最高线程档位 |
 | 主池 / 弹性区 | 70% / 30% | `DownloadManager.kt:1866` |

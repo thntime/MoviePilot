@@ -212,6 +212,41 @@ def test_list_files_paginates_until_page_without_new_entries(monkeypatch) -> Non
     assert files[0].parent_id == "dir-9"
 
 
+def test_share_pagination_does_not_skip_items(monkeypatch) -> None:
+    """
+    分享目录每页请求 50 条并翻页取满 300 条，服务端截断时不会跳页漏文件。
+    """
+    total = 300
+    items = [
+        {"fid": f"f{i}", "file_name": f"{i:03d}.mkv", "size": i, "dir": False}
+        for i in range(total)
+    ]
+    sizes = []
+
+    def handler(method, http, url, account, params, body):
+        """
+        按 _page/_size 返回 300 条中的对应区间，每页最多 50 条。
+        """
+        if url == quark_module._TOKEN_URL:
+            return {"status": 200, "data": {"stoken": "st-1", "title": "示例剧集"}}
+        assert url == quark_module._DETAIL_URL
+        page = int((params or {}).get("_page", 1))
+        size = int((params or {}).get("_size", 0))
+        sizes.append((params or {}).get("_size"))
+        # 服务端按请求的 size 计算偏移，但单页最多返回 50 条。
+        start = (page - 1) * size
+        return {"status": 200, "data": {"list": items[start:start + min(size, 50)]}}
+
+    _patch_http(monkeypatch, handler)
+    adapter = quark_module.QuarkAdapter()
+
+    files = adapter.list_files(_ref(), "0", _account())
+
+    assert len(files) == total
+    assert [item.file_id for item in files] == [f"f{i}" for i in range(total)]
+    assert set(sizes) == {"50"}
+
+
 def test_resolve_returns_direct_link_without_transfer(monkeypatch) -> None:
     """
     免转存取链成功时不创建临时目录，直链携带 Cookie、UA 与固定 Referer。
@@ -246,6 +281,173 @@ def test_resolve_returns_direct_link_without_transfer(monkeypatch) -> None:
     assert link.headers["Referer"] == "https://pan.quark.cn/"
     assert calls[0][1]["pwd_id"] == "abc123"
     assert calls[0][1]["fids_token"] == ["ft1"]
+
+
+def test_account_path_skips_guest(monkeypatch) -> None:
+    """
+    有账号时完全不走游客分支：一旦调用 _guest_link 即判定失败。
+    """
+    guest_calls = []
+
+    def fail_guest(self, share_id, stoken, file):
+        """
+        游客分支被误调用时立即失败。
+        """
+        guest_calls.append(share_id)
+        raise AssertionError("有账号时不应进入游客取链")
+
+    monkeypatch.setattr(quark_module.QuarkAdapter, "_guest_link", fail_guest)
+
+    def handler(method, http, url, account, params, body):
+        """
+        令牌请求正常返回，下载接口返回直链。
+        """
+        if url == quark_module._TOKEN_URL:
+            return {"status": 200, "data": {"stoken": "st-1", "title": "示例剧集"}}
+        assert url == quark_module._DOWNLOAD_URL
+        return {
+            "status": 200,
+            "data": [{"download_url": "https://dl.quark.cn/a.mkv", "file_name": "01.mkv", "size": 1024}],
+        }
+
+    _patch_http(monkeypatch, handler)
+    adapter = quark_module.QuarkAdapter()
+
+    link = adapter.resolve(_ref(), _file(), _account())
+
+    assert guest_calls == []
+    assert link.url == "https://dl.quark.cn/a.mkv"
+    assert link.account_id == 7
+    assert link.headers["Cookie"] == _COOKIE
+
+
+def test_guest_link_uses_pugs_cookie(monkeypatch) -> None:
+    """
+    无账号时走游客取链：请求不带账号 Cookie，直链改用响应下发的 __pugs。
+    """
+    requests = []
+
+    def handler(method, http, url, account, params, body):
+        """
+        记录请求账号，下载接口下发游客 Cookie。
+        """
+        requests.append((url, account))
+        if url == quark_module._TOKEN_URL:
+            return {"status": 200, "data": {"stoken": "st-1", "title": "示例剧集"}}
+        assert url == quark_module._DOWNLOAD_URL
+        http.last_set_cookie = "__pugs=guest-1; Path=/"
+        return {
+            "status": 200,
+            "data": [{"download_url": "https://dl.quark.cn/g.mkv", "file_name": "01.mkv", "size": 1024}],
+        }
+
+    _patch_http(monkeypatch, handler)
+    adapter = quark_module.QuarkAdapter()
+
+    link = adapter.resolve(_ref(), _file(), None)
+
+    assert link.url == "https://dl.quark.cn/g.mkv"
+    assert link.account_id == 0
+    assert link.cleanup_handle is None
+    assert link.headers["Cookie"] == "__pugs=guest-1"
+    assert all(account is None for _, account in requests)
+
+
+def test_guest_link_rejects_files_over_50mb(monkeypatch) -> None:
+    """
+    超过 50MB 的分享文件不能走游客取链，且不发出下载请求。
+    """
+    downloads = []
+
+    def handler(method, http, url, account, params, body):
+        """
+        只允许令牌请求，下载请求记为违规。
+        """
+        if url == quark_module._TOKEN_URL:
+            return {"status": 200, "data": {"stoken": "st-1", "title": "示例剧集"}}
+        downloads.append(url)
+        return {"status": 200, "data": [{"download_url": "https://dl.quark.cn/big.mkv"}]}
+
+    _patch_http(monkeypatch, handler)
+    adapter = quark_module.QuarkAdapter()
+    big = ShareFile(
+        file_id="f1",
+        name="big.mkv",
+        size=50 * 1024 * 1024 + 1,
+        is_dir=False,
+        parent_id="0",
+        token="ft1",
+    )
+
+    with pytest.raises(NetdiskError) as error:
+        adapter.resolve(_ref(), big, None)
+
+    assert error.value.code is NetdiskErrorCode.UNSUPPORTED
+    assert downloads == []
+
+
+def test_guest_link_allows_file_exactly_50mb(monkeypatch) -> None:
+    """
+    游客大小上限按「超过」判定：恰好 50MB 的文件仍可走游客取链。
+    """
+    downloads = []
+
+    def handler(method, http, url, account, params, body):
+        """
+        令牌请求正常返回，下载请求记录并返回直链。
+        """
+        if url == quark_module._TOKEN_URL:
+            return {"status": 200, "data": {"stoken": "st-1", "title": "示例剧集"}}
+        downloads.append((url, account))
+        return {
+            "status": 200,
+            "data": [{"download_url": "https://dl.quark.cn/edge.mkv", "file_name": "edge.mkv", "size": 50 * 1024 * 1024}],
+        }
+
+    _patch_http(monkeypatch, handler)
+    adapter = quark_module.QuarkAdapter()
+    edge = ShareFile(
+        file_id="f1",
+        name="edge.mkv",
+        size=50 * 1024 * 1024,
+        is_dir=False,
+        parent_id="0",
+        token="ft1",
+    )
+
+    link = adapter.resolve(_ref(), edge, None)
+
+    assert link.url == "https://dl.quark.cn/edge.mkv"
+    assert downloads == [(quark_module._DOWNLOAD_URL, None)]
+
+
+def test_guest_limit_error_maps_to_unsupported(monkeypatch) -> None:
+    """
+    服务端 23018（超出游客大小限制）经适配器真实分类路径归为 UNSUPPORTED，且不转存。
+    """
+    requests = []
+
+    def handler(method, http, url, account, params, body):
+        """
+        令牌请求正常返回，游客取链返回 23018 业务错误。
+        """
+        requests.append((url, account))
+        if url == quark_module._TOKEN_URL:
+            return {"status": 200, "data": {"stoken": "st-1", "title": "示例剧集"}}
+        assert url == quark_module._DOWNLOAD_URL
+        return {"status": 400, "code": 23018, "message": "超出游客大小限制"}
+
+    _patch_http(monkeypatch, handler)
+    adapter = quark_module.QuarkAdapter()
+
+    with pytest.raises(NetdiskError) as error:
+        adapter.resolve(_ref(), _file(), None)
+
+    assert error.value.code is NetdiskErrorCode.UNSUPPORTED
+    assert error.value.platform is NetdiskPlatform.QUARK
+    # 游客路径没有账号，不能退化成转存：只应出现令牌与一次下载请求。
+    assert [url for url, _ in requests] == [quark_module._TOKEN_URL, quark_module._DOWNLOAD_URL]
+    assert all(account is None for _, account in requests)
 
 
 class _ErrorResponse:

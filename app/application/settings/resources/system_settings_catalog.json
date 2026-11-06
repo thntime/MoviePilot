@@ -1484,8 +1484,13 @@
       "source_file": "app/schemas/types.py"
     },
     "NetdiskMaxConcurrentDownloads": {
-      "description": "网盘单任务最大并发下载文件数",
+      "description": "网盘全局同时运行的任务槽上限",
       "enum_name": "NetdiskMaxConcurrentDownloads",
+      "source_file": "app/schemas/types.py"
+    },
+    "NetdiskMaxConcurrentFiles": {
+      "description": "网盘单任务最大并发下载文件数",
+      "enum_name": "NetdiskMaxConcurrentFiles",
       "source_file": "app/schemas/types.py"
     },
     "NetdiskMultiSourceEnabled": {

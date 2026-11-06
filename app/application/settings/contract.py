@@ -397,6 +397,12 @@ SYSTEMCONFIG_CONTRACTS: dict[SystemConfigKey, _SystemConfigContract] = {
         unit="个",
         examples=(8, 32, 512),
     ),
+    SystemConfigKey.NetdiskMaxConcurrentFiles: _contract(
+        "netdisk",
+        Optional[int],
+        unit="个",
+        examples=(3,),
+    ),
     SystemConfigKey.NetdiskMaxConcurrentDownloads: _contract(
         "netdisk",
         Optional[int],

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import Any, Mapping, Optional
 
 from app.adapters.external.netdisk.base import (
@@ -35,6 +36,7 @@ from app.domain.netdisk import (
     ShareRef,
     TransferHandle,
 )
+from app.runtime.log import logger
 
 _API_BASE = "https://drive-pc.quark.cn"
 _DOWNLOAD_URL = f"{_API_BASE}/1/clouddrive/file/download?pr=ucpro&fr=pc&sys=win32&ve=3.23.2"
@@ -57,15 +59,18 @@ QUARK_REFERER = "https://pan.quark.cn/"
 
 # 转存临时目录前缀；目录名带毫秒时间戳，保证每次转存都是唯一目标目录。
 _TEMP_DIR_PREFIX = "mp_tr_"
-# 分享列表单页条数；服务端可能截断到 50，翻页以「整页无新条目」结束。
-_SHARE_PAGE_SIZE = 100
-_SHARE_MAX_PAGES = 20
+# 分享列表单页条数；服务端单页上限 50，按 50 翻页最多 200 页（1 万条），
+# 翻页以「整页无新条目」结束。
+_SHARE_PAGE_SIZE = 50
+_SHARE_MAX_PAGES = 200
 # 转存任务轮询次数与间隔。
 _TASK_POLL_TIMES = 10
 _TASK_POLL_INTERVAL = 1.0
 # 登录态失效与游客大小限制的服务端错误码。
 _CODE_LOGIN_REQUIRED = 31001
 _CODE_GUEST_LIMIT = 23018
+# 游客取链的文件大小上限：超过该值的分享文件必须登录转存。
+_GUEST_MAX_BYTES = 50 * 1024 * 1024
 # 分享 stoken 的进程内缓存时长；任务开始时会强制换新，任务进行中复用同一 token，
 # 避免「新 stoken + 旧 share_fid_token」被取链接口拒绝。
 _STOKEN_TTL_SECONDS = 6 * 3600.0
@@ -113,6 +118,26 @@ def _merge_cookie(cookie: str, raw: str) -> str:
     ]
     kept.extend(f"{key}={value}" for key, value in updates.items())
     return "; ".join(kept)
+
+
+def _cookie_token(raw: str, name: str) -> str:
+    """
+    从 Set-Cookie 原文中解析指定 Cookie 的值。
+
+    :param raw: 响应 Set-Cookie 原文
+    :param name: Cookie 名称
+    :return: Cookie 值；未下发时返回空串
+    """
+    if not raw or not name:
+        return ""
+    for part in raw.replace("\n", ",").split(","):
+        pair = part.strip().split(";")[0].strip()
+        if "=" not in pair:
+            continue
+        key, value = pair.split("=", 1)
+        if key.strip() == name and value.strip():
+            return value.strip()
+    return ""
 
 
 def _set_cookie_header(response: Any) -> str:
@@ -522,6 +547,47 @@ class QuarkAdapter(BaseNetdiskAdapter):
         )
         return self._first_link(payload, "获取分享直链")
 
+    def _guest_link(self, share_id: str, stoken: str, file: ShareFile) -> DirectLink:
+        """
+        游客取链：无账号时用分享凭证换直链，下载头改用响应下发的 __pugs。
+
+        :param share_id: 分享码
+        :param stoken: 分享访问令牌
+        :param file: 目标文件
+        :return: 直链
+        :raises NetdiskError: 文件超过游客大小限制或取链失败时抛出
+        """
+        if int(file.size or 0) > _GUEST_MAX_BYTES:
+            raise NetdiskError(
+                NetdiskErrorCode.UNSUPPORTED,
+                "游客取链仅支持 50MB 以内文件",
+                platform=self.platform,
+            )
+        payload = self._post_json(
+            _DOWNLOAD_URL,
+            {
+                "fids": [file.file_id],
+                "fids_token": [file.token],
+                "pwd_id": share_id,
+                "stoken": stoken,
+                "speedup_session": "",
+                "token": "",
+            },
+            account=None,
+            action="游客获取分享直链",
+        )
+        link = self._first_link(payload, "游客获取分享直链")
+        built = self._build_link(link, file, None, None)
+        pugs = _cookie_token(getattr(self.http, "last_set_cookie", ""), "__pugs")
+        if not pugs:
+            logger.warning(
+                f"游客取链未获得 __pugs：platform={self.platform.value} share={share_id}"
+            )
+            return built
+        headers = dict(built.headers)
+        headers["Cookie"] = f"__pugs={pugs}"
+        return replace(built, headers=headers)
+
     def _file_link(self, fid: str, account: Optional[NetdiskAccountRecord]) -> dict[str, Any]:
         """
         个人网盘文件取链（转存后使用）。
@@ -794,6 +860,8 @@ class QuarkAdapter(BaseNetdiskAdapter):
         :return: 直链
         """
         stoken, _ = self._stoken(ref, account)
+        if account is None:
+            return self._guest_link(ref.share_id, stoken, file)
         if transfer_first and account is not None:
             try:
                 handle, link = self._transfer_link(ref.share_id, stoken, file, account)

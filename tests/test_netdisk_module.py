@@ -417,6 +417,48 @@ def test_run_task_applies_instance_tuning(
     assert resolver.resolve_calls[0]["multi_source"] is False
 
 
+def test_run_task_gives_each_file_full_threads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    多文件并发时 threads 是每个文件的分片并发数，不能被 workers 均分。
+    """
+    files = [
+        ShareFile(file_id=str(index), name=f"{index:02d}.mkv", size=1)
+        for index in range(3)
+    ]
+    links = tuple(
+        DirectLink(url=f"https://cdn/{index}", headers={}, size=1)
+        for index in range(3)
+    )
+    resolver = FakeResolver(files, links)
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda **kwargs: resolver)
+    module = NetdiskModule()
+    tuning = NetdiskTuning(threads=12, max_tasks=3)
+    seen: List[int] = []
+    lock = threading.Lock()
+
+    def fake_download(*args: Any, **kwargs: Any) -> None:
+        """记录每个文件收到的分片并发数，并写出完成标记。"""
+        item = args[4]
+        target = Path(args[5]) / item.name
+        target.write_bytes(b"x" * int(item.size or 0))
+        target.with_name(target.name + ".done").write_text(
+            str(item.size or 0), encoding="utf-8"
+        )
+        with lock:
+            seen.append(kwargs["threads"])
+
+    monkeypatch.setattr(module, "_download_one", fake_download)
+
+    module._run_task(  # pylint: disable=protected-access
+        "t-threads", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None, None, "", tuning,
+    )
+
+    assert sorted(seen) == [12, 12, 12]
+
+
 def test_list_torrents_exposes_netdisk_source_and_error() -> None:
     """
     任务列表应携带网盘平台、分享码与最近一次失败原因，供前端展示来源与失败详情。
@@ -673,6 +715,99 @@ def test_run_task_downloads_files_in_parallel(
     record = store.get_task("t-parallel")
     assert record is not None
     assert record["state"] == "completed"
+
+
+def test_instance_tuning_allows_64_files() -> None:
+    """
+    实例 max_tasks 允许配置到 64，超过 64 时夹到 64。
+    """
+    tuning = NetdiskModule._instance_tuning(  # pylint: disable=protected-access
+        SimpleNamespace(config={"max_tasks": 64}), NetdiskPlatform.QUARK
+    )
+    assert tuning.max_tasks == 64
+
+    clamped = NetdiskModule._instance_tuning(  # pylint: disable=protected-access
+        SimpleNamespace(config={"max_tasks": 100}), NetdiskPlatform.QUARK
+    )
+    assert clamped.max_tasks == 64
+
+
+def test_instance_tuning_caps_xunlei_threads() -> None:
+    """
+    每文件连接数仍受平台上限夹取：迅雷夹到 8，夸克保留配置的 32。
+    """
+    xunlei = NetdiskModule._instance_tuning(  # pylint: disable=protected-access
+        SimpleNamespace(config={"threads": 32}), NetdiskPlatform.XUNLEI
+    )
+    assert xunlei.threads == 8
+
+    quark = NetdiskModule._instance_tuning(  # pylint: disable=protected-access
+        SimpleNamespace(config={"threads": 32}), NetdiskPlatform.QUARK
+    )
+    assert quark.threads == 32
+
+
+def test_run_task_workers_never_exceed_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    文件数少于 max_tasks 时并发峰值等于文件数，不会凭空拉起多余 worker。
+    """
+    files = tuple(
+        ShareFile(file_id=str(index), name=f"{index:02d}.mkv", size=1)
+        for index in range(2)
+    )
+
+    class _Resolver:
+        """返回两个小文件的取链服务替身。"""
+
+        tuning = NetdiskTuning(max_tasks=64, threads=6)
+
+        def walk(self, *args: Any, **kwargs: Any) -> ResolvedShare:
+            """返回固定文件列表。"""
+            return ResolvedShare(
+                ref=ShareRef(
+                    platform=NetdiskPlatform.QUARK, share_id="abc", url="https://pan.quark.cn/s/abc"
+                ),
+                detail=ShareDetail(title="合集", size=2, files=files),
+                files=files,
+            )
+
+    monkeypatch.setattr(
+        netdisk_module, "NetdiskResolveService", lambda **kwargs: _Resolver()
+    )
+    module = NetdiskModule()
+    store.upsert_task("t-workers", {"state": "downloading"})
+
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+    barrier = threading.Barrier(2)
+
+    def fake_download(*args: Any, **kwargs: Any) -> None:
+        """写出文件与完成标记，并等待两个文件同时进入下载。"""
+        nonlocal active, peak
+        item = args[4]
+        target = Path(args[5]) / item.name
+        target.write_bytes(b"x" * int(item.size or 0))
+        target.with_name(target.name + ".done").write_text(
+            str(item.size or 0), encoding="utf-8"
+        )
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        barrier.wait(timeout=3)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr(module, "_download_one", fake_download)
+
+    module._run_task(  # pylint: disable=protected-access
+        "t-workers", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None, None, "", NetdiskTuning(max_tasks=64, threads=6),
+    )
+
+    assert peak == 2
 
 
 def test_run_task_records_account_and_strategy(

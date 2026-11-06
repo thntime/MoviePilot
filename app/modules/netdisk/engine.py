@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
+import psutil
+
 from app.adapters.network.http import RequestUtils
 from app.domain.netdisk import DirectLink
 from app.runtime.log import logger
@@ -56,8 +58,70 @@ READ_BUFFER = 64 * 1024
 MIN_SPLIT_SIZE = 5 * 1024 * 1024
 # 网盘 CDN 直链走直连，避免宿主代理按域名/协议分流导致下载失败或 IPv6 解析异常。
 _DIRECT_PROXIES = {"http": "", "https": ""}
+# 全局在飞分片上限区间，实际值按可用内存与读缓冲推导。
+_INFLIGHT_MIN = 512
+_INFLIGHT_MAX = 4096
+
+
+def inflight_limit(available_bytes: int, buffer_size: int = READ_BUFFER) -> int:
+    """
+    按可用内存与单连接读缓冲推导全局在飞分片上限。
+
+    预算取可用内存的四分之一，每片最多占用一个读缓冲，结果夹在固定区间内。
+
+    :param available_bytes: 系统可用内存字节数
+    :param buffer_size: 单连接读缓冲字节数
+    :return: 在飞分片上限
+    """
+    safe_buffer = max(int(buffer_size), 1)
+    budget = int(int(available_bytes) * 0.25 // safe_buffer)
+    return max(_INFLIGHT_MIN, min(_INFLIGHT_MAX, budget))
+
+
+class _ChunkSlots:
+    """
+    全局在飞分片信号量，按可用内存惰性创建。
+
+    首次进入时才读取系统可用内存，避免导入期阻塞与固定上限。
+    """
+
+    def __init__(self) -> None:
+        """
+        初始化惰性信号量占位。
+        """
+        self._lock = threading.Lock()
+        self._semaphore: Optional[threading.BoundedSemaphore] = None
+
+    def _get(self) -> threading.BoundedSemaphore:
+        """
+        返回进程级信号量，首次调用时按可用内存创建。
+
+        :return: 在飞分片信号量
+        """
+        if self._semaphore is None:
+            with self._lock:
+                if self._semaphore is None:
+                    available = psutil.virtual_memory().available
+                    self._semaphore = threading.BoundedSemaphore(
+                        inflight_limit(available)
+                    )
+        return self._semaphore
+
+    def __enter__(self) -> None:
+        """
+        获取一个在飞名额。
+        """
+        self._get().acquire()
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        """
+        释放一个在飞名额。
+        """
+        self._get().release()
+
+
 # 全进程在飞分片上限：多任务、多文件各自开线程时，真正同时在飞的请求不超过该值。
-_CHUNK_SLOTS = threading.BoundedSemaphore(512)
+_CHUNK_SLOTS = _ChunkSlots()
 
 
 def _sanitize_url(url: str) -> str:

@@ -183,6 +183,15 @@ def test_plan_chunks_covers_main_pool_contiguously() -> None:
     assert chunks[-1][1] >= int(total * engine.MAIN_POOL_RATIO) - engine.MIN_CHUNK_SIZE
 
 
+def test_inflight_limit_follows_memory_budget() -> None:
+    """
+    全局在飞上限随可用内存与读缓冲推导，并夹在固定区间内。
+    """
+    assert engine.inflight_limit(2 * 1024**3, 64 * 1024) == 4096
+    assert engine.inflight_limit(64 * 1024**2, 64 * 1024) == 512
+    assert engine.inflight_limit(1 * 1024**3, 64 * 1024) >= 64 * 32
+
+
 def test_download_writes_full_content(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """
     分片下载应写出与源一致的完整文件，并清理计划文件。

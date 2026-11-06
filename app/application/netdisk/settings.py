@@ -16,7 +16,7 @@ from app.schemas.types import SystemConfigKey
 _THREADS_MIN = 1
 _THREADS_MAX = 512
 _MAX_TASKS_MIN = 1
-_MAX_TASKS_MAX = 16
+_MAX_TASKS_MAX = 64
 _RETRIES_MIN = 1
 _RETRIES_MAX = 10
 _BUFFER_MIN = 16 * 1024
@@ -80,9 +80,9 @@ class SystemNetdiskSettings:
             return config.get(key)
 
         return NetdiskTuning(
-            threads=_clamp(value(SystemConfigKey.NetdiskDownloadThreads), 8, _THREADS_MIN, _THREADS_MAX),
+            threads=_clamp(value(SystemConfigKey.NetdiskDownloadThreads), 32, _THREADS_MIN, _THREADS_MAX),
             max_tasks=_clamp(
-                value(SystemConfigKey.NetdiskMaxConcurrentDownloads),
+                value(SystemConfigKey.NetdiskMaxConcurrentFiles),
                 3,
                 _MAX_TASKS_MIN,
                 _MAX_TASKS_MAX,

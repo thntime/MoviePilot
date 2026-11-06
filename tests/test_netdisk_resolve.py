@@ -309,6 +309,60 @@ def test_walk_recurses_directories(env):
     assert [item.file_id for item in result.files] == ["f1"]
 
 
+def _depth_chain(depth):
+    """
+    构造最深视频位于第 depth 层的目录链。
+
+    第 1 至 depth-1 层是目录，第 depth 层是视频文件；根目录只含第一层目录。
+
+    :param depth: 最深文件的层号，根目录条目为第 1 层
+    :return: 根目录条目与「目录 ID -> 子项」映射
+    """
+    dirs = [
+        ShareFile(file_id=f"d{level}", name=f"d{level}", is_dir=True)
+        for level in range(1, depth)
+    ]
+    children = {}
+    for index, item in enumerate(dirs):
+        if index + 1 < len(dirs):
+            children[item.file_id] = [dirs[index + 1]]
+        else:
+            children[item.file_id] = [
+                ShareFile(file_id=f"f{depth}", name=f"e{depth}.mkv", size=1)
+            ]
+    return tuple(dirs[:1]), children
+
+
+def _walk_depth_names(service, adapter, depth, max_depth):
+    """
+    按给定最大深度展开目录链，返回展开到的文件名。
+
+    :param service: 取链服务
+    :param adapter: 适配器替身
+    :param depth: 最深文件的层号
+    :param max_depth: 传给 walk 的最大递归深度
+    :return: 展开到的文件名列表
+    """
+    root, children = _depth_chain(depth)
+    adapter.share_detail = lambda ref, account: ShareDetail(title="t", files=root)
+    adapter.list_files = lambda ref, parent_id, account: children[parent_id]
+    result = service.walk("https://pan.quark.cn/s/abc123", max_depth=max_depth)
+    return [item.name for item in result.files]
+
+
+def test_walk_reaches_twelfth_level(env):
+    """
+    分享目录递归到第 12 层文件，第 13 层被截断。
+    """
+    from app.modules.netdisk import _MAX_WALK_DEPTH
+
+    service, adapter, store, settings = env
+    accounts = NetdiskAccountService(store)
+    _account(accounts)
+    assert "e12.mkv" in _walk_depth_names(service, adapter, 12, _MAX_WALK_DEPTH)
+    assert "e13.mkv" not in _walk_depth_names(service, adapter, 13, _MAX_WALK_DEPTH)
+
+
 def test_share_token_is_passed_to_adapter(env):
     """
     候选透传的分享令牌直接进入 ShareRef，避免重复换取。
@@ -335,3 +389,62 @@ def test_inspect_without_account_raises(env):
     with pytest.raises(NetdiskError) as error:
         service.inspect("https://pan.quark.cn/s/abc123")
     assert error.value.code is NetdiskErrorCode.AUTH_EXPIRED
+
+
+def test_resolve_file_without_account_uses_guest(env):
+    """
+    支持游客的平台在无账号时直接返回游客直链，不抛 AUTH_EXPIRED。
+    """
+    service, adapter, store, settings = env
+    adapter.guest_supported = True
+    file = ShareFile(file_id="f1", name="a.mp4", size=10)
+
+    links = service.resolve_file("https://pan.quark.cn/s/abc123", None, file)
+
+    assert len(links) == 1
+    assert links[0].account_id == 0
+    assert adapter.resolve_calls == [(0, True)]
+
+
+def test_resolve_file_with_account_skips_guest(env):
+    """
+    有可用账号时 resolve_file 只走账号链路，不回落游客。
+    """
+    service, adapter, store, settings = env
+    adapter.guest_supported = True
+    accounts = NetdiskAccountService(store)
+    account = _account(accounts)
+    file = ShareFile(file_id="f1", name="a.mp4", size=10)
+
+    links = service.resolve_file("https://pan.quark.cn/s/abc123", None, file)
+
+    assert len(links) == 1
+    assert links[0].account_id == account.id
+    assert adapter.resolve_calls == [(account.id, True)]
+
+
+def test_account_space_error_is_not_treated_as_guest(env, monkeypatch):
+    """
+    账号选择报空间不足时必须原样抛出，不能回落成游客取链。
+    """
+    service, adapter, store, settings = env
+    adapter.guest_supported = True
+    file = ShareFile(file_id="f1", name="a.mp4", size=10)
+
+    def fail_select(platform, exclude_ids=(), required_bytes=0):
+        """
+        模拟账号选择阶段判定空间不足。
+        """
+        raise NetdiskError(
+            NetdiskErrorCode.SPACE_INSUFFICIENT,
+            "空间不足",
+            platform=NetdiskPlatform.QUARK,
+        )
+
+    monkeypatch.setattr(service._accounts, "select", fail_select)
+
+    with pytest.raises(NetdiskError) as error:
+        service.resolve_file("https://pan.quark.cn/s/abc123", None, file)
+
+    assert error.value.code is NetdiskErrorCode.SPACE_INSUFFICIENT
+    assert adapter.resolve_calls == []

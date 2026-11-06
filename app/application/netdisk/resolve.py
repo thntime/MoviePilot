@@ -254,7 +254,9 @@ class NetdiskResolveService:
         :return: 直链元组
         """
         adapter, ref = self.parse(url, password, platform, share_token)
-        accounts = self._resolve_accounts(adapter, account_id, multi_source)
+        accounts = self._resolve_accounts(
+            adapter, account_id, multi_source, allow_guest=adapter.guest_supported,
+        )
         links: list[DirectLink] = []
         for account in accounts:
             links.append(
@@ -647,6 +649,8 @@ class NetdiskResolveService:
         adapter: NetdiskAdapter,
         account_id: Optional[int],
         multi_source: bool,
+        *,
+        allow_guest: bool = False,
     ) -> list[Optional[NetdiskAccountRecord]]:
         """
         按平台要求与多源开关选择取链账号。
@@ -654,11 +658,18 @@ class NetdiskResolveService:
         :param adapter: 平台适配器
         :param account_id: 指定账号
         :param multi_source: 是否启用多源
+        :param allow_guest: 无账号时是否允许游客取链
         :return: 账号列表，游客链路为单个 None
         """
         if account_id:
             return [self._accounts.require_account(adapter.platform, account_id)]
-        primary = self._select_primary(adapter)
+        try:
+            primary = self._select_primary(adapter)
+        except NetdiskError as error:
+            # 只有「无可用账号」才能回落游客；空间不足、限流等必须交给上层恢复链路。
+            if not allow_guest or error.code is not NetdiskErrorCode.AUTH_EXPIRED:
+                raise
+            primary = None
         if primary is None:
             return [None]
         if not multi_source or not self.tuning.multi_source:

@@ -63,7 +63,7 @@ _DOWNLOAD_SUFFIXES = frozenset({
 # 分享目录最大递归深度。
 # 平台硬上限：迅雷超过 8 路并发会被 CDN 降级为整文件响应。
 _PLATFORM_CONCURRENCY_CAP = {NetdiskPlatform.XUNLEI: 8}
-_MAX_WALK_DEPTH = 3
+_MAX_WALK_DEPTH = 12
 # 任务目录标记文件：只有带该标记的目录才允许被定时孤儿清理删除，避免误删用户目录。
 _TASK_MARKER = ".netdisk-task"
 # 文件名中的明确季集标记，用于按目标季过滤，避免跨季误下。
@@ -696,7 +696,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         return replace(
             base,
             threads=int_value("threads", base.threads, 1, cap),
-            max_tasks=int_value("max_tasks", base.max_tasks, 1, 8),
+            max_tasks=int_value("max_tasks", base.max_tasks, 1, 64),
             rate_limit=rate_limit,
             preempt_enabled=bool_value("preempt", base.preempt_enabled),
             multi_source=bool_value("multi_source", base.multi_source),
@@ -827,7 +827,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 workers = max(1, min(int(task_tuning.max_tasks), len(pending))) if pending else 1
                 workers = self._limit_workers_for_task(workers, pending, platform, task_tuning)
                 account_map = self._assign_accounts(platform, pending)
-                per_file_threads = max(1, int(task_tuning.threads) // workers)
+                per_file_threads = max(1, int(task_tuning.threads))
                 with ThreadPoolExecutor(
                     max_workers=workers, thread_name_prefix=f"netdisk-file-{task_key}"
                 ) as pool:
@@ -836,8 +836,9 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                             self._download_one,
                             resolver, platform, share_url, passcode, item, task_dir,
                             task_key, stop_event, share_token, task_tuning,
-                            on_file_progress, per_file_threads, workers,
-                            account_map.get(item.name),
+                            on_file_progress, threads=per_file_threads,
+                            concurrency=workers,
+                            account_id=account_map.get(item.name),
                         ): item
                         for item in pending
                     }

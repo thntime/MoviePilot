@@ -465,6 +465,8 @@ class SystemConfigKey(Enum):
     # 网盘下载默认并发连接数
     NetdiskDownloadThreads = "NetdiskDownloadThreads"
     # 网盘单任务最大并发下载文件数
+    NetdiskMaxConcurrentFiles = "NetdiskMaxConcurrentFiles"
+    # 网盘全局同时运行的任务槽上限
     NetdiskMaxConcurrentDownloads = "NetdiskMaxConcurrentDownloads"
     # 网盘全局限速（字节/秒，0 表示不限）
     NetdiskDownloadSpeedLimit = "NetdiskDownloadSpeedLimit"
