@@ -1220,9 +1220,9 @@ def test_instance_tuning_uses_platform_overrides() -> None:
 
 def test_platform_total_connection_cap() -> None:
     """
-    迅雷按任务总连接上限反推每文件连接数，其他平台不受影响。
+    迅雷按任务总连接上限限制并发文件数，每文件连接数保持不变。
     """
-    assert netdisk_module._cap_platform_connections(NetdiskPlatform.XUNLEI, 8, 8) == 1
-    assert netdisk_module._cap_platform_connections(NetdiskPlatform.XUNLEI, 2, 8) == 4
-    assert netdisk_module._cap_platform_connections(NetdiskPlatform.XUNLEI, 1, 8) == 8
-    assert netdisk_module._cap_platform_connections(NetdiskPlatform.QUARK, 8, 64) == 64
+    assert netdisk_module._cap_platform_workers(NetdiskPlatform.XUNLEI, 8, 8) == 1
+    assert netdisk_module._cap_platform_workers(NetdiskPlatform.XUNLEI, 2, 8) == 1
+    assert netdisk_module._cap_platform_workers(NetdiskPlatform.XUNLEI, 2, 4) == 2
+    assert netdisk_module._cap_platform_workers(NetdiskPlatform.QUARK, 8, 64) == 8

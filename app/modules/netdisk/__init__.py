@@ -166,19 +166,20 @@ def _is_completed_file(target: Path, expected: int) -> bool:
     return target.with_name(target.name + ".done").exists()
 
 
-def _cap_platform_connections(platform: NetdiskPlatform, workers: int, threads: int) -> int:
+def _cap_platform_workers(platform: NetdiskPlatform, workers: int, threads: int) -> int:
     """
-    按平台任务级总连接上限计算每个文件可用的连接数。
+    按平台任务级总连接上限限制并发文件数，保持每文件连接数不变。
 
     :param platform: 网盘平台
-    :param workers: 实际并发文件数
-    :param threads: 期望的每文件连接数
-    :return: 夹紧后的每文件连接数
+    :param workers: 期望并发文件数
+    :param threads: 每文件连接数
+    :return: 夹紧后的并发文件数
     """
     total_cap = _PLATFORM_TOTAL_CONCURRENCY_CAP.get(platform)
     if not total_cap:
-        return max(1, int(threads))
-    return max(1, min(int(threads), total_cap // max(int(workers), 1)))
+        return max(1, int(workers))
+    per_file = max(1, int(threads))
+    return max(1, min(int(workers), total_cap // per_file))
 
 
 def _limit_workers(requested: int, file_sizes: Sequence[int], free_bytes: int) -> int:
@@ -869,9 +870,8 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 workers = max(1, min(int(task_tuning.max_tasks), len(pending))) if pending else 1
                 workers = self._limit_workers_for_task(workers, pending, platform, task_tuning)
                 account_map = self._assign_accounts(platform, pending)
-                per_file_threads = _cap_platform_connections(
-                    platform, workers, int(task_tuning.threads)
-                )
+                per_file_threads = max(1, int(task_tuning.threads))
+                workers = _cap_platform_workers(platform, workers, per_file_threads)
                 with ThreadPoolExecutor(
                     max_workers=workers, thread_name_prefix=f"netdisk-file-{task_key}"
                 ) as pool:
