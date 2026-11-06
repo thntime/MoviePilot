@@ -63,6 +63,9 @@ _DOWNLOAD_SUFFIXES = frozenset({
 # 分享目录最大递归深度。
 # 平台硬上限：迅雷超过 8 路并发会被 CDN 降级为整文件响应。
 _PLATFORM_CONCURRENCY_CAP = {NetdiskPlatform.XUNLEI: 8}
+# 平台任务级总连接上限：迅雷实测超过 10 路并发会在约 1 分钟内返回 HTTP 503，
+# 因此把单个任务的总连接数夹在 8 路（并发文件数 × 每文件连接数）。
+_PLATFORM_TOTAL_CONCURRENCY_CAP = {NetdiskPlatform.XUNLEI: 8}
 _MAX_WALK_DEPTH = 12
 # 任务目录标记文件：只有带该标记的目录才允许被定时孤儿清理删除，避免误删用户目录。
 _TASK_MARKER = ".netdisk-task"
@@ -161,6 +164,21 @@ def _is_completed_file(target: Path, expected: int) -> bool:
     if target.with_suffix(target.suffix + ".plan.json").exists():
         return False
     return target.with_name(target.name + ".done").exists()
+
+
+def _cap_platform_connections(platform: NetdiskPlatform, workers: int, threads: int) -> int:
+    """
+    按平台任务级总连接上限计算每个文件可用的连接数。
+
+    :param platform: 网盘平台
+    :param workers: 实际并发文件数
+    :param threads: 期望的每文件连接数
+    :return: 夹紧后的每文件连接数
+    """
+    total_cap = _PLATFORM_TOTAL_CONCURRENCY_CAP.get(platform)
+    if not total_cap:
+        return max(1, int(threads))
+    return max(1, min(int(threads), total_cap // max(int(workers), 1)))
 
 
 def _limit_workers(requested: int, file_sizes: Sequence[int], free_bytes: int) -> int:
@@ -666,6 +684,22 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         adapter = find_adapter(platform)
         cap = max(1, min(512, int(getattr(adapter, "max_concurrency", 512) or 512)))
         cap = min(cap, _PLATFORM_CONCURRENCY_CAP.get(platform, cap))
+        platform_key = getattr(platform, "value", str(platform))
+
+        def platform_value(mapping: Any, default: int) -> int:
+            """
+            读取平台级覆盖值，缺失或非法时回落到实例默认值。
+            """
+            if not isinstance(mapping, dict):
+                return default
+            value = mapping.get(platform_key)
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        threads_override = platform_value(raw.get("platform_threads"), 0)
+        max_tasks_override = platform_value(raw.get("platform_max_tasks"), 0)
 
         def int_value(key: str, default: int, minimum: int, maximum: int) -> int:
             """
@@ -695,8 +729,16 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             rate_limit = base.rate_limit
         return replace(
             base,
-            threads=int_value("threads", base.threads, 1, cap),
-            max_tasks=int_value("max_tasks", base.max_tasks, 1, 64),
+            threads=(
+                max(1, min(cap, threads_override))
+                if threads_override > 0
+                else int_value("threads", base.threads, 1, cap)
+            ),
+            max_tasks=(
+                max(1, min(64, max_tasks_override))
+                if max_tasks_override > 0
+                else int_value("max_tasks", base.max_tasks, 1, 64)
+            ),
             rate_limit=rate_limit,
             preempt_enabled=bool_value("preempt", base.preempt_enabled),
             multi_source=bool_value("multi_source", base.multi_source),
@@ -827,7 +869,9 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 workers = max(1, min(int(task_tuning.max_tasks), len(pending))) if pending else 1
                 workers = self._limit_workers_for_task(workers, pending, platform, task_tuning)
                 account_map = self._assign_accounts(platform, pending)
-                per_file_threads = max(1, int(task_tuning.threads))
+                per_file_threads = _cap_platform_connections(
+                    platform, workers, int(task_tuning.threads)
+                )
                 with ThreadPoolExecutor(
                     max_workers=workers, thread_name_prefix=f"netdisk-file-{task_key}"
                 ) as pool:

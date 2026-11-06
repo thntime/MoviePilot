@@ -396,6 +396,8 @@ class ChunkedDownloader:
         self.preempt = preempt
         self.buffer_size = max(int(buffer_size), 1024)
         self.retries = max(int(retries), 1)
+        # 多分片并发写计划时共用一个临时文件，必须串行化，否则 rename 会互相覆盖。
+        self._plan_lock = threading.Lock()
         self.preempt_bps = max(int(preempt_bps), 0)
         self.preempt_age = max(float(preempt_age_seconds), 0.0)
         self.refresh_seconds = max(int(refresh_seconds), 0)
@@ -452,9 +454,10 @@ class ChunkedDownloader:
         payload = {"total": self.total, "chunks": len(self._chunks), "done": done}
         try:
             # 原子写：进程被杀时不会留下半截 JSON，避免恢复时把已下载数据清零。
-            temp = self.plan_path.with_suffix(".tmp")
-            temp.write_text(json.dumps(payload), encoding="utf-8")
-            temp.replace(self.plan_path)
+            with self._plan_lock:
+                temp = self.plan_path.with_suffix(".tmp")
+                temp.write_text(json.dumps(payload), encoding="utf-8")
+                temp.replace(self.plan_path)
         except Exception as err:  # noqa: BLE001
             logger.warn(f"写入下载计划失败：{err}")
 

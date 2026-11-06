@@ -1190,3 +1190,39 @@ def test_collect_files_strips_path_traversal() -> None:
     collected = module._collect_files(files, season=1)  # pylint: disable=protected-access
 
     assert [item.name for item in collected] == ["evil.mkv"]
+
+
+def test_instance_tuning_uses_platform_overrides() -> None:
+    """
+    平台级覆盖优先于实例默认值，未覆盖的平台沿用默认值。
+    """
+    config = SimpleNamespace(
+        config={
+            "threads": 8,
+            "max_tasks": 2,
+            "platform_threads": {"quark": 64},
+            "platform_max_tasks": {"quark": 3},
+        }
+    )
+
+    quark = NetdiskModule._instance_tuning(  # pylint: disable=protected-access
+        config, NetdiskPlatform.QUARK
+    )
+    assert quark.threads == 64
+    assert quark.max_tasks == 3
+
+    uc = NetdiskModule._instance_tuning(  # pylint: disable=protected-access
+        config, NetdiskPlatform.UC
+    )
+    assert uc.threads == 8
+    assert uc.max_tasks == 2
+
+
+def test_platform_total_connection_cap() -> None:
+    """
+    迅雷按任务总连接上限反推每文件连接数，其他平台不受影响。
+    """
+    assert netdisk_module._cap_platform_connections(NetdiskPlatform.XUNLEI, 8, 8) == 1
+    assert netdisk_module._cap_platform_connections(NetdiskPlatform.XUNLEI, 2, 8) == 4
+    assert netdisk_module._cap_platform_connections(NetdiskPlatform.XUNLEI, 1, 8) == 8
+    assert netdisk_module._cap_platform_connections(NetdiskPlatform.QUARK, 8, 64) == 64
