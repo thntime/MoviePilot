@@ -652,3 +652,112 @@ async def test_recovery_requests_both_pages_through_existing_site_interval(manua
     assert [page for _site, _keyword, page in calls] == [2, 3]
     assert waits == [10]
     assert [item["torrent_info"]["description"] for item in result[-2]["items"]] == ["1-3"]
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_distinguishes_empty_error_and_cooldown_without_secrets(manual_owner, monkeypatch):
+    """
+    页诊断只包含实际调度来源，保留空结果、请求失败与未发请求冷却的区别。
+    """
+    owner, _, _ = manual_owner
+
+    def request(**params):
+        """
+        模拟含敏感地址的失败与未发请求的冷却，不访问外部站点。
+        """
+        first = params["site"]["id"] == 1
+        report_site_search_outcome(
+            attempted=first, outcome="error" if first else "deferred",
+            error="https://secret.example/download?passkey=private&token=private",
+        )
+        return []
+
+    monkeypatch.setattr(owner, "search_site_torrents", request)
+    result = await events(SearchManualOwner.events(owner, params={"keyword": "Show"}))
+    diagnostics = result[-1]["diagnostics"]
+    sites = {site["site_id"]: site for site in diagnostics["searched_sites"]}
+    assert sites[1]["outcome"] == "error" and sites[1]["attempted"] is True
+    assert sites[2]["outcome"] == "cooldown" and sites[2]["attempted"] is False
+    assert sites[None]["outcome"] == "empty"
+    assert diagnostics["scope"] == "page"
+    assert diagnostics["stage_counts"] == {"candidates": 0, "retained": 0}
+    assert diagnostics["rejection_reasons"] == []
+    assert {warning["code"] for warning in diagnostics["warnings"]} == {"provider_error", "provider_cooldown"}
+    assert not any(value in str(diagnostics) for value in ("secret.example", "passkey", "token=", "private"))
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_keeps_rule_skip_separate_from_resource_rejection(manual_owner, monkeypatch):
+    """
+    只适用外语电影的规则不会把动画电影资源伪报为被规则拒绝。
+    """
+    from app.application import rules as rule_module
+    from app.schemas.rule import FilterRuleGroup
+
+    owner, _, _ = manual_owner
+    rule = FilterRuleGroup(name="中文字幕", media_type="电影", category="外语电影", rule_string="1080P")
+    monkeypatch.setattr(rule_module.RuleHelper, "get_rule_groups", lambda _self: [rule])
+    monkeypatch.setattr(manual_module, "get_configured_system_config", lambda: SimpleNamespace(get=lambda _key: ["中文字幕"]))
+    media = MediaInfo(media_source=MediaSource.TMDB, media_id="1", tmdb_id=1, type=MediaType.MOVIE,
+                      title="Show", original_title="Show", names=["Show"], category="动画电影")
+    recognizer = manual_module.MediaChain()
+    monkeypatch.setattr(recognizer, "async_recognize_media", AsyncMock(return_value=media))
+    monkeypatch.setattr(recognizer, "async_supplement_media_info", AsyncMock(return_value=media))
+    # 过滤模块没有适用组时保留全部输入，诊断不能改变这一既有合同。
+    monkeypatch.setattr(owner, "filter_torrents", lambda **params: params["torrent_list"])
+    result = await events(SearchManualOwner.events(owner, params={"media_source": MediaSource.TMDB, "media_id": "1"}))
+    diagnostics = result[-1]["diagnostics"]
+    assert diagnostics["rule_groups"] == [{
+        "name": "中文字幕", "status": "skipped", "reason": "rule_group_not_applicable",
+        "media_type": "电影", "categories": ["外语电影"],
+    }]
+    assert {warning["code"] for warning in diagnostics["warnings"]} == {"rule_group_not_applicable"}
+    assert all(reason["code"] != "filter_rules" for reason in diagnostics["rejection_reasons"])
+
+
+@pytest.mark.asyncio
+async def test_page_diagnostics_and_context_bind_to_current_user_and_search(manual_owner, monkeypatch):
+    """
+    首页按认证用户一次发布完整快照，续页沿用搜索编号但不覆盖首页结果。
+    """
+    owner, _, _ = manual_owner
+    save_context = AsyncMock()
+    monkeypatch.setattr(owner, "async_save_search_context", save_context)
+    first = await events(SearchManualOwner.events(owner, params={"keyword": "Show", "user_id": 31, "sites": [1]}))
+    user_id, snapshot = save_context.await_args.args
+    assert user_id == 31
+    assert snapshot.params["keyword"] == "Show"
+    assert len(snapshot.results) == snapshot.diagnostics.stage_counts.retained == 1
+    assert snapshot.diagnostics.search_id == first[-1]["diagnostics"]["search_id"]
+    assert {site["site_id"] for site in first[-1]["diagnostics"]["searched_sites"]} == {1, None}
+    source = site_facts(first)[0]["source"]
+    next_page = await events(SearchManualOwner.events(owner, params={
+        "keyword": "Show", "user_id": 31, "page": 1, "source": source,
+    }))
+    assert next_page[-1]["diagnostics"]["search_id"] == first[-1]["diagnostics"]["search_id"]
+    assert [site["site_id"] for site in next_page[-1]["diagnostics"]["searched_sites"]] == [1]
+    assert save_context.await_count == 1
+    other = await events(SearchManualOwner.events(owner, params={"keyword": "Other", "user_id": 32, "sites": [2]}))
+    assert other[-1]["diagnostics"]["search_id"] != first[-1]["diagnostics"]["search_id"]
+    assert save_context.await_args.args[0] == 32
+
+
+@pytest.mark.asyncio
+async def test_cancelled_page_never_publishes_diagnostics_snapshot(manual_owner, blocked_site, monkeypatch):
+    """
+    关闭预览等待工作线程结束，但不发布当前用户的完成快照。
+    """
+    owner, _, _ = manual_owner
+    _, release, _, _ = blocked_site
+    save_context = AsyncMock()
+    monkeypatch.setattr(owner, "async_save_search_context", save_context)
+    stream = SearchManualOwner.events(owner, params={"keyword": "Show", "user_id": 31})
+    try:
+        while not (await anext(stream)).get("items"):
+            pass
+        release.set()
+        await stream.aclose()
+    finally:
+        release.set()
+        await stream.aclose()
+    save_context.assert_not_awaited()

@@ -19,6 +19,9 @@ Identity scope: `bound_user`; required role: `user`.
 - `path_params`: none
 - `query`: none
 - `body`: none
+- `params` and `results` are saved together for the authenticated user. Legacy global caches are not restored; search again after upgrading.
+- Optional Web `manual_paging=true` diagnostics use `scope=page` for the current page. `searched_sites` records attempted requests and outcomes; `stage_counts` and `rejection_reasons` record observed filtering. Skipped rule groups do not increase the resource rejection count.
+- Ordinary searches and legacy streams save `diagnostics=null`, including empty results. Errors and cancellation preserve the previous complete snapshot.
 
 ### `search.title`
 `GET /api/v1/search/title`; policy effect: `external_side_effect`.

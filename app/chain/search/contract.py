@@ -80,6 +80,8 @@ if TYPE_CHECKING:
         _torrent_type: Callable[..., Any]
         _unique_music_texts: Callable[..., Any]
         async_last_search_params: Callable[..., Any]
+        async_last_search_context: Callable[..., Any]
+        async_save_search_context: Callable[..., Any]
         async_last_search_results: Callable[..., Any]
         async_last_subtitle_search_results: Callable[..., Any]
         async_process: Callable[..., Awaitable[list[Context]]]

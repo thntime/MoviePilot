@@ -299,3 +299,22 @@ def test_site_deleted_delegates_reference_cleanup_to_atomic_scope() -> None:
     )
 
     mutation.apply.assert_called_once_with(3)
+
+
+def test_rule_applicability_explains_missing_untyped_and_wrong_media_groups(monkeypatch) -> None:
+    """
+    诊断复用实际选择策略，缺失规则与范围不符都有稳定原因且不拒绝资源。
+    """
+    helper = RuleHelper()
+    groups = [FilterRuleGroup(name="all", rule_string="1080P"),
+              FilterRuleGroup(name="movie", rule_string="1080P", media_type="电影")]
+    monkeypatch.setattr(helper, "get_rule_groups", lambda: groups)
+    result = helper.explain_rule_groups(media=None, group_names=["all", "movie", "missing"])
+    assert [(item.name, item.status, item.reason) for item in result] == [
+        ("all", "effective", None), ("movie", "skipped", "rule_group_not_applicable"),
+        ("missing", "skipped", "rule_group_missing"),
+    ]
+    assert helper.explain_rule_groups(media=None, group_names=[]) == []
+    movie = MediaInfo(type=MediaType.MOVIE, title="Example")
+    assert helper.explain_rule_groups(media=movie, group_names=["movie"])[0].status == "effective"
+    assert helper.explain_rule_groups(media=movie, group_names=["all", "all"])[0].name == "all"

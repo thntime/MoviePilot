@@ -1,5 +1,5 @@
 """
-AniList 的无效 GraphQL 响应不得阻止官方回退与中文合并。
+AniList 的无效 GraphQL 响应应返回失败，中文合并保留原始身份与别名顺序。
 """
 
 import asyncio
@@ -11,39 +11,31 @@ from app.modules.anilist.anilist import AniListApi
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("proxy_payload", [
+@pytest.mark.parametrize("payload", [
     None, [], [1], "invalid", 7, False,
     {"data": []}, {"data": [1]}, {"data": "invalid"}, {"data": 7},
     {"data": False}, {"errors": ["unavailable"], "data": {"Media": {"id": 1}}},
 ])
-def test_invalid_proxy_payload_preserves_official_fallback(asynchronous, proxy_payload):
+def test_invalid_official_payload_does_not_download_translations(asynchronous: bool, payload: object) -> None:
     """
-    无效对象、无效 data 和 GraphQL 错误都应触发既有官方查询路径。
+    无效对象、无效 data 和 GraphQL 错误不得触发数据集下载或再次查询。
     """
-    proxy = Mock(status_code=200)
-    proxy.json.return_value = proxy_payload
-    official = Mock(status_code=200)
-    media = {"id": 12, "title": {"native": "Original"}, "synonyms": ["Alias"]}
-    data = {"Media": media}
-    official.json.return_value = {"data": data}
-    request = AsyncMock(side_effect=[proxy, official]) if asynchronous else Mock(side_effect=[proxy, official])
-    translations = [{"id": 12, "title": "中文标题", "synonyms": ["Alias", "Chinese Alias"]}]
+    response = Mock(status_code=200)
+    response.json.return_value = payload
+    request = AsyncMock(return_value=response) if asynchronous else Mock(return_value=response)
     client = AniListApi()
     transport = Mock()
     transport.post_res = request
-    transport.get_json = AsyncMock(return_value=translations) if asynchronous else Mock(return_value=translations)
+    transport.get_json = AsyncMock() if asynchronous else Mock()
     if asynchronous:
         client._async_request = transport
         result = asyncio.run(client._async_invoke("query", {"id": 12}))
     else:
         client._request = transport
         result = client._invoke("query", {"id": 12})
-    assert result is data
-    assert media["title"]["chinese"] == "中文标题"
-    assert media["synonyms"] == ["Alias", "Chinese Alias"]
-    assert client._proxy_available is False
-    assert [call.args[0] for call in request.call_args_list] == [client._base_url, client._official_url]
-    assert all(call.kwargs["json"] == {"query": "query", "variables": {"id": 12}} for call in request.call_args_list)
+    assert result is None
+    request.assert_called_once_with(client._official_url, json={"query": "query", "variables": {"id": 12}})
+    transport.get_json.assert_not_called()
 
 
 @pytest.mark.parametrize("payload", [{}, {"Media": None}, {"Page": {"media": []}}])

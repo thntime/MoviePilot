@@ -441,6 +441,12 @@ canonical `app.db.oper.workflow.WorkflowOper` 只提供显式 Session 的 query/
 API 中允许丢失或可重建的进程内任务必须登记到 `app/runtime/tasks.py`；登记器先于其他
 运行资源启动，并在资源释放前停止接收、取消和有限等待。需要崩溃恢复的 E2/E3 副作用仍应
 进入 Outbox 或持久任务表，不能把 TaskRegistry 当成 durable queue。
+浏览器空闲回收由 `BrowserSessionHelper` 持有，normal/safe 模式均在模块服务和 TaskRegistry
+启动后登记一个扫描任务；每 60 秒向已有会话线程投递条件关闭，不创建额外线程池或浏览器。
+空闲期从末次操作结束起计算 15 分钟，排队和在途操作受同一准入锁保护；关闭前复核会话、
+执行器、owner 和时间，旧关闭不能撤销同名新实例。TaskRegistry 取消扫描后等待已投递关闭，
+超时沿用登记器的 fail-fast 语义；最终全关仍在模块关闭阶段，不提前释放消费者资源。
+启动性能清单仅新增该组件：normal 33 → 34、safe 21 → 22，历史计时样本与三秒上限不变。
 Runtime 关闭后不可逆；完整应用生命周期的再次启动必须由新进程承载，不能在同一解释器中重建局部资源域。
 插件需要浏览器时使用 `app.sdk.browser`，由宿主浏览器适配器协调资源，不直接依赖资源实现。
 插件需要飞书事件长连接时使用 `app.sdk.feishu.FeishuLongConnection`，与宿主飞书模块共用同一传输实现，不再各自依赖 lark-oapi。
@@ -678,18 +684,21 @@ Shared subscription metadata and media-key construction belongs to
 `app.application.subscription.contract`; `app.chain.subscribe` is a same-named package
 whose root exposes only the stable `SubscribeChain`. `facade.py` owns the class
 identity and event entry wrappers; `create.py`, `search.py`, `match.py`, `refresh.py`,
-`completion.py`, `music.py`, `reconcile.py` and `notify.py` are the single owners of their
+`completion.py`, `music.py`, `reconcile.py`, `library.py` and `notify.py` are the single owners of their
 respective workflows, while `query.py`, `interaction.py`, `identity.py` and `policy.py`
 own the remaining focused capabilities. Startup imports the subscription share Port
 directly from `notify.py`; canonical callers import identity projection directly from
 `identity.py`. The retired `app/chain/subscribe.py` monolith must not return, package
 owners must not be re-exported, and `_music` must not import its concrete chain owner.
+`library.py` 消费整理完成事件，把本次交付的集号补写为订阅的入库集号并同步收缩缺失集数，
+使订阅卡片与日历在整理完成后立即反映媒体库状态；入库事实只按订阅目标范围内的集号写入，
+缺失集数与入库集号来自同一份事实。
 `music.py` 通过已注入的下载/整理历史 Port 关联成功入库文件，只读取本地音频标签和
 有效 CUE，按真实发行身份分组对账；发行身份与逐盘完整覆盖的纯规则归 `domain/music.py`。
 它通过既有订阅 mutation 写入事实和总曲目数，不新增数据库字段，也不从文件数量猜测完成。
 下载提交 owner 则按种子实际 hash、全部音频成功整理记录及仍存在的本地目标阻止音乐订阅重复提交；人工下载
 和未完整整理的任务保留原行为。新增 owner 使冷导入宿主模块数各增加 1：
-`app.startup.lifecycle` 586 → 587、`app.factory` 599 → 600、`app.main` 601 → 602；
+`app.startup.lifecycle` 598 → 599、`app.factory` 612 → 613、`app.main` 614 → 615；
 原有耗时预算、采样和生命周期约束保持不变。
 `app.chain.search.execution` reads the Application-owned `SubscriptionSiteBudget`
 contract to apply subscription-only keyword scheduling and IMDb query deduplication;
@@ -995,6 +1004,19 @@ Durable post-commit side effects have a separate boundary:
   before plugin, module or database teardown; a timeout preserves ownership and
   fails shutdown rather than resetting bindings. Retry backoff starts when the
   failed handler finishes, not when the message was claimed.
+- Durable broadcast topics first freeze their enabled handler identifiers and
+  persist one delivery per handler in a fenced short transaction. The parent
+  records that expansion in the same transaction; replay after a settlement
+  failure reuses the committed recipients. Parent completion confirms durable
+  expansion, while `event.handler.<sha256>` records track actual consumer
+  completion. Each stable handler has its own serial recovery topic, so a slow
+  plugin cannot serialize the same batch for its peers. All deliveries share the
+  existing 20-worker bound, lease renewal and shutdown ownership; no third-party
+  thread is abandoned or treated as complete on timeout. Child envelopes retain
+  the original event payload, idempotency key and correlation context. The
+  strict event API can select one registered handler; missing handlers retry
+  through reload, disabled handlers retain the existing skip behavior. An
+  individual failure retries only that delivery, never successful peers.
 - `PostCommitResult` distinguishes the committed business value from completed
   and pending effects. This does not provide exactly-once delivery: a process may
   stop after an external sink succeeds but before complete is persisted. Outbox
@@ -1304,6 +1326,7 @@ driven workflow registration.
 | `app/runtime/extensions/module/manager.py` | Module discovery and lifecycle |
 | `app/runtime/extensions/plugin/manager.py` | Stable PluginManager ABI facade plus plugin discovery/lifecycle entrypoints; its constructor only consumes the startup-injected Runtime factory and does not build an environment or individual owner |
 | `app/runtime/extensions/plugin/runtime.py` | Frozen typed aggregate and construction primitive for plugin registry, lifecycle, catalog, dependency, monitor, projection, sync and package-system owners; it does not choose concrete startup dependencies |
+| `app/runtime/extensions/plugin/gate.py` | 插件生命周期的可重入执行权与钩子耗时快照；仅更新 owner 时持锁，竞争者立即拒绝，第三方代码在锁外执行；`admission.py` 在完整可变事务的副作用前取得同一运行时的根事务资格 |
 | `app/runtime/extensions/plugin/system.py` | Startup-injected market/package/dependency system-port facade, including delegation to the unique physical package deletion owner; it does not construct concrete adapters |
 | `app/runtime/extensions/plugin/dependency.py` | Virtual-instance dependency classification and runtime-status persistence owner |
 | `app/startup/initializers/plugins.py` | Plugin Runtime dependency-graph composition, concrete system/storage/catalog ports and lifecycle initialization |
@@ -1322,6 +1345,7 @@ driven workflow registration.
 | `app/application/server/report.py` | Server reporting use cases over injected local readers and transport callbacks |
 | `app/application/server/share.py` | Server sharing use cases over injected repositories and transport callbacks |
 | `app/domain/plugin.py` | Pure local-source, generation-compatibility and Release-install-plan rules |
+| `app/domain/chat.py` | 会话展示快照的纯时间戳兼容与选择状态合并规则；保留首次选择及回执时间，不读取交互管理器或持久化服务 |
 | `app/adapters/external/plugin/client.py` | `PluginMarketTransport`, the unique market transport, index/Release and local-candidate owner |
 | `app/adapters/system/plugin/package.py` | `PluginPackageManager`, the unique install, checkpoint, backup, restore and physical-delete owner |
 | `app/adapters/system/plugin/dependency.py` | `PluginDependencyInstaller`, enabled-source dependency inspection and constrained per-plugin recovery owner; `async_install` has two completion-owned worker boundaries for request preparation and fallback planning, while package subprocess cancellation remains with `PluginRuntimeHealth` |

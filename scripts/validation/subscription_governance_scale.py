@@ -345,6 +345,8 @@ class _ScaleTorrentHelper:
 
 # 线程同步最多等待 5 秒，避免验收异常时无限挂起。
 _SITE_PRESSURE_SYNC_TIMEOUT = 5.0
+# 执行方退出单独计时，故障注入可缩短收口等待而不影响请求竞争场景的建立。
+_SITE_PRESSURE_JOIN_TIMEOUT = 5.0
 
 
 class _ScaleSiteRequestBoundary:
@@ -574,7 +576,7 @@ def _run_site_pressure_case(
         contention_observed = pressure_event.wait(timeout=_SITE_PRESSURE_SYNC_TIMEOUT)
         boundary.release_first.set()
         for thread in threads:
-            thread.join(timeout=_SITE_PRESSURE_SYNC_TIMEOUT)
+            thread.join(timeout=_SITE_PRESSURE_JOIN_TIMEOUT)
         owners_finished = all(not thread.is_alive() for thread in threads)
 
         initial_deferrals = [
@@ -676,10 +678,11 @@ def _run_site_pressure_case(
                 )
                 cooldown_calls = boundary.calls - calls_before_cooldown
                 cooldown_deferrals = loser.consume_subscription_site_budget_deferrals()
+                # 出错暂停中的站点本轮直接跳过：不发请求，也不让订阅进入等待。
                 error_cooldown_blocked = bool(
                     not cooldown_result
                     and cooldown_calls == 0
-                    and cooldown_deferrals
+                    and not cooldown_deferrals
                 )
                 error_cooldown_persisted = bool(
                     error_record

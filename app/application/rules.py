@@ -7,7 +7,8 @@ import copy
 import threading
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol
+from typing import Literal as TypingLiteral
 
 from pyparsing import (
     Combine,
@@ -37,6 +38,9 @@ from app.domain.context import MediaInfo
 from app.schemas.common import JsonData
 from app.schemas.rule import CustomRule, FilterRuleGroup
 from app.schemas.types import SystemConfigKey
+
+if TYPE_CHECKING:
+    from app.schemas.search import SearchDiagnosticRuleGroup
 
 _RULE_GROUP_LIST_CONFIG_KEYS = (
     SystemConfigKey.SearchFilterRuleGroups,
@@ -550,6 +554,38 @@ class RuleHelper:
                 and (not group.category or category_resolver.matches_media_category(media, group.category))
             )
         ]
+
+    def explain_rule_groups(
+        self, *, media: Optional[MediaInfo], group_names: list[str],
+    ) -> list["SearchDiagnosticRuleGroup"]:
+        """
+        用现有规则选择策略说明所选规则的适用范围，不执行资源过滤。
+
+        :param media: 实际交给过滤器的媒体上下文；标题搜索传 None
+        :param group_names: 本次选择的规则组名称；空列表不诊断其它规则
+        :return: 按选择顺序返回适用、作用范围不符或配置已删除的说明
+        """
+        if not group_names:
+            return []
+        # 搜索诊断在首次调用时加载，规则服务导入不扩大启动模块集合。
+        from app.schemas.search import SearchDiagnosticRuleGroup
+
+        configured = {group.name: group for group in self.get_rule_groups()}
+        effective = {group.name for group in self.get_rule_group_by_media(media=media, group_names=group_names)}
+        result = []
+        for name in dict.fromkeys(group_names):
+            group = configured.get(name)
+            reason: Optional[TypingLiteral["rule_group_not_applicable", "rule_group_missing"]] = None
+            if group is None:
+                reason = "rule_group_missing"
+            elif name not in effective:
+                reason = "rule_group_not_applicable"
+            result.append(SearchDiagnosticRuleGroup(
+                name=name, status="skipped" if reason else "effective", reason=reason,
+                media_type=group.media_type if group else None,
+                categories=[group.category] if group and group.category else [],
+            ))
+        return result
 
     @staticmethod
     def get_custom_rules() -> List[CustomRule]:

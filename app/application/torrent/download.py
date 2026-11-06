@@ -63,6 +63,21 @@ class TorrentResponsePort(Protocol):
     reason: str
 
 
+def _torrent_magnet_link(response: Optional[TorrentResponsePort], url: str) -> Optional[str]:
+    """
+    从最终跳转地址或响应正文提取磁力链接，GET 和首次下载确认共用该判断。
+
+    :param response: 最终 HTTP 响应；直接跳到磁力链接时为空
+    :param url: 最终下载地址或磁力链接
+    :return: 磁力链接；响应仍需按种子或错误处理时返回 None
+    """
+    if url.startswith("magnet:"):
+        return url
+    if response is not None and response.status_code == 200 and response.content.startswith(b"magnet:"):
+        return response.text
+    return None
+
+
 def torrent_rate_limit_error(response: Optional[TorrentResponsePort]) -> Optional[str]:
     """
     在种子解析前提取 JSON 或 HTML 中明确的限流提示，保留站点原文。
@@ -366,9 +381,14 @@ class TorrentHelper:
         proxies: Optional[dict[str, Any]],
         retry: bool,
         site: Mapping[str, Any],
+        method: str = "GET",
+        data: Optional[dict[str, Any]] = None,
     ) -> tuple[Optional[TorrentResponsePort], str, Optional[str]]:
         """
-        有界处理GET跳转，跨来源后永久移除原站点凭据和Referer。
+        有界处理种子 GET 和首次确认 POST 的跳转，跨来源后永久移除凭据和 Referer。
+
+        POST 收到 301/302/303 后改用 GET；307/308 仅在同来源保留表单。
+        确认 POST 不自动重试，后续 GET 沿用原下载地址的重试策略。
 
         :param http_port: 已装配HTTP端口
         :param url: 当前下载地址
@@ -378,19 +398,27 @@ class TorrentHelper:
         :param proxies: 本次请求代理
         :param retry: 是否对普通GET执行既有瞬时失败重试
         :param site: 原始资源所属站点的流控配置，跳转到其他主机后仍共用该额度
+        :param method: 起始请求方法，只使用 GET 或 POST
+        :param data: 首次确认表单；改用 GET 后永久移除
         :return: 最终响应、最终地址及允许在该地址使用的Cookie
-        :raises ValueError: 跳转缺少地址、目标非法、重复或超过上限
+        :raises ValueError: 跳转缺少地址、目标非法、重复、超过上限或要求跨来源提交表单
         """
         seen = set()
         for _hop in range(9):
-            if url in seen:
+            if (method, url) in seen:
                 raise ValueError("种子下载重定向出现环路")
-            seen.add(url)
-            response = self._request_torrent_get(
-                http_port, retry and not torrent_rules.is_expiring_download_url(url), site,
-                url=url, cookie=cookie, ua=ua, referer=referer,
-                proxies=proxies, allow_redirects=False,
-            )
+            seen.add((method, url))
+            if method == "POST":
+                response = self._request_torrent(
+                    http_port, site, method=method, url=url, cookie=cookie, ua=ua,
+                    referer=referer, proxies=proxies, data=data, allow_redirects=False,
+                )
+            else:
+                response = self._request_torrent_get(
+                    http_port, retry and not torrent_rules.is_expiring_download_url(url), site,
+                    url=url, cookie=cookie, ua=ua, referer=referer,
+                    proxies=proxies, allow_redirects=False,
+                )
             if response is None or response.status_code not in (301, 302, 303, 307, 308):
                 return response, url, cookie
             location = response.headers.get("Location") or response.headers.get("location")
@@ -405,7 +433,11 @@ class TorrentHelper:
             target = urlsplit(destination)
             if target.scheme not in ("http", "https") or not target.hostname or target.username or target.password:
                 raise ValueError("种子下载重定向目标无效")
+            if response.status_code in (301, 302, 303):
+                method, data = "GET", None
             if not UrlUtils.same_origin(url, destination):
+                if method == "POST":
+                    raise ValueError("首次下载确认重定向不能向其他来源提交表单")
                 cookie, referer = None, None
             url = destination
         raise ValueError("种子下载重定向次数超过上限")
@@ -487,15 +519,13 @@ class TorrentHelper:
             )
         except (ValueError, RateLimitExceededException) as err:
             return cache_path, None, "", [], str(err)
-        if url.startswith("magnet:"):
-            return None, url, "", [], "获取到磁力链接"
+        if magnet := _torrent_magnet_link(req, url):
+            return cache_path if req is not None else None, magnet, "", [], "获取到磁力链接"
         if rate_limit_error := torrent_rate_limit_error(req):
             return cache_path, None, "", [], rate_limit_error
         if req is not None and req.status_code == 200:
             if not req.content:
                 return cache_path, None, "", [], "未下载到种子数据"
-            if req.content.startswith(b"magnet:"):
-                return cache_path, req.text, "", [], "获取到磁力链接"
             # 优先按原始二进制解析，避免合法 torrent 被误判为首次下载 HTML。
             folder_name, file_list = _cache_valid_torrent_content(
                 self.get_fileinfo_from_torrent_content, cache_backend, cache_path, req.content
@@ -511,12 +541,14 @@ class TorrentHelper:
                     return cache_path, None, "", [], "种子数据有误，请确认链接是否正确，如为PT站点则需手工在站点下载一次种子"
                 action, data = confirmation
                 try:
-                    req = self._request_torrent(
-                        http_port, site, method="POST", url=action, cookie=cookie, ua=ua,
-                        referer=url, proxies=config.proxy if proxy else None, data=data, allow_redirects=False,
+                    req, url, cookie = self._request_torrent_redirects(
+                        http_port, site=site, method="POST", url=action, cookie=cookie, ua=ua,
+                        referer=url, proxies=config.proxy if proxy else None, data=data, retry=retry,
                     )
-                except RateLimitExceededException as err:
+                except (ValueError, RateLimitExceededException) as err:
                     return cache_path, None, "", [], str(err)
+                if magnet := _torrent_magnet_link(req, url):
+                    return cache_path if req is not None else None, magnet, "", [], "获取到磁力链接"
                 if rate_limit_error := torrent_rate_limit_error(req):
                     return cache_path, None, "", [], rate_limit_error
                 if req is None:
@@ -526,14 +558,13 @@ class TorrentHelper:
                 if not req.content:
                     return cache_path, None, "", [], "未下载到种子数据"
                 logger.info("已提交站点首次种子下载确认，正在校验种子内容")
-            # 首次下载提示页面完成后，重新按原始二进制解析 POST 响应。
+            # 首次下载提示页面完成后，校验确认请求及其后续跳转取得的内容。
             assert req is not None
-            if req.content:
-                folder_name, file_list = _cache_valid_torrent_content(
-                    self.get_fileinfo_from_torrent_content, cache_backend, cache_path, req.content
-                )
-                if file_list:
-                    return cache_path, req.content, folder_name, file_list, ""
+            folder_name, file_list = _cache_valid_torrent_content(
+                self.get_fileinfo_from_torrent_content, cache_backend, cache_path, req.content
+            )
+            if file_list:
+                return cache_path, req.content, folder_name, file_list, ""
             # 解析失败时终止，避免把 HTML 继续下沉到下载器或缓存。
             if cache_invalid:
                 self.add_invalid(original_url)
@@ -767,7 +798,13 @@ class TorrentHelper:
             self._invalid_torrents[url] = True
 
     @staticmethod
-    def match_torrent(mediainfo: MediaInfo, torrent_meta: MetaBase, torrent: TorrentInfo) -> bool:
+    def match_torrent(
+            mediainfo: MediaInfo,
+            torrent_meta: MetaBase,
+            torrent: TorrentInfo,
+            *,
+            season_episodes: Optional[Dict[int, List[int]]] = None,
+    ) -> bool:
         """
         检查种子是否匹配媒体信息
 
@@ -776,6 +813,8 @@ class TorrentHelper:
         :param mediainfo: 需要匹配的媒体信息
         :param torrent_meta: 种子识别信息
         :param torrent: 种子信息
+        :param season_episodes: 本次明确请求的季集号，可扩展默认季内集数上限；空集列表不扩展
+        :return: 资源按显式媒体身份或名称、年份及季集范围匹配时返回 True
         """
         # 显式标题标签与识别结果使用同一主身份比较。
         torrent_identity = resolve_media_identity(media=torrent_meta)
@@ -819,11 +858,12 @@ class TorrentHelper:
                                                                       str(int(mediainfo.year) + 1)]:
                     logger.debug(f'{torrent.site_name} - {torrent.title} 年份不匹配 {mediainfo.year}')
                     return False
-        # 无年份同名剧仅靠标题无法消歧，先用目标剧已知的季集拓扑排除不可能候选。
+        # 先用目标剧已知的季集拓扑和本轮明确范围排除不可能的同名候选。
         if mediainfo.type == MediaType.TV and not TorrentHelper._match_tv_topology(
                 mediainfo=mediainfo,
                 torrent_meta=torrent_meta,
                 torrent=torrent,
+                season_episodes=season_episodes,
         ):
             return False
         if meta_names.intersection(media_titles):
@@ -855,9 +895,19 @@ class TorrentHelper:
             mediainfo: MediaInfo,
             torrent_meta: MetaBase,
             torrent: TorrentInfo,
+            season_episodes: Optional[Dict[int, List[int]]] = None,
     ) -> bool:
         """
-        用目标剧已知的季集范围排除无年份同名候选。
+        用目标剧已知的季集范围排除不可能的同名候选。
+
+        显式请求的集号与订阅缺集计算使用同一编号体系，允许累计集号扩展默认上限；
+        普通搜索沿用媒体源范围，季号检查仍使用媒体源事实。
+
+        :param mediainfo: 已确定身份的目标媒体，保留其原始季集数据
+        :param torrent_meta: 从资源自身标题解析的季集号
+        :param torrent: 资源信息，用于记录拒绝原因
+        :param season_episodes: 本次明确请求的季集号；未指定或空集列表不扩展上限
+        :return: 资源季集范围未超出媒体源与显式请求的已知上限时返回 True
         """
         begin_season = getattr(torrent_meta, "begin_season", None)
         end_season = getattr(torrent_meta, "end_season", None)
@@ -897,7 +947,38 @@ class TorrentHelper:
         if len(torrent_seasons) != 1:
             return True
         season = next(iter(torrent_seasons))
-        target_episodes = (getattr(mediainfo, "seasons", None) or {}).get(season) or []
+        episode_limit = TorrentHelper._tv_episode_limit(
+            mediainfo, season, known_seasons, (season_episodes or {}).get(season),
+        )
+        torrent_episodes = getattr(torrent_meta, "episode_list", None) or []
+        if episode_limit is not None and torrent_episodes and max(torrent_episodes) > episode_limit:
+            logger.debug(
+                f'{torrent.site_name} - {torrent.title} 最大集数 {max(torrent_episodes)} '
+                f'超出目标媒体第 {season} 季集数上限 {episode_limit}'
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _tv_episode_limit(
+            mediainfo: MediaInfo,
+            season: int,
+            known_seasons: set[int],
+            requested_episodes: Optional[List[int]],
+    ) -> Optional[int]:
+        """
+        从媒体源与显式请求计算目标季的已知集号上限，不修改原始媒体信息。
+
+        未知上限时继续交给后续选集处理；已知上限只能被本轮明确请求的集号扩展，
+        不能因缺集列表较短而缩小正常合集的允许范围。
+
+        :param mediainfo: 目标媒体的默认或剧集组季集信息
+        :param season: 当前资源对应的单个季号
+        :param known_seasons: 已知季号，只有单季媒体可使用全剧总集数作为回退
+        :param requested_episodes: 本次明确请求的当前季集号；空列表不扩展上限
+        :return: 可接受的最大集号；媒体源未提供上限时返回 None
+        """
+        target_episodes: List[int] = (getattr(mediainfo, "seasons", None) or {}).get(season) or []
         if not target_episodes and len(known_seasons) == 1:
             try:
                 episode_count = int(getattr(mediainfo, "number_of_episodes", None) or 0)
@@ -905,14 +986,9 @@ class TorrentHelper:
                 episode_count = 0
             if episode_count:
                 target_episodes = list(range(1, episode_count + 1))
-        torrent_episodes = getattr(torrent_meta, "episode_list", None) or []
-        if target_episodes and torrent_episodes and max(torrent_episodes) > max(target_episodes):
-            logger.debug(
-                f'{torrent.site_name} - {torrent.title} 最大集数 {max(torrent_episodes)} '
-                f'超出目标媒体第 {season} 季总集数 {max(target_episodes)}'
-            )
-            return False
-        return True
+        if not target_episodes:
+            return None
+        return max(target_episodes + (requested_episodes or []))
 
     @staticmethod
     def requires_identity_disambiguation(
@@ -960,12 +1036,14 @@ class TorrentHelper:
             torrent_meta: MetaBase,
     ) -> Tuple[bool, str]:
         """
-        判断媒体 ID 冲突时是否存在足以覆盖候选识别的同作品证据。
+        判断无年份别名资源能否按订阅目标处理，只有明确属于另一部作品时才拒绝。
 
-        TMDB 的电影与电视剧数字 ID 不可跨类型比较；类型冲突时仍需资源精确年份、
-        其他共同标识或一致的作品元数据，不能仅凭相同 TMDB ID 覆盖候选。
+        同名撞车偶尔下错的代价远低于资源一直下不下来：原名或语言不同、候选条目没有首播日期
+        （多为未播出或残缺的重复条目）都不足以否定目标，按目标处理。唯一拒绝的情况是候选是另一部
+        已播出作品，且首播年份与目标及其各季年份都对不上，例如 2024 年韩剧的英文别名撞上 2008 年同名美剧。
+        TMDB 的电影与电视剧数字 ID 不可跨类型比较。
 
-        :return: 是否有同作品证据，以及用于诊断的证据或拒绝原因
+        :return: 是否按目标处理，以及给用户看的依据或拒绝原因
         """
         target_identity = resolve_media_identity(media=target_mediainfo)
         candidate_identity = resolve_media_identity(media=candidate_mediainfo)
@@ -973,60 +1051,35 @@ class TorrentHelper:
         if all(target_identity) and target_identity == candidate_identity and (
                 same_type or target_identity[0] != MediaSource.TMDB
         ):
-            return True, f"媒体身份 {target_identity[0]}:{target_identity[1]}"
+            return True, "识别结果就是订阅的作品"
 
-        torrent_year = str(getattr(torrent_meta, "year", None) or "")[:4]
+        candidate_year = str(candidate_mediainfo.year or "")[:4]
+        if not candidate_year:
+            return True, f"按名字查到的《{candidate_mediainfo.title}》没有首播日期，不能说明是另一部作品"
+
         target_years = {
             str(year)[:4]
-            for year in (
-                [getattr(target_mediainfo, "year", None)]
-                + list((getattr(target_mediainfo, "season_years", None) or {}).values())
-            )
+            for year in [target_mediainfo.year, *(target_mediainfo.season_years or {}).values()]
             if year
         }
-        if torrent_year and torrent_year in target_years:
-            return True, f"资源年份 {torrent_year}"
+        torrent_year = str(torrent_meta.year or "")[:4]
+        if candidate_year in target_years or (torrent_year and torrent_year in target_years):
+            return True, "年份与订阅的作品一致"
 
         for field in ("tmdb_id", "imdb_id", "tvdb_id", "douban_id", "bangumi_id"):
             if field == "tmdb_id" and not same_type:
                 continue
-            target_id = getattr(target_mediainfo, field, None)
-            candidate_id = getattr(candidate_mediainfo, field, None)
+            target_id = getattr(target_mediainfo, field)
+            candidate_id = getattr(candidate_mediainfo, field)
             if target_id and candidate_id and str(target_id) == str(candidate_id):
-                return True, f"共同 {field}"
+                return True, "与订阅的作品有相同的媒体编号"
 
-        target_year = str(getattr(target_mediainfo, "year", None) or "")[:4]
-        candidate_year = str(getattr(candidate_mediainfo, "year", None) or "")[:4]
-        if target_year and candidate_year and target_year != candidate_year:
-            return False, f"首播年份冲突 {candidate_year} != {target_year}"
-
-        target_original_title = text_tools.normalize_upper(
-            getattr(target_mediainfo, "original_title", None) or ""
+        if not target_years:
+            return True, "订阅的作品没有年份可以比较"
+        return False, (
+            f"按名字查到的是另一部作品《{candidate_mediainfo.title}》（{candidate_year}），"
+            f"和订阅的《{target_mediainfo.title}》（{target_mediainfo.year}）首播年份不同"
         )
-        candidate_original_title = text_tools.normalize_upper(
-            getattr(candidate_mediainfo, "original_title", None) or ""
-        )
-        if (
-                target_original_title
-                and candidate_original_title
-                and target_original_title != candidate_original_title
-        ):
-            return False, "原始标题冲突"
-
-        target_language = str(
-            getattr(target_mediainfo, "original_language", None) or ""
-        ).casefold()
-        candidate_language = str(
-            getattr(candidate_mediainfo, "original_language", None) or ""
-        ).casefold()
-        if target_language and candidate_language and target_language != candidate_language:
-            return False, f"原始语言冲突 {candidate_language} != {target_language}"
-
-        if target_year and candidate_year:
-            return True, f"共同首播年份 {target_year}"
-        if target_original_title and candidate_original_title:
-            return True, "共同原始标题"
-        return False, "资源无年份，候选与目标也没有可核验的共同元数据"
 
     @staticmethod
     def filter_torrent(torrent_info: TorrentInfo,

@@ -2,7 +2,7 @@
 搜索参数与结果缓存适配 owner。
 """
 
-from typing import Any, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 from app.application.search.state import (
     SearchStateService,
@@ -15,6 +15,9 @@ from app.schemas.types import (
     MediaSource,
     MediaType,
 )
+
+if TYPE_CHECKING:
+    from app.schemas.search import SearchLastContextData
 
 
 class SearchCacheOwner(_SearchOwnerBase):
@@ -134,6 +137,24 @@ class SearchCacheOwner(_SearchOwnerBase):
         异步获取上次搜索使用的参数。
         """
         return await self._search_state().async_load_params()
+
+    async def async_last_search_context(self, user_id: int) -> "SearchLastContextData":
+        """
+        读取已认证用户的原子搜索上下文，不与旧全局结果拼接。
+
+        :param user_id: 当前认证用户主键
+        :return: 该用户最近完成的完整搜索快照，缺失时为空
+        """
+        return await self._search_state().async_load_context(user_id)
+
+    async def async_save_search_context(self, user_id: int, context: "SearchLastContextData") -> None:
+        """
+        通过状态服务一次发布参数、结果和诊断。
+
+        :param user_id: 当前认证用户主键
+        :param context: 正常完成的搜索完整快照
+        """
+        await self._search_state().async_save_context(user_id, context)
 
     def last_search_results(self) -> Optional[List[Context]]:
         """

@@ -9,6 +9,7 @@ import signal
 import stat
 import threading
 from pathlib import Path
+from unittest.mock import Mock
 
 import psutil
 import pytest
@@ -287,3 +288,26 @@ async def test_parent_death_also_retires_inherited_descendants(kernel):
     kernel._watch.close()
     await asyncio.wait_for(kernel.process.wait(), 5)
     assert not psutil.pid_exists(child_pid) or psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('suffix', [
+    b'invalid\n', b'-1\n', b'5\n{}', b'2\n[]', b'0' * 33, b'1\n{',
+])
+async def test_malformed_output_frames_report_failure_and_preserve_bytes(tmp_path: Path, suffix: bytes) -> None:
+    """
+    损坏或截断的输出帧必须报告协议失败并保留原始字节，不依赖真实进程关闭时序。
+    """
+    instance = PythonKernel(tmp_path / 'protocol', (), blocking=asyncio.to_thread)
+    stream = asyncio.StreamReader()
+    frame = ('\n' + instance._sentinel + ' ').encode() + suffix
+    stream.feed_data(frame)
+    stream.feed_eof()
+    instance.process = Mock(stdout=stream)
+
+    await asyncio.wait_for(instance._stdout(), timeout=2)
+
+    assert instance._responses.get_nowait() == {'status': 'protocol-error'}
+    assert instance._responses.get_nowait() == {'status': 'kernel-eof'}
+    assert instance._responses.empty()
+    assert instance._raw.drain() == (frame.decode('utf-8'), len(frame))

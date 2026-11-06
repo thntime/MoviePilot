@@ -4,7 +4,7 @@
 
 import threading
 from collections.abc import AsyncIterator, Callable
-from typing import Any, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Optional, TypeVar, cast
 
 from app.application.subscription.sitebudget import (
     SubscriptionSiteBudget,
@@ -28,6 +28,9 @@ from app.domain.context import Context, MediaInfo, MusicInfo, SubtitleInfo
 from app.runtime.events import Event, eventmanager
 from app.schemas.mediaserver import NotExistMediaInfo
 from app.schemas.types import EventType, MediaSource, MediaType
+
+if TYPE_CHECKING:
+    from app.schemas.search import SearchLastContextData
 
 _PUBLIC_MODULE = "app.chain.search"
 _Handler = TypeVar("_Handler", bound=Callable[..., Any])
@@ -197,6 +200,24 @@ class SearchChain(ChainBase):
     _async_save_subtitles = SearchCacheOwner._async_save_subtitles
     save_last_search_params = SearchCacheOwner.save_last_search_params
     async_save_last_search_params = SearchCacheOwner.async_save_last_search_params
+
+    async def async_last_search_context(self, user_id: int) -> "SearchLastContextData":
+        """
+        读取当前认证用户的完整搜索快照，不读取全局散键。
+
+        :param user_id: 当前认证用户主键
+        :return: 最近完成的搜索上下文；尚无记录时为空
+        """
+        return await SearchCacheOwner.async_last_search_context(cast(SearchCacheOwner, self), user_id)
+
+    async def async_save_search_context(self, user_id: int, context: "SearchLastContextData") -> None:
+        """
+        向状态 owner 委托发布当前用户的完整搜索快照。
+
+        :param user_id: 当前认证用户主键
+        :param context: 本轮正常完成的参数、结果与诊断
+        """
+        await SearchCacheOwner.async_save_search_context(cast(SearchCacheOwner, self), user_id, context)
 
     def last_search_params(self) -> Optional[dict[str, str]]:
         """

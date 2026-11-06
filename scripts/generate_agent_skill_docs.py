@@ -17,8 +17,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-MOVIEPILOT_API_SKILL_VERSION = "70"
-DATABASE_OPERATION_SKILL_VERSION = "17"
+MOVIEPILOT_API_SKILL_VERSION = "72"
+DATABASE_OPERATION_SKILL_VERSION = "18"
 
 
 DATABASE_TABLE_GUIDES: dict[str, tuple[str, str, str]] = {
@@ -188,7 +188,9 @@ DATABASE_TABLE_GUIDES: dict[str, tuple[str, str, str]] = {
     "transferhistory": (
         "Stores transfer source, destination, mode, media identity, download linkage, and outcome.",
         "Reviewing success/failure history, destination paths, media classification, and download linkage.",
-        "Written by transfer settlement; delete or retry through transfer-history business APIs.",
+        "Written by transfer settlement or the external registration API; never insert history rows directly. "
+        "External rows preserve administrator audit and file verification evidence; actor_id is the authoritative "
+        "identity and actor_name is a bounded display snapshot. Old rows have unknown origin.",
     ),
     "transferpending": (
         "Durably stores pending transfer input, plans, checkpoints, leases, retries, and manual review state.",
@@ -307,6 +309,19 @@ _MEDIA_TYPE_FIELD_VALUES: dict[tuple[str, str, str], str] = {
 # OpenAPI 无法表达的操作级 Agent 指引，在生成时追加到操作参数组之后，
 # 保证运行中的 Skill 包含这些指引，无需手动修改生成的 api/*.md。
 _OPERATION_NOTES: dict[str, list[str]] = {
+    "transfer.history.register": [
+        "- **Completed external work only:** Register a completed copy, native local hard link, or move; "
+        "this operation only writes history and never moves files, scrapes metadata, or changes downloads.",
+        "- Supply administrator-confirmed media identity and absolute paths. The server queries file facts. "
+        "Copy requires equal file sizes; link requires distinct local directory entries with the same inode; "
+        "move requires a confirmed absent source and verifies only the destination. These are not content checksums.",
+        "- Retrying the same source, destination and metadata returns the original receipt. Conflicting or "
+        "internal history returns a conflict and is never overwritten. Actor and registration time come from the server.",
+        "- The complete `actor_id` is authoritative. `actor_name` is a display snapshot: nonempty names up to "
+        "128 characters stay unchanged; longer names use the first 127 characters plus `…`; empty names use `#<actor_id>`.",
+        "- Use transfer.history with query origin=external to page through external registrations; "
+        "older records have no recorded origin.",
+    ],
     "plugin.instance.purge": [
         "- **Historical invalid-ID recovery:** If the exact instance ID from a warning is "
         "rejected by normal validation, send only `config: true` (all other scope flags false). "
@@ -332,6 +347,16 @@ _OPERATION_NOTES: dict[str, list[str]] = {
         "against the user's request. If recognition is missing or ambiguous, use `media.search` and "
         "compare candidates by title, type, and year. Preserve the selected result's exact "
         "`media_source` + `media_id` for `search.torrents`.",
+    ],
+    "search.results": [
+        "- `params` and `results` are saved together for the authenticated user. "
+        "Legacy global caches are not restored; search again after upgrading.",
+        "- Optional Web `manual_paging=true` diagnostics use `scope=page` for the current page. "
+        "`searched_sites` records attempted requests and outcomes; `stage_counts` and "
+        "`rejection_reasons` record observed filtering. Skipped rule groups do not increase "
+        "the resource rejection count.",
+        "- Ordinary searches and legacy streams save `diagnostics=null`, including empty results. "
+        "Errors and cancellation preserve the previous complete snapshot.",
     ],
     "search.torrents": [
         "- **Agent note:** `media_id` is a **path** parameter and MUST be nested under "

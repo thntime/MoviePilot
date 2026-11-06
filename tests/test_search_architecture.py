@@ -117,3 +117,25 @@ def test_search_facade_directly_extends_chain_base_with_stable_mro():
         NotificationMixin,
         object,
     )
+
+
+def test_search_diagnostic_models_stay_lazy_during_startup(tmp_path):
+    """
+    共享 owner 不在应用冷导入时加载搜索诊断模型。
+    """
+    script = """
+import sys
+from app.testing.bootstrap import ensure_sites_stub
+
+ensure_sites_stub()
+import app.factory
+
+assert "app.schemas.search" not in sys.modules
+"""
+    environment = os.environ.copy()
+    environment["CONFIG_DIR"] = str(tmp_path / "config")
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=PROJECT_ROOT, env=environment,
+        check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout

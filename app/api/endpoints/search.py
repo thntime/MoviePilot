@@ -17,6 +17,7 @@ from app.api.response import (
     CompatiblePageParam,
     ResponseAPIRouter,
 )
+from app.application.search.state import SearchStateService
 from app.application.security.url import SecurityUtils
 from app.chain.search.facade import SearchChain
 from app.domain.context import Context
@@ -42,6 +43,51 @@ _SSE_RESPONSE_HEADERS = {
     "Cache-Control": "no-cache",
     "X-Accel-Buffering": "no",
 }
+
+
+def _search_user_id(payload: object) -> Optional[int]:
+    """
+    仅从已验证的令牌载荷读取身份，缺失身份时不保存或回退全局记录。
+    """
+    return payload.sub if isinstance(payload, _SchemaTokenPayload) else None
+
+
+async def _save_user_search_context(
+    user_id: Optional[int], *, params: dict[str, Any], results: list[dict[str, Any]],
+) -> None:
+    """
+    普通搜索也发布无诊断的用户快照，防止继续显示旧的页搜索诊断。
+
+    :param user_id: 认证依赖提供的用户主键；缺失时不保存
+    :param params: 本次实际搜索参数
+    :param results: 本次完整结果；字幕保留未签名地址，读取时重新签名
+    """
+    if user_id is not None:
+        await SearchChain().async_save_search_context(user_id, _SchemaSearchLastContextData.model_validate({
+            "params": SearchStateService.build_params(**params) or {}, "results": results,
+        }))
+
+
+async def _iter_user_search_events(
+    source: AsyncIterator[dict[str, Any]], user_id: Optional[int], *, params: dict[str, Any],
+) -> AsyncIterator[dict[str, Any]]:
+    """
+    旧 SSE 仅在最终完成时发布无诊断快照，错误与取消不覆盖最近记录。
+
+    :param source: 未经传输拆包或字幕签名的原始搜索事件
+    :param user_id: 认证依赖提供的用户主键
+    :param params: 本次实际搜索参数
+    :yields: 保持原有顺序与字段的事件
+    """
+    try:
+        async for event in source:
+            if event.get("type") == "done" and event.get("stage") in (None, "done"):
+                await _save_user_search_context(user_id, params=params, results=event.get("items") or [])
+            yield event
+    finally:
+        close = getattr(source, "aclose", None)
+        if close is not None:
+            await close()
 
 
 def _parse_site_list(sites: Optional[str]) -> Optional[List[int]]:
@@ -380,25 +426,17 @@ async def search_latest(_: _SchemaTokenPayload = Depends(verify_token), page: Co
 )
 async def search_latest_context(_: _SchemaTokenPayload = Depends(verify_token)) -> Any:
     """
-    查询上次搜索结果及其对应的搜索参数。
+    查询当前用户最近完成的搜索上下文，首次搜索前返回空快照。
     """
-    search_chain = SearchChain()
-    params = await search_chain.async_last_search_params() or {}
-    if params.get("result_type") == "subtitle":
-        subtitle_results = (
-            await search_chain.async_last_subtitle_search_results() or []
-        )
-        serialized_results = _serialize_signed_subtitle_results(subtitle_results)
-    else:
-        context_results = await search_chain.async_last_search_results() or []
-        serialized_results = _serialize_context_results(context_results)
-    return _SchemaResponse(
-        success=True,
-        data={
-            "params": params,
-            "results": serialized_results,
-        },
-    )
+    user_id = _search_user_id(_)
+    context = await SearchChain().async_last_search_context(user_id) if user_id is not None else _SchemaSearchLastContextData()
+    if context.params.get("result_type") == "subtitle":
+        context = _SchemaSearchLastContextData.model_validate({
+            "params": context.params,
+            "results": _serialize_signed_subtitle_results([item.model_dump(mode="json") for item in context.results]),
+            "diagnostics": context.diagnostics,
+        })
+    return _SchemaResponse(success=True, data=context)
 
 
 @router.get(
@@ -456,6 +494,7 @@ async def search_by_id_stream(
                 "media_source": media_source, "media_id": media_id, "mtype": media_type,
                 "area": area, "season": media_season, "sites": site_list,
                 "page": page, "source": source,
+                "user_id": _search_user_id(_),
             }):
                 yield event
             return
@@ -467,7 +506,9 @@ async def search_by_id_stream(
             sites=site_list,
             cache_local=True,
         )
-        async for event in torrents:
+        async for event in _iter_user_search_events(torrents, _search_user_id(_), params={
+            **search_params, "mtype": media_type, "area": area, "season": media_season, "sites": site_list,
+        }):
             yield event
 
     return StreamingResponse(
@@ -518,10 +559,15 @@ async def search_by_id(
         sites=_parse_site_list(sites),
         cache_local=True,
     )
+    serialized_results = _serialize_context_results(torrents or [])
+    await _save_user_search_context(_search_user_id(_), params={
+        **search_params, "mtype": media_type, "area": area, "season": media_season,
+        "sites": _parse_site_list(sites),
+    }, results=serialized_results)
     if not torrents:
         return _SchemaResponse(success=False, message="未搜索到任何资源")
     return _SchemaResponse(
-        success=True, data=_serialize_context_results(torrents)
+        success=True, data=serialized_results
     )
 
 
@@ -555,15 +601,18 @@ async def search_by_title_stream(
         event_source = SearchChain().search_page_events(params={
             "keyword": keyword, "mtype": _parse_media_type(mtype), "sites": _parse_site_list(sites),
             "page": page, "source": source,
+            "user_id": _search_user_id(_),
         })
     else:
-        event_source = SearchChain().async_search_by_title_stream(
+        event_source = _iter_user_search_events(SearchChain().async_search_by_title_stream(
             title=keyword or "",
             page=page,
             sites=_parse_site_list(sites),
             cache_local=True,
             mtype=_parse_media_type(mtype),
-        )
+        ), _search_user_id(_), params={
+            "keyword": keyword or "", "mtype": _parse_media_type(mtype), "sites": _parse_site_list(sites),
+        })
     return StreamingResponse(
         _stream_search_events(request, event_source),
         media_type="text/event-stream",
@@ -593,10 +642,14 @@ async def search_by_title(
         cache_local=True,
         mtype=_parse_media_type(mtype),
     )
+    serialized_results = _serialize_context_results(torrents or [])
+    await _save_user_search_context(_search_user_id(_), params={
+        "keyword": keyword or "", "mtype": _parse_media_type(mtype), "sites": _parse_site_list(sites),
+    }, results=serialized_results)
     if not torrents:
         return _SchemaResponse(success=False, message="未搜索到任何资源")
     return _SchemaResponse(
-        success=True, data=_serialize_context_results(torrents)
+        success=True, data=serialized_results
     )
 
 
@@ -632,7 +685,9 @@ async def search_subtitle_by_title_stream(
     return StreamingResponse(
         _stream_search_events(
             request,
-            _iter_signed_subtitle_search_events(event_source),
+            _iter_signed_subtitle_search_events(_iter_user_search_events(event_source, _search_user_id(_), params={
+                "keyword": keyword or "", "sites": _parse_site_list(sites), "result_type": "subtitle",
+            })),
         ),
         media_type="text/event-stream",
         headers=_SSE_RESPONSE_HEADERS,
@@ -659,6 +714,9 @@ async def search_subtitle_by_title(
         sites=_parse_site_list(sites),
         cache_local=True,
     )
+    await _save_user_search_context(_search_user_id(_), params={
+        "keyword": keyword or "", "sites": _parse_site_list(sites), "result_type": "subtitle",
+    }, results=[subtitle.to_dict() for subtitle in subtitles or []])
     if not subtitles:
         return _SchemaResponse(success=False, message="未搜索到任何字幕")
     return _SchemaResponse(
@@ -752,7 +810,11 @@ async def search_subtitle_by_id_stream(
         if not subtitles:
             yield {"type": "error", "success": False, "message": message or "未搜索到任何字幕"}
             return
-        async for event in subtitles:
+        async for event in _iter_user_search_events(subtitles, _search_user_id(_), params={
+            "media_source": media_source, "media_id": media_id, "mtype": _parse_media_type(mtype),
+            "season": int(season) if season else None, "episode": int(episode) if episode else None,
+            "sites": _parse_site_list(sites), "result_type": "subtitle",
+        }):
             yield event
 
     return StreamingResponse(
@@ -796,6 +858,11 @@ async def search_subtitle_by_id(
         return _SchemaResponse(success=False, message=message or "未搜索到任何字幕")
 
     subtitles = await subtitles
+    await _save_user_search_context(_search_user_id(_), params={
+        "media_source": media_source, "media_id": media_id, "mtype": _parse_media_type(mtype),
+        "season": int(season) if season else None, "episode": int(episode) if episode else None,
+        "sites": _parse_site_list(sites), "result_type": "subtitle",
+    }, results=[subtitle.to_dict() for subtitle in subtitles or []])
     if not subtitles:
         return _SchemaResponse(success=False, message="未搜索到任何字幕")
     return _SchemaResponse(

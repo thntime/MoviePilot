@@ -2,6 +2,30 @@
 
 本文面向通过 MCP 调用 MoviePilot 的外部 Agent 和工具开发者。接入后，客户端通过工具目录发现能力，按 JSON Schema 构造参数，并根据业务结果判断操作是否完成。
 
+### 外部整理历史登记
+
+管理员可通过 `transfer.history.register`（`POST /api/v1/history/transfer`）登记已经完成的
+外部复制、硬链接或移动。请求提供源与目标存储、绝对路径、整理模式，以及管理员确认的
+电影或电视剧身份、标题和可选季集。接口不移动文件、不刮削、不操作下载器，也不会触发
+后续整理事件。媒体声明不代替媒体识别结果，调用前应确认所填信息。
+
+复制要求两个普通文件存在且大小相等；硬链接还要求本地存储中两个不同目录项对应相同
+设备和 inode；移动要求源已确认不存在，只核验目标。符号链接（含悬空源链接）、目录、
+存储查询失败或不一致回执均拒绝。上述核验不等于内容校验和，也不保证文件以后不变。
+超级管理员可登记当前存储提供方可访问的绝对路径，不限于配置的下载或媒体库目录。
+
+成功返回 `history` 和 `created`。相同源、目标及媒体声明的重试返回最初的回执，保留原
+登记人和时间；不同声明、内部整理、失败历史或持久任务绑定均返回冲突，不覆盖原行。
+登记审计由服务器生成，旧历史来源保持未记录。`GET /api/v1/history/transfer` 可增加
+`origin=external`，列表和总数同时筛选；历史页面提供对应筛选和登记审计显示。
+
+审计身份以完整的 `actor_id` 为准，`actor_name` 是最多 128 字符的名称显示快照：
+非空且未超长时原样保留，超长时取前 127 字符加 `…`，空名称显示 `#<actor_id>`。
+该显示处理不改变账号名称规则，重复登记仍返回最初保存的身份和名称快照。
+
+数据库升级只增加可空 `origin` 与 `registration` 列，保留既有源地址唯一约束和旧记录。
+
+
 **最短调用路径：**配置连接与密钥 → `initialize` → `notifications/initialized` → `tools/list` → `tools/call`。已有 MCP 客户端通常会自动完成初始化和工具发现，只需配置下表中的连接信息。
 
 ### 插件安装前说明入口
@@ -11,6 +35,15 @@
 返回 `{"url":"https://..."}`；链接未声明时按所选候选的实际代际探测 GitHub README，
 缺失或超时返回 `{"url":null}`，不要求先安装插件。本地来源只返回显式声明的链接。
 探测总时限为五秒，结果缓存五分钟；接口不返回文档正文，也不新增 Agent operation。
+
+### 插件生命周期忙碌与超时
+
+`plugin.runtime.status`（`GET /api/v1/plugin/runtime`）的可选 `active_operation` 返回当前
+`operation`、`plugin_id`、`hook`、`elapsed_seconds` 与 `hook_elapsed_seconds`；空值表示没有
+持有者。有在途变更或钩子时 `ready=false`，准备态数量仍由 `pending_count` 独立表达。
+插件变更竞争共享执行权时在副作用前明确拒绝；安装的逐插件或启动准入最多等待五秒。
+调用方超时、取消或停机超时不会终止第三方同步钩子，执行权、实例及数据库保留到真实结束。
+遇到执行结果未知时先只读检查此摘要及插件实际状态，不能仅凭超时重复提交变更。
 
 ### 订阅下载的提交来源
 
@@ -34,6 +67,46 @@
 升级前历史没有来源标记，界面显示“未记录”，不会按当前订阅设置追溯推断。
 普通订阅的首次提交与洗版订阅补缺在活动中都标记为首次订阅。
 
+### WebAgent 会话状态
+
+`POST /api/v1/message/agent/callback` 在返回前保存首次选择。`already_selected=true` 表示
+该选择已领取执行，客户端仅恢复原反馈；已选但尚未执行时返回 `false`，可重试原选项。
+后端按用户、会话和选择 ID 领取一次执行；入队前明确拒绝可重试，执行结果未知时不重放。
+`echo_user=false` 仅隐藏用户回显，选择结果仍保存；完整快照替换保留隐藏选择收据，
+即使旧快照不含卡片，也不能让后续快照把已选卡片改回 `pending`。普通消息仍按完整快照替换。
+选择回执合并时保留原始 `createdAt` 毫秒时间戳；旧历史缺少该字段时，读取和保存边界
+使用相邻消息时间补齐，不丢弃选择内容。整份快照都没有时间时以 `0` 表示未知。
+
+会话 `is_processing` 只表示实际执行或排队，空闲等待下一条消息的 worker 不计入。
+工具事件沿用 `tool_id` 与 `assistant_message_id`，跨 steering 后仍更新原助手段。
+全流结束收口所有助手段；缺少终态的结构化工具标为 `error`，旧文本提示保留完成兼容。
+
+### 资源搜索诊断
+
+Web 影视精确与标题 SSE 的 `manual_paging=true` 模式在最终 `done` 事件增加可选
+`diagnostics`。V1 的 `scope=page` 仅覆盖当前页请求，续页沿用来源中的 `search_id`。
+旧后端可缺省此字段，客户端应兼容 `null` 和未知原因代码。普通资源 API 的 `data` 数组
+及 `GET /api/v1/search/last` 保持原合同。
+
+- `searched_sites` 提供实际调度来源的 `site_id`、`site_name`、`attempted`、`outcome`
+  和 `raw_count`。状态为 `success`、`empty`、`error`、`cooldown` 或 `unknown`；
+  未发请求的冷却标记为 `attempted=false`。别名请求和摘要补取的数量按站点累加。
+- `stage_counts` 包含候选数 `candidates` 和保留数 `retained`。`rejection_reasons`
+  使用 `{code,count}`：`filter_params`、`filter_rules`、`title_missing`、`scope_mismatch`、
+  `identity_mismatch`、`caller_filter`、`duplicate`。身份不符可能包含类型不符；
+  索引器内部未报告的丢弃原因不作推测。
+- `rule_groups` 包含 `name`、`status`、`reason`、`media_type` 和 `categories`。
+  `effective` 表示规则适用，`skipped` 不增加拒绝数。标题搜索沿用过滤器的空媒体上下文。
+- `warnings` 使用 `{code,rule_group?}`，代码包括 `rule_group_not_applicable`、
+  `rule_group_missing`、`provider_error`、`provider_cooldown`、`provider_outcome_unknown`。
+  原始异常、下载地址和凭据不进入诊断。
+
+`GET /api/v1/search/last/context` 按认证用户返回完整的 `params`、`results` 和可选
+`diagnostics`。同一用户并发搜索按完成顺序保存，异常或取消保留上次完整记录。普通
+影视、标题、字幕 API 和旧 SSE 完成后也保存结果（含空结果），`diagnostics=null`；
+字幕链接在读取时重新签名。旧全局缓存不迁移，升级后需重新搜索；首次搜索前返回
+空参数、空结果和 `diagnostics=null`。
+
 ### 大集合查询窗口
 
 `POST /api/v1/media/status` 接受 1 至 50 个媒体身份/标题/年份/季号查询，按输入顺序返回
@@ -52,6 +125,10 @@
 `GET /api/v1/site/userdata/{site_id}` 支持 `page` / `count`；趋势界面使用最近 90 条记录，
 并传入 `latest_seeding_only=true`，仅窗口内最新记录携带 `seeding_info`，历史统计字段不变。
 省略该选项时保留每条记录的完整明细；这不会删除或修改采集历史。
+
+`GET /api/v1/site/category/{site_id}` 只返回分类项，不包含 `field`、`delimiter`、`param`
+等搜索配置。分类 `id` 支持整数和文本，数字字符串沿用整数响应；客户端应保留返回值，
+浏览资源时将所选分类用逗号拼接后传入 `site.resource` 的 `query.cat`，不要强制转为整数。
 
 `GET /api/v1/torrent/cache` 支持可选 `page` / `count`，每页最多 200 条，省略两项时保留全量合同。
 `title` 为不区分大小写的标题包含条件，`site` 为站点名称精确条件，均在分页前应用。
@@ -428,6 +505,17 @@ Emby、Jellyfin、Plex、Navidrome 的目录、条目、搜索、季集和活动
 
 读取行时使用必要字段和有限窗口；写入前核对目标与条件，完成后只读核验。普通设置修改使用 `config.system.*`，避免绕过配置校验、事件通知和专用业务流程。更多约束见[数据库操作参考](../skills/database-operation/SKILL.md)。
 
+### 4.4 浏览器会话的空闲回收
+
+当当前工具目录提供 `browse_webpage` 时，连续操作可复用浏览器会话，但不能把会话当作永久存储。
+正常和安全模式均每 60 秒扫描一次：最后一次操作结束后空闲满 15 分钟、且没有排队或运行中操作的
+会话才可回收；关闭在该会话已有的专属线程排队并复核条件，不打断正在执行的操作。
+回收不依赖下一次工具调用，也不保证恰在第 15 分钟完成。后续需要页面时重新打开并核验当前状态。
+
+完成操作后建议显式调用 `browse_webpage` 的 `action="close_session"`，使用原会话的 `session_key`
+（如调用时指定），不要依赖空闲回收及时释放资源。宿主关停或启动失败回滚时，TaskRegistry
+只停止扫描并等待已投递的关闭，不提前全关活动会话；最终全关仍由模块关闭阶段负责。
+
 ## 5. 组合业务调用
 
 以下是调用顺序指引。具体参数仍按各 operation 的 Schema 构造，不将顺序中的操作全部默认执行。
@@ -449,6 +537,7 @@ Emby、Jellyfin、Plex、Navidrome 的目录、条目、搜索、季集和活动
 - `agent_task` 更新的 `enabled:null` 保留原启用状态，仅重命名暂停任务不会恢复调度。MCP 工具发现和 Google 模型发现会读取全部分页；重复游标或超过分页上限时报告失败。
 - `agent_task` 创建时固定真实执行账号；渠道入口须唯一绑定启用账号。后台查询与管理员操作沿用同一账号权限，身份失效记录为失败。升级前的任务须从原会话 `update` 确认绑定或重新创建，详见[自主任务执行账号](agent-execution.md#自主任务执行账号)。
 - 传统消息会话按渠道、配置接入源与原始用户 ID 隔离，停止、清除、状态和确认操作使用同一范围。WebAgent 后台完成追加本轮展示历史，前端完整快照仍按原合同替换。
+- Web 智能助手的临时附件按创建者账号隔离；下载、语音转写和附件事件只接受同一账号登记的引用，跨账号访问按不存在处理。
 - Agent 文件工具的禁止覆盖创建使用排他提交；同目标并发版本修改只允许仍匹配原 SHA 的请求提交。冲突后重新读取当前文件再编辑。`view_image` 使用只读权限，普通用户可读取允许范围内的公共技能图片。
 - 安装市场技能保留用户明确选择的 GitHub 分支，该分支不可用时不改装默认分支。Agent 运行时人格文件变化使缓存失效；关闭 Agent 配置会通过能力 owner 停止服务。
 - 订阅身份包含用户名、媒体类型、来源、媒体 ID、季号、剧集组和音乐实体类型。同编号的电影与电视剧可分别订阅；按来源定位时保留剧集组。同用户并发创建同一目标会复用真实订阅 ID。

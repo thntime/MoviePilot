@@ -1,6 +1,6 @@
 ---
 name: moviepilot-api
-version: 70
+version: 72
 description: >-
   Use this skill for MoviePilot product operations such as media search, torrent
   search, downloads, subscriptions, library checks, sites, storage, workflows,
@@ -17,11 +17,11 @@ allowed-api-operations: >-
   download.clients download.paths download.history.list download.history.delete
   transfer.history.delete site.update site.list site.userdata site.test site.cookie.update
   recommendation.list library.exists library.latest storage.settings storage.list transfer.history
-  transfer.file scheduler.list scheduler.run workflow.list workflow.run plugin.installed
-  plugin.market plugin.capabilities plugin.config.get plugin.config.update plugin.source.options
-  plugin.source.install plugin.source.change plugin.reload plugin.install plugin.uninstall
-  slash.list config.identifiers.get config.identifiers.update search.torrents search.results
-  filter.builtin filter.custom filter.groups filter.custom.add filter.custom.update
+  transfer.history.register transfer.file scheduler.list scheduler.run workflow.list workflow.run
+  plugin.installed plugin.market plugin.capabilities plugin.config.get plugin.config.update
+  plugin.source.options plugin.source.install plugin.source.change plugin.reload plugin.install
+  plugin.uninstall slash.list config.identifiers.get config.identifiers.update search.torrents
+  search.results filter.builtin filter.custom filter.groups filter.custom.add filter.custom.update
   filter.custom.delete filter.group.add filter.group.update filter.group.delete plugin.data
   config.system.list config.system.describe config.system.get config.system.update slash.run
   music.recognize music.explore music.album.get music.album.related music.artist.get
@@ -66,6 +66,11 @@ allowed-api-operations: >-
 ---
 
 # MoviePilot API
+
+When a plugin mutation is busy or its outcome is unknown, inspect `plugin.runtime.status`
+before retrying. `active_operation` identifies the running plugin, operation, hook, and
+elapsed time. A caller timeout or cancellation does not stop the hook and must never
+trigger automatic replay of the same mutation.
 
 For a historical invalid plugin instance ID reported in logs, `plugin.instance.purge`
 accepts the exact ID with only `config: true` (all other scope flags false). It deletes
@@ -327,6 +332,10 @@ Select the operation for the task first, then send only fields declared by that 
 | `download.tasks.active` | none | optional `page`, `count`, `name` |
 | `site.list` | none | optional `page`, `count`, `name`, `status=all\|active\|inactive` |
 
+`site.category` returns category entries without search settings. Category `id`
+values may be integers or text; numeric strings retain the integer response.
+Join selected IDs with commas for `site.resource`'s `query.cat`, preserving text IDs.
+
 Subscription execution logs are browser resource endpoints:
 `GET /api/v1/subscribe/{subscription_id}/logs` (SSE, or text with `length=-1`)
 and `/logs/download` (ZIP). They require the existing resource Cookie and enforce
@@ -373,6 +382,11 @@ token exchange downloads retain their existing credential rules.
 - `agent_task` pins a real execution account at creation. Channel senders must uniquely bind to an active MoviePilot user. Background API calls retain that account's permissions, and invalid identity fails the run. Confirm legacy tasks with `update` in their original conversation or recreate them; never substitute a same-name account or fall back to the superuser.
 - Traditional message sessions are scoped by channel, configured source, and user ID. A stop, clear, status query, or confirmation targets the current source's session.
 - Background WebAgent completion appends the current turn to display history. Frontend complete snapshots keep their existing replacement contract.
+- Complete snapshot replacement retains hidden choice receipts so delayed snapshots cannot restore a selected card to pending; ordinary messages retain replacement behavior.
+- WebAgent choice callbacks save the first selection before replying. `already_selected=true` means
+  execution was claimed; restore its feedback without sending another message. Unclaimed selections
+  can retry the same value. Idle waiting workers do not count toward `is_processing`.
+- WebAgent temporary attachments are scoped to their creating account. Download, voice transcription, and attachment events accept only references registered to the current account; cross-account access is treated as missing.
 - File creation with `overwrite=false` rejects a concurrent creator. Versioned edits reject a peer's intervening write; reread the file and use its current SHA before retrying.
 - Market skill installation preserves an explicitly selected GitHub branch. If that branch is unavailable, treat installation as failed instead of silently switching branches.
 
@@ -390,6 +404,9 @@ token exchange downloads retain their existing credential rules.
   operations; keep using the documented `search.*` operations. Web streams search
   sites concurrently and emit `append` previews before the final filtered page;
   only the completed result carries source state for advancing page numbers.
+- Recent `search.results` snapshots belong to the authenticated user; search again after
+  upgrading to populate them. Optional Web `done.diagnostics` uses `scope=page` for the current
+  page. Skipped rule groups do not increase the resource rejection count.
 - For list inspection, explicitly send the operation's documented pagination
   fields instead of requesting an unbounded legacy result. For optional legacy
   pagination, start with `query={"page":1,"count":20}`.

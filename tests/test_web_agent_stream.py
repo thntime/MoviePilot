@@ -3,6 +3,7 @@
 """
 
 import asyncio
+import json
 import time
 from queue import Queue
 from threading import Event as ThreadEvent
@@ -867,7 +868,8 @@ def test_build_web_agent_message_events_extracts_image():
             title="海报",
             text="已找到图片",
             image="https://example.com/poster.jpg",
-        )
+        ),
+        owner_id="1",
     )
 
     assert events == [
@@ -969,7 +971,8 @@ def test_build_web_agent_message_events_registers_local_file(tmp_path):
             mtype=MessageType.Agent,
             file_path=str(file_path),
             file_name="report.txt",
-        )
+        ),
+        owner_id="1",
     )
 
     assert len(events) == 1
@@ -980,6 +983,8 @@ def test_build_web_agent_message_events_registers_local_file(tmp_path):
     assert attachment["mime_type"] == "text/plain"
     assert attachment["size"] == 5
     assert attachment["url"].startswith("message/agent/file/")
+    assert agent_application.get_web_agent_registered_file(attachment["url"], owner_id="1")
+    assert agent_application.get_web_agent_registered_file(attachment["url"], owner_id="2") is None
 
 
 def test_build_web_agent_message_events_registers_voice_attachment(tmp_path):
@@ -995,7 +1000,8 @@ def test_build_web_agent_message_events_registers_voice_attachment(tmp_path):
             mtype=MessageType.Agent,
             text="你好",
             voice_path=str(voice_path),
-        )
+        ),
+        owner_id="1",
     )
 
     assert len(events) == 2
@@ -1348,6 +1354,7 @@ def test_transcribe_web_agent_audio_files_reads_registered_upload(tmp_path):
         "path": voice_path,
         "name": "recording.webm",
         "mime_type": "audio/webm",
+        "owner_id": "1",
         "created_at": time.time(),
     }
 
@@ -1362,12 +1369,21 @@ def test_transcribe_web_agent_audio_files_reads_registered_upload(tmp_path):
                 return_value="帮我推荐一部电影",
             ) as transcribe_audio,
         ):
-            audio_files = _resolve_web_agent_audio_refs(["message/agent/file/audio-test"])
+            audio_files = _resolve_web_agent_audio_refs(
+                ["message/agent/file/audio-test"],
+                owner_id="1",
+            )
+            foreign_audio_files = _resolve_web_agent_audio_refs(
+                ["message/agent/file/audio-test"],
+                owner_id="2",
+            )
             _WEB_AGENT_FILE_REGISTRY.pop("audio-test", None)
             transcript = _transcribe_web_agent_audio_files(audio_files)
     finally:
         _WEB_AGENT_FILE_REGISTRY.pop("audio-test", None)
 
+    assert len(audio_files) == 1
+    assert foreign_audio_files == []
     assert transcript == "帮我推荐一部电影"
     transcribe_audio.assert_called_once_with(
         content=b"webm-bytes",
@@ -1548,7 +1564,8 @@ def test_web_agent_stream_binds_session_to_agent_manager():
             worker.cancel()
 
 
-def test_web_agent_stream_queues_mid_run_input_into_the_same_assistant_stream():
+@pytest.mark.parametrize("finish_old_tool", [False, True])
+def test_web_agent_stream_queues_mid_run_input_into_the_same_assistant_stream(finish_old_tool):
     """
     第一条 WebAgent 流运行时的第二条请求应在真实应用点切分助手回合。
     """
@@ -1624,17 +1641,13 @@ def test_web_agent_stream_queues_mid_run_input_into_the_same_assistant_stream():
                             }
                         )
                     self.output_callback("首轮处理中")
-                    if callable(self.tool_event_callback):
-                        self.tool_event_callback(
-                            {
-                                "type": "tool",
-                                "status": "done",
-                                "tool_id": "tool-steering-boundary",
-                            }
-                        )
                     started.set()
                     await release.wait()
                 else:
+                    if finish_old_tool and callable(self.tool_event_callback):
+                        self.tool_event_callback({
+                            "type": "tool", "status": "done", "tool_id": "tool-steering-boundary",
+                        })
                     self.output_callback("补充已应用")
                 return message
 
@@ -1734,9 +1747,13 @@ def test_web_agent_stream_queues_mid_run_input_into_the_same_assistant_stream():
             "id": "tool-steering-boundary",
             "tool_name": "search",
             "message": "检查任务状态",
-            "status": "done",
+            "status": "done" if finish_old_tool else "error",
         }
     ]
+    assert messages[3]["tools"] == []
+    tool_events = [json.loads(line[6:]) for line in first_body.splitlines() if line.startswith("data: ")]
+    tool_events = [event for event in tool_events if event.get("tool_id") == "tool-steering-boundary"]
+    assert all(event["assistant_message_id"] == messages[1]["id"] for event in tool_events)
 
 
 def test_web_agent_stream_emits_secret_result_only_as_protected_event():
@@ -2603,7 +2620,8 @@ def test_build_web_agent_message_events_extracts_choice_card():
                     }
                 ],
             ],
-        )
+        ),
+        owner_id="1",
     )
 
     assert events == [

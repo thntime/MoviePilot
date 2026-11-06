@@ -10,8 +10,9 @@ import shutil
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from queue import Empty, Queue
 from typing import (
@@ -497,9 +498,9 @@ def _apply_web_agent_tool_event(event: dict[str, Any], assistant_message: dict[s
             matching_tool["status"] = tool_status
         return
 
-    # 兼容尚未升级的事件生产者：没有调用 ID 时只能把前一批提示视为已结束。
+    # 旧提示没有调用 ID，只收口上一条旧提示，保留结构化并行工具的实际状态。
     for tool in assistant_message["tools"]:
-        if tool.get("status") == "running":
+        if tool.get("status") == "running" and tool.get("tool_name") is None:
             tool["status"] = "done"
     tool_index = len(assistant_message["tools"])
     assistant_message["tools"].append(
@@ -565,14 +566,14 @@ def apply_web_agent_display_event(event: dict[str, Any], assistant_message: dict
             )
         for tool in assistant_message["tools"]:
             if tool.get("status") == "running":
-                tool["status"] = "done"
+                tool["status"] = "error"
     elif event_type == "done":
         assistant_message["thinking"] = False
         if assistant_message.get("status") != "error":
             assistant_message["status"] = "done"
         for tool in assistant_message["tools"]:
             if tool.get("status") == "running":
-                tool["status"] = "done"
+                tool["status"] = "done" if tool.get("tool_name") is None else "error"
 
 
 async def save_web_agent_display_snapshot(
@@ -796,6 +797,8 @@ def register_web_agent_file(
     file_name: Optional[str] = None,
     kind: Optional[str] = None,
     mime_type: Optional[str] = None,
+    *,
+    owner_id: str,
 ) -> Optional[dict[str, Any]]:
     """
     注册 Web Agent 本地附件并返回前端可访问的短期下载地址。
@@ -804,9 +807,11 @@ def register_web_agent_file(
     :param file_name: 前端展示文件名
     :param kind: 附件展示类型
     :param mime_type: 已知 MIME 类型
+    :param owner_id: 创建附件的用户 ID
     :return: 前端附件描述，文件不可访问时返回 None
     """
-    if not file_path:
+    normalized_owner_id = str(owner_id).strip()
+    if not file_path or not normalized_owner_id:
         return None
     try:
         resolved_path = Path(file_path).expanduser().resolve(strict=True)
@@ -824,6 +829,7 @@ def register_web_agent_file(
         "path": resolved_path,
         "name": display_name,
         "mime_type": resolved_mime_type or "application/octet-stream",
+        "owner_id": normalized_owner_id,
         "created_at": time.time(),
     }
     return {
@@ -979,22 +985,24 @@ async def prepare_web_agent_audio_attachment_path_async(voice_path: str) -> Path
         return source_path
 
 
-def get_web_agent_registered_file(ref: str) -> Optional[dict[str, Any]]:
+def get_web_agent_registered_file(ref: str, *, owner_id: str) -> Optional[dict[str, Any]]:
     """
-    根据前端附件引用读取 WebAgent 临时文件登记信息。
+    根据前端附件引用读取当前用户登记的 WebAgent 临时文件。
 
     :param ref: message/agent/file/{file_id} 形式的短期引用
-    :return: 文件登记信息，引用无效或过期时返回 None
+    :param owner_id: 请求读取附件的用户 ID
+    :return: 文件登记信息，引用无效、过期或不属于当前用户时返回 None
     """
+    normalized_owner_id = str(owner_id).strip()
     normalized_ref = (ref or "").strip()
     prefix = "message/agent/file/"
-    if not normalized_ref.startswith(prefix):
+    if not normalized_owner_id or not normalized_ref.startswith(prefix):
         return None
 
     cleanup_web_agent_file_registry()
     file_id = normalized_ref[len(prefix) :].split("/", 1)[0]
     file_info = _WEB_AGENT_FILE_REGISTRY.get(file_id)
-    if not file_info:
+    if not file_info or file_info.get("owner_id") != normalized_owner_id:
         return None
     file_path = Path(file_info["path"])
     if not file_path.exists() or not file_path.is_file():
@@ -1005,13 +1013,19 @@ def get_web_agent_registered_file(ref: str) -> Optional[dict[str, Any]]:
 
 def resolve_web_agent_audio_refs(
     audio_refs: list[str],
+    *,
+    owner_id: str,
 ) -> list[tuple[str, Path, str]]:
     """
-    在调用协程中解析音频引用，返回不依赖登记表的文件快照。
+    在调用协程中解析当前用户的音频引用，返回不依赖登记表的文件快照。
+
+    :param audio_refs: 前端提交的临时音频引用
+    :param owner_id: 请求转写音频的用户 ID
+    :return: 已解析的引用、文件路径和文件名
     """
     audio_files = []
     for audio_ref in audio_refs:
-        file_info = get_web_agent_registered_file(audio_ref)
+        file_info = get_web_agent_registered_file(audio_ref, owner_id=owner_id)
         if not file_info:
             logger.warning("WebAgent 语音引用不存在或已过期: ref=%s", audio_ref)
             continue
@@ -1054,11 +1068,19 @@ def transcribe_web_agent_audio_files(
     return "\n".join(transcripts).strip() if transcripts else None
 
 
-async def transcribe_web_agent_audio_input(audio_refs: list[str]) -> Optional[str]:
+async def transcribe_web_agent_audio_input(
+    audio_refs: list[str],
+    *,
+    owner_id: str,
+) -> Optional[str]:
     """
-    解析并在线程池中转写 WebAgent 音频引用。
+    解析并在线程池中转写当前用户的 WebAgent 音频引用。
+
+    :param audio_refs: 前端提交的临时音频引用
+    :param owner_id: 请求转写音频的用户 ID
+    :return: 合并后的转写文本，没有可转写内容时返回 None
     """
-    audio_files = resolve_web_agent_audio_refs(audio_refs)
+    audio_files = resolve_web_agent_audio_refs(audio_refs, owner_id=owner_id)
     if not audio_files:
         return None
     return await asyncio.to_thread(transcribe_web_agent_audio_files, audio_files)
@@ -1121,7 +1143,7 @@ def resolve_web_agent_choice_payload(callback_data: str, user_id: str) -> Option
         return None
 
     request_id, option_index = parsed
-    resolved = agent_interaction.agent_interaction_manager.resolve(
+    resolved = agent_interaction.agent_interaction_manager.resolve_web_choice(
         request_id=request_id,
         option_index=option_index,
         user_id=str(user_id),
@@ -1129,10 +1151,11 @@ def resolve_web_agent_choice_payload(callback_data: str, user_id: str) -> Option
     if not resolved:
         return None
 
-    request, option = resolved
+    request, option, already_selected = resolved
     buttons, button_rows = agent_interaction.build_agent_choice_button_rows(request)
     selected_description = option.description or option.label
     return {
+        "already_selected": already_selected,
         "message": option.value,
         "session_id": request.session_id,
         "display_message": selected_description,
@@ -1159,15 +1182,54 @@ def resolve_web_agent_choice_payload(callback_data: str, user_id: str) -> Option
     }
 
 
+async def resolve_and_save_web_agent_choice(
+    callback_data: str, current_user: AgentChatPrincipal,
+    service: Optional[AgentChatService] = None,
+    persistence: Optional[AgentChatPersistenceService] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    校验会话归属并在返回选择反馈前持久化，失败不会派发 Agent。
+    """
+    parsed = agent_interaction.parse_agent_choice_callback(callback_data)
+    if parsed is None:
+        return None
+    request = agent_interaction.agent_interaction_manager.get_request(parsed[0], str(current_user.id))
+    if request is None:
+        return None
+    service = service or get_configured_agent_chat_service()
+    existing = await service.get(request.session_id)
+    if existing is not None and not can_access_agent_chat(existing, current_user):
+        return None
+    result = resolve_web_agent_choice_payload(callback_data, str(current_user.id))
+    if result is None:
+        return None
+    receipt = build_web_agent_display_message(role="user")
+    receipt["id"] = f"choice-selection-{request.request_id}"
+    receipt["choice_selection"] = result["choice_selection"]
+    try:
+        await save_web_agent_display_snapshot(
+            session_id=request.session_id, current_user=current_user, messages=[receipt],
+            service=service, persistence=persistence, append=True,
+        )
+    except Exception:
+        agent_interaction.agent_interaction_manager.finish_web_choice(request.request_id, str(current_user.id), persisted=False)
+        raise
+    agent_interaction.agent_interaction_manager.finish_web_choice(request.request_id, str(current_user.id), persisted=True)
+    return result
+
+
 def build_web_agent_message_events(
     message: Message,
     *,
+    owner_id: str,
     prepared_audio_path: Optional[Path] = None,
 ) -> list[dict[str, Any]]:
     """
-    将 Agent 工具通知转换为 Web SSE 事件。
+    将 Agent 工具通知转换为当前用户的 Web SSE 事件。
 
     :param message: 工具产生的通知消息
+    :param owner_id: 当前接收通知的用户 ID
+    :param prepared_audio_path: 已准备好的语音文件路径
     :return: 前端可直接应用到当前助手消息的事件列表
     """
     events = []
@@ -1184,7 +1246,12 @@ def build_web_agent_message_events(
         image_path = Path(image_ref).expanduser()
         attachment = None
         if not image_ref.startswith(("http://", "https://", "data:", "blob:")):
-            attachment = register_web_agent_file(image_ref, file_name=Path(image_ref).name, kind="image")
+            attachment = register_web_agent_file(
+                image_ref,
+                file_name=Path(image_ref).name,
+                kind="image",
+                owner_id=owner_id,
+            )
         if not attachment:
             attachment = build_web_agent_url_attachment(
                 image_ref,
@@ -1200,6 +1267,7 @@ def build_web_agent_message_events(
             file_name=audio_path.name,
             kind="audio",
             mime_type=get_web_agent_audio_mime_type(audio_path),
+            owner_id=owner_id,
         )
         if attachment:
             events.append({"type": "attachment", "attachment": attachment})
@@ -1208,6 +1276,7 @@ def build_web_agent_message_events(
         attachment = register_web_agent_file(
             message.file_path,
             file_name=message.file_name or Path(message.file_path).name,
+            owner_id=owner_id,
         )
         if attachment:
             events.append({"type": "attachment", "attachment": attachment})
@@ -1217,15 +1286,22 @@ def build_web_agent_message_events(
 
 async def build_web_agent_message_events_async(
     message: Message,
+    *,
+    owner_id: str,
 ) -> list[dict[str, Any]]:
     """
-    异步构造 WebAgent 通知，确保语音转码不占用事件循环。
+    异步构造当前用户的 WebAgent 通知，确保语音转码不占用事件循环。
+
+    :param message: 工具产生的通知消息
+    :param owner_id: 当前接收通知的用户 ID
+    :return: 前端可直接应用到当前助手消息的事件列表
     """
     prepared_audio_path = None
     if message.voice_path:
         prepared_audio_path = await prepare_web_agent_audio_attachment_path_async(message.voice_path)
     return build_web_agent_message_events(
         message,
+        owner_id=owner_id,
         prepared_audio_path=prepared_audio_path,
     )
 
@@ -1460,7 +1536,7 @@ async def collect_web_agent_traditional_events(
 
             if not web_agent_events.is_web_agent_message_for_user(message, user_id):
                 continue
-            events.extend(await build_web_agent_message_events_async(message))
+            events.extend(await build_web_agent_message_events_async(message, owner_id=user_id))
             idle_deadline = time.monotonic() + WEB_AGENT_TRADITIONAL_IDLE_TIMEOUT_SECONDS
         return events
     finally:
@@ -1615,6 +1691,22 @@ async def build_web_agent_stream(
         return WebAgentStreamResult(
             events=_single_web_agent_event({"type": "error", "message": "会话不存在或无权访问"})
         )
+    if command.choice_selection:
+        choice_id = str(command.choice_selection.get("choice_id") or "")
+        claimed = agent_interaction.agent_interaction_manager.get_web_choice(choice_id, str(current_user.id), session_id)
+        if claimed is None:
+            return WebAgentStreamResult(events=_single_web_agent_event({
+                "type": "error", "message": "该选择已处理或不属于当前会话",
+            }))
+        choice_request, option = claimed
+        canonical = resolve_web_agent_choice_payload(
+            agent_interaction.build_agent_choice_callback(choice_id, choice_request.selected_index or 1), str(current_user.id),
+        )
+        if canonical is None:
+            return WebAgentStreamResult(events=_single_web_agent_event({"type": "error", "message": "该选择已失效"}))
+        prompt = option.value
+        display_prompt = option.description or option.label
+        command = replace(command, text=prompt, display_text=display_prompt, choice_selection=canonical["choice_selection"])
     is_secret_confirmation_candidate = (
         prompt in {"确认", "取消"} and not command.images and not command.audio_refs and not command.files
     )
@@ -1639,7 +1731,7 @@ async def build_web_agent_stream(
             )
         )
 
-    is_traditional_message = not agent_interaction.is_agent_learning_command(prompt) and (
+    is_traditional_message = not command.choice_selection and not agent_interaction.is_agent_learning_command(prompt) and (
         is_web_agent_traditional_message(prompt) or has_web_agent_traditional_interaction(str(current_user.id))
     )
     if is_traditional_message:
@@ -1684,7 +1776,10 @@ async def build_web_agent_stream(
         submit_web_agent_steering,
     )
 
-    transcript = await transcribe_web_agent_audio_input(command.audio_refs)
+    transcript = await transcribe_web_agent_audio_input(
+        command.audio_refs,
+        owner_id=str(current_user.id),
+    )
     prompt = merge_web_agent_prompt_with_transcript(prompt, transcript)
     display_prompt = merge_web_agent_prompt_with_transcript(display_prompt, transcript)
     if not prompt and command.audio_refs and not command.images and not command.files:
@@ -1701,7 +1796,7 @@ async def build_web_agent_stream(
             )
         )
     # 活动 Agent 运行内的补充输入走同一张图；无活动运行时才创建新一轮。
-    steering_message = await submit_web_agent_steering(
+    steering_message = None if command.choice_selection else await submit_web_agent_steering(
         manager=manager,
         session_id=session_id,
         user_id=str(current_user.id),
@@ -1722,7 +1817,10 @@ async def build_web_agent_stream(
         apply_display_event=apply_web_agent_display_event,
         build_display_message=build_web_agent_display_message,
         build_input_attachments=build_web_agent_input_attachments,
-        build_message_events_async=build_web_agent_message_events_async,
+        build_message_events_async=partial(
+            build_web_agent_message_events_async,
+            owner_id=str(current_user.id),
+        ),
         save_display_snapshot=save_web_agent_display_snapshot,
         split_output=split_web_agent_output,
         create_background_task=create_web_agent_background_task,
