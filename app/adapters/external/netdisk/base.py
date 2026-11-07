@@ -597,6 +597,12 @@ class NetdiskHttp:
             return NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "网盘登录态已失效", platform=self.platform)
         if status_code == 429:
             return NetdiskError(NetdiskErrorCode.RATE_LIMITED, "网盘接口请求过于频繁", platform=self.platform)
+        if status_code == 404 and self.platform is NetdiskPlatform.UC:
+            return NetdiskError(
+                NetdiskErrorCode.SHARE_INVALID,
+                "UC 分享已失效或已被删除",
+                platform=self.platform,
+            )
         return NetdiskError(
             NetdiskErrorCode.UNKNOWN,
             f"网盘接口返回 HTTP {status_code}",

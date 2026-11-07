@@ -519,3 +519,23 @@ def test_cookie_helpers_keep_unrelated_fields() -> None:
     assert strip_puus("__pus=1; __puus=2; uid=3") == "__pus=1; uid=3"
     merged = merge_set_cookies("__pus=1; __puus=2; uid=3", ["__puus=9; Path=/"])
     assert merged == "__pus=1; __puus=9; uid=3"
+
+
+def test_uc_http_404_is_share_invalid() -> None:
+    """
+    UC 分享被删除时 HTTP 404 应按分享失效处理。
+    """
+    from app.adapters.external.netdisk import uc as uc_module
+
+    assert uc_module.UC_ERROR_CODES[404][0] is uc_module.NetdiskErrorCode.SHARE_INVALID
+
+
+def test_uc_http_404_is_share_invalid() -> None:
+    """
+    UC 分享被删除时 HTTP 404 应按分享失效处理。
+    """
+    from app.adapters.external.netdisk.base import NetdiskHttp
+    from app.domain.netdisk import NetdiskErrorCode, NetdiskPlatform
+
+    error = NetdiskHttp(platform=NetdiskPlatform.UC).error_for_status(404)
+    assert error.code is NetdiskErrorCode.SHARE_INVALID

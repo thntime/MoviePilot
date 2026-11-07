@@ -79,6 +79,7 @@ UC_ERROR_CODES: dict[int, tuple[NetdiskErrorCode, str]] = {
     429: (NetdiskErrorCode.RATE_LIMITED, "UC 网盘接口请求过于频繁"),
     31001: (NetdiskErrorCode.AUTH_EXPIRED, "该分享需要登录 UC 网盘后才能访问"),
     14001: (NetdiskErrorCode.SHARE_INVALID, "UC 分享已失效或提取码有误"),
+    404: (NetdiskErrorCode.SHARE_INVALID, "UC 分享已失效或已被删除"),
     41020: (NetdiskErrorCode.LINK_EXPIRED, "UC 文件令牌已过期，请重新解析分享"),
     23018: (NetdiskErrorCode.UNSUPPORTED, "该文件超出当前取链方式的限制"),
 }

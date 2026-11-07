@@ -129,9 +129,8 @@ def _classify(errno: int, message: str) -> NetdiskErrorCode:
         return NetdiskErrorCode.AUTH_EXPIRED
     if errno in (8888, 429):
         return NetdiskErrorCode.RATE_LIMITED
-    if errno == -12:
-        return NetdiskErrorCode.SHARE_INVALID
-    if errno in (-20, 403, 31066):
+    if errno in (-12, -20, -21, 403, 31066):
+        # -21 分享已取消；其余为分享失效/不存在，搜索阶段都无法使用。
         return NetdiskErrorCode.SHARE_INVALID
     return NetdiskErrorCode.UNKNOWN
 
@@ -372,7 +371,7 @@ class BaiduAdapter(BaseNetdiskAdapter):
                 data={"pwd": password, "vcode_str": "", "vcode": ""},
                 headers=retry_headers,
             )
-        if _errno(payload) == -12:
+        if _errno(payload) in (-12, -9):
             raise NetdiskError(
                 NetdiskErrorCode.SHARE_INVALID,
                 "百度网盘提取码错误",
@@ -444,6 +443,15 @@ class BaiduAdapter(BaseNetdiskAdapter):
                 f"该百度分享需要提取码（errno={errno}）",
                 platform=self.platform,
             )
+        if errno in (-9, -21):
+            # 有 sekey 仍返回 -9/-21：仅当提示不是风控/容量时才按提取码错误或分享失效丢弃。
+            message = as_text(payload.get("err_msg") or payload.get("message") or "")
+            if _classify(errno, message) is NetdiskErrorCode.UNKNOWN:
+                raise NetdiskError(
+                    NetdiskErrorCode.SHARE_INVALID,
+                    "百度网盘分享提取码错误或已失效",
+                    platform=self.platform,
+                )
         self._check(payload, "获取百度网盘分享文件列表")
         return _parse_files(payload), dict(payload)
 

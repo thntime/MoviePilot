@@ -474,3 +474,13 @@ def test_baidu_share_surl_strips_leading_one() -> None:
     assert baidu_module._share_surl("1AbCdEf") == "AbCdEf"
     assert baidu_module._share_surl("AbCdEf") == "AbCdEf"
     assert baidu_module._share_surl("") == ""
+
+
+def test_baidu_share_errors_are_share_invalid() -> None:
+    """
+    分享取消与提取码错误在搜索阶段按分享失效处理，避免保留为未验证。
+    """
+    from app.adapters.external.netdisk import baidu as baidu_module
+
+    assert baidu_module._classify(-12, "提取码错误") is baidu_module.NetdiskErrorCode.SHARE_INVALID
+    assert baidu_module._classify(-21, "该分享已被取消") is baidu_module.NetdiskErrorCode.SHARE_INVALID
