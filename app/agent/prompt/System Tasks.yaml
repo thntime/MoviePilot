@@ -122,6 +122,7 @@ task_types:
     steps:
       - "Review all search result items carefully."
       - "Evaluate each item based on the user preference criteria."
+      - "网盘候选可能带有 download_type 与 netdisk_platform 字段：download_type 区分网盘资源与 PT 资源，netdisk_platform 表示网盘平台；可据此判断是否符合用户偏好，但不要把平台名称当作品质排序。"
       - "Select the top items that best match the preferences."
       - "Return ONLY a JSON array of item indices."
     task_rules:

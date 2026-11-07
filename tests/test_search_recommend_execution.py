@@ -6,6 +6,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from app.agent.prompt import PromptManager
 from app.application.configuration import ChainRuntimeConfig
 from app.chain.search import SearchChain
 from app.chain.search import recommend as recommend_module
@@ -64,6 +65,19 @@ def test_execution_helpers_are_not_exported_on_search_facade():
     assert "_run_recommend" not in SearchChain.__dict__
     assert "_parse_recommend_response" not in SearchChain.__dict__
     assert "_recommend_prompt" not in SearchChain.__dict__
+
+
+def test_search_recommend_prompt_includes_netdisk_fields():
+    """
+    搜索推荐提示应说明网盘候选携带的下载类型与网盘平台字段。
+    """
+    prompt = PromptManager().render_system_task_message(
+        "search_recommend",
+        template_context={"search_results": "[0] 候选资源"},
+    )
+
+    assert "download_type" in prompt
+    assert "netdisk_platform" in prompt
 
 
 def test_empty_candidates_publish_error_and_finish(monkeypatch):
