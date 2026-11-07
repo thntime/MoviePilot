@@ -265,6 +265,25 @@ def test_extract_recommend_items_includes_netdisk_fields() -> None:
 
 
 @pytest.mark.usefixtures("_isolate_recommend_tasks")
+def test_extract_recommend_items_keeps_pt_payload_unchanged() -> None:
+    """
+    PT 候选投影保持原有字段集合，不因网盘字段扩展而改变。
+    """
+    pt_result = _make_result("PT资源", 2048, 10)
+
+    with patch.object(settings, "AI_RECOMMEND_MAX_ITEMS", 50, create=True):
+        items, valid_indices = SearchChain._extract_recommend_items(None, [pt_result])
+
+    assert [0] == valid_indices
+    assert 1 == len(items)
+    pt_item = json.loads(items[0])
+    assert {"index", "title", "size", "seeders"} == set(pt_item)
+    assert 0 == pt_item["index"]
+    assert "PT资源" == pt_item["title"]
+    assert 10 == pt_item["seeders"]
+
+
+@pytest.mark.usefixtures("_isolate_recommend_tasks")
 def test_search_by_title_clears_previous_recommend_state_when_caching() -> None:
     """
     按标题重新搜索并缓存时清除上次推荐状态。
