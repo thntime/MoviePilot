@@ -17,9 +17,14 @@ allowed-api-operations: >-
 # Netdisk Operation
 
 Use structured `moviepilot_api` operations only; discover their current schemas
-instead of guessing fields. Never request, print, or pass a password, Cookie,
-token, QR code, SMS code, or arbitrary URL. Login remains in the existing
-MoviePilot web interface.
+instead of guessing fields. Never request, print, or pass login credentials: a
+login password, Cookie, token, QR code, SMS code, or arbitrary URL. Login
+remains in the existing MoviePilot web interface.
+
+A user-provided share extraction code may be passed only in the `password` field
+of `netdisk.files.share`. Share results, including the link and extraction code,
+are delivered only to the requesting user in a private reply, never to a group
+channel or public place.
 
 ## Read-Only Flow
 

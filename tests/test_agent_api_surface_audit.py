@@ -90,13 +90,21 @@ def test_netdisk_operation_skill_declares_registered_operations() -> None:
     assert metadata["allowed_tools"] == ["moviepilot_api"]
     declared = metadata["allowed_api_operations"]
     expected = set(NETDISK_READ_ROUTES) | set(NETDISK_WRITE_ROUTES)
+    registered_netdisk = {
+        operation_id
+        for operation_id in API_OPERATION_ROUTES
+        if operation_id.startswith("netdisk.")
+    }
     assert len(declared) == 10
     assert set(declared) == expected
-    assert set(declared) <= set(API_OPERATION_ROUTES)
+    assert registered_netdisk == set(declared)
 
-    body = content.lower()
+    body = " ".join(content.lower().split())
     assert "host" in body
-    assert "confirm" in body
+    assert "confirmation_required" in body
+    assert "fail closed" in body
+    assert "private reply" in body
+    assert "group" in body
     assert "netdisk.files.delete" in body
 
 
