@@ -281,6 +281,12 @@ class SearchRecommendOwner(_SearchOwnerBase):
         normalized = []
         seen = set()
         for index in ai_indices:
+            if isinstance(index, bool):
+                # 布尔值是 int 的子类，不能当作候选索引
+                continue
+            if isinstance(index, float) and not index.is_integer():
+                # 小数浮点不是合法索引，不做截断
+                continue
             try:
                 value = int(index)
             except (TypeError, ValueError):

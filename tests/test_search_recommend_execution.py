@@ -103,7 +103,9 @@ def test_restore_original_indices_drops_invalid_netdisk_indices():
             _netdisk_result("网盘资源三"),
             _netdisk_result("网盘资源四"),
         ]
-        chain._invoke_recommend_llm = AsyncMock(return_value='[1, 0, 1, 3, 9, -1, 2, "abc"]')
+        chain._invoke_recommend_llm = AsyncMock(
+            return_value='[1.0, 0, 1, 3, 2.5, 1.5, true, 9, -1, "abc"]'
+        )
 
         indices = await SearchRecommendOwner._generate_recommend_indices(
             chain,
@@ -111,7 +113,10 @@ def test_restore_original_indices_drops_invalid_netdisk_indices():
             results=results,
         )
 
-        assert indices == [1, 0, 3, 2]
+        # 1.0 按整数索引接受；重复 1、小数 2.5/1.5、布尔 true、越界 9/-1、
+        # 非数字 "abc" 全部丢弃。
+        assert indices == [1, 0, 3]
+        assert SearchChain._normalize_ai_indices([1.0, 1.5, True, False, "2", "abc"]) == [1, 2]
         prompt = chain._invoke_recommend_llm.await_args.args[0]
         assert prompt.count('"download_type": "netdisk"') == len(results)
         assert prompt.count('"netdisk_platform": "quark"') == len(results)
