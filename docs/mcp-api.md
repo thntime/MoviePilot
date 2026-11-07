@@ -516,6 +516,27 @@ Emby、Jellyfin、Plex、Navidrome 的目录、条目、搜索、季集和活动
 （如调用时指定），不要依赖空闲回收及时释放资源。宿主关停或启动失败回滚时，TaskRegistry
 只停止扫描并等待已投递的关闭，不提前全关活动会话；最终全关仍由模块关闭阶段负责。
 
+### 4.5 网盘操作
+
+内置 Agent 的 `netdisk-operation` 技能只授权十个 `moviepilot_api` 操作：只读的
+`netdisk.platforms`、`netdisk.accounts`、`netdisk.account`、`netdisk.files.capabilities`、
+`netdisk.files.quota`、`netdisk.files.list`，以及写操作 `netdisk.files.share`、
+`netdisk.files.move`、`netdisk.files.rename`、`netdisk.files.delete`。这些操作均为管理员操作，
+执行账号需具备系统管理员权限；只读操作通过授权后直接执行。
+
+四个写操作由宿主强制确认：内置 Agent 在执行前暂停本轮调用，用户必须明确确认；“取消”或超时
+丢弃该次调用，没有确认处理器的入口直接 fail closed。工具返回 `confirmation_required` 表示
+未执行任何写入，不要绕过确认、改换账号或改用原始 HTTP 重试。外部 MCP 客户端不经过该内置
+确认流程，因此网盘写操作会以该错误结束；需要写入时在内置 Agent 的交互入口完成。超时或结果
+未知时，先用对应的只读操作核验目标实际状态，再决定是否重试。
+
+`netdisk.files.delete` 在平台侧无法本地回滚。执行后应重新读取父目录核对实际状态，不能承诺或
+暗示内容可恢复；核验不清晰或调用失败时停止并报告，不要扩大范围重试。`netdisk.files.share`
+的结果可能包含分享链接与提取码，只能私下交付给请求者，不要发送到群聊或公共渠道。
+
+网盘登录仍在 MoviePilot 网页完成。该技能不授权登录自动化、任意 HTTP 请求或 URL、Cookie、
+口令、令牌；调用方不得索取、传递或回显这些凭据，只使用网关返回的脱敏结构化结果。
+
 ## 5. 组合业务调用
 
 以下是调用顺序指引。具体参数仍按各 operation 的 Schema 构造，不将顺序中的操作全部默认执行。

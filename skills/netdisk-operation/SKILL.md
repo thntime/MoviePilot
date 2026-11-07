@@ -55,6 +55,21 @@ for explicit user confirmation. If the user changes the target or scope,
 confirm the new request again before executing. Never chain an unconfirmed
 follow-up write from a previous confirmation.
 
+## Host Confirmation
+
+The host enforces confirmation; this skill cannot bypass it. Before executing
+any of the four writes, the host pauses the call and asks the user, who must
+explicitly confirm. Entries without an interactive confirmation handler fail
+closed and execute nothing.
+
+- Do not claim that a write has run, or can run, without the host confirmation.
+- If a result returns `confirmation_required`, the call was not executed. Ask
+  the user to confirm instead of retrying, renaming the operation, or switching
+  to another account or raw HTTP.
+- A cancelled confirmation executes nothing. After a timeout or an unknown
+  result, re-read the target state with the matching read operation before
+  retrying, and never promise that the change is recoverable.
+
 ## Destructive Delete
 
 `netdisk.files.delete` is destructive. Confirm the exact files and directories,

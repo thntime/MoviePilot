@@ -6,10 +6,12 @@ import re
 from pathlib import Path
 
 from app.agent.policy.api import API_OPERATION_ROUTES
+from app.agent.skills.metadata import parse_skill_metadata
 from app.agent.tools.impl.api import MoviePilotApiTool
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 API_SKILL = PROJECT_ROOT / "skills/moviepilot-api/SKILL.md"
+NETDISK_SKILL = PROJECT_ROOT / "skills/netdisk-operation/SKILL.md"
 
 NETDISK_READ_ROUTES = {
     "netdisk.platforms": ("GET", "/api/v1/netdisk/platforms"),
@@ -75,6 +77,27 @@ def test_netdisk_write_operations_use_fixed_routes() -> None:
         route = API_OPERATION_ROUTES[operation_id]
         assert route.method == method, operation_id
         assert route.path == path, operation_id
+
+
+def test_netdisk_operation_skill_declares_registered_operations() -> None:
+    """
+    网盘操作技能只声明已注册的十个操作，并说明宿主确认与删除边界。
+    """
+    content = NETDISK_SKILL.read_text(encoding="utf-8")
+    metadata = parse_skill_metadata(content, str(NETDISK_SKILL), "netdisk-operation")
+
+    assert metadata is not None
+    assert metadata["allowed_tools"] == ["moviepilot_api"]
+    declared = metadata["allowed_api_operations"]
+    expected = set(NETDISK_READ_ROUTES) | set(NETDISK_WRITE_ROUTES)
+    assert len(declared) == 10
+    assert set(declared) == expected
+    assert set(declared) <= set(API_OPERATION_ROUTES)
+
+    body = content.lower()
+    assert "host" in body
+    assert "confirm" in body
+    assert "netdisk.files.delete" in body
 
 
 def test_every_gateway_operation_has_exact_skill_and_chinese_mcp_contract() -> None:
