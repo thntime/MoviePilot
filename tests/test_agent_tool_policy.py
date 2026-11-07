@@ -1337,6 +1337,7 @@ def _netdisk_confirmation_agent() -> agent_module.MoviePilotAgent:
         user_id="1",
         channel=NotificationChannel.WebAgent.value,
         source="web-agent",
+        is_channel_admin=True,
     )
 
 
@@ -1387,3 +1388,135 @@ def test_netdisk_confirmation_control_timeout_does_not_execute() -> None:
 
     assert "过期" in result
     executor.execute.assert_not_awaited()
+
+
+def test_netdisk_confirmation_registration_denies_non_admin_without_leaking_target() -> None:
+    """
+    非管理员在登记阶段即被拒绝，提示不得包含账号或文件标识。
+    """
+    executor = AsyncMock()
+    tool = _netdisk_write_tool(executor)
+    tool.set_agent_context({"is_admin": False})
+    agent = agent_module.MoviePilotAgent(
+        session_id="session-1",
+        user_id="1",
+        channel=NotificationChannel.WebAgent.value,
+        source="web-agent",
+        is_channel_admin=False,
+    )
+
+    message = asyncio.run(
+        agent._register_netdisk_write_confirmation(tool, _netdisk_arguments("netdisk.files.delete"))
+    )
+
+    assert "无权" in message
+    assert str(_NETDISK_ACCOUNT_ID) not in message
+    assert _NETDISK_FILE["file_id"] not in message
+    assert _NETDISK_FILE["name"] not in message
+    assert agent._pending_secret_confirmation is None
+    executor.execute.assert_not_awaited()
+
+
+def test_netdisk_confirmation_prompt_redacts_urls_and_never_echoes_password() -> None:
+    """
+    确认提示把疑似链接替换为占位符，且不回显分享提取码。
+    """
+    executor = AsyncMock()
+    tool = _netdisk_write_tool(executor)
+    agent = _netdisk_confirmation_agent()
+    arguments = {
+        "operation_id": "netdisk.files.share",
+        "path_params": {"account_id": _NETDISK_ACCOUNT_ID},
+        "body": {
+            "files": [{"file_id": "f-1", "name": "https://example.invalid/share.mkv"}],
+            "password": "abcd",
+            "expires_in": 86400,
+        },
+    }
+
+    prompt = asyncio.run(agent._register_netdisk_write_confirmation(tool, arguments))
+
+    assert "[链接]" in prompt
+    assert "https://example.invalid" not in prompt
+    assert "abcd" not in prompt
+    assert str(_NETDISK_ACCOUNT_ID) in prompt
+
+
+def _telegram_confirmation_agent() -> agent_module.MoviePilotAgent:
+    """
+    构造可私聊投递结果的 Telegram 会话。
+    """
+    return agent_module.MoviePilotAgent(
+        session_id="session-1",
+        user_id="1",
+        channel=NotificationChannel.Telegram.value,
+        source="telegram",
+        is_channel_admin=True,
+    )
+
+
+def _netdisk_share_result() -> str:
+    """
+    返回包含分享链接与提取码的网盘分享结果。
+    """
+    return json.dumps(
+        {
+            "success": True,
+            "data": {"share_url": "https://pan.example/s/abc", "password": "abcd"},
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_netdisk_confirmation_telegram_delivers_result_privately() -> None:
+    """
+    Telegram 确认执行后通过私聊交付原始结果，控制路径不返回链接或提取码。
+    """
+    executor = AsyncMock()
+    tool = _netdisk_write_tool(executor)
+    executor.execute.return_value = _netdisk_share_result()
+    agent = _telegram_confirmation_agent()
+    deliver = AsyncMock(return_value=True)
+
+    with patch.object(agent, "_deliver_private_channel_message", deliver):
+        prompt = asyncio.run(
+            agent._register_netdisk_write_confirmation(
+                tool, _netdisk_arguments("netdisk.files.share")
+            )
+        )
+        result = asyncio.run(agent._handle_secret_confirmation_control("确认", None, None, False))
+
+    assert "确认" in prompt
+    assert deliver.await_count == 2
+    delivered_result = deliver.await_args_list[1].args[0]
+    assert "https://pan.example/s/abc" in delivered_result
+    assert "abcd" in delivered_result
+    assert "https://pan.example/s/abc" not in result
+    assert "abcd" not in result
+    assert "私聊" in result
+    executor.execute.assert_awaited_once()
+
+
+def test_netdisk_confirmation_telegram_delivery_failure_returns_generic_status() -> None:
+    """
+    私聊交付失败时只返回通用状态，不把分享链接或提取码回传到原会话。
+    """
+    executor = AsyncMock()
+    tool = _netdisk_write_tool(executor)
+    executor.execute.return_value = _netdisk_share_result()
+    agent = _telegram_confirmation_agent()
+    deliver = AsyncMock(side_effect=[True, False])
+
+    with patch.object(agent, "_deliver_private_channel_message", deliver):
+        asyncio.run(
+            agent._register_netdisk_write_confirmation(
+                tool, _netdisk_arguments("netdisk.files.share")
+            )
+        )
+        result = asyncio.run(agent._handle_secret_confirmation_control("确认", None, None, False))
+
+    assert "投递失败" in result
+    assert "https://pan.example/s/abc" not in result
+    assert "abcd" not in result
+    assert deliver.await_count == 2
+    executor.execute.assert_awaited_once()

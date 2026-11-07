@@ -1316,6 +1316,9 @@ class MoviePilotAgent:
         operation_id = str(validated_arguments.get("operation_id") or "")
         if operation_id not in NETDISK_WRITE_OPERATIONS:
             return "当前操作不需要网盘写操作确认。"
+        if not await self._is_system_admin_context():
+            self._pending_secret_confirmation = None
+            return "当前用户无权执行网盘写操作，未执行任何操作。"
 
         operation_label = NETDISK_WRITE_OPERATION_LABELS.get(operation_id, operation_id)
         target_summary = self._netdisk_write_target_summary(validated_arguments)
@@ -1522,8 +1525,13 @@ class MoviePilotAgent:
             self._emit_output(message_text)
             return message_text
         result_text = str(result)
-        self._emit_output(result_text)
-        return result_text
+        if self.channel in {NotificationChannel.Web.value, NotificationChannel.WebAgent.value}:
+            self._emit_output(result_text)
+            return result_text
+        delivered = await self._deliver_private_channel_message(result_text)
+        if delivered:
+            return "网盘写操作已执行，结果已私聊发送。"
+        return "网盘写操作已执行，结果投递失败，请私聊查看。"
 
     def _build_policy_context(self) -> ToolPolicyContext:
         """
