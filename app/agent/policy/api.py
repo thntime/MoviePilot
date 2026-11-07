@@ -664,6 +664,21 @@ API_NETDISK_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
     _admin_read("netdisk.files.capabilities", sensitivity=ResultSensitivity.PRIVATE),
     _admin_read("netdisk.files.quota", sensitivity=ResultSensitivity.PRIVATE),
     _admin_read("netdisk.files.list", sensitivity=ResultSensitivity.PRIVATE),
+    # 分享链接落在平台外部，删除无法本地回滚：两者都只能事后对账。
+    _write(
+        "netdisk.files.share",
+        effect=ActionEffect.EXTERNAL_SIDE_EFFECT,
+        recovery=RecoveryMode.RECONCILE,
+        sensitivity=ResultSensitivity.PRIVATE,
+    ),
+    _write("netdisk.files.move", sensitivity=ResultSensitivity.PRIVATE),
+    _write("netdisk.files.rename", sensitivity=ResultSensitivity.PRIVATE),
+    _write(
+        "netdisk.files.delete",
+        effect=ActionEffect.DESTRUCTIVE_WRITE,
+        recovery=RecoveryMode.RECONCILE,
+        sensitivity=ResultSensitivity.PRIVATE,
+    ),
 )
 
 
@@ -759,6 +774,18 @@ API_OPERATION_ROUTES: dict[str, ApiOperationRoute] = {
     ),
     "netdisk.files.list": ApiOperationRoute(
         "GET", "/api/v1/netdisk/files/{account_id}/list"
+    ),
+    "netdisk.files.share": ApiOperationRoute(
+        "POST", "/api/v1/netdisk/files/{account_id}/share"
+    ),
+    "netdisk.files.move": ApiOperationRoute(
+        "POST", "/api/v1/netdisk/files/{account_id}/move"
+    ),
+    "netdisk.files.rename": ApiOperationRoute(
+        "POST", "/api/v1/netdisk/files/{account_id}/rename"
+    ),
+    "netdisk.files.delete": ApiOperationRoute(
+        "POST", "/api/v1/netdisk/files/{account_id}/delete"
     ),
     "search.torrents": ApiOperationRoute("GET", "/api/v1/search/media/{media_id}"),
     "search.results": ApiOperationRoute("GET", "/api/v1/search/last/context"),

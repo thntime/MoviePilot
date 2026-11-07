@@ -54,8 +54,8 @@ def test_api_operation_registry_matches_migration_batches() -> None:
     assert len(API_MUSIC_OPERATION_SPECS) == 10
     assert len(API_SYSTEM_OPERATION_SPECS) == 7
     assert len(API_EXTENDED_OPERATION_SPECS) == 145
-    assert len(API_NETDISK_OPERATION_SPECS) == 6
-    assert len(API_OPERATION_SPECS) == 239
+    assert len(API_NETDISK_OPERATION_SPECS) == 10
+    assert len(API_OPERATION_SPECS) == 243
     assert {spec.operation_id for spec in API_OPERATION_SPECS} == set(API_OPERATION_ROUTES)
     assert {
         "download.list",
@@ -99,7 +99,7 @@ def test_netdisk_read_operations_are_admin_scoped_and_private() -> None:
     只读网盘操作仅管理员可用，账号与文件结果按私密数据标记。
     """
     specs = {spec.operation_id: spec for spec in API_NETDISK_OPERATION_SPECS}
-    assert set(specs) == {
+    read_ids = {
         "netdisk.platforms",
         "netdisk.accounts",
         "netdisk.account",
@@ -107,7 +107,9 @@ def test_netdisk_read_operations_are_admin_scoped_and_private() -> None:
         "netdisk.files.quota",
         "netdisk.files.list",
     }
-    for operation_id, spec in specs.items():
+    assert read_ids.issubset(specs)
+    for operation_id in read_ids:
+        spec = specs[operation_id]
         assert spec.effect is ActionEffect.SAFE_READ, operation_id
         assert spec.required_role is PrincipalRole.SYSTEM_ADMIN, operation_id
         assert spec.confirmation is ConfirmationMode.NONE, operation_id
@@ -117,6 +119,39 @@ def test_netdisk_read_operations_are_admin_scoped_and_private() -> None:
             else ResultSensitivity.PRIVATE
         )
         assert spec.result_sensitivity is expected, operation_id
+
+
+def test_netdisk_write_operations_require_admin_confirmation() -> None:
+    """
+    网盘写操作仅管理员可用、必须确认，并按副作用与可恢复性分级。
+    """
+    specs = {spec.operation_id: spec for spec in API_NETDISK_OPERATION_SPECS}
+    expected = {
+        "netdisk.files.share": (
+            ActionEffect.EXTERNAL_SIDE_EFFECT,
+            RecoveryMode.RECONCILE,
+        ),
+        "netdisk.files.move": (
+            ActionEffect.REVERSIBLE_WRITE,
+            RecoveryMode.IDEMPOTENT,
+        ),
+        "netdisk.files.rename": (
+            ActionEffect.REVERSIBLE_WRITE,
+            RecoveryMode.IDEMPOTENT,
+        ),
+        "netdisk.files.delete": (
+            ActionEffect.DESTRUCTIVE_WRITE,
+            RecoveryMode.RECONCILE,
+        ),
+    }
+    for operation_id, (effect, recovery) in expected.items():
+        spec = specs[operation_id]
+        assert spec.effect is effect, operation_id
+        assert spec.recovery is recovery, operation_id
+        assert spec.required_role is PrincipalRole.SYSTEM_ADMIN, operation_id
+        assert spec.confirmation is ConfirmationMode.REQUIRED, operation_id
+        assert spec.result_sensitivity is ResultSensitivity.PRIVATE, operation_id
+
 
 
 def test_classification_operations_expose_versioned_policy_contract() -> None:

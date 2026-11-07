@@ -112,6 +112,53 @@ async def test_gateway_sends_restored_body_to_http_transport(
 
 
 @pytest.mark.parametrize("entrypoint", ["direct", "langchain", "manager"])
+@pytest.mark.parametrize(
+    ("operation_id", "body"),
+    [
+        ("netdisk.files.share", {
+            "files": [{"file_id": "f-1", "name": "电影.mkv"}],
+            "password": "abcd",
+            "expires_in": 86400,
+        }),
+        ("netdisk.files.move", {
+            "files": [{"file_id": "f-1", "name": "电影.mkv"}],
+            "target_id": "dir-1",
+        }),
+        ("netdisk.files.rename", {
+            "file": {"file_id": "f-1", "name": "电影.mkv"},
+            "name": "电影（重命名）.mkv",
+        }),
+        ("netdisk.files.delete", {"files": [{"file_id": "f-1", "name": "电影.mkv"}]}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_gateway_sends_netdisk_write_body(
+    api_transport: tuple[MoviePilotApiTool, AsyncMock],
+    entrypoint: str,
+    operation_id: str,
+    body: dict[str, Any],
+) -> None:
+    """
+    网盘写操作的嵌套请求体必须按原生类型发送，路径参数只取固定账号标识。
+    """
+    gateway, request = api_transport
+    arguments = {
+        "operation_id": operation_id,
+        "path_params": {"account_id": 7},
+        "body": deepcopy(body),
+    }
+
+    result = await _invoke_gateway(entrypoint, gateway, arguments)
+
+    assert json.loads(result)["success"] is True
+    request.assert_awaited_once()
+    assert request.call_args.kwargs["json"] == body
+    assert request.call_args.kwargs["url"].endswith(
+        f"/api/v1/netdisk/files/7/{operation_id.rsplit('.', 1)[-1]}"
+    )
+
+
+@pytest.mark.parametrize("entrypoint", ["direct", "langchain", "manager"])
 @pytest.mark.parametrize("json_encoded", [False, True], ids=["native", "encoded"])
 @pytest.mark.asyncio
 async def test_gateway_restores_get_body_before_moving_it_to_query(

@@ -2940,6 +2940,153 @@
       "title": "MusicRecognizeRequest",
       "type": "object"
     },
+    "NetdiskDeleteRequest": {
+      "description": "删除个人盘文件的请求，可一次提交多个文件或目录。",
+      "properties": {
+        "files": {
+          "description": "历史记录保存的序列化文件列表。",
+          "items": {
+            "$ref": "#/$defs/NetdiskDriveFileModel"
+          },
+          "minItems": 1,
+          "title": "Files",
+          "type": "array"
+        }
+      },
+      "required": [
+        "files"
+      ],
+      "title": "NetdiskDeleteRequest",
+      "type": "object"
+    },
+    "NetdiskDriveFileModel": {
+      "description": "个人盘文件或目录条目；file_id 与 name 由浏览目录结果提供。",
+      "properties": {
+        "file_id": {
+          "description": "平台文件标识",
+          "title": "File Id",
+          "type": "string"
+        },
+        "is_dir": {
+          "default": false,
+          "description": "是否目录",
+          "title": "Is Dir",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "文件名",
+          "title": "Name",
+          "type": "string"
+        },
+        "parent_id": {
+          "default": "",
+          "description": "父目录标识",
+          "title": "Parent Id",
+          "type": "string"
+        },
+        "size": {
+          "default": 0,
+          "description": "字节数；目录为 0",
+          "title": "Size",
+          "type": "integer"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "修改时间",
+          "title": "Updated At"
+        }
+      },
+      "required": [
+        "file_id",
+        "name"
+      ],
+      "title": "NetdiskDriveFileModel",
+      "type": "object"
+    },
+    "NetdiskMoveRequest": {
+      "description": "移动个人盘文件的请求，指定目标目录标识。",
+      "properties": {
+        "files": {
+          "description": "历史记录保存的序列化文件列表。",
+          "items": {
+            "$ref": "#/$defs/NetdiskDriveFileModel"
+          },
+          "minItems": 1,
+          "title": "Files",
+          "type": "array"
+        },
+        "target_id": {
+          "description": "目标目录标识",
+          "title": "Target Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "files",
+        "target_id"
+      ],
+      "title": "NetdiskMoveRequest",
+      "type": "object"
+    },
+    "NetdiskRenameRequest": {
+      "description": "重命名个人盘文件的请求，指定原条目和新名称。",
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/NetdiskDriveFileModel",
+          "description": "待操作的个人盘文件或目录条目；file_id 与 name 由浏览目录结果提供。"
+        },
+        "name": {
+          "description": "站点、存储项目、订阅或规则组的可读名称。",
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "file",
+        "name"
+      ],
+      "title": "NetdiskRenameRequest",
+      "type": "object"
+    },
+    "NetdiskShareRequest": {
+      "description": "创建个人盘分享的请求，可指定提取码和有效期。",
+      "properties": {
+        "expires_in": {
+          "default": 0,
+          "description": "有效期秒数，0 为平台默认",
+          "title": "Expires In",
+          "type": "integer"
+        },
+        "files": {
+          "description": "历史记录保存的序列化文件列表。",
+          "items": {
+            "$ref": "#/$defs/NetdiskDriveFileModel"
+          },
+          "minItems": 1,
+          "title": "Files",
+          "type": "array"
+        },
+        "password": {
+          "default": "",
+          "description": "提取码，留空由平台决定",
+          "title": "Password",
+          "type": "string"
+        }
+      },
+      "required": [
+        "files"
+      ],
+      "title": "NetdiskShareRequest",
+      "type": "object"
+    },
     "PluginCloneRequest": {
       "description": "插件分身标识及可选展示名称请求。",
       "properties": {
@@ -10272,7 +10419,7 @@
     },
     {
       "additionalProperties": false,
-      "description": "读取一个网盘账号的详情；管理员专用，结果可能包含明文凭据。请求方法：GET；路径：/api/v1/netdisk/accounts/{account_id}。操作效果：safe_read；身份范围：admin。所需角色：system_admin。",
+      "description": "读取一个网盘账号的详情；管理员专用，结果包含脱敏账号信息。请求方法：GET；路径：/api/v1/netdisk/accounts/{account_id}。操作效果：safe_read；身份范围：admin。所需角色：system_admin。",
       "properties": {
         "operation_id": {
           "const": "netdisk.account",
@@ -10281,7 +10428,7 @@
         },
         "path_params": {
           "additionalProperties": false,
-          "description": "netdisk.account 的资源标识参数。读取一个网盘账号的详情；管理员专用，结果可能包含明文凭据。仅使用下列已声明字段。",
+          "description": "netdisk.account 的资源标识参数。读取一个网盘账号的详情；管理员专用，结果包含脱敏账号信息。仅使用下列已声明字段。",
           "properties": {
             "account_id": {
               "description": "网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。",
@@ -10371,6 +10518,43 @@
     },
     {
       "additionalProperties": false,
+      "description": "删除指定账号的个人盘文件，平台侧无法本地回滚；管理员专用，需要确认。请求方法：POST；路径：/api/v1/netdisk/files/{account_id}/delete。操作效果：destructive_write；身份范围：admin。所需角色：system_admin。",
+      "properties": {
+        "body": {
+          "$ref": "#/$defs/NetdiskDeleteRequest",
+          "description": "netdisk.files.delete 的请求内容。删除指定账号的个人盘文件，平台侧无法本地回滚；管理员专用，需要确认。严格使用下列类型和字段。"
+        },
+        "operation_id": {
+          "const": "netdisk.files.delete",
+          "description": "白名单中的精确操作标识，用于选择对应 oneOf 分支。",
+          "type": "string"
+        },
+        "path_params": {
+          "additionalProperties": false,
+          "description": "netdisk.files.delete 的资源标识参数。删除指定账号的个人盘文件，平台侧无法本地回滚；管理员专用，需要确认。仅使用下列已声明字段。",
+          "properties": {
+            "account_id": {
+              "description": "网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。",
+              "title": "Account Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "account_id"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "operation_id",
+        "path_params",
+        "body"
+      ],
+      "title": "netdisk.files.delete",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
       "description": "浏览指定网盘账号的个人盘目录条目；管理员专用，结果包含用户文件信息。请求方法：GET；路径：/api/v1/netdisk/files/{account_id}/list。操作效果：safe_read；身份范围：admin。所需角色：system_admin。",
       "properties": {
         "operation_id": {
@@ -10416,6 +10600,43 @@
     },
     {
       "additionalProperties": false,
+      "description": "把指定账号的个人盘文件移动到目标目录；管理员专用，需要确认。请求方法：POST；路径：/api/v1/netdisk/files/{account_id}/move。操作效果：reversible_write；身份范围：admin。所需角色：system_admin。",
+      "properties": {
+        "body": {
+          "$ref": "#/$defs/NetdiskMoveRequest",
+          "description": "netdisk.files.move 的请求内容。把指定账号的个人盘文件移动到目标目录；管理员专用，需要确认。严格使用下列类型和字段。"
+        },
+        "operation_id": {
+          "const": "netdisk.files.move",
+          "description": "白名单中的精确操作标识，用于选择对应 oneOf 分支。",
+          "type": "string"
+        },
+        "path_params": {
+          "additionalProperties": false,
+          "description": "netdisk.files.move 的资源标识参数。把指定账号的个人盘文件移动到目标目录；管理员专用，需要确认。仅使用下列已声明字段。",
+          "properties": {
+            "account_id": {
+              "description": "网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。",
+              "title": "Account Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "account_id"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "operation_id",
+        "path_params",
+        "body"
+      ],
+      "title": "netdisk.files.move",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
       "description": "查询指定网盘账号的个人盘空间配额；管理员专用，结果关联具体账号。请求方法：GET；路径：/api/v1/netdisk/files/{account_id}/quota。操作效果：safe_read；身份范围：admin。所需角色：system_admin。",
       "properties": {
         "operation_id": {
@@ -10444,6 +10665,80 @@
         "path_params"
       ],
       "title": "netdisk.files.quota",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "description": "重命名指定账号的一个个人盘文件；管理员专用，需要确认。请求方法：POST；路径：/api/v1/netdisk/files/{account_id}/rename。操作效果：reversible_write；身份范围：admin。所需角色：system_admin。",
+      "properties": {
+        "body": {
+          "$ref": "#/$defs/NetdiskRenameRequest",
+          "description": "netdisk.files.rename 的请求内容。重命名指定账号的一个个人盘文件；管理员专用，需要确认。严格使用下列类型和字段。"
+        },
+        "operation_id": {
+          "const": "netdisk.files.rename",
+          "description": "白名单中的精确操作标识，用于选择对应 oneOf 分支。",
+          "type": "string"
+        },
+        "path_params": {
+          "additionalProperties": false,
+          "description": "netdisk.files.rename 的资源标识参数。重命名指定账号的一个个人盘文件；管理员专用，需要确认。仅使用下列已声明字段。",
+          "properties": {
+            "account_id": {
+              "description": "网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。",
+              "title": "Account Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "account_id"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "operation_id",
+        "path_params",
+        "body"
+      ],
+      "title": "netdisk.files.rename",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "description": "为指定账号的个人盘文件创建分享链接；管理员专用，结果含分享链接与提取码。请求方法：POST；路径：/api/v1/netdisk/files/{account_id}/share。操作效果：external_side_effect；身份范围：admin。所需角色：system_admin。",
+      "properties": {
+        "body": {
+          "$ref": "#/$defs/NetdiskShareRequest",
+          "description": "netdisk.files.share 的请求内容。为指定账号的个人盘文件创建分享链接；管理员专用，结果含分享链接与提取码。严格使用下列类型和字段。"
+        },
+        "operation_id": {
+          "const": "netdisk.files.share",
+          "description": "白名单中的精确操作标识，用于选择对应 oneOf 分支。",
+          "type": "string"
+        },
+        "path_params": {
+          "additionalProperties": false,
+          "description": "netdisk.files.share 的资源标识参数。为指定账号的个人盘文件创建分享链接；管理员专用，结果含分享链接与提取码。仅使用下列已声明字段。",
+          "properties": {
+            "account_id": {
+              "description": "网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。",
+              "title": "Account Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "account_id"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "operation_id",
+        "path_params",
+        "body"
+      ],
+      "title": "netdisk.files.share",
       "type": "object"
     },
     {
@@ -17394,8 +17689,12 @@
         "netdisk.account",
         "netdisk.accounts",
         "netdisk.files.capabilities",
+        "netdisk.files.delete",
         "netdisk.files.list",
+        "netdisk.files.move",
         "netdisk.files.quota",
+        "netdisk.files.rename",
+        "netdisk.files.share",
         "netdisk.platforms",
         "plugin.capabilities",
         "plugin.clone",

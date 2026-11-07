@@ -384,6 +384,15 @@ This runtime model has no directly writable fields.
 MoviePilot 媒体类型。
 This runtime model has no directly writable fields.
 
+### `NetdiskDriveFileModel`
+个人盘文件或目录条目；file_id 与 name 由浏览目录结果提供。
+- `file_id*` (string): 平台文件标识
+- `is_dir` (boolean; default `False`): 是否目录
+- `name*` (string): 文件名
+- `parent_id` (string; default ``): 父目录标识
+- `size` (integer; default `0`): 字节数；目录为 0
+- `updated_at` (string|null): 修改时间
+
 ### `SubscriptionExecutionStatus`
 订阅刷新执行状态和进度摘要。
 - `batch_id` (string|null): 所属批次标识

@@ -1,12 +1,12 @@
 # Netdisk APIs
 
-Netdisk platform discovery, account inspection, and read-only drive browsing for administrators.
+Netdisk platform discovery, account inspection, read-only drive browsing, and confirmed file operations for administrators.
 
 ## Operations
 
 ### `netdisk.account`
 `GET /api/v1/netdisk/accounts/{account_id}`; policy effect: `safe_read`.
-Purpose: 读取一个网盘账号的详情；管理员专用，结果可能包含明文凭据。
+Purpose: 读取一个网盘账号的详情；管理员专用，结果包含脱敏账号信息。
 Identity scope: `admin`; required role: `system_admin`.
 - `path_params`: `account_id*` (integer): 网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。
 - `query`: none
@@ -28,6 +28,14 @@ Identity scope: `admin`; required role: `system_admin`.
 - `query`: none
 - `body`: none
 
+### `netdisk.files.delete`
+`POST /api/v1/netdisk/files/{account_id}/delete`; policy effect: `destructive_write`.
+Purpose: 删除指定账号的个人盘文件，平台侧无法本地回滚；管理员专用，需要确认。
+Identity scope: `admin`; required role: `system_admin`.
+- `path_params`: `account_id*` (integer): 网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。
+- `query`: none
+- `body`: `files*` (array<NetdiskDriveFileModel>; minimum items `1`): 历史记录保存的序列化文件列表。
+
 ### `netdisk.files.list`
 `GET /api/v1/netdisk/files/{account_id}/list`; policy effect: `safe_read`.
 Purpose: 浏览指定网盘账号的个人盘目录条目；管理员专用，结果包含用户文件信息。
@@ -36,6 +44,14 @@ Identity scope: `admin`; required role: `system_admin`.
 - `query`: `parent_id` (string; default ``): 父目录标识，空串为根目录
 - `body`: none
 
+### `netdisk.files.move`
+`POST /api/v1/netdisk/files/{account_id}/move`; policy effect: `reversible_write`.
+Purpose: 把指定账号的个人盘文件移动到目标目录；管理员专用，需要确认。
+Identity scope: `admin`; required role: `system_admin`.
+- `path_params`: `account_id*` (integer): 网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。
+- `query`: none
+- `body`: `files*` (array<NetdiskDriveFileModel>; minimum items `1`): 历史记录保存的序列化文件列表。; `target_id*` (string): 目标目录标识
+
 ### `netdisk.files.quota`
 `GET /api/v1/netdisk/files/{account_id}/quota`; policy effect: `safe_read`.
 Purpose: 查询指定网盘账号的个人盘空间配额；管理员专用，结果关联具体账号。
@@ -43,6 +59,22 @@ Identity scope: `admin`; required role: `system_admin`.
 - `path_params`: `account_id*` (integer): 网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。
 - `query`: none
 - `body`: none
+
+### `netdisk.files.rename`
+`POST /api/v1/netdisk/files/{account_id}/rename`; policy effect: `reversible_write`.
+Purpose: 重命名指定账号的一个个人盘文件；管理员专用，需要确认。
+Identity scope: `admin`; required role: `system_admin`.
+- `path_params`: `account_id*` (integer): 网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。
+- `query`: none
+- `body`: `file*` (NetdiskDriveFileModel): 待操作的个人盘文件或目录条目；file_id 与 name 由浏览目录结果提供。; `name*` (string; minimum length `1`): 站点、存储项目、订阅或规则组的可读名称。
+
+### `netdisk.files.share`
+`POST /api/v1/netdisk/files/{account_id}/share`; policy effect: `external_side_effect`.
+Purpose: 为指定账号的个人盘文件创建分享链接；管理员专用，结果含分享链接与提取码。
+Identity scope: `admin`; required role: `system_admin`.
+- `path_params`: `account_id*` (integer): 网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。
+- `query`: none
+- `body`: `expires_in` (integer; default `0`): 有效期秒数，0 为平台默认; `files*` (array<NetdiskDriveFileModel>; minimum items `1`): 历史记录保存的序列化文件列表。; `password` (string; default ``): 提取码，留空由平台决定
 
 ### `netdisk.platforms`
 `GET /api/v1/netdisk/platforms`; policy effect: `safe_read`.
@@ -148,6 +180,15 @@ This runtime model has no directly writable fields.
 ### `MediaType`
 MoviePilot 媒体类型。
 This runtime model has no directly writable fields.
+
+### `NetdiskDriveFileModel`
+个人盘文件或目录条目；file_id 与 name 由浏览目录结果提供。
+- `file_id*` (string): 平台文件标识
+- `is_dir` (boolean; default `False`): 是否目录
+- `name*` (string): 文件名
+- `parent_id` (string; default ``): 父目录标识
+- `size` (integer; default `0`): 字节数；目录为 0
+- `updated_at` (string|null): 修改时间
 
 ### `SubscriptionExecutionStatus`
 订阅刷新执行状态和进度摘要。

@@ -20,6 +20,13 @@ NETDISK_READ_ROUTES = {
     "netdisk.files.list": ("GET", "/api/v1/netdisk/files/{account_id}/list"),
 }
 
+NETDISK_WRITE_ROUTES = {
+    "netdisk.files.share": ("POST", "/api/v1/netdisk/files/{account_id}/share"),
+    "netdisk.files.move": ("POST", "/api/v1/netdisk/files/{account_id}/move"),
+    "netdisk.files.rename": ("POST", "/api/v1/netdisk/files/{account_id}/rename"),
+    "netdisk.files.delete": ("POST", "/api/v1/netdisk/files/{account_id}/delete"),
+}
+
 
 def _read_api_skill_contract() -> str:
     """
@@ -55,6 +62,16 @@ def test_netdisk_read_operations_use_fixed_routes() -> None:
     只读网盘操作必须注册为固定方法与方法模板，禁止调用方注入任意 URL。
     """
     for operation_id, (method, path) in NETDISK_READ_ROUTES.items():
+        route = API_OPERATION_ROUTES[operation_id]
+        assert route.method == method, operation_id
+        assert route.path == path, operation_id
+
+
+def test_netdisk_write_operations_use_fixed_routes() -> None:
+    """
+    网盘写操作必须注册为固定 POST 路由，禁止调用方注入任意 URL。
+    """
+    for operation_id, (method, path) in NETDISK_WRITE_ROUTES.items():
         route = API_OPERATION_ROUTES[operation_id]
         assert route.method == method, operation_id
         assert route.path == path, operation_id
