@@ -19,6 +19,7 @@ from app.agent.middleware.skills import (
     SkillsMiddleware,
     _alist_skills,
 )
+from app.agent.skills.metadata import parse_skill_metadata
 from app.agent.tools.base import DEFAULT_TOOL_RESULT_MAX_CHARS
 from app.agent.tools.tags import ToolTag
 
@@ -203,6 +204,35 @@ async def test_bundled_moviepilot_api_skill_loads_complete_contract() -> None:
     assert "### `workflow.update`" in category["content"]
     assert "## Body Models" in category["content"]
     assert "### `WorkflowExecutionConfig`" in category["content"]
+
+
+def test_netdisk_operation_skill_parses() -> None:
+    """
+    内置网盘技能必须声明完整的受控操作范围。
+    """
+    skill_path = PROJECT_ROOT / "skills" / "netdisk-operation" / "SKILL.md"
+    metadata = parse_skill_metadata(
+        skill_path.read_text(encoding="utf-8"),
+        str(skill_path),
+        "netdisk-operation",
+    )
+
+    assert metadata is not None
+    assert metadata["name"] == "netdisk-operation"
+    assert metadata["version"] == 1
+    assert "moviepilot_api" in metadata["allowed_tools"]
+    assert metadata["allowed_api_operations"] == [
+        "netdisk.platforms",
+        "netdisk.accounts",
+        "netdisk.account",
+        "netdisk.files.capabilities",
+        "netdisk.files.quota",
+        "netdisk.files.list",
+        "netdisk.files.share",
+        "netdisk.files.move",
+        "netdisk.files.rename",
+        "netdisk.files.delete",
+    ]
 
 
 @pytest.mark.anyio
