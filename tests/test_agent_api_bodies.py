@@ -147,6 +147,8 @@ async def test_gateway_sends_netdisk_write_body(
         "path_params": {"account_id": 7},
         "body": deepcopy(body),
     }
+    # 网盘写操作要求宿主确认；本用例只验证请求体传输，先注入一次性确认标记。
+    gateway.authorize_netdisk_write()
 
     result = await _invoke_gateway(entrypoint, gateway, arguments)
 

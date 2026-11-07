@@ -4,11 +4,12 @@
 
 import asyncio
 import json
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import BaseModel, Field
 
 import app.agent.orchestrator as agent_module
@@ -1207,3 +1208,182 @@ def test_netdisk_delete_is_destructive_and_requires_external_reconciliation() ->
     assert receipt.needs_reconcile is True
     assert "可恢复" not in description
     assert "回滚" in description
+
+
+def _netdisk_write_tool(executor: AsyncMock | None = None) -> MoviePilotApiTool:
+    """
+    构造带管理员上下文和可观测执行器的网盘网关工具。
+    """
+    executor = executor or AsyncMock()
+    executor.execute.return_value = json.dumps(
+        {"success": True, "data": {"deleted": True}},
+        ensure_ascii=False,
+    )
+    tool = MoviePilotApiTool(session_id="session-1", user_id="1", executor=executor)
+    tool.set_agent_context({"is_admin": True})
+    return tool
+
+
+def _netdisk_tool_call_message(operation_id: str) -> AIMessage:
+    """
+    构造模型对网盘操作的单次工具调用消息。
+    """
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "moviepilot_api",
+                "args": _netdisk_arguments(operation_id),
+                "id": "netdisk-call-1",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+def test_netdisk_confirmation_run_requires_call_level_flag() -> None:
+    """
+    未获宿主确认标记的网盘写操作必须在执行器前 fail closed。
+    """
+    executor = AsyncMock()
+    tool = _netdisk_write_tool(executor)
+
+    result = json.loads(asyncio.run(tool.run(**_netdisk_arguments("netdisk.files.delete"))))
+
+    assert result["success"] is False
+    assert result["error"] == "confirmation_required"
+    assert "未执行" in result["message"]
+    executor.execute.assert_not_awaited()
+
+
+def test_netdisk_confirmation_flag_allows_exactly_one_execution() -> None:
+    """
+    确认标记只放行一次写操作，执行后立即清除，后续调用再次被拒绝。
+    """
+    executor = AsyncMock()
+    tool = _netdisk_write_tool(executor)
+    arguments = _netdisk_arguments("netdisk.files.delete")
+
+    tool.authorize_netdisk_write()
+    first_result = json.loads(asyncio.run(tool.run(**arguments)))
+    second_result = json.loads(asyncio.run(tool.run(**arguments)))
+
+    assert first_result["success"] is True
+    assert second_result["error"] == "confirmation_required"
+    executor.execute.assert_awaited_once()
+
+
+def test_netdisk_confirmation_middleware_pauses_write_before_execution() -> None:
+    """
+    宿主中间件在网盘写操作执行前暂停，并把确认提示交给已注册处理器。
+    """
+    executor = AsyncMock()
+    tool = _netdisk_write_tool(executor)
+    handler = AsyncMock(return_value="即将删除 1 个文件，请回复确认。")
+    context = _interactive_context()
+    context.agent_context["netdisk_write_confirmation_handler"] = handler
+    middleware = AgentPolicyMiddleware(context=context, tools=[tool])
+
+    result = asyncio.run(
+        middleware.aafter_model({"messages": [_netdisk_tool_call_message("netdisk.files.delete")]}, None)
+    )
+
+    assert result["jump_to"] == "end"
+    assert "已暂停" in result["messages"][0].content
+    assert result["messages"][-1].content == "即将删除 1 个文件，请回复确认。"
+    handler.assert_awaited_once()
+    executor.execute.assert_not_awaited()
+
+
+def test_netdisk_confirmation_middleware_does_not_pause_reads() -> None:
+    """
+    网盘只读调用不进入写操作确认暂停。
+    """
+    tool = _netdisk_write_tool()
+    context = _interactive_context()
+    context.agent_context["netdisk_write_confirmation_handler"] = AsyncMock()
+    middleware = AgentPolicyMiddleware(context=context, tools=[tool])
+
+    result = asyncio.run(
+        middleware.aafter_model({"messages": [_netdisk_tool_call_message(_NETDISK_READ_OPERATION)]}, None)
+    )
+
+    assert result is None
+
+
+def test_netdisk_confirmation_middleware_fails_closed_without_handler() -> None:
+    """
+    没有确认处理器的入口直接拒绝网盘写操作，不产生外部副作用。
+    """
+    executor = AsyncMock()
+    tool = _netdisk_write_tool(executor)
+    middleware = AgentPolicyMiddleware(context=_interactive_context(), tools=[tool])
+
+    result = asyncio.run(
+        middleware.aafter_model({"messages": [_netdisk_tool_call_message("netdisk.files.delete")]}, None)
+    )
+
+    assert result["jump_to"] == "end"
+    assert "未执行" in result["messages"][-1].content
+    executor.execute.assert_not_awaited()
+
+
+def _netdisk_confirmation_agent() -> agent_module.MoviePilotAgent:
+    """
+    构造可处理确认控制文本的 WebAgent 会话。
+    """
+    return agent_module.MoviePilotAgent(
+        session_id="session-1",
+        user_id="1",
+        channel=NotificationChannel.WebAgent.value,
+        source="web-agent",
+    )
+
+
+def test_netdisk_confirmation_control_executes_once() -> None:
+    """
+    用户回复确认后仅执行一次已登记的网盘写操作。
+    """
+    executor = AsyncMock()
+    tool = _netdisk_write_tool(executor)
+    agent = _netdisk_confirmation_agent()
+    arguments = _netdisk_arguments("netdisk.files.delete")
+
+    prompt = asyncio.run(agent._register_netdisk_write_confirmation(tool, arguments))
+    result = asyncio.run(agent._handle_secret_confirmation_control("确认", None, None, False))
+
+    assert "确认" in prompt
+    assert json.loads(result)["success"] is True
+    executor.execute.assert_awaited_once()
+
+
+def test_netdisk_confirmation_control_cancel_does_not_execute() -> None:
+    """
+    用户取消后丢弃待确认调用，不执行任何网盘写入。
+    """
+    executor = AsyncMock()
+    tool = _netdisk_write_tool(executor)
+    agent = _netdisk_confirmation_agent()
+
+    asyncio.run(agent._register_netdisk_write_confirmation(tool, _netdisk_arguments("netdisk.files.delete")))
+    result = asyncio.run(agent._handle_secret_confirmation_control("取消", None, None, False))
+
+    assert "已取消" in result
+    executor.execute.assert_not_awaited()
+
+
+def test_netdisk_confirmation_control_timeout_does_not_execute() -> None:
+    """
+    超过有效期的确认请求被丢弃，不执行网盘写入。
+    """
+    executor = AsyncMock()
+    tool = _netdisk_write_tool(executor)
+    agent = _netdisk_confirmation_agent()
+
+    asyncio.run(agent._register_netdisk_write_confirmation(tool, _netdisk_arguments("netdisk.files.delete")))
+    assert agent._pending_secret_confirmation is not None
+    agent._pending_secret_confirmation.created_at = datetime.now() - timedelta(minutes=10)
+    result = asyncio.run(agent._handle_secret_confirmation_control("确认", None, None, False))
+
+    assert "过期" in result
+    executor.execute.assert_not_awaited()

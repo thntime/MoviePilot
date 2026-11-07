@@ -87,7 +87,7 @@ from app.agent.terminal.ownership import (
     current_terminal_scope,
 )
 from app.agent.tools.catalog import ToolCatalogSnapshot
-from app.agent.tools.impl.api import MoviePilotApiTool
+from app.agent.tools.impl.api import NETDISK_WRITE_OPERATIONS, MoviePilotApiTool
 from app.agent.tools.impl.mcp import create_external_mcp_tools
 from app.agent.tools.result import is_image_content_block, sanitize_tool_image_message
 from app.application.agent import AgentDataContext
@@ -453,19 +453,37 @@ AGENT_CHAT_TITLE_MAX_CJK_CHARS = 18
 SECRET_CONFIRMATION_TTL = timedelta(minutes=5)
 SECRET_CONFIRM_TEXT = "确认"
 SECRET_CANCEL_TEXT = "取消"
+CONFIRMATION_KIND_SECRET_SETTING = "secret_setting"
+CONFIRMATION_KIND_NETDISK_WRITE = "netdisk_write"
+NETDISK_WRITE_OPERATION_LABELS = {
+    "netdisk.files.share": "创建分享",
+    "netdisk.files.move": "移动文件",
+    "netdisk.files.rename": "重命名文件",
+    "netdisk.files.delete": "删除文件",
+}
+_NETDISK_SUMMARY_URL_PATTERN = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
+
+
+def _sanitize_netdisk_summary_text(value: object) -> str:
+    """
+    限制确认提示中的目标文本长度，并把疑似链接替换为占位符。
+    """
+    text = _NETDISK_SUMMARY_URL_PATTERN.sub("[链接]", str(value or ""))
+    return text.strip()[:60]
 
 
 @dataclass
 class _PendingSecretConfirmation:
     """
-    保存当前会话中一次待确认的敏感设置读取。
+    保存当前会话中一次待确认的敏感设置读取或网盘写操作。
 
-    :param tool: 等待确认后执行敏感设置读取的网关工具实例
-    :param arguments: 已确定的敏感读取参数，确认时复用而不接受重新解释
+    :param tool: 等待确认后执行的网关工具实例
+    :param arguments: 已确定的调用参数，确认时复用而不接受重新解释
     :param created_at: 发起确认的时间，用于判定是否超过有效期
-    :param user_id: 发起敏感读取的可信用户标识
+    :param user_id: 发起确认的可信用户标识
     :param channel: 发起确认的消息渠道，用于限制确认来源
     :param source: 渠道内的确认来源标识，用于限制确认上下文
+    :param kind: 待确认操作类型，区分敏感设置读取与网盘写操作
     """
 
     tool: MoviePilotApiTool
@@ -474,6 +492,7 @@ class _PendingSecretConfirmation:
     user_id: str
     channel: str
     source: str
+    kind: str = CONFIRMATION_KIND_SECRET_SETTING
 
 
 class MoviePilotAgent:
@@ -1122,6 +1141,7 @@ class MoviePilotAgent:
             "execution_identity_error": {},
             "require_secret_confirmation": True,
             "secret_confirmation_handler": self._register_secret_confirmation,
+            "netdisk_write_confirmation_handler": self._register_netdisk_write_confirmation,
             # 工具回调消息需要发回原会话（群聊@机器人时按钮选择等卡片不能发到私聊），
             # 后台任务无渠道上下文时置空，交由通知链广播。
             "original_chat_id": None if self.is_background else self.original_chat_id,
@@ -1174,7 +1194,7 @@ class MoviePilotAgent:
         校验并冻结一次待用户确认的敏感设置读取。
         """
         if self.has_pending_secret_confirmation():
-            return "当前会话已有待确认的敏感设置读取，请先回复“确认”或“取消”。"
+            return "当前会话已有待确认操作，请先回复“确认”或“取消”。"
         if not self._can_confirm_secret_read():
             self._pending_secret_confirmation = None
             return "当前入口不支持安全交付敏感设置，未执行读取。"
@@ -1219,6 +1239,7 @@ class MoviePilotAgent:
                 user_id=str(self.user_id or ""),
                 channel=str(self.channel or ""),
                 source=str(self.source or ""),
+                kind=CONFIRMATION_KIND_SECRET_SETTING,
             )
             self._emit_output(confirmation_message)
         else:
@@ -1233,7 +1254,94 @@ class MoviePilotAgent:
                 user_id=str(self.user_id or ""),
                 channel=str(self.channel or ""),
                 source=str(self.source or ""),
+                kind=CONFIRMATION_KIND_SECRET_SETTING,
             )
+            self._tool_context["user_reply_sent"] = True
+        return confirmation_message
+
+    @staticmethod
+    def _netdisk_write_target_summary(arguments: Dict[str, Any]) -> str:
+        """
+        构造只含账号、数量和目标名称的网盘写操作摘要。
+        """
+        path_params = arguments.get("path_params")
+        body = arguments.get("body")
+        account_id = path_params.get("account_id") if isinstance(path_params, dict) else None
+        account_text = (
+            _sanitize_netdisk_summary_text(account_id) if account_id is not None else "未知"
+        )
+        parts = [f"账号 {account_text}"]
+        if isinstance(body, dict):
+            files = body.get("files")
+            if isinstance(files, list):
+                names = []
+                for item in files[:3]:
+                    if not isinstance(item, dict):
+                        continue
+                    name = _sanitize_netdisk_summary_text(item.get("name"))
+                    if name:
+                        names.append(name)
+                suffix = f"（{'、'.join(names)}）" if names else ""
+                parts.append(f"{len(files)} 个文件{suffix}")
+            file_item = body.get("file")
+            if isinstance(file_item, dict) and file_item.get("name"):
+                parts.append(f"文件 {_sanitize_netdisk_summary_text(file_item.get('name'))}")
+            target_id = body.get("target_id")
+            if target_id:
+                parts.append(f"目标目录 {_sanitize_netdisk_summary_text(target_id)}")
+            new_name = body.get("name")
+            if new_name:
+                parts.append(f"新名称 {_sanitize_netdisk_summary_text(new_name)}")
+        return "，".join(parts)
+
+    async def _register_netdisk_write_confirmation(
+        self,
+        tool: MoviePilotApiTool,
+        arguments: Dict[str, Any],
+    ) -> str:
+        """
+        校验并冻结一次待用户确认的网盘写操作。
+        """
+        if self.has_pending_secret_confirmation():
+            return "当前会话已有待确认操作，请先回复“确认”或“取消”。"
+        if not isinstance(tool, MoviePilotApiTool):
+            return "当前工具不支持网盘写操作确认。"
+        args_schema = tool.args_schema
+        if args_schema is None:
+            return "网盘写操作参数无法校验，未执行操作。"
+        try:
+            validated_arguments = args_schema.model_validate(arguments).model_dump()
+        except Exception:
+            return "网盘写操作参数无效，未执行操作。"
+        operation_id = str(validated_arguments.get("operation_id") or "")
+        if operation_id not in NETDISK_WRITE_OPERATIONS:
+            return "当前操作不需要网盘写操作确认。"
+
+        operation_label = NETDISK_WRITE_OPERATION_LABELS.get(operation_id, operation_id)
+        target_summary = self._netdisk_write_target_summary(validated_arguments)
+        confirmation_message = (
+            f"即将执行网盘写操作：{operation_label}（{operation_id}），{target_summary}。"
+            "该操作会修改网盘内容，执行后无法由本地回滚。"
+            "请在 5 分钟内回复“确认”继续，或回复“取消”放弃。"
+        )
+        pending = _PendingSecretConfirmation(
+            tool=tool,
+            arguments=validated_arguments,
+            created_at=datetime.now(),
+            user_id=str(self.user_id or ""),
+            channel=str(self.channel or ""),
+            source=str(self.source or ""),
+            kind=CONFIRMATION_KIND_NETDISK_WRITE,
+        )
+        if self.channel in {NotificationChannel.Web.value, NotificationChannel.WebAgent.value}:
+            self._pending_secret_confirmation = pending
+            self._emit_output(confirmation_message)
+        else:
+            delivered = await self._deliver_private_channel_message(confirmation_message)
+            if not delivered:
+                self._pending_secret_confirmation = None
+                return "无法向当前用户建立私聊，未执行网盘写操作。"
+            self._pending_secret_confirmation = pending
             self._tool_context["user_reply_sent"] = True
         return confirmation_message
 
@@ -1320,17 +1428,28 @@ class MoviePilotAgent:
             or pending.source != str(self.source or "")
         ):
             return None
+        is_netdisk_write = pending.kind == CONFIRMATION_KIND_NETDISK_WRITE
         if datetime.now() - pending.created_at > SECRET_CONFIRMATION_TTL:
             self._pending_secret_confirmation = None
-            message_text = "敏感设置读取确认已过期，请重新发起。"
-            await self._deliver_protected_output(message_text)
+            if is_netdisk_write:
+                message_text = "网盘写操作确认已过期，请重新发起。"
+                self._emit_output(message_text)
+            else:
+                message_text = "敏感设置读取确认已过期，请重新发起。"
+                await self._deliver_protected_output(message_text)
             return message_text
         self._pending_secret_confirmation = None
         if command == SECRET_CANCEL_TEXT:
-            message_text = "已取消敏感设置读取。"
-            await self._deliver_protected_output(message_text)
+            if is_netdisk_write:
+                message_text = "已取消网盘写操作。"
+                self._emit_output(message_text)
+            else:
+                message_text = "已取消敏感设置读取。"
+                await self._deliver_protected_output(message_text)
             return message_text
 
+        if is_netdisk_write:
+            return await self._execute_netdisk_write_confirmation(pending)
         if not self._can_confirm_secret_read():
             return "当前入口不支持安全交付敏感设置，未执行读取。"
 
@@ -1369,6 +1488,42 @@ class MoviePilotAgent:
         if not delivered:
             return fallback_message
         return "敏感设置确认已处理。"
+
+    async def _execute_netdisk_write_confirmation(
+        self,
+        pending: _PendingSecretConfirmation,
+    ) -> str:
+        """
+        用户确认后只执行一次已登记的网盘写操作，并把结果作为私密普通回复返回。
+        """
+        async def _execute_confirmed() -> str:
+            """
+            再次确认工具权限后设置一次性调用标记并执行网盘写入。
+            """
+            permission_result = await pending.tool._check_permission()
+            if permission_result:
+                return permission_result
+            pending.tool.authorize_netdisk_write()
+            return await pending.tool.run_with_timeout(**pending.arguments)
+
+        policy = AgentPolicyMiddleware(
+            context=self._build_policy_context(),
+            tools=[pending.tool],
+        )
+        try:
+            _, result = await policy.execute_tool_call(
+                tool=pending.tool,
+                arguments=pending.arguments,
+                invocation_id=f"netdisk-write-confirmation-{uuid.uuid4().hex}",
+                handler=_execute_confirmed,
+            )
+        except Exception:
+            message_text = "网盘写操作执行失败或超时，请先只读核验实际状态，避免重复执行。"
+            self._emit_output(message_text)
+            return message_text
+        result_text = str(result)
+        self._emit_output(result_text)
+        return result_text
 
     def _build_policy_context(self) -> ToolPolicyContext:
         """

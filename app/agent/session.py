@@ -301,7 +301,7 @@ class AgentSessionOwner:
             source: Optional[str] = None,
     ) -> bool:
         """
-        判断指定用户是否可继续当前会话的敏感设置确认。
+        判断指定用户是否可继续当前会话的待确认操作。
         """
         agent = self.active_agents.get(session_id)
         pending = agent._pending_secret_confirmation if agent else None

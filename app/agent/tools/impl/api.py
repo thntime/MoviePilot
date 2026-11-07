@@ -31,6 +31,16 @@ _TOOL_MESSAGE_OPERATION_MAX_CHARS = 96
 _TOOL_MESSAGE_PARAMETER_MAX_CHARS = 320
 _SEARCH_TORRENTS_TOOL_TIMEOUT_SECONDS = 300.0
 
+# 这四类网盘写入必须在宿主确认后执行；直接调用缺少确认标记时一律 fail closed。
+NETDISK_WRITE_OPERATIONS: frozenset[str] = frozenset(
+    {
+        "netdisk.files.share",
+        "netdisk.files.move",
+        "netdisk.files.rename",
+        "netdisk.files.delete",
+    }
+)
+
 # API 网关顶层请求体只开放对象、数组和 system.upgrade.dev 的固定字符串。
 MoviePilotApiBody = Union[Dict[str, JsonData], list[JsonData], Literal["dev"], None]
 
@@ -144,6 +154,7 @@ class MoviePilotApiTool(MoviePilotTool):
     )
 
     _executor: Optional[MoviePilotApiExecutor] = PrivateAttr(default=None)
+    _netdisk_write_confirmed: bool = PrivateAttr(default=False)
 
     def __init__(
         self,
@@ -158,6 +169,14 @@ class MoviePilotApiTool(MoviePilotTool):
         """
         super().__init__(session_id=session_id, user_id=user_id, **kwargs)
         self._executor = executor
+
+    def authorize_netdisk_write(self) -> None:
+        """
+        由宿主确认路径标记下一次网盘写操作已获用户确认。
+
+        标记只对当前工具实例生效，`run` 会在执行结束后清除它。
+        """
+        self._netdisk_write_confirmed = True
 
     def get_tool_message(self, **kwargs: Any) -> Optional[str]:
         """
@@ -439,75 +458,93 @@ class MoviePilotApiTool(MoviePilotTool):
                 },
                 ensure_ascii=False,
             )
+        netdisk_write = operation_id in NETDISK_WRITE_OPERATIONS
         try:
-            body = coerce_string_body(body)
-            arguments: dict[str, Any] = {"operation_id": operation_id, **kwargs}
-            if path_params is not None:
-                arguments["path_params"] = path_params
-            if query is not None:
-                arguments["query"] = query
-            if body is not None:
-                arguments["body"] = body
-            self.canonical_arguments(arguments)
-        except (TypeError, ValueError) as error:
-            return self._invalid_input_result(operation_id, error)
-        try:
-            requires_system_admin = spec.required_role is PrincipalRole.SYSTEM_ADMIN
-            executor, is_admin = await self._get_executor(
-                require_system_admin=requires_system_admin,
-                public_read_only=operation_id in API_UNBOUND_READ_OPERATIONS,
-            )
-            if requires_system_admin and not is_admin:
-                self._record_identity_error("任务执行账号不具备此操作需要的系统管理员权限。")
+            try:
+                body = coerce_string_body(body)
+                arguments: dict[str, Any] = {"operation_id": operation_id, **kwargs}
+                if path_params is not None:
+                    arguments["path_params"] = path_params
+                if query is not None:
+                    arguments["query"] = query
+                if body is not None:
+                    arguments["body"] = body
+                self.canonical_arguments(arguments)
+            except (TypeError, ValueError) as error:
+                return self._invalid_input_result(operation_id, error)
+            try:
+                requires_system_admin = spec.required_role is PrincipalRole.SYSTEM_ADMIN
+                executor, is_admin = await self._get_executor(
+                    require_system_admin=requires_system_admin,
+                    public_read_only=operation_id in API_UNBOUND_READ_OPERATIONS,
+                )
+                if requires_system_admin and not is_admin:
+                    self._record_identity_error("任务执行账号不具备此操作需要的系统管理员权限。")
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": "permission_denied",
+                            "message": "This MoviePilot API operation requires a system administrator.",
+                        },
+                        ensure_ascii=False,
+                    )
+                if netdisk_write and not self._netdisk_write_confirmed:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": "confirmation_required",
+                            "operation_id": operation_id,
+                            "message": (
+                                f"{operation_id} 是网盘写操作，必须先由宿主完成用户确认后执行；"
+                                "当前调用未获确认，未执行任何网盘写入。"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                result = await executor.execute(
+                    operation_id,
+                    path_params=path_params,
+                    query=query,
+                    body=body,
+                )
+                try:
+                    payload = json.loads(result)
+                except (TypeError, ValueError):
+                    payload = None
+                self._record_api_identity_failure(payload)
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("error") == "api_error"
+                    and payload.get("status_code") in {400, 422}
+                ):
+                    payload["operation_id"] = operation_id
+                    payload["message"] = (
+                        f"{operation_id} 被 API 拒绝，请根据 input_contract 修正输入后重试。"
+                    )
+                    payload["input_contract"] = self.get_operation_input_contract(operation_id)
+                    result = json.dumps(payload, ensure_ascii=False)
+                if operation_id == "scheduler.run" and inspect_tool_result(result) is ExecutionOutcome.SUCCEEDED:
+                    payload = json.loads(result)
+                    if isinstance(payload, dict) and payload.get("success") is True:
+                        payload["execution_outcome"] = "pending"
+                        return json.dumps(payload, ensure_ascii=False)
+                return result
+            except ApiExecutionError as error:
+                failure: dict[str, Any] = {
+                    "success": False,
+                    "error": "operation_unavailable",
+                    "message": str(error),
+                }
+                if error.external_may_continue:
+                    failure["execution_outcome"] = "unknown"
+                    failure["message"] += "；操作可能已生效，请先只读核验实际状态，避免重复执行。"
                 return json.dumps(
-                    {
-                        "success": False,
-                        "error": "permission_denied",
-                        "message": "This MoviePilot API operation requires a system administrator.",
-                    },
+                    failure,
                     ensure_ascii=False,
                 )
-            result = await executor.execute(
-                operation_id,
-                path_params=path_params,
-                query=query,
-                body=body,
-            )
-            try:
-                payload = json.loads(result)
-            except (TypeError, ValueError):
-                payload = None
-            self._record_api_identity_failure(payload)
-            if (
-                isinstance(payload, dict)
-                and payload.get("error") == "api_error"
-                and payload.get("status_code") in {400, 422}
-            ):
-                payload["operation_id"] = operation_id
-                payload["message"] = (
-                    f"{operation_id} 被 API 拒绝，请根据 input_contract 修正输入后重试。"
-                )
-                payload["input_contract"] = self.get_operation_input_contract(operation_id)
-                result = json.dumps(payload, ensure_ascii=False)
-            if operation_id == "scheduler.run" and inspect_tool_result(result) is ExecutionOutcome.SUCCEEDED:
-                payload = json.loads(result)
-                if isinstance(payload, dict) and payload.get("success") is True:
-                    payload["execution_outcome"] = "pending"
-                    return json.dumps(payload, ensure_ascii=False)
-            return result
-        except ApiExecutionError as error:
-            failure: dict[str, Any] = {
-                "success": False,
-                "error": "operation_unavailable",
-                "message": str(error),
-            }
-            if error.external_may_continue:
-                failure["execution_outcome"] = "unknown"
-                failure["message"] += "；操作可能已生效，请先只读核验实际状态，避免重复执行。"
-            return json.dumps(
-                failure,
-                ensure_ascii=False,
-            )
+        finally:
+            if netdisk_write:
+                self._netdisk_write_confirmed = False
 
 
-__all__ = ["MoviePilotApiInput", "MoviePilotApiTool"]
+__all__ = ["NETDISK_WRITE_OPERATIONS", "MoviePilotApiInput", "MoviePilotApiTool"]

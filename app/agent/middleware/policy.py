@@ -26,7 +26,7 @@ from app.agent.policy.orchestrator import (
 from app.agent.policy.registry import requests_system_setting_secrets
 from app.agent.policy.sanitizer import stable_type_name
 from app.agent.tools.catalog import ToolCatalogSnapshot
-from app.agent.tools.impl.api import MoviePilotApiTool
+from app.agent.tools.impl.api import NETDISK_WRITE_OPERATIONS, MoviePilotApiTool
 from app.agent.tools.impl.mcp import McpExternalTool
 from app.agent.tools.result import EXECUTION_OUTCOME_KEY, ToolExecutionError, annotate_tool_result
 from app.agent.tools.tags import ToolTag
@@ -80,6 +80,9 @@ class AgentPolicyMiddleware(AgentMiddleware):
         paused = await self._sensitive_pause(state)
         if paused is not None:
             return paused
+        paused = await self._netdisk_write_pause(state)
+        if paused is not None:
+            return paused
         return await self.guardrails.after_model_update(state, runtime) if self.guardrails else None
 
     async def _sensitive_pause(self, state: AgentState) -> Any:
@@ -123,6 +126,55 @@ class AgentPolicyMiddleware(AgentMiddleware):
         paused_messages: list[AnyMessage] = [
             ToolMessage(
                 content=("本轮工具调用已暂停，未执行任何操作；请等待用户确认或取消敏感设置读取。"),
+                tool_call_id=str(tool_call.get("id") or ""),
+                name=str(tool_call.get("name") or "unknown"),
+            )
+            for tool_call in tool_calls
+        ]
+        paused_messages.append(AIMessage(content=confirmation_message))
+        return {"messages": paused_messages, "jump_to": "end"}
+
+    async def _netdisk_write_pause(self, state: AgentState) -> Any:
+        """
+        网盘写操作必须在执行前取得用户确认；无确认处理器时直接 fail closed。
+        """
+        messages = state.get("messages") or []
+        if not messages or not isinstance(messages[-1], AIMessage):
+            return None
+
+        tool_calls = messages[-1].tool_calls or []
+        target_call = None
+        target_tool = None
+        for tool_call in tool_calls:
+            tool = self._tools.get(tool_call.get("name"))
+            arguments = tool_call.get("args")
+            if (
+                isinstance(tool, MoviePilotApiTool)
+                and isinstance(arguments, dict)
+                and str(arguments.get("operation_id") or "") in NETDISK_WRITE_OPERATIONS
+            ):
+                target_call = tool_call
+                target_tool = tool
+                break
+        if target_call is None or target_tool is None:
+            return None
+
+        confirmation_handler = (
+            self.context.agent_context.get("netdisk_write_confirmation_handler")
+            if self.context.origin is ToolOrigin.AGENT_INTERACTIVE
+            else None
+        )
+        if not callable(confirmation_handler):
+            confirmation_message = "当前入口不支持网盘写操作确认，未执行任何工具。"
+        else:
+            confirmation_message = await confirmation_handler(
+                target_tool,
+                target_call.get("args") or {},
+            )
+
+        paused_messages: list[AnyMessage] = [
+            ToolMessage(
+                content=("本轮工具调用已暂停，未执行任何操作；请等待用户确认或取消网盘写操作。"),
                 tool_call_id=str(tool_call.get("id") or ""),
                 name=str(tool_call.get("name") or "unknown"),
             )
