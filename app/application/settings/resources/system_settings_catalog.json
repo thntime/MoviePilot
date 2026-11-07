@@ -67,7 +67,7 @@
       "source_file": "app/runtime/config.py"
     },
     "AI_RECOMMEND_ENABLED": {
-      "description": "是否启用AI推荐",
+      "description": "是否启用AI推荐（含网盘候选试用）",
       "group": "ai_agent",
       "source_file": "app/runtime/config.py"
     },

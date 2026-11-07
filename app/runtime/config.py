@@ -773,7 +773,7 @@ class ConfigModel(BaseModel):
     LLM_TOOL_TIMEOUT: int = Field(default=300, description='LLM工具调用超时时间（秒）')
     LLM_VERBOSE: bool = Field(default=False, description='是否启用详细日志')
     LLM_MEMORY_RETENTION_DAYS: int = Field(default=1, description='内存记忆保留天数')
-    AI_RECOMMEND_ENABLED: bool = Field(default=False, description='是否启用AI推荐')
+    AI_RECOMMEND_ENABLED: bool = Field(default=False, description='是否启用AI推荐（含网盘候选试用）')
     AI_RECOMMEND_USER_PREFERENCE: str = Field(default="", description='AI推荐用户偏好')
 
     AI_RECOMMEND_MAX_ITEMS: int = Field(default=50, description='AI推荐条目数量限制')
