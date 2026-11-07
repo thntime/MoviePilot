@@ -657,12 +657,23 @@ API_EXTENDED_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
 )
 
 
+API_NETDISK_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
+    _admin_read("netdisk.platforms"),
+    _admin_read("netdisk.accounts", sensitivity=ResultSensitivity.PRIVATE),
+    _admin_read("netdisk.account", sensitivity=ResultSensitivity.PRIVATE),
+    _admin_read("netdisk.files.capabilities", sensitivity=ResultSensitivity.PRIVATE),
+    _admin_read("netdisk.files.quota", sensitivity=ResultSensitivity.PRIVATE),
+    _admin_read("netdisk.files.list", sensitivity=ResultSensitivity.PRIVATE),
+)
+
+
 API_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
     *API_FIRST_BATCH_OPERATION_SPECS,
     *API_PARITY_OPERATION_SPECS,
     *API_MUSIC_OPERATION_SPECS,
     *API_SYSTEM_OPERATION_SPECS,
     *API_EXTENDED_OPERATION_SPECS,
+    *API_NETDISK_OPERATION_SPECS,
 )
 API_OPERATION_BY_ID = {spec.operation_id: spec for spec in API_OPERATION_SPECS}
 # 身份范围是唯一事实源；不能按 safe_read 批量放行实例、文件或用户数据。
@@ -737,6 +748,18 @@ API_OPERATION_ROUTES: dict[str, ApiOperationRoute] = {
     "slash.list": ApiOperationRoute("GET", "/api/v1/message/agent/commands"),
     "config.identifiers.get": ApiOperationRoute("GET", "/api/v1/system/identifiers"),
     "config.identifiers.update": ApiOperationRoute("POST", "/api/v1/system/identifiers"),
+    "netdisk.platforms": ApiOperationRoute("GET", "/api/v1/netdisk/platforms"),
+    "netdisk.accounts": ApiOperationRoute("GET", "/api/v1/netdisk/accounts"),
+    "netdisk.account": ApiOperationRoute("GET", "/api/v1/netdisk/accounts/{account_id}"),
+    "netdisk.files.capabilities": ApiOperationRoute(
+        "GET", "/api/v1/netdisk/files/{account_id}/capabilities"
+    ),
+    "netdisk.files.quota": ApiOperationRoute(
+        "GET", "/api/v1/netdisk/files/{account_id}/quota"
+    ),
+    "netdisk.files.list": ApiOperationRoute(
+        "GET", "/api/v1/netdisk/files/{account_id}/list"
+    ),
     "search.torrents": ApiOperationRoute("GET", "/api/v1/search/media/{media_id}"),
     "search.results": ApiOperationRoute("GET", "/api/v1/search/last/context"),
     "filter.builtin": ApiOperationRoute("GET", "/api/v1/rule/builtin"),
@@ -963,6 +986,7 @@ __all__ = [
     "API_FIRST_BATCH_OPERATION_SPECS",
     "API_EXTENDED_OPERATION_SPECS",
     "API_MUSIC_OPERATION_SPECS",
+    "API_NETDISK_OPERATION_SPECS",
     "API_OPERATION_BY_ID",
     "API_OPERATION_ROUTES",
     "API_OPERATION_SPECS",

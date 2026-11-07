@@ -21,11 +21,13 @@ from app.agent.policy import (
     ConfirmationMode,
     PrincipalRole,
     RecoveryMode,
+    ResultSensitivity,
 )
 from app.agent.policy.api import (
     API_EXTENDED_OPERATION_SPECS,
     API_FIRST_BATCH_OPERATION_SPECS,
     API_MUSIC_OPERATION_SPECS,
+    API_NETDISK_OPERATION_SPECS,
     API_OPERATION_ROUTES,
     API_OPERATION_SPECS,
     API_PARITY_OPERATION_SPECS,
@@ -52,7 +54,8 @@ def test_api_operation_registry_matches_migration_batches() -> None:
     assert len(API_MUSIC_OPERATION_SPECS) == 10
     assert len(API_SYSTEM_OPERATION_SPECS) == 7
     assert len(API_EXTENDED_OPERATION_SPECS) == 145
-    assert len(API_OPERATION_SPECS) == 233
+    assert len(API_NETDISK_OPERATION_SPECS) == 6
+    assert len(API_OPERATION_SPECS) == 239
     assert {spec.operation_id for spec in API_OPERATION_SPECS} == set(API_OPERATION_ROUTES)
     assert {
         "download.list",
@@ -89,6 +92,31 @@ def test_api_operation_registry_matches_migration_batches() -> None:
         "system.module.list",
         "plugin.clone",
     }.issubset(API_OPERATION_ROUTES)
+
+
+def test_netdisk_read_operations_are_admin_scoped_and_private() -> None:
+    """
+    只读网盘操作仅管理员可用，账号与文件结果按私密数据标记。
+    """
+    specs = {spec.operation_id: spec for spec in API_NETDISK_OPERATION_SPECS}
+    assert set(specs) == {
+        "netdisk.platforms",
+        "netdisk.accounts",
+        "netdisk.account",
+        "netdisk.files.capabilities",
+        "netdisk.files.quota",
+        "netdisk.files.list",
+    }
+    for operation_id, spec in specs.items():
+        assert spec.effect is ActionEffect.SAFE_READ, operation_id
+        assert spec.required_role is PrincipalRole.SYSTEM_ADMIN, operation_id
+        assert spec.confirmation is ConfirmationMode.NONE, operation_id
+        expected = (
+            ResultSensitivity.NORMAL
+            if operation_id == "netdisk.platforms"
+            else ResultSensitivity.PRIVATE
+        )
+        assert spec.result_sensitivity is expected, operation_id
 
 
 def test_classification_operations_expose_versioned_policy_contract() -> None:

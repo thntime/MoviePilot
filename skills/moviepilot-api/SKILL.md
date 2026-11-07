@@ -62,7 +62,8 @@ allowed-api-operations: >-
   plugin.folder.create plugin.folder.update plugin.folder.delete plugin.folder.plugins.update
   plugin.folder.plugin.assign plugin.folder.plugin.remove plugin.loglevel.get plugin.loglevel.set
   plugin.loglevel.clear plugin.default_target.set plugin.default_target.clear
-  plugin.instance.set_enabled plugin.instance.purge
+  plugin.instance.set_enabled plugin.instance.purge netdisk.platforms netdisk.accounts
+  netdisk.account netdisk.files.capabilities netdisk.files.quota netdisk.files.list
 ---
 
 # MoviePilot API

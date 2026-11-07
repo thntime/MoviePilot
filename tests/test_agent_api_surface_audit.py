@@ -11,6 +11,15 @@ from app.agent.tools.impl.api import MoviePilotApiTool
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 API_SKILL = PROJECT_ROOT / "skills/moviepilot-api/SKILL.md"
 
+NETDISK_READ_ROUTES = {
+    "netdisk.platforms": ("GET", "/api/v1/netdisk/platforms"),
+    "netdisk.accounts": ("GET", "/api/v1/netdisk/accounts"),
+    "netdisk.account": ("GET", "/api/v1/netdisk/accounts/{account_id}"),
+    "netdisk.files.capabilities": ("GET", "/api/v1/netdisk/files/{account_id}/capabilities"),
+    "netdisk.files.quota": ("GET", "/api/v1/netdisk/files/{account_id}/quota"),
+    "netdisk.files.list": ("GET", "/api/v1/netdisk/files/{account_id}/list"),
+}
+
 
 def _read_api_skill_contract() -> str:
     """
@@ -32,13 +41,23 @@ def test_moviepilot_api_skill_routes_contracts_to_category_files() -> None:
     }
 
     assert "### `" not in entrypoint
-    assert len(category_files) == 21
+    assert len(category_files) == 22
     assert "models" not in category_files
     assert all(
         f"### `{operation_id}`" in category_files[operation_id.split(".", 1)[0]]
         for operation_id in API_OPERATION_ROUTES
     )
     assert all("## Body Models" in content for content in category_files.values())
+
+
+def test_netdisk_read_operations_use_fixed_routes() -> None:
+    """
+    只读网盘操作必须注册为固定方法与方法模板，禁止调用方注入任意 URL。
+    """
+    for operation_id, (method, path) in NETDISK_READ_ROUTES.items():
+        route = API_OPERATION_ROUTES[operation_id]
+        assert route.method == method, operation_id
+        assert route.path == path, operation_id
 
 
 def test_every_gateway_operation_has_exact_skill_and_chinese_mcp_contract() -> None:

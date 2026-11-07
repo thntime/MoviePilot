@@ -226,7 +226,7 @@ and pass the flag only for an explicitly authorized repair.
 - Purpose: Stores encrypted cloud-drive credentials, primary-account markers, and sign-in status.
 - Useful queries: Checking account status and primary selection when a netdisk download reports an authentication failure.
 - Write boundary: Owned by the netdisk account service; credentials are encrypted and must never be read or written directly.
-- Columns: `id`, `platform`, `name`, `credential_enc`, `is_primary`, `status`, `expires_at`, `last_checked_at`, `created_at`, `updated_at`
+- Columns: `id`, `platform`, `name`, `credential_enc`, `is_primary`, `nickname`, `quota_used`, `quota_total`, `status`, `expires_at`, `last_checked_at`, `created_at`, `updated_at`
 
 ### `outboxmessage`
 - Purpose: Stores externally visible side-effect intents committed atomically with business transactions.
