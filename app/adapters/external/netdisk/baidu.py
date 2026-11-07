@@ -58,6 +58,17 @@ _VERIFY_URL = "https://pan.baidu.com/share/verify"
 _SHARE_LIST_URL = "https://pan.baidu.com/rest/2.0/xpan/share"
 # bdstoken 模板变量。
 _TEMPLATE_URL = "https://pan.baidu.com/api/gettemplatevariable"
+
+
+def _share_surl(share_id: str) -> str:
+    """
+    百度分享校验接口使用去掉首位 1 的 surl。
+
+    :param share_id: 分享码（形如 1AbCdEf）
+    :return: surl（形如 AbCdEf）
+    """
+    text = str(share_id or "")
+    return text[1:] if text.startswith("1") else text
 # 账号信息（登录态与昵称）：xpan 接口只认 BDUSS，网页模板接口在部分会话下会返回 -6。
 _UINFO_URL = "https://pan.baidu.com/rest/2.0/xpan/nas"
 # 新建目录。
@@ -344,7 +355,7 @@ class BaiduAdapter(BaseNetdiskAdapter):
         payload = self._post_json(
             _VERIFY_URL,
             account=account,
-            params={"surl": ref.share_id},
+            params={"surl": _share_surl(ref.share_id)},
             data={"pwd": password, "vcode_str": "", "vcode": ""},
             headers=headers,
         )
@@ -357,7 +368,7 @@ class BaiduAdapter(BaseNetdiskAdapter):
             payload = self._post_json(
                 _VERIFY_URL,
                 account=None,
-                params={"surl": ref.share_id},
+                params={"surl": _share_surl(ref.share_id)},
                 data={"pwd": password, "vcode_str": "", "vcode": ""},
                 headers=retry_headers,
             )

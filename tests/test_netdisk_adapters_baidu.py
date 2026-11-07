@@ -463,3 +463,14 @@ def test_verify_retries_without_cookie_on_risk_control(
     assert sekey == "sekey-1"
     assert "Cookie" in calls[0]["headers"]
     assert "Cookie" not in calls[1]["headers"]
+
+
+def test_baidu_share_surl_strips_leading_one() -> None:
+    """
+    百度校验接口的 surl 必须去掉分享码首位的 1。
+    """
+    from app.adapters.external.netdisk import baidu as baidu_module
+
+    assert baidu_module._share_surl("1AbCdEf") == "AbCdEf"
+    assert baidu_module._share_surl("AbCdEf") == "AbCdEf"
+    assert baidu_module._share_surl("") == ""
