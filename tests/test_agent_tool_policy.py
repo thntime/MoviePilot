@@ -24,15 +24,18 @@ from app.agent.policy import (
     ActionEffect,
     AuthSource,
     ConfirmationMode,
+    ExecutionOutcome,
     MigrationState,
     PolicyPrincipal,
     PrincipalRole,
     PrincipalType,
+    RecoveryMode,
     ResultSensitivity,
     ToolOrigin,
     ToolPolicyContext,
     call_policy_hook,
 )
+from app.agent.policy.mcp import OPERATION_DESCRIPTIONS
 from app.agent.tools.base import MoviePilotTool
 from app.agent.tools.factory import MoviePilotToolFactory
 from app.agent.tools.impl.api import MoviePilotApiTool
@@ -1050,3 +1053,157 @@ def test_main_agent_preserves_memory_middleware_order() -> None:
     assert memory_middleware.user_memory_dir == str(
         agent_module.agent_runtime_manager.get_user_memory_dir("user-1")
     )
+
+
+_NETDISK_READ_OPERATION = "netdisk.files.list"
+_NETDISK_WRITE_OPERATIONS = (
+    "netdisk.files.share",
+    "netdisk.files.move",
+    "netdisk.files.rename",
+    "netdisk.files.delete",
+)
+_NETDISK_ACCOUNT_ID = 6421
+_NETDISK_FILE = {"file_id": "file-6421", "name": "episode.mkv"}
+
+
+def _netdisk_arguments(operation_id: str) -> dict:
+    """
+    构造通过网盘操作输入合同的调用参数，供策略解析与真实工具执行共用。
+    """
+    arguments: dict = {
+        "operation_id": operation_id,
+        "path_params": {"account_id": _NETDISK_ACCOUNT_ID},
+    }
+    if operation_id == "netdisk.files.share":
+        arguments["body"] = {"files": [dict(_NETDISK_FILE)]}
+    elif operation_id == "netdisk.files.move":
+        arguments["body"] = {"files": [dict(_NETDISK_FILE)], "target_id": "target-6421"}
+    elif operation_id == "netdisk.files.rename":
+        arguments["body"] = {"file": dict(_NETDISK_FILE), "name": "renamed.mkv"}
+    elif operation_id == "netdisk.files.delete":
+        arguments["body"] = {"files": [dict(_NETDISK_FILE)]}
+    return arguments
+
+
+def test_netdisk_admin_read_is_enforced_safe_read_and_executes_without_confirmation() -> None:
+    """
+    管理员读取网盘目录解析为强制执行的安全读取，直接执行且不要求确认。
+    """
+    arguments = _netdisk_arguments(_NETDISK_READ_OPERATION)
+    executor = AsyncMock()
+    executor.execute.return_value = json.dumps({"success": True, "data": []})
+    tool = MoviePilotApiTool(session_id="session-1", user_id="1", executor=executor)
+    tool.set_agent_context({"is_admin": True})
+
+    observation = DEFAULT_TOOL_POLICY_ORCHESTRATOR.start(
+        context=_interactive_context(),
+        tool=tool,
+        arguments=arguments,
+    )
+    result = asyncio.run(tool.run(**arguments))
+
+    assert observation.policy.effect is ActionEffect.SAFE_READ
+    assert observation.policy.required_role is PrincipalRole.SYSTEM_ADMIN
+    assert observation.policy.confirmation is ConfirmationMode.NONE
+    assert observation.policy.result_sensitivity is ResultSensitivity.PRIVATE
+    assert observation.policy.migration_state is MigrationState.ENFORCED
+    assert observation.decision.allowed is True
+    assert observation.decision.confirmation_required is False
+    assert observation.decision.shadow is False
+    assert observation.decision.reason_code == "safe_read_allow"
+    assert json.loads(result) == {"success": True, "data": []}
+    executor.execute.assert_awaited_once()
+
+
+@pytest.mark.parametrize("operation_id", [_NETDISK_READ_OPERATION, *_NETDISK_WRITE_OPERATIONS])
+def test_netdisk_non_admin_operation_is_rejected_without_leaking_account_data(operation_id: str) -> None:
+    """
+    非管理员读取或写入网盘都在执行前被拒绝，拒绝回执不携带账号与文件标识。
+    """
+    arguments = _netdisk_arguments(operation_id)
+    executor = AsyncMock()
+    tool = MoviePilotApiTool(session_id="session-1", user_id="1", executor=executor)
+    tool.set_agent_context({"is_admin": False})
+
+    # 网盘操作的管理员要求来自 operation 规格，而不是工具自身的 require_admin 默认值。
+    policy = DEFAULT_TOOL_POLICY_REGISTRY.resolve(
+        tool_name=tool.name,
+        arguments=arguments,
+        requires_admin=False,
+    )
+    result = json.loads(asyncio.run(tool.run(**arguments)))
+
+    assert policy.required_role is PrincipalRole.SYSTEM_ADMIN
+    assert result == {
+        "success": False,
+        "error": "permission_denied",
+        "message": "This MoviePilot API operation requires a system administrator.",
+    }
+    executor.execute.assert_not_awaited()
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert str(_NETDISK_ACCOUNT_ID) not in serialized
+    assert _NETDISK_FILE["file_id"] not in serialized
+
+
+@pytest.mark.parametrize("operation_id", _NETDISK_WRITE_OPERATIONS)
+def test_netdisk_write_requires_confirmation_and_never_resolves_to_safe_read(operation_id: str) -> None:
+    """
+    网盘写操作解析为需确认的强制策略，通用编排器只能给出等待入口确认的 shadow 决定。
+
+    通用编排器不替代各入口的确认流程：这里断言写操作不会被误判成无需确认的安全读取，
+    也不会报告成已批准执行。
+    """
+    arguments = _netdisk_arguments(operation_id)
+    tool = MoviePilotApiTool(session_id="session-1", user_id="1")
+    tool.set_agent_context({"is_admin": True})
+
+    observation = DEFAULT_TOOL_POLICY_ORCHESTRATOR.start(
+        context=_interactive_context(),
+        tool=tool,
+        arguments=arguments,
+    )
+
+    assert observation.policy.effect not in {ActionEffect.SAFE_READ, ActionEffect.SENSITIVE_READ}
+    assert observation.policy.required_role is PrincipalRole.SYSTEM_ADMIN
+    assert observation.policy.confirmation is ConfirmationMode.REQUIRED
+    assert observation.policy.migration_state is MigrationState.ENFORCED
+    assert observation.decision.shadow is True
+    assert observation.decision.reason_code == "confirmation_policy_shadow_allow"
+
+
+def test_netdisk_delete_is_destructive_and_requires_external_reconciliation() -> None:
+    """
+    删除解析为破坏性写入且只能事后核对；中断回执要求外部核对，不承诺可恢复。
+    """
+    arguments = _netdisk_arguments("netdisk.files.delete")
+    policy = DEFAULT_TOOL_POLICY_REGISTRY.resolve(
+        tool_name="moviepilot_api",
+        arguments=arguments,
+        requires_admin=True,
+    )
+    tool = MoviePilotApiTool(session_id="session-1", user_id="1")
+    tool.set_agent_context({"is_admin": True})
+    observation = DEFAULT_TOOL_POLICY_ORCHESTRATOR.start(
+        context=_interactive_context(),
+        tool=tool,
+        arguments=arguments,
+    )
+    receipt = DEFAULT_TOOL_POLICY_ORCHESTRATOR.fail(observation, TimeoutError())
+    description = OPERATION_DESCRIPTIONS["netdisk.files.delete"]
+
+    assert policy.effect is ActionEffect.DESTRUCTIVE_WRITE
+    assert policy.recovery is RecoveryMode.RECONCILE
+    assert policy.recovery not in {
+        RecoveryMode.RECOVERABLE_DELETE,
+        RecoveryMode.TRANSACTION,
+        RecoveryMode.BEFORE_STATE,
+        RecoveryMode.IDEMPOTENT,
+    }
+    assert observation.policy.effect is ActionEffect.DESTRUCTIVE_WRITE
+    assert observation.policy.recovery is RecoveryMode.RECONCILE
+    assert observation.policy.confirmation is ConfirmationMode.REQUIRED
+    assert receipt.outcome is ExecutionOutcome.UNKNOWN
+    assert receipt.external_may_continue is True
+    assert receipt.needs_reconcile is True
+    assert "可恢复" not in description
+    assert "回滚" in description
