@@ -10,7 +10,7 @@ from app.agent.prompt import PromptManager
 from app.application.configuration import ChainRuntimeConfig
 from app.chain.search import SearchChain
 from app.chain.search import recommend as recommend_module
-from app.chain.search.recommend import recommend_coordinator
+from app.chain.search.recommend import SearchRecommendOwner, recommend_coordinator
 from app.runtime.tasks import TaskRegistry
 
 
@@ -29,6 +29,16 @@ def _result(title: str):
             category="电影",
         )
     )
+
+
+def _netdisk_result(title: str):
+    """
+    构造一条携带网盘下载类型与平台的候选资源。
+    """
+    result = _result(title)
+    result.torrent_info.download_type = "netdisk"
+    result.torrent_info.netdisk_platform = "quark"
+    return result
 
 
 def _chain() -> SearchChain:
@@ -78,6 +88,61 @@ def test_search_recommend_prompt_includes_netdisk_fields():
 
     assert "download_type" in prompt
     assert "netdisk_platform" in prompt
+
+
+def test_restore_original_indices_drops_invalid_netdisk_indices():
+    """
+    网盘候选推荐只保留合法且唯一的原始索引，越界、重复与非整数索引均被丢弃。
+    """
+
+    async def scenario():
+        chain = _chain()
+        results = [
+            _netdisk_result("网盘资源一"),
+            _netdisk_result("网盘资源二"),
+            _netdisk_result("网盘资源三"),
+            _netdisk_result("网盘资源四"),
+        ]
+        chain._invoke_recommend_llm = AsyncMock(return_value='[1, 0, 1, 3, 9, -1, 2, "abc"]')
+
+        indices = await SearchRecommendOwner._generate_recommend_indices(
+            chain,
+            filtered_indices=None,
+            results=results,
+        )
+
+        assert indices == [1, 0, 3, 2]
+        prompt = chain._invoke_recommend_llm.await_args.args[0]
+        assert prompt.count('"download_type": "netdisk"') == len(results)
+        assert prompt.count('"netdisk_platform": "quark"') == len(results)
+
+    asyncio.run(scenario())
+
+
+def test_restore_original_indices_maps_filtered_netdisk_indices():
+    """
+    筛选后的网盘候选推荐应映射回原始搜索索引，并丢弃越界与重复索引。
+    """
+
+    async def scenario():
+        chain = _chain()
+        results = [
+            _netdisk_result("网盘资源一"),
+            _netdisk_result("网盘资源二"),
+            _netdisk_result("网盘资源三"),
+            _netdisk_result("网盘资源四"),
+        ]
+        chain._invoke_recommend_llm = AsyncMock(return_value="[0, 1, 0, 4]")
+
+        indices = await SearchRecommendOwner._generate_recommend_indices(
+            chain,
+            filtered_indices=[3, 1],
+            results=results,
+        )
+
+        assert indices == [3, 1]
+
+    asyncio.run(scenario())
 
 
 def test_empty_candidates_publish_error_and_finish(monkeypatch):
