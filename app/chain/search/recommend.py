@@ -320,6 +320,10 @@ class SearchRecommendOwner(_SearchOwnerBase):
                 "size": (size_tools.format_size(torrent.torrent_info.size) if torrent.torrent_info.size else "0 B"),
                 "seeders": torrent.torrent_info.seeders or 0,
             }
+            if str(getattr(torrent.torrent_info, "download_type", "torrent") or "torrent") == "netdisk":
+                # 网盘候选额外携带下载类型与平台，PT 候选保持原有字段不变
+                item_info["download_type"] = "netdisk"
+                item_info["netdisk_platform"] = getattr(torrent.torrent_info, "netdisk_platform", None) or ""
             items.append(json.dumps(item_info, ensure_ascii=False))
 
         return items, valid_indices

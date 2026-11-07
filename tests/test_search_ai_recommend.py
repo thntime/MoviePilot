@@ -4,6 +4,7 @@
 
 import asyncio
 import importlib.machinery
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -233,6 +234,34 @@ async def test_invoke_recommend_llm_disables_output_message_persistence() -> Non
     assert "[0, 2]" == result
     assert ReplyMode.CAPTURE_ONLY == captured["reply_mode"]
     assert not captured["allow_message_tools"]
+
+
+@pytest.mark.usefixtures("_isolate_recommend_tasks")
+def test_extract_recommend_items_includes_netdisk_fields() -> None:
+    """
+    网盘候选投影携带下载类型与网盘平台，PT 候选字段保持不变。
+    """
+    netdisk_result = SimpleNamespace(
+        torrent_info=SimpleNamespace(
+            title="网盘资源",
+            size=1024,
+            seeders=0,
+            download_type="netdisk",
+            netdisk_platform="quark",
+        )
+    )
+    pt_result = _make_result("PT资源", 2048, 10)
+
+    with patch.object(settings, "AI_RECOMMEND_MAX_ITEMS", 50, create=True):
+        items, valid_indices = SearchChain._extract_recommend_items(None, [netdisk_result, pt_result])
+
+    assert [0, 1] == valid_indices
+    netdisk_item = json.loads(items[0])
+    pt_item = json.loads(items[1])
+    assert "netdisk" == netdisk_item["download_type"]
+    assert "quark" == netdisk_item["netdisk_platform"]
+    assert "download_type" not in pt_item
+    assert "netdisk_platform" not in pt_item
 
 
 @pytest.mark.usefixtures("_isolate_recommend_tasks")
