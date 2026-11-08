@@ -537,6 +537,24 @@ Emby、Jellyfin、Plex、Navidrome 的目录、条目、搜索、季集和活动
 网盘登录仍在 MoviePilot 网页完成。该技能不授权登录自动化、任意 HTTP 请求或 URL、Cookie、
 口令、令牌；调用方不得索取、传递或回显这些凭据，只使用网关返回的脱敏结构化结果。
 
+### 4.6 手动下载的 AI 预选
+
+手动下载弹窗的网盘分享区域提供“AI 预选”按钮，调用管理员端点
+`POST /api/v1/netdisk/share/preview`，把分享文件树交给后台模型预选目标文件与集数。
+该端点使用网页登录的管理员身份，只服务内置手动下载弹窗，**不是** Agent 的
+`moviepilot_api` 操作，外部 MCP 客户端不能通过网关调用。
+
+请求字段为 `url`、`password`（提取码，留空表示无）、`platform`（缺省按链接识别）、
+`account_id`（缺省用平台主账号）、`season`、`episodes`（均支持整数、`S01` / `E01-E03`
+文本或列表）与 `user_intent`。成功响应的 `data` 包含 `files`（仅 `file_id`、`name`、
+`size`、`is_dir`、`parent_id`、`path`）、`selected_file_ids`（保持模型返回顺序）和
+`suggested_episode_selection`（可直接填入集数输入框的建议集数）。
+
+- 预选只是建议：端点不提交下载，用户需审阅或修改回填的集数后自行确认下载。
+- 分享文件树为空时不调用 AI；AI 不可用、超时或返回非法结果时降级为空预选。两种情况仍返回文件列表，用户可手动选择。
+- 单次最多把 200 个文件送入 AI，超出部分仍可手动选择；只有能解析出集数的选中文件才计入 `suggested_episode_selection`。
+- 响应只使用安全文件字段，不回显提取码、分享 token 或 Cookie；请求与响应都不包含账号凭据。
+
 ## 5. 组合业务调用
 
 以下是调用顺序指引。具体参数仍按各 operation 的 Schema 构造，不将顺序中的操作全部默认执行。
