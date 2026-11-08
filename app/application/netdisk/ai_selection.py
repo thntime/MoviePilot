@@ -36,7 +36,7 @@ DEFAULT_MAX_FILES = 200
 AI_SELECTION_TIMEOUT_SECONDS = 30
 # 显式季号标记：S01 / 第1季 / Season 1。裸数字不参与季号判断。
 _EXPLICIT_SEASON_PATTERN = re.compile(
-    r"[Ss]\d{1,3}|第\s*\d{1,3}\s*季|[Ss]eason\s*\d{1,3}", re.IGNORECASE
+    r"(?<![A-Za-z0-9])(?:[Ss]\d{1,3}|第\s*\d{1,3}\s*季|[Ss]eason\s*\d{1,3})", re.IGNORECASE
 )
 # 模型可能返回解释文本，只截取第一个 JSON 数组。
 _JSON_ARRAY_PATTERN = re.compile(r"\[.*?]", re.DOTALL)
@@ -95,7 +95,8 @@ async def select_share_files(
         logger.warning(f"网盘分享 AI 预选结果无法解析，降级为空预选：{error}")
         return ShareSelectionResult()
 
-    names = {candidate["file_id"]: candidate["name"] for candidate in candidates}
+    candidates_by_id = {candidate["file_id"]: candidate for candidate in candidates}
+    names = {file_id: candidate["name"] for file_id, candidate in candidates_by_id.items()}
     selected: list[str] = []
     seen: set[str] = set()
     for file_id in selected_ids:
@@ -106,8 +107,12 @@ async def select_share_files(
     if not selected:
         return ShareSelectionResult()
 
+    target_seasons = _normalize_seasons(season)
     numbers: list[int] = []
     for file_id in selected:
+        candidate = candidates_by_id[file_id]
+        if target_seasons and candidate.get("season") not in (None, *target_seasons):
+            continue
         numbers.extend(episode_numbers(names[file_id]))
     suggestion = compact_numbers(sorted(set(numbers))) if numbers else ""
     return ShareSelectionResult(
@@ -153,6 +158,7 @@ async def _invoke_selection_llm(template_context: dict[str, str]) -> str:
             output_callback=on_output,
             reply_mode=ReplyMode.CAPTURE_ONLY,
             allow_message_tools=False,
+            allow_tools=False,
         ),
         timeout=AI_SELECTION_TIMEOUT_SECONDS,
     )

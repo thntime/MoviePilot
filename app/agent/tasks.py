@@ -35,6 +35,7 @@ class AgentTaskOwner(AgentLifecycleOwner):
             output_callback: Optional[Callable[[str], None]] = None,
             reply_mode: ReplyMode = ReplyMode.CAPTURE_ONLY,
             allow_message_tools: Optional[bool] = None,
+            allow_tools: bool = True,
     ) -> None:
         """
         以独立后台会话执行一段 prompt。
@@ -58,6 +59,7 @@ class AgentTaskOwner(AgentLifecycleOwner):
                 reply_mode=reply_mode,
                 output_callback=output_callback,
                 allow_message_tools=allow_message_tools,
+                allow_tools=allow_tools,
                 wait_for_completion=True,
             )
         finally:

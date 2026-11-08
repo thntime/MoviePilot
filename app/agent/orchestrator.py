@@ -514,6 +514,7 @@ class MoviePilotAgent:
         original_chat_id: Optional[str] = None,
         replay_mode: ReplyMode = ReplyMode.DISPATCH,
         allow_message_tools: bool = True,
+        allow_tools: bool = True,
         output_callback: Optional[Callable[[str], None]] = None,
         protected_output_callback: Optional[Callable[[str], Optional[bool]]] = None,
         data: Optional[AgentDataContext] = None,
@@ -546,6 +547,7 @@ class MoviePilotAgent:
         self.original_chat_id = original_chat_id
         self.reply_mode = replay_mode
         self.allow_message_tools = allow_message_tools
+        self.allow_tools = allow_tools
         self.output_callback = output_callback
         self.protected_output_callback = protected_output_callback
         self._data = data
@@ -1274,15 +1276,26 @@ class MoviePilotAgent:
         if isinstance(body, dict):
             files = body.get("files")
             if isinstance(files, list):
+                dir_count = sum(
+                    1 for item in files if isinstance(item, dict) and item.get("is_dir")
+                )
                 names = []
                 for item in files[:3]:
                     if not isinstance(item, dict):
                         continue
                     name = _sanitize_netdisk_summary_text(item.get("name"))
                     if name:
+                        if item.get("is_dir"):
+                            name = f"[目录] {name}"
                         names.append(name)
                 suffix = f"（{'、'.join(names)}）" if names else ""
-                parts.append(f"{len(files)} 个文件{suffix}")
+                parts.append(f"{len(files)} 个条目{suffix}")
+                if dir_count:
+                    operation_id = str(arguments.get("operation_id") or "")
+                    if operation_id == "netdisk.files.delete":
+                        parts.append(f"其中 {dir_count} 个目录，删除目录将递归处理")
+                    else:
+                        parts.append(f"其中 {dir_count} 个目录")
             file_item = body.get("file")
             if isinstance(file_item, dict) and file_item.get("name"):
                 parts.append(f"文件 {_sanitize_netdisk_summary_text(file_item.get('name'))}")
@@ -1507,7 +1520,8 @@ class MoviePilotAgent:
             if permission_result:
                 return permission_result
             pending.tool.authorize_netdisk_write()
-            return await pending.tool.run_with_timeout(**pending.arguments)
+            result = await pending.tool.run_with_timeout(**pending.arguments)
+            return await self._reconcile_netdisk_delete(pending, result)
 
         policy = AgentPolicyMiddleware(
             context=self._build_policy_context(),
@@ -1532,6 +1546,67 @@ class MoviePilotAgent:
         if delivered:
             return "网盘写操作已执行，结果已私聊发送。"
         return "网盘写操作已执行，结果投递失败，请私聊查看。"
+
+    async def _reconcile_netdisk_delete(
+        self,
+        pending: _PendingSecretConfirmation,
+        result: str,
+    ) -> str:
+        """
+        删除成功后由宿主重新读取父目录，把外部实际状态附在结果中。
+
+        :param pending: 已确认的网盘写操作
+        :param result: 删除操作的原始结果
+        :return: 附带 reconciliation 的结果
+        """
+        arguments = pending.arguments
+        if str(arguments.get("operation_id") or "") != "netdisk.files.delete":
+            return result
+        path_params = arguments.get("path_params")
+        body = arguments.get("body")
+        account_id = path_params.get("account_id") if isinstance(path_params, dict) else None
+        files = body.get("files") if isinstance(body, dict) else None
+        if account_id is None or not isinstance(files, list):
+            return result
+        parent_ids: list[str] = []
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            parent_id = str(item.get("parent_id") or "")
+            if parent_id and parent_id not in parent_ids:
+                parent_ids.append(parent_id)
+        if not parent_ids:
+            return result
+        observations: dict[str, Any] = {}
+        for parent_id in parent_ids:
+            try:
+                observation = await pending.tool.run_with_timeout(
+                    operation_id="netdisk.files.list",
+                    path_params={"account_id": account_id},
+                    query={"parent_id": parent_id},
+                )
+                try:
+                    observations[parent_id] = json.loads(observation)
+                except (TypeError, ValueError):
+                    observations[parent_id] = {
+                        "success": False,
+                        "error": "invalid_reconcile_result",
+                        "raw": str(observation)[:500],
+                    }
+            except Exception as error:
+                observations[parent_id] = {
+                    "success": False,
+                    "error": "reconcile_failed",
+                    "message": f"{type(error).__name__}: {error}",
+                }
+        try:
+            payload = json.loads(result)
+        except (TypeError, ValueError):
+            payload = {"success": True, "result": result}
+        if not isinstance(payload, dict):
+            payload = {"success": True, "result": payload}
+        payload["reconciliation"] = observations
+        return json.dumps(payload, ensure_ascii=False)
 
     def _build_policy_context(self) -> ToolPolicyContext:
         """
@@ -1882,6 +1957,7 @@ class MoviePilotAgent:
             stream_handler=self.stream_handler,
             agent_context=self._tool_context,
             allow_message_tools=self.allow_message_tools,
+            allow_tools=self.allow_tools,
             data=self._data,
         ))
 
@@ -2063,6 +2139,8 @@ class MoviePilotAgent:
         """
         初始化子代理专用静默工具列表。
         """
+        if not self.allow_tools:
+            return []
         from app.agent.loader import get_tool_factory
 
         return list(get_tool_factory().create_tools(
@@ -2090,6 +2168,8 @@ class MoviePilotAgent:
         """
         初始化外部 MCP 工具列表。
         """
+        if not self.allow_tools:
+            return []
         return await create_external_mcp_tools(
             session_id=self.session_id,
             user_id=self.user_id or "",

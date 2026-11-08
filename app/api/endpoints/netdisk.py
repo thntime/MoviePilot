@@ -173,6 +173,8 @@ async def preview_share(
             payload.password or None,
             payload.platform,
             payload.account_id,
+            # 与下载链路 _MAX_WALK_DEPTH 保持一致，避免深层分享在预览阶段被截断。
+            max_depth=12,
         )
     except NetdiskError as error:
         return _error_response(error)

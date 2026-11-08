@@ -388,6 +388,7 @@ class SearchRecommendOwner(_SearchOwnerBase):
             output_callback=on_output,
             reply_mode=ReplyMode.CAPTURE_ONLY,
             allow_message_tools=False,
+            allow_tools=False,
         )
         return full_output[0].strip()
 

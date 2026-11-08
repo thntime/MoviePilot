@@ -45,7 +45,8 @@ operation or raw HTTP.
 ## Write Flow
 
 These operations change external state and MUST be confirmed by the user before
-execution:
+execution. Host confirmation is available on Web/WebAgent, Telegram, and Feishu;
+other channels fail closed without writing.
 
 - `netdisk.files.share` creates a share. Confirm the exact files/directories,
   expiration, and password behavior first.

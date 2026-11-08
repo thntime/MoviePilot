@@ -527,7 +527,8 @@ Emby、Jellyfin、Plex、Navidrome 的目录、条目、搜索、季集和活动
 Agent 操作；Agent 只使用脱敏的 `netdisk.accounts` 列表。
 
 四个写操作由宿主强制确认：内置 Agent 在执行前暂停本轮调用，用户必须明确确认；“取消”或超时
-丢弃该次调用，没有确认处理器的入口直接 fail closed。工具返回 `confirmation_required` 表示
+丢弃该次调用，没有确认处理器的入口直接 fail closed。确认与结果私聊投递当前支持 Web/WebAgent、
+Telegram、Feishu；其他交互渠道因无法建立私聊而 fail closed，不执行写入。工具返回 `confirmation_required` 表示
 未执行任何写入，不要绕过确认、改换账号或改用原始 HTTP 重试。外部 MCP 客户端不经过该内置
 确认流程，因此网盘写操作会以 `confirmation_required` 结束；需要写入时在内置 Agent 的交互入口
 完成。超时或结果未知时，先用对应的只读操作核验目标实际状态，再决定是否重试。

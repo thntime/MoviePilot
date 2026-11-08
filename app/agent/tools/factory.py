@@ -230,6 +230,7 @@ class MoviePilotToolFactory:
         stream_handler: Optional["StreamingHandler"] = None,
         agent_context: Optional[dict[str, object]] = None,
         allow_message_tools: bool = True,
+        allow_tools: bool = True,
         include_external_service_tools: bool = False,
         data: Optional[AgentDataContext] = None,
     ) -> List[MoviePilotTool]:
@@ -240,6 +241,8 @@ class MoviePilotToolFactory:
         `moviepilot_api` 结构化网关承载，只有宿主交互与 Agent 编排能力保留为
         原生工具。
         """
+        if not allow_tools:
+            return []
         tools = []
         tool_definitions = cls._get_builtin_tool_classes(channel)
         if include_external_service_tools:

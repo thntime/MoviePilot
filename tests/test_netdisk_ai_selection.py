@@ -133,6 +133,7 @@ async def test_select_share_files_maps_selected_ids_and_episodes(agent_env) -> N
     assert ShareSelectionResult(
         selected_file_ids=("f1", "f2"), suggested_episode_selection="1-2"
     ) == result
+    assert agent_env.manager.calls[0]["allow_tools"] is False
     assert 1 == len(agent_env.prompt.calls)
     task_type, template_context = agent_env.prompt.calls[0]
     assert "netdisk_share_select" == task_type
@@ -162,6 +163,24 @@ async def test_select_share_files_maps_selected_ids_and_episodes(agent_env) -> N
     from app.schemas.types import ReplyMode
 
     assert ReplyMode.CAPTURE_ONLY == call["reply_mode"]
+    assert call["allow_tools"] is False
+
+
+@pytest.mark.asyncio
+async def test_select_share_files_excludes_other_season_from_suggestion(agent_env) -> None:
+    """
+    目标季明确时，其他季的选中文件不进入集数建议。
+    """
+    agent_env.manager.output = '["f1", "f2"]'
+    files = [
+        _share_file("f1", "S01E01.mkv", path="S01/S01E01.mkv"),
+        _share_file("f2", "S02E02.mkv", path="S02/S02E02.mkv"),
+    ]
+
+    result = await select_share_files(files, season=2, episodes=[2])
+
+    assert ("f1", "f2") == result.selected_file_ids
+    assert "2" == result.suggested_episode_selection
 
 
 @pytest.mark.asyncio

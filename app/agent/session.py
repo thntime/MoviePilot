@@ -110,6 +110,7 @@ class _MessageTask:
     :param processing_status: 已建立的渠道处理中状态，供任务结束时收口
     :param reply_mode: 回复投递方式，默认通过渠道派发
     :param allow_message_tools: 是否允许本次 Agent 使用消息发送工具
+    :param allow_tools: 是否允许本次 Agent 使用工具；关闭时工具列表为空
     :param output_callback: 接收增量文本的同步回调；未提供时为 None
     :param tool_event_callback: 接收工具调用事件的同步回调；未提供时为 None
     :param protected_output_callback: 接收敏感输出的受保护回调，返回值表示是否接收；未提供时为 None
@@ -143,6 +144,7 @@ class _MessageTask:
     processing_status: Optional[dict[str, Any]] = None
     reply_mode: ReplyMode = ReplyMode.DISPATCH
     allow_message_tools: bool = True
+    allow_tools: bool = True
     output_callback: Optional[Callable[[str], None]] = None
     tool_event_callback: Optional[Callable[[dict[str, Any]], None]] = None
     protected_output_callback: Optional[Callable[[str], Optional[bool]]] = None
@@ -363,6 +365,7 @@ class AgentSessionOwner:
             original_chat_id: Optional[str] = None,
             reply_mode: ReplyMode = ReplyMode.DISPATCH,
             allow_message_tools: bool = True,
+            allow_tools: bool = True,
             output_callback: Optional[Callable[[str], None]] = None,
             tool_event_callback: Optional[Callable[[dict[str, Any]], None]] = None,
             protected_output_callback: Optional[Callable[[str], Optional[bool]]] = None,
@@ -400,6 +403,7 @@ class AgentSessionOwner:
             original_chat_id=original_chat_id,
             reply_mode=reply_mode,
             allow_message_tools=allow_message_tools,
+            allow_tools=allow_tools,
             output_callback=output_callback,
             tool_event_callback=tool_event_callback,
             protected_output_callback=protected_output_callback,
@@ -503,7 +507,7 @@ class AgentSessionOwner:
             return False
         identity_fields = (
             "user_id", "channel", "source", "original_chat_id", "is_channel_admin",
-            "reply_mode", "allow_message_tools",
+            "reply_mode", "allow_message_tools", "allow_tools",
         )
         if any(getattr(active, name) != getattr(task, name) for name in identity_fields):
             return False
@@ -763,6 +767,7 @@ class AgentSessionOwner:
                     original_chat_id=task.original_chat_id,
                     replay_mode=task.reply_mode,
                     allow_message_tools=task.allow_message_tools,
+                    allow_tools=task.allow_tools,
                     output_callback=task.output_callback,
                     protected_output_callback=task.protected_output_callback,
                     data=self._data,
@@ -791,6 +796,8 @@ class AgentSessionOwner:
                 if task.message_callback is not None:
                     agent_kwargs["message_callback"] = task.message_callback
                 agent = task.agent_factory(**agent_kwargs)
+                if hasattr(agent, "allow_tools"):
+                    agent.allow_tools = task.allow_tools
             self.active_agents[session_id] = agent
         else:
             agent = self.active_agents[session_id]
@@ -804,6 +811,8 @@ class AgentSessionOwner:
             agent.original_chat_id = task.original_chat_id
             agent.reply_mode = task.reply_mode
             agent.allow_message_tools = task.allow_message_tools
+            if hasattr(agent, "allow_tools"):
+                agent.allow_tools = task.allow_tools
             if hasattr(agent, "set_output_callback"):
                 agent.set_output_callback(task.output_callback)
             else:

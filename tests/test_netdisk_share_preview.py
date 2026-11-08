@@ -90,9 +90,15 @@ def api(monkeypatch: pytest.MonkeyPatch):
         """
         记录解析入参并返回预置文件树。
         """
-        del self, kwargs
+        del self
         state.walk_calls.append(
-            {"url": url, "password": password, "platform": platform, "account_id": account_id}
+            {
+                "url": url,
+                "password": password,
+                "platform": platform,
+                "account_id": account_id,
+                "max_depth": kwargs.get("max_depth"),
+            }
         )
         if state.error is not None:
             raise state.error
@@ -152,6 +158,7 @@ def test_preview_returns_files_and_ai_selection(api):
             "password": "9527",
             "platform": None,
             "account_id": None,
+            "max_depth": 12,
         }
     ]
     assert api.state.select_calls[0]["season"] == 1

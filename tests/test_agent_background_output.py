@@ -906,6 +906,7 @@ class TestAgentBackgroundOutput:
             captured["message"] = task.message
             captured["reply_mode"] = task.reply_mode
             captured["allow_message_tools"] = task.allow_message_tools
+            captured["allow_tools"] = task.allow_tools
             captured["user_id"] = task.user_id
 
         manager._process_message_internal = fake_process
@@ -922,4 +923,30 @@ class TestAgentBackgroundOutput:
         assert captured["message"] == "background task"
         assert captured["reply_mode"] == ReplyMode.CAPTURE_ONLY
         assert captured["allow_message_tools"] is False
+        assert captured["allow_tools"] is True
         assert captured["user_id"] == SYSTEM_INTERNAL_USER_ID
+
+    async def test_run_background_prompt_can_disable_all_tools(self):
+        """
+        后台预选等任务可以显式关闭全部工具，避免文件名提示注入触发工具。
+        """
+        captured = {}
+        manager = AgentManager()
+
+        async def fake_process(task):
+            """
+            捕获后台参数而不触发真实 Agent 推理。
+            """
+            captured["allow_tools"] = task.allow_tools
+
+        manager._process_message_internal = fake_process
+        await manager.initialize()
+        try:
+            await manager.run_background_prompt(
+                message="background task",
+                allow_tools=False,
+            )
+        finally:
+            await manager.close()
+
+        assert captured["allow_tools"] is False

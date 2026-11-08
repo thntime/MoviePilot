@@ -1086,6 +1086,19 @@ def _netdisk_arguments(operation_id: str) -> dict:
     return arguments
 
 
+def test_create_tools_can_disable_all_tools() -> None:
+    """
+    后台预选等任务可以要求工具工厂返回空列表。
+    """
+    from app.agent.loader import get_tool_factory
+
+    assert get_tool_factory().create_tools(
+        session_id="session-1",
+        user_id="1",
+        allow_tools=False,
+    ) == []
+
+
 def test_netdisk_admin_read_is_enforced_safe_read_and_executes_without_confirmation() -> None:
     """
     管理员读取网盘目录解析为强制执行的安全读取，直接执行且不要求确认。
@@ -1358,6 +1371,30 @@ def test_netdisk_confirmation_control_executes_once() -> None:
     executor.execute.assert_awaited_once()
 
 
+def test_netdisk_delete_confirmation_reconciles_parent_directory() -> None:
+    """
+    删除确认后重新读取父目录，并把外部实际状态附在结果中。
+    """
+    executor = AsyncMock()
+    executor.execute.side_effect = [
+        json.dumps({"success": True, "data": {}}),
+        json.dumps({"success": True, "data": {"files": []}}),
+    ]
+    tool = _netdisk_write_tool(executor)
+    agent = _netdisk_confirmation_agent()
+    arguments = _netdisk_arguments("netdisk.files.delete")
+    arguments["body"]["files"][0]["parent_id"] = "parent-6421"
+
+    asyncio.run(agent._register_netdisk_write_confirmation(tool, arguments))
+    result = asyncio.run(agent._handle_secret_confirmation_control("确认", None, None, False))
+
+    payload = json.loads(result)
+    assert payload["success"] is True
+    assert "parent-6421" in payload["reconciliation"]
+    assert executor.execute.await_count == 2
+    assert executor.execute.await_args_list[1].args[0] == "netdisk.files.list"
+
+
 def test_netdisk_confirmation_control_cancel_does_not_execute() -> None:
     """
     用户取消后丢弃待确认调用，不执行任何网盘写入。
@@ -1440,6 +1477,21 @@ def test_netdisk_confirmation_prompt_redacts_urls_and_never_echoes_password() ->
     assert "https://example.invalid" not in prompt
     assert "abcd" not in prompt
     assert str(_NETDISK_ACCOUNT_ID) in prompt
+
+
+def test_netdisk_delete_confirmation_marks_directories_and_recursion() -> None:
+    """
+    删除目录的确认摘要必须标明目录与递归语义。
+    """
+    arguments = _netdisk_arguments("netdisk.files.delete")
+    arguments["body"]["files"] = [
+        {"file_id": "dir-1", "name": "Season 1", "is_dir": True, "parent_id": "parent-1"}
+    ]
+
+    prompt = _netdisk_confirmation_agent()._netdisk_write_target_summary(arguments)
+
+    assert "[目录]" in prompt
+    assert "递归" in prompt
 
 
 def _telegram_confirmation_agent() -> agent_module.MoviePilotAgent:

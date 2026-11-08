@@ -234,6 +234,7 @@ async def test_invoke_recommend_llm_disables_output_message_persistence() -> Non
     assert "[0, 2]" == result
     assert ReplyMode.CAPTURE_ONLY == captured["reply_mode"]
     assert not captured["allow_message_tools"]
+    assert captured["allow_tools"] is False
 
 
 @pytest.mark.usefixtures("_isolate_recommend_tasks")
