@@ -16,7 +16,6 @@ NETDISK_SKILL = PROJECT_ROOT / "skills/netdisk-operation/SKILL.md"
 NETDISK_READ_ROUTES = {
     "netdisk.platforms": ("GET", "/api/v1/netdisk/platforms"),
     "netdisk.accounts": ("GET", "/api/v1/netdisk/accounts"),
-    "netdisk.account": ("GET", "/api/v1/netdisk/accounts/{account_id}"),
     "netdisk.files.capabilities": ("GET", "/api/v1/netdisk/files/{account_id}/capabilities"),
     "netdisk.files.quota": ("GET", "/api/v1/netdisk/files/{account_id}/quota"),
     "netdisk.files.list": ("GET", "/api/v1/netdisk/files/{account_id}/list"),
@@ -81,7 +80,7 @@ def test_netdisk_write_operations_use_fixed_routes() -> None:
 
 def test_netdisk_operation_skill_declares_registered_operations() -> None:
     """
-    网盘操作技能只声明已注册的十个操作，并说明宿主确认与删除边界。
+    网盘操作技能只声明已注册的九个操作，并说明宿主确认与删除边界。
     """
     content = NETDISK_SKILL.read_text(encoding="utf-8")
     metadata = parse_skill_metadata(content, str(NETDISK_SKILL), "netdisk-operation")
@@ -95,7 +94,7 @@ def test_netdisk_operation_skill_declares_registered_operations() -> None:
         for operation_id in API_OPERATION_ROUTES
         if operation_id.startswith("netdisk.")
     }
-    assert len(declared) == 10
+    assert len(declared) == 9
     assert set(declared) == expected
     assert registered_netdisk == set(declared)
 

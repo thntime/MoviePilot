@@ -54,8 +54,8 @@ def test_api_operation_registry_matches_migration_batches() -> None:
     assert len(API_MUSIC_OPERATION_SPECS) == 10
     assert len(API_SYSTEM_OPERATION_SPECS) == 7
     assert len(API_EXTENDED_OPERATION_SPECS) == 145
-    assert len(API_NETDISK_OPERATION_SPECS) == 10
-    assert len(API_OPERATION_SPECS) == 243
+    assert len(API_NETDISK_OPERATION_SPECS) == 9
+    assert len(API_OPERATION_SPECS) == 242
     assert {spec.operation_id for spec in API_OPERATION_SPECS} == set(API_OPERATION_ROUTES)
     assert {
         "download.list",
@@ -102,7 +102,6 @@ def test_netdisk_read_operations_are_admin_scoped_and_private() -> None:
     read_ids = {
         "netdisk.platforms",
         "netdisk.accounts",
-        "netdisk.account",
         "netdisk.files.capabilities",
         "netdisk.files.quota",
         "netdisk.files.list",
@@ -119,6 +118,14 @@ def test_netdisk_read_operations_are_admin_scoped_and_private() -> None:
             else ResultSensitivity.PRIVATE
         )
         assert spec.result_sensitivity is expected, operation_id
+
+
+def test_netdisk_account_detail_is_not_agent_visible() -> None:
+    """
+    账号详情接口返回编辑回填明文凭据，不能注册为 Agent 操作。
+    """
+    assert "netdisk.account" not in API_OPERATION_ROUTES
+    assert all(spec.operation_id != "netdisk.account" for spec in API_OPERATION_SPECS)
 
 
 def test_netdisk_write_operations_require_admin_confirmation() -> None:

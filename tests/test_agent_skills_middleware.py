@@ -188,7 +188,7 @@ async def test_bundled_moviepilot_api_skill_loads_complete_contract() -> None:
     assert payload["content_limit_bytes"] == MAX_SKILL_CONTENT_BYTES
     assert payload["truncated"] is False
     assert payload["truncation_message"] is None
-    assert len(payload["skill"]["allowed_api_operations"]) == 243
+    assert len(payload["skill"]["allowed_api_operations"]) == 242
     assert "## API Category Index" in payload["content"]
     assert "### `workflow.update`" not in payload["content"]
     assert "api/workflow.md" in payload["supporting_files"]
@@ -224,7 +224,6 @@ def test_netdisk_operation_skill_parses() -> None:
     assert metadata["allowed_api_operations"] == [
         "netdisk.platforms",
         "netdisk.accounts",
-        "netdisk.account",
         "netdisk.files.capabilities",
         "netdisk.files.quota",
         "netdisk.files.list",

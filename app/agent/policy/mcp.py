@@ -55,7 +55,6 @@ OPERATION_DESCRIPTIONS = {
     "music.cache.get": "查看仅管理员可访问的 MusicBrainz 识别缓存及统计数量。",
     "music.explore": "浏览 MusicBrainz 榜单和新发行，或豆瓣音乐标签分类。",
     "music.recognize": "按精确音乐来源及其原生标识解析一首录音或一张专辑。",
-    "netdisk.account": "读取一个网盘账号的详情；管理员专用，结果包含脱敏账号信息。",
     "netdisk.accounts": "列出网盘账号的脱敏信息；管理员专用，结果包含账号私密标识与配额状态。",
     "netdisk.files.capabilities": "查询指定账号对应平台支持的个人盘能力；管理员专用，结果关联具体账号。",
     "netdisk.files.delete": "删除指定账号的个人盘文件，平台侧无法本地回滚；管理员专用，需要确认。",

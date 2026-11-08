@@ -9,7 +9,7 @@ description: >-
   arbitrary HTTP, URLs, credentials, Cookies, or tokens.
 allowed-tools: moviepilot_api
 allowed-api-operations: >-
-  netdisk.platforms netdisk.accounts netdisk.account netdisk.files.capabilities
+  netdisk.platforms netdisk.accounts netdisk.files.capabilities
   netdisk.files.quota netdisk.files.list netdisk.files.share netdisk.files.move
   netdisk.files.rename netdisk.files.delete
 ---
@@ -30,8 +30,9 @@ channel or public place.
 
 1. `netdisk.platforms` lists the configured netdisk platforms and their support
    flags.
-2. `netdisk.accounts` lists accounts without secrets; `netdisk.account` reads one
-   exact account. Reuse the returned identifiers verbatim in later calls.
+2. `netdisk.accounts` lists accounts without secrets. Reuse the returned identifiers
+   verbatim in later calls. The account detail endpoint is not exposed to the Agent
+   because it returns edit-only plaintext credentials.
 3. `netdisk.files.capabilities` reports which file operations the target
    platform/account supports; `netdisk.files.quota` reads its quota.
 4. `netdisk.files.list` browses one directory. Pass the platform, account, and

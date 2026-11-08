@@ -4,14 +4,6 @@ Netdisk platform discovery, account inspection, read-only drive browsing, and co
 
 ## Operations
 
-### `netdisk.account`
-`GET /api/v1/netdisk/accounts/{account_id}`; policy effect: `safe_read`.
-Purpose: 读取一个网盘账号的详情；管理员专用，结果包含脱敏账号信息。
-Identity scope: `admin`; required role: `system_admin`.
-- `path_params`: `account_id*` (integer): 网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。
-- `query`: none
-- `body`: none
-
 ### `netdisk.accounts`
 `GET /api/v1/netdisk/accounts`; policy effect: `safe_read`.
 Purpose: 列出网盘账号的脱敏信息；管理员专用，结果包含账号私密标识与配额状态。
@@ -34,7 +26,7 @@ Purpose: 删除指定账号的个人盘文件，平台侧无法本地回滚；�
 Identity scope: `admin`; required role: `system_admin`.
 - `path_params`: `account_id*` (integer): 网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。
 - `query`: none
-- `body`: `files*` (array<NetdiskDriveFileModel>; minimum items `1`): 历史记录保存的序列化文件列表。
+- `body`: `files*` (array<NetdiskDriveFileModel>; minimum items `1`): 要删除的个人盘文件列表；条目来自 netdisk.files.list 的浏览结果。
 
 ### `netdisk.files.list`
 `GET /api/v1/netdisk/files/{account_id}/list`; policy effect: `safe_read`.
@@ -50,7 +42,7 @@ Purpose: 把指定账号的个人盘文件移动到目标目录；管理员专�
 Identity scope: `admin`; required role: `system_admin`.
 - `path_params`: `account_id*` (integer): 网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。
 - `query`: none
-- `body`: `files*` (array<NetdiskDriveFileModel>; minimum items `1`): 历史记录保存的序列化文件列表。; `target_id*` (string): 目标目录标识
+- `body`: `files*` (array<NetdiskDriveFileModel>; minimum items `1`): 要移动的个人盘文件列表；条目来自 netdisk.files.list 的浏览结果。; `target_id*` (string): 目标目录标识
 
 ### `netdisk.files.quota`
 `GET /api/v1/netdisk/files/{account_id}/quota`; policy effect: `safe_read`.
@@ -66,7 +58,7 @@ Purpose: 重命名指定账号的一个个人盘文件；管理员专用，需�
 Identity scope: `admin`; required role: `system_admin`.
 - `path_params`: `account_id*` (integer): 网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。
 - `query`: none
-- `body`: `file*` (NetdiskDriveFileModel): 待操作的个人盘文件或目录条目；file_id 与 name 由浏览目录结果提供。; `name*` (string; minimum length `1`): 站点、存储项目、订阅或规则组的可读名称。
+- `body`: `file*` (NetdiskDriveFileModel): 待操作的个人盘文件或目录条目；file_id 与 name 由浏览目录结果提供。; `name*` (string; minimum length `1`): 新的文件名，不包含路径。
 
 ### `netdisk.files.share`
 `POST /api/v1/netdisk/files/{account_id}/share`; policy effect: `external_side_effect`.
@@ -74,7 +66,7 @@ Purpose: 为指定账号的个人盘文件创建分享链接；管理员专用�
 Identity scope: `admin`; required role: `system_admin`.
 - `path_params`: `account_id*` (integer): 网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。
 - `query`: none
-- `body`: `expires_in` (integer; default `0`): 有效期秒数，0 为平台默认; `files*` (array<NetdiskDriveFileModel>; minimum items `1`): 历史记录保存的序列化文件列表。; `password` (string; default ``): 提取码，留空由平台决定
+- `body`: `expires_in` (integer; default `0`): 有效期秒数，0 为平台默认; `files*` (array<NetdiskDriveFileModel>; minimum items `1`): 要分享的个人盘文件列表；条目来自 netdisk.files.list 的浏览结果。; `password` (string; default ``): 提取码，留空由平台决定
 
 ### `netdisk.platforms`
 `GET /api/v1/netdisk/platforms`; policy effect: `safe_read`.

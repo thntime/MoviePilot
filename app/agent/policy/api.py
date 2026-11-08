@@ -660,7 +660,6 @@ API_EXTENDED_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
 API_NETDISK_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
     _admin_read("netdisk.platforms"),
     _admin_read("netdisk.accounts", sensitivity=ResultSensitivity.PRIVATE),
-    _admin_read("netdisk.account", sensitivity=ResultSensitivity.PRIVATE),
     _admin_read("netdisk.files.capabilities", sensitivity=ResultSensitivity.PRIVATE),
     _admin_read("netdisk.files.quota", sensitivity=ResultSensitivity.PRIVATE),
     _admin_read("netdisk.files.list", sensitivity=ResultSensitivity.PRIVATE),
@@ -765,7 +764,6 @@ API_OPERATION_ROUTES: dict[str, ApiOperationRoute] = {
     "config.identifiers.update": ApiOperationRoute("POST", "/api/v1/system/identifiers"),
     "netdisk.platforms": ApiOperationRoute("GET", "/api/v1/netdisk/platforms"),
     "netdisk.accounts": ApiOperationRoute("GET", "/api/v1/netdisk/accounts"),
-    "netdisk.account": ApiOperationRoute("GET", "/api/v1/netdisk/accounts/{account_id}"),
     "netdisk.files.capabilities": ApiOperationRoute(
         "GET", "/api/v1/netdisk/files/{account_id}/capabilities"
     ),

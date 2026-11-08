@@ -59,7 +59,9 @@ class NetdiskShareRequest(BaseModel):
     创建分享的请求体。
     """
 
-    files: list[NetdiskDriveFileModel] = Field(..., min_length=1)
+    files: list[NetdiskDriveFileModel] = Field(
+        ..., min_length=1, description="要分享的个人盘文件列表；条目来自 netdisk.files.list 的浏览结果。"
+    )
     password: str = Field("", description="提取码，留空由平台决定")
     expires_in: int = Field(0, description="有效期秒数，0 为平台默认")
 
@@ -69,7 +71,9 @@ class NetdiskMoveRequest(BaseModel):
     移动文件的请求体。
     """
 
-    files: list[NetdiskDriveFileModel] = Field(..., min_length=1)
+    files: list[NetdiskDriveFileModel] = Field(
+        ..., min_length=1, description="要移动的个人盘文件列表；条目来自 netdisk.files.list 的浏览结果。"
+    )
     target_id: str = Field(..., description="目标目录标识")
 
 
@@ -79,7 +83,7 @@ class NetdiskRenameRequest(BaseModel):
     """
 
     file: NetdiskDriveFileModel
-    name: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1, description="新的文件名，不包含路径。")
 
 
 class NetdiskDeleteRequest(BaseModel):
@@ -87,4 +91,6 @@ class NetdiskDeleteRequest(BaseModel):
     删除请求体。
     """
 
-    files: list[NetdiskDriveFileModel] = Field(..., min_length=1)
+    files: list[NetdiskDriveFileModel] = Field(
+        ..., min_length=1, description="要删除的个人盘文件列表；条目来自 netdisk.files.list 的浏览结果。"
+    )

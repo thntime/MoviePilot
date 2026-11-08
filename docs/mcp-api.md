@@ -518,11 +518,13 @@ Emby、Jellyfin、Plex、Navidrome 的目录、条目、搜索、季集和活动
 
 ### 4.5 网盘操作
 
-内置 Agent 的 `netdisk-operation` 技能只授权十个 `moviepilot_api` 操作：只读的
-`netdisk.platforms`、`netdisk.accounts`、`netdisk.account`、`netdisk.files.capabilities`、
+内置 Agent 的 `netdisk-operation` 技能只授权九个 `moviepilot_api` 操作：只读的
+`netdisk.platforms`、`netdisk.accounts`、`netdisk.files.capabilities`、
 `netdisk.files.quota`、`netdisk.files.list`，以及写操作 `netdisk.files.share`、
 `netdisk.files.move`、`netdisk.files.rename`、`netdisk.files.delete`。这些操作均为管理员操作，
-执行账号需具备系统管理员权限；只读操作通过授权后直接执行。
+执行账号需具备系统管理员权限；只读操作通过授权后直接执行。账号详情端点
+`GET /api/v1/netdisk/accounts/{account_id}` 会返回编辑回填用的明文凭据，因此不注册为
+Agent 操作；Agent 只使用脱敏的 `netdisk.accounts` 列表。
 
 四个写操作由宿主强制确认：内置 Agent 在执行前暂停本轮调用，用户必须明确确认；“取消”或超时
 丢弃该次调用，没有确认处理器的入口直接 fail closed。工具返回 `confirmation_required` 表示

@@ -2944,7 +2944,7 @@
       "description": "删除个人盘文件的请求，可一次提交多个文件或目录。",
       "properties": {
         "files": {
-          "description": "历史记录保存的序列化文件列表。",
+          "description": "要删除的个人盘文件列表；条目来自 netdisk.files.list 的浏览结果。",
           "items": {
             "$ref": "#/$defs/NetdiskDriveFileModel"
           },
@@ -3014,7 +3014,7 @@
       "description": "移动个人盘文件的请求，指定目标目录标识。",
       "properties": {
         "files": {
-          "description": "历史记录保存的序列化文件列表。",
+          "description": "要移动的个人盘文件列表；条目来自 netdisk.files.list 的浏览结果。",
           "items": {
             "$ref": "#/$defs/NetdiskDriveFileModel"
           },
@@ -3043,7 +3043,7 @@
           "description": "待操作的个人盘文件或目录条目；file_id 与 name 由浏览目录结果提供。"
         },
         "name": {
-          "description": "站点、存储项目、订阅或规则组的可读名称。",
+          "description": "新的文件名，不包含路径。",
           "minLength": 1,
           "title": "Name",
           "type": "string"
@@ -3066,7 +3066,7 @@
           "type": "integer"
         },
         "files": {
-          "description": "历史记录保存的序列化文件列表。",
+          "description": "要分享的个人盘文件列表；条目来自 netdisk.files.list 的浏览结果。",
           "items": {
             "$ref": "#/$defs/NetdiskDriveFileModel"
           },
@@ -10419,38 +10419,6 @@
     },
     {
       "additionalProperties": false,
-      "description": "读取一个网盘账号的详情；管理员专用，结果包含脱敏账号信息。请求方法：GET；路径：/api/v1/netdisk/accounts/{account_id}。操作效果：safe_read；身份范围：admin。所需角色：system_admin。",
-      "properties": {
-        "operation_id": {
-          "const": "netdisk.account",
-          "description": "白名单中的精确操作标识，用于选择对应 oneOf 分支。",
-          "type": "string"
-        },
-        "path_params": {
-          "additionalProperties": false,
-          "description": "netdisk.account 的资源标识参数。读取一个网盘账号的详情；管理员专用，结果包含脱敏账号信息。仅使用下列已声明字段。",
-          "properties": {
-            "account_id": {
-              "description": "网盘账号的稳定持久化标识；先通过 netdisk.accounts 获取。",
-              "title": "Account Id",
-              "type": "integer"
-            }
-          },
-          "required": [
-            "account_id"
-          ],
-          "type": "object"
-        }
-      },
-      "required": [
-        "operation_id",
-        "path_params"
-      ],
-      "title": "netdisk.account",
-      "type": "object"
-    },
-    {
-      "additionalProperties": false,
       "description": "列出网盘账号的脱敏信息；管理员专用，结果包含账号私密标识与配额状态。请求方法：GET；路径：/api/v1/netdisk/accounts。操作效果：safe_read；身份范围：admin。所需角色：system_admin。",
       "properties": {
         "operation_id": {
@@ -17686,7 +17654,6 @@
         "music.cache.get",
         "music.explore",
         "music.recognize",
-        "netdisk.account",
         "netdisk.accounts",
         "netdisk.files.capabilities",
         "netdisk.files.delete",
