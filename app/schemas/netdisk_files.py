@@ -18,6 +18,7 @@ class NetdiskDriveFileModel(BaseModel):
     is_dir: bool = Field(False, description="是否目录")
     updated_at: Optional[str] = Field(default=None, description="修改时间")
     parent_id: str = Field("", description="父目录标识")
+    path: str = Field("", description="分享内相对路径；个人盘条目为空")
 
 
 class NetdiskDriveQuotaModel(BaseModel):

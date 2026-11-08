@@ -21,9 +21,11 @@ from app.api.principal import ApiPrincipal
 from app.api.response import ResponseAPIRouter
 from app.application.netdisk import registry, selection
 from app.application.netdisk.accounts import NetdiskAccountService
+from app.application.netdisk.ai_selection import select_share_files
 from app.application.netdisk.contract import NetdiskAccountDetail, NetdiskAccountView
 from app.application.netdisk.login import NetdiskLoginService
-from app.domain.netdisk import NetdiskError, NetdiskErrorCode
+from app.application.netdisk.resolve import NetdiskResolveService
+from app.domain.netdisk import NetdiskError, NetdiskErrorCode, ShareFile
 from app.schemas.netdisk import (
     NetdiskAccountDetailView,
     NetdiskData,
@@ -34,9 +36,11 @@ from app.schemas.netdisk import (
     NetdiskPasswordRequest,
     NetdiskQrInputRequest,
     NetdiskQrStartRequest,
+    NetdiskSharePreviewRequest,
     NetdiskSmsLoginRequest,
     NetdiskSmsSendRequest,
 )
+from app.schemas.netdisk_files import NetdiskDriveFileModel
 from app.schemas.response import Response as _SchemaResponse
 
 router = ResponseAPIRouter()
@@ -75,6 +79,23 @@ def _account_detail_view(detail: NetdiskAccountDetail) -> NetdiskAccountDetailVi
     payload = _account_view(detail.account)
     payload.credential = dict(detail.credential)
     return payload
+
+
+def _share_file_model(item: ShareFile) -> NetdiskDriveFileModel:
+    """
+    把分享文件条目转换为接口响应；不输出平台条目令牌。
+
+    :param item: 分享文件条目
+    :return: 接口响应模型
+    """
+    return NetdiskDriveFileModel(
+        file_id=item.file_id,
+        name=item.name,
+        size=item.size,
+        is_dir=item.is_dir,
+        parent_id=item.parent_id,
+        path=item.path,
+    )
 
 
 def _error_response(error: NetdiskError) -> _SchemaResponse[NetdiskData]:
@@ -133,6 +154,49 @@ async def list_platforms(
             )
         )
     return _SchemaResponse(success=True, data=NetdiskData(platforms=platforms))
+
+
+@router.post("/share/preview", summary="预览分享文件并生成 AI 预选")
+async def preview_share(
+    payload: NetdiskSharePreviewRequest,
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> _SchemaResponse[NetdiskData]:
+    """
+    展开分享文件树并让 AI 预选目标季集，结果只作为建议，不发起下载。
+
+    AI 不可用、超时或返回空结果时降级为空预选，仍返回文件列表供用户手动选择。
+    """
+    try:
+        resolved = await run_in_threadpool(
+            NetdiskResolveService().walk,
+            payload.url,
+            payload.password or None,
+            payload.platform,
+            payload.account_id,
+        )
+    except NetdiskError as error:
+        return _error_response(error)
+    files = list(resolved.files)
+    if not files:
+        return _SchemaResponse(
+            success=True,
+            message="分享内没有可选择的文件",
+            data=NetdiskData(),
+        )
+    result = await select_share_files(
+        files,
+        season=payload.season,
+        episodes=payload.episodes,
+        user_intent=payload.user_intent,
+    )
+    return _SchemaResponse(
+        success=True,
+        data=NetdiskData(
+            files=[_share_file_model(item) for item in files],
+            selected_file_ids=list(result.selected_file_ids),
+            suggested_episode_selection=result.suggested_episode_selection,
+        ),
+    )
 
 
 @router.get("/accounts", summary="查询网盘账号")

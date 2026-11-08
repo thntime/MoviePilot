@@ -2,7 +2,7 @@
 网盘账号与登录接口的请求模型。
 """
 
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -115,6 +115,26 @@ class NetdiskAccountUpdateRequest(BaseModel):
     cookie: Optional[str] = Field(default=None, description="新的 Cookie 或令牌，留空表示不修改")
 
 
+class NetdiskSharePreviewRequest(BaseModel):
+    """
+    分享文件 AI 预选预览的请求体。
+
+    只传分享链接与提取码，不接收或回显账号凭据。
+    """
+
+    url: str = Field(..., description="分享链接")
+    password: str = Field("", description="分享提取码，留空表示无提取码")
+    platform: Optional[str] = Field(default=None, description="网盘平台标识；缺省时按链接识别")
+    account_id: Optional[int] = Field(default=None, description="指定取链账号，缺省使用平台主账号")
+    season: Optional[Union[int, str, list[int]]] = Field(
+        default=None, description="目标季号，支持整数、S01 文本或季号列表"
+    )
+    episodes: Optional[Union[int, str, list[int]]] = Field(
+        default=None, description="目标集数，支持整数、E01-E03 文本或集数列表"
+    )
+    user_intent: str = Field("", description="用户自然语言意图，作为预选补充")
+
+
 class NetdiskPlatformInfo(BaseModel):
     """
     网盘平台能力与登录方式描述。
@@ -190,6 +210,12 @@ class NetdiskData(BaseModel):
     code: Optional[str] = Field(default=None, description="错误分类")
     account_name: Optional[str] = Field(default=None, description="相关账号名称")
     files: list[NetdiskDriveFileModel] = Field(default_factory=list, description="目录条目")
+    selected_file_ids: list[str] = Field(
+        default_factory=list, description="AI 预选中的文件标识，保持模型返回顺序"
+    )
+    suggested_episode_selection: str = Field(
+        "", description="由 AI 预选文件压缩出的建议集数，可直接填入集数输入框"
+    )
     quota: Optional[NetdiskDriveQuotaModel] = Field(default=None, description="空间配额")
     share: Optional[NetdiskDriveShareModel] = Field(default=None, description="分享结果")
     capabilities: Optional[NetdiskDriveCapabilitiesModel] = Field(default=None, description="个人盘能力")
