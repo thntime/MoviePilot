@@ -8,10 +8,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any, Optional
 
 from app.domain.episode import (
@@ -30,6 +32,12 @@ SYSTEM_TASK = "netdisk_share_select"
 SESSION_PREFIX = "__agent_netdisk_share_select"
 # 单次分享参与 AI 预选的文件数量上限。
 DEFAULT_MAX_FILES = 200
+# 单次预选的后台调用硬超时；模型挂起时按失败降级，避免阻塞手动下载。
+AI_SELECTION_TIMEOUT_SECONDS = 30
+# 显式季号标记：S01 / 第1季 / Season 1。裸数字不参与季号判断。
+_EXPLICIT_SEASON_PATTERN = re.compile(
+    r"[Ss]\d{1,3}|第\s*\d{1,3}\s*季|[Ss]eason\s*\d{1,3}", re.IGNORECASE
+)
 # 模型可能返回解释文本，只截取第一个 JSON 数组。
 _JSON_ARRAY_PATTERN = re.compile(r"\[.*?]", re.DOTALL)
 
@@ -115,6 +123,7 @@ async def _invoke_selection_llm(template_context: dict[str, str]) -> str:
     :param template_context: 提示词模板上下文
     :return: 模型最终输出文本
     :raises RuntimeError: 智能助手服务未运行时抛出
+    :raises asyncio.TimeoutError: 后台调用超过硬超时时抛出
     """
     from app.application.agent import get_prompt_manager, get_running_agent_manager
     from app.schemas.types import ReplyMode
@@ -137,12 +146,15 @@ async def _invoke_selection_llm(template_context: dict[str, str]) -> str:
         """
         full_output[0] = text
 
-    await manager.run_background_prompt(
-        message=prompt,
-        session_prefix=SESSION_PREFIX,
-        output_callback=on_output,
-        reply_mode=ReplyMode.CAPTURE_ONLY,
-        allow_message_tools=False,
+    await asyncio.wait_for(
+        manager.run_background_prompt(
+            message=prompt,
+            session_prefix=SESSION_PREFIX,
+            output_callback=on_output,
+            reply_mode=ReplyMode.CAPTURE_ONLY,
+            allow_message_tools=False,
+        ),
+        timeout=AI_SELECTION_TIMEOUT_SECONDS,
     )
     return full_output[0].strip()
 
@@ -182,16 +194,26 @@ def _build_candidates(
 
 def _season_of(item: ShareFile, path: str) -> Optional[int]:
     """
-    从相对路径或文件名解析季号线索。
+    从相对路径解析季号线索，文件名中的显式季号优先于目录名。
+
+    文件名只认显式季号标记（`S01`/`第1季`/`Season 1`），裸数字不当作季号；目录段
+    反向查找，先认显式标记，再接受 1-99 的纯数字目录。与下载链的季号判定保持一致。
 
     :param item: 分享文件条目
     :param path: 已规范化的相对路径
     :return: 季号；无法识别时返回 None
     """
-    season = parse_season_number(path)
-    if season is None:
-        season = parse_season_number(item.name)
-    return season
+    relative = PurePosixPath(path or item.name or "")
+    matched = _EXPLICIT_SEASON_PATTERN.search(relative.name)
+    if matched:
+        return parse_season_number(matched.group(0))
+    for part in reversed(relative.parent.parts):
+        matched = _EXPLICIT_SEASON_PATTERN.search(part)
+        if matched:
+            return parse_season_number(matched.group(0))
+        if part.isdigit() and 0 < int(part) <= 99:
+            return int(part)
+    return None
 
 
 def _target_text(season: object, episodes: object, user_intent: str) -> str:

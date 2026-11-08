@@ -2,6 +2,7 @@
 验证网盘分享的 AI 预选服务：候选构造、模型输出校验与降级行为。
 """
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -48,8 +49,9 @@ class _FakeAgentManager:
     """
 
     def __init__(self, output: str = "[]") -> None:
-        """初始化回放输出与空的调用记录。"""
+        """初始化回放输出、模拟延迟与空的调用记录。"""
         self.output = output
+        self.delay = 0.0
         self.error = None
         self.calls = []
 
@@ -60,6 +62,8 @@ class _FakeAgentManager:
         :param kwargs: 后台任务调用参数
         """
         self.calls.append(kwargs)
+        if self.delay:
+            await asyncio.sleep(self.delay)
         if self.error is not None:
             raise self.error
         callback = kwargs.get("output_callback")
@@ -214,6 +218,24 @@ async def test_select_share_files_caps_candidates_at_max_files(agent_env) -> Non
 
 
 @pytest.mark.asyncio
+async def test_select_share_files_season_ignores_bare_numbers(agent_env) -> None:
+    """
+    扁平文件与年份目录里的裸数字不当季号，显式季号目录仍可识别。
+    """
+    files = [
+        _share_file("f1", "05.mp4"),
+        _share_file("f2", "05.mp4", path="S01/05.mp4"),
+        _share_file("f3", "01.mp4", path="电影2024/01.mp4"),
+    ]
+
+    await select_share_files(files)
+
+    candidates = json.loads(agent_env.prompt.calls[0][1]["share_files"])
+    assert [None, 1, None] == [item["season"] for item in candidates]
+    assert [[5], [5], [1]] == [item["episodes"] for item in candidates]
+
+
+@pytest.mark.asyncio
 async def test_select_share_files_selected_file_without_episodes(agent_env) -> None:
     """
     选中文件解析不出集数时，该文件不贡献集数，预选集数为空。
@@ -286,6 +308,23 @@ async def test_select_share_files_returns_empty_on_exception(agent_env) -> None:
     后台调用抛异常（含超时）时返回空预选。
     """
     agent_env.manager.error = TimeoutError("timeout")
+
+    result = await select_share_files([_share_file("f1", "S01E01.mkv")])
+
+    assert ShareSelectionResult() == result
+
+
+@pytest.mark.asyncio
+async def test_select_share_files_returns_empty_on_hard_timeout(
+    agent_env, monkeypatch
+) -> None:
+    """
+    后台调用超过硬超时时降级为空预选，不抛异常。
+    """
+    monkeypatch.setattr(
+        "app.application.netdisk.ai_selection.AI_SELECTION_TIMEOUT_SECONDS", 0.01
+    )
+    agent_env.manager.delay = 0.2
 
     result = await select_share_files([_share_file("f1", "S01E01.mkv")])
 
