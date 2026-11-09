@@ -107,7 +107,6 @@ def test_find_miss_when_episode_missing(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_budget_exceeded_returns_none(
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """
     目录数超过预算时立即按未命中处理并记录超预算日志。
@@ -117,13 +116,21 @@ def test_budget_exceeded_returns_none(
     for index in range(51):
         trees[1][f"d{index}"] = []
     _install(monkeypatch, trees)
+    warnings = []
+    # 项目 logger 使用独立 console logger（propagate=False），caplog 抓不到，
+    # 这里直接记录告警调用，避免依赖 stderr 初始化状态。
+    monkeypatch.setattr(
+        existing.logger,
+        "warning",
+        lambda message, *args, **kwargs: warnings.append(str(message)),
+    )
 
     hit = existing.find_complete_media(
         [(1, "主账号")], "Example Show", 1, {1},
     )
 
     assert hit is None
-    assert "超出预算" in capsys.readouterr().err
+    assert any("超出预算" in message for message in warnings)
 
 
 def test_same_title_season_different_episodes_not_reused(
