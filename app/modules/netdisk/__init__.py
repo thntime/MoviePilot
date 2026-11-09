@@ -17,6 +17,7 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
 
@@ -150,6 +151,15 @@ def _as_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _utc_now_iso() -> str:
+    """
+    返回带时区的当前时间，用于记录暂停时刻。
+
+    :return: ISO8601 时间字符串
+    """
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _is_completed_file(target: Path, expected: int) -> bool:
@@ -446,6 +456,8 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         super().__init__()
         self._tasks: Dict[str, Dict[str, Any]] = {}
         self._stops: Dict[str, threading.Event] = {}
+        # 停止信号只表示「停下」，暂停原因由发起方登记，后台线程收尾时写入记录。
+        self._pause_reasons: Dict[str, str] = {}
         # 已被用户删除的任务，后台线程收尾时不得再把记录写回去。
         self._discarded: Set[str] = set()
         self._lock = threading.RLock()
@@ -459,13 +471,18 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
 
     def _reconcile_store_state(self) -> None:
         """
-        进程重启后恢复仍在下载中的任务；用户主动暂停的任务保持暂停。
+        进程重启后恢复仍在下载中的任务与重启中断的暂停任务；用户主动暂停保持暂停。
 
         无法还原分享地址、目录或下载器实例的记录才回落为 paused，避免前端显示
         一个永远不动、又暂停不了的任务。
         """
         for record in store.all_tasks():
-            if _as_text(record.get("state")) != "downloading":
+            state = _as_text(record.get("state"))
+            paused_reason = _as_text(record.get("paused_reason"))
+            resumable = state == "downloading" or (
+                state == "paused" and paused_reason == "shutdown"
+            )
+            if not resumable:
                 continue
             task_hash = _as_text(record.get("hash"))
             if not task_hash or task_hash in self._tasks:
@@ -474,9 +491,28 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 continue
             store.upsert_task(task_hash, {
                 "state": "paused", "error": None,
+                "paused_reason": "unrecoverable",
+                "paused_at": _utc_now_iso(),
                 "dlspeed": None, "dlspeed_bytes": 0,
             })
             logger.info(f"网盘任务缺少恢复信息，已回落为暂停：{task_hash}")
+
+    def _mark_task_paused(self, task_hash: str) -> None:
+        """
+        把任务标记为暂停，并写入发起方登记的暂停原因与暂停时间。
+
+        :param task_hash: 任务标识
+        """
+        if task_hash in self._discarded:
+            return
+        with self._lock:
+            reason = self._pause_reasons.pop(task_hash, "user")
+        store.upsert_task(task_hash, {
+            "state": "paused", "error": None,
+            "paused_reason": reason,
+            "paused_at": _utc_now_iso(),
+            "dlspeed": None, "dlspeed_bytes": 0,
+        })
 
     def _resume_task(self, task_hash: str, record: Dict[str, Any]) -> bool:
         """
@@ -516,6 +552,9 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 daemon=True,
                 name=f"netdisk-existing-{task_hash}",
             )
+            store.upsert_task(task_hash, {
+                "state": "downloading", "paused_reason": None, "paused_at": None,
+            })
             thread.start()
             logger.info(f"网盘已有文件任务已恢复下载：{task_hash}")
             return True
@@ -543,6 +582,9 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             daemon=True,
             name=f"netdisk-download-{task_hash}",
         )
+        store.upsert_task(task_hash, {
+            "state": "downloading", "paused_reason": None, "paused_at": None,
+        })
         thread.start()
         logger.info(f"网盘任务已恢复下载：{task_hash}")
         return True
@@ -565,10 +607,11 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
 
     def stop(self) -> None:
         """
-        停止所有在跑的下载任务。
+        停止所有在跑的下载任务；中断原因记为进程停止，供下次启动恢复。
         """
         with self._lock:
-            for event in self._stops.values():
+            for task_hash, event in self._stops.items():
+                self._pause_reasons[task_hash] = "shutdown"
                 event.set()
             self._stops.clear()
 
@@ -1057,11 +1100,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                     })
             logger.info(f"网盘已有文件下载完成：{platform.value}:{account_id}")
         except DownloadCancelled:
-            if task_key not in self._discarded:
-                store.upsert_task(task_key, {
-                    "state": "paused", "error": None,
-                    "dlspeed": None, "dlspeed_bytes": 0,
-                })
+            self._mark_task_paused(task_key)
         except Exception as err:  # noqa: BLE001
             error_text = _friendly_download_error(err)
             logger.warn(f"网盘已有文件下载失败：{account_id} - {error_text}")
@@ -1073,6 +1112,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         finally:
             _remove_empty_dir(task_dir)
             with self._lock:
+                self._pause_reasons.pop(task_key, None)
                 self._stops.pop(task_key, None)
                 self._tasks.pop(task_key, None)
 
@@ -1545,11 +1585,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 # 否则引擎的「下载已取消」会掩盖真实错误，前端表现为任务自动暂停。
                 if stop_event.is_set():
                     logger.info(f"网盘下载已暂停：{share_code}")
-                    if task_key not in self._discarded:
-                        store.upsert_task(task_key, {
-                            "state": "paused", "error": None,
-                            "dlspeed": None, "dlspeed_bytes": 0,
-                        })
+                    self._mark_task_paused(task_key)
                 else:
                     error_text = _friendly_download_error(err)
                     if is_share_level_error(err):
@@ -1572,6 +1608,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 # 部分完成的文件保留给续传。
                 _remove_empty_dir(task_dir)
                 with self._lock:
+                    self._pause_reasons.pop(task_key, None)
                     self._stops.pop(task_key, None)
                     self._tasks.pop(task_key, None)
 
@@ -2217,6 +2254,8 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 account_id=record.get("account_id"),
                 strategy=record.get("strategy"),
                 capacity_error=record.get("capacity_error"),
+                paused_reason=record.get("paused_reason"),
+                paused_at=record.get("paused_at"),
                 partial=bool(record.get("partial")),
                 warning=record.get("warning"),
                 missing_episodes=record.get("missing_episodes"),
@@ -2508,6 +2547,8 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         for task_hash in targets:
             event = self._stops.get(task_hash)
             if event:
+                with self._lock:
+                    self._pause_reasons[task_hash] = "user"
                 event.set()
                 stopped = True
                 continue
@@ -2516,6 +2557,8 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             if record and _as_text(record.get("state")) == "downloading":
                 store.upsert_task(task_hash, {
                     "state": "paused", "error": None,
+                    "paused_reason": "user",
+                    "paused_at": _utc_now_iso(),
                     "dlspeed": None, "dlspeed_bytes": 0,
                 })
                 stopped = True

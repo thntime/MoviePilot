@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence, Set
 
@@ -30,6 +31,9 @@ from app.schemas.media import normalize_media_source
 from app.schemas.message import Message
 from app.schemas.types import MediaType, MessageType
 
+# 暂停任务超过该时长仍未恢复时，其覆盖集数视为未交付，交给订阅重新搜索。
+PAUSED_UNDELIVERED_AFTER_SECONDS = 1800
+
 
 class DownloadFailureReconcileOwner(_DownloadOwnerBase):
     """
@@ -43,7 +47,7 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         season: Optional[int] = None,
     ) -> Set[int]:
         """
-        返回当前媒体在网盘失败任务中覆盖的集数。
+        返回当前媒体在网盘失败或暂停超时任务中覆盖的集数。
 
         :param media_source: 标准媒体来源
         :param media_id: 媒体标识
@@ -63,7 +67,8 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
                 continue
             state = str(getattr(torrent, "state", ""))
             partial_missing = self._partial_retry_episodes(torrent, state)
-            if state != "error" and partial_missing is None:
+            paused_undelivered = self._paused_undelivered(torrent, state)
+            if state != "error" and partial_missing is None and not paused_undelivered:
                 continue
             history = self.download_history_repository.get_by_hash(str(torrent.hash))
             if history is None:
@@ -113,6 +118,38 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         return {
             int(item) for item in (getattr(torrent, "missing_episodes", None) or [])
         }
+
+    @staticmethod
+    def _paused_undelivered(torrent: Any, state: Optional[str] = None) -> bool:
+        """
+        判断暂停任务是否已超过交付等待窗口。
+
+        重启中断、用户暂停与不可恢复都写 ``paused``；只有超过等待窗口且不是
+        不可恢复的任务才把覆盖集数视为未交付，避免重启瞬间的暂停触发重复搜索。
+
+        :param torrent: 下载器任务投影
+        :param state: 已读取的任务状态；缺省时从投影读取
+        :return: 应按未交付处理返回 True
+        """
+        task_state = str(
+            state if state is not None else getattr(torrent, "state", "")
+        )
+        if task_state != "paused":
+            return False
+        if str(getattr(torrent, "paused_reason", "") or "") == "unrecoverable":
+            return False
+        paused_at = getattr(torrent, "paused_at", None)
+        if not paused_at:
+            # 旧记录没有暂停时间，按超时处理，符合「暂停即未交付」的修复目标。
+            return True
+        try:
+            paused_moment = datetime.fromisoformat(str(paused_at))
+        except ValueError:
+            return True
+        if paused_moment.tzinfo is None:
+            paused_moment = paused_moment.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - paused_moment).total_seconds()
+        return elapsed >= PAUSED_UNDELIVERED_AFTER_SECONDS
 
     def is_download_file_transferred(self, fullpath: str) -> bool:
         """

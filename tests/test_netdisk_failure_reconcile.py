@@ -4,6 +4,7 @@
 
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -893,3 +894,67 @@ def test_transfer_local_path_calls_transfer_chain(
     assert calls
     assert calls[0]["fileitem"].path == str(target)
     assert calls[0]["background"] is False
+
+
+def _paused_torrent(minutes_ago: float | None, reason: str = "user") -> SimpleNamespace:
+    """
+    构造一条暂停的网盘任务投影。
+
+    :param minutes_ago: 暂停距今分钟数；None 表示缺少暂停时间
+    :param reason: 暂停原因
+    :return: 任务投影
+    """
+    paused_at = None
+    if minutes_ago is not None:
+        paused_at = (
+            datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+        ).isoformat()
+    return SimpleNamespace(
+        netdisk_platform="quark", state="paused", hash="p1", reconciled=False,
+        paused_reason=reason, paused_at=paused_at,
+    )
+
+
+def _paused_history() -> SimpleNamespace:
+    """
+    构造暂停任务对应的下载历史。
+
+    :return: 下载历史投影
+    """
+    return SimpleNamespace(
+        media_source="tmdb", media_id="100", seasons="S01", episodes="E05-E06",
+    )
+
+
+def test_paused_task_over_timeout_contributes_episodes() -> None:
+    """
+    暂停超过 30 分钟的网盘任务，其覆盖集数视为未交付。
+    """
+    chain = _ReconcileChain([_paused_torrent(31)], _paused_history())
+    assert chain.failed_netdisk_episodes("tmdb", "100", 1) == {5, 6}
+
+
+def test_paused_task_within_timeout_does_not_contribute() -> None:
+    """
+    暂停不足 30 分钟的任务集数仍按已交付处理。
+    """
+    chain = _ReconcileChain([_paused_torrent(5)], _paused_history())
+    assert chain.failed_netdisk_episodes("tmdb", "100", 1) == set()
+
+
+def test_paused_task_without_timestamp_contributes_episodes() -> None:
+    """
+    缺少暂停时间的旧记录按超时处理，集数视为未交付。
+    """
+    chain = _ReconcileChain([_paused_torrent(None)], _paused_history())
+    assert chain.failed_netdisk_episodes("tmdb", "100", 1) == {5, 6}
+
+
+def test_unrecoverable_paused_task_does_not_contribute() -> None:
+    """
+    不可恢复的暂停任务不触发重新搜索。
+    """
+    chain = _ReconcileChain(
+        [_paused_torrent(120, reason="unrecoverable")], _paused_history(),
+    )
+    assert chain.failed_netdisk_episodes("tmdb", "100", 1) == set()
