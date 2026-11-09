@@ -47,14 +47,19 @@ _alive_lock = threading.Lock()
 
 def _platform_supported(platform: str) -> bool:
     """
-    判断平台是否已注册取链适配器。
+    判断平台是否在搜索结果中保留。
+
+    已注册取链适配器的平台可以正常下载；没有适配器但已知的网盘平台
+    （如天翼云盘）同样保留候选并如实展示，下载阶段再明确提示不支持。
 
     :param platform: 平台标识
-    :return: 已实现返回 True
+    :return: 需要保留返回 True
     """
     from app.application.netdisk.registry import find_adapter, registered_platforms
-    from app.domain.netdisk import normalize_platform
+    from app.domain.netdisk import DISPLAY_ONLY_PLATFORMS, normalize_platform
 
+    if platform in DISPLAY_ONLY_PLATFORMS:
+        return True
     if find_adapter(platform) is not None:
         return True
     if registered_platforms():
@@ -246,9 +251,10 @@ class CloudSaverModule(_ModuleBase):
                 platform = self._as_text(link.get("platform"))
                 if not _platform_supported(platform):
                     continue
-                # 同一分享可能以不同链接形式重复出现，按分享码去重，无法解析时退回链接本身。
+                # 同一分享可能以不同链接形式重复出现，按分享码去重；没有可解析分享码的链接
+                # （如天翼云盘的 code 在查询串里）保留完整链接，避免不同分享被合并。
                 share_code = parse_share_code(url)
-                dedup_key = share_code or url.split("?", 1)[0].rstrip("/")
+                dedup_key = share_code or url.rstrip("/")
                 if dedup_key in seen:
                     continue
                 seen.add(dedup_key)
@@ -620,7 +626,7 @@ class CloudSaverModule(_ModuleBase):
         提取候选的分享标识与缓存键片段。
 
         优先用统一解析规则读取平台分享码，覆盖 139、115 等非夸克链接；
-        无法解析时退回夸克分享码或去掉查询串的链接本身，保证候选仍参与有效性检查。
+        无法解析时退回夸克分享码或完整链接，保证候选仍参与有效性检查。
 
         :param torrent: 网盘候选
         :return: 分享标识与缓存键片段
@@ -632,8 +638,8 @@ class CloudSaverModule(_ModuleBase):
         share_code = parse_share_code(url)
         if share_code:
             return share_code, share_code
-        trimmed = url.split("?", 1)[0].rstrip("/")
-        return url, trimmed or url
+        # 没有可解析分享码时保留完整地址，避免同一域名下不同分享共用缓存键。
+        return url, url.rstrip("/") or url
 
     def _filter_alive_shares(
         self,

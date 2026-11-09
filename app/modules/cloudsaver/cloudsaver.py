@@ -48,6 +48,7 @@ _PLATFORM_DOMAIN_RULES: Tuple[Tuple[str, str], ...] = (
     ("115.com", "pan115"),
     ("aliyundrive", "aliyun"),
     ("alipan", "aliyun"),
+    # 天翼云盘（cloud.189.cn）与中国移动云盘（139）是不同平台，保留独立标识。
     ("cloud.189.cn", "tianyi"),
     ("189.cn", "tianyi"),
     ("123pan", "pan123"),
@@ -62,7 +63,6 @@ _PLATFORM_DOMAIN_RULES: Tuple[Tuple[str, str], ...] = (
 _PLATFORM_ALIASES: Dict[str, str] = {
     "baidupan": "baiduPan",
     "baidu": "baiduPan",
-    "tianyi": "c139",
     "aliyun": "aliyun",
     "pan115": "pan115",
     "115": "pan115",

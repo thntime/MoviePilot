@@ -29,6 +29,7 @@ def configure_netdisk_composition() -> None:
     from app.adapters.external.netdisk.pan115 import Pan115Adapter
     from app.adapters.external.netdisk.pan123 import Pan123Adapter
     from app.adapters.external.netdisk.quark import QuarkAdapter
+    from app.adapters.external.netdisk.tianyi import TianyiAdapter
     from app.adapters.external.netdisk.uc import UCAdapter
     from app.adapters.external.netdisk.xunlei import XunleiAdapter
     from app.adapters.system.netdisk_speed import JsonNetdiskSpeedStore
@@ -52,6 +53,7 @@ def configure_netdisk_composition() -> None:
             GuangYaAdapter(),
             BaiduAdapter(),
             XunleiAdapter(),
+            TianyiAdapter(),
         )
     }
     cipher = FernetCredentialCipher(get_token_runtime_config().secret_key)

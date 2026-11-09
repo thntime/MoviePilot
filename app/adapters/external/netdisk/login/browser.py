@@ -33,11 +33,14 @@ _COOKIE_DOMAINS: dict[NetdiskPlatform, tuple[str, ...]] = {
     NetdiskPlatform.PAN123: (".123pan.com", ".123952.com"),
     NetdiskPlatform.GUANGYA: (".guangyapan.com",),
     NetdiskPlatform.XUNLEI: (".xunlei.com",),
+    NetdiskPlatform.TIANYI: (".189.cn",),
 }
 
 # 各平台网盘主页域名，用于登录后把画面切回主页面。
 _PRIMARY_HOSTS: dict[NetdiskPlatform, str] = {
     NetdiskPlatform.BAIDU: "pan.baidu.com",
+    # 天翼的登录 Cookie 下发在 cloud.189.cn，优先取该域名的同名 Cookie，避免旧值覆盖。
+    NetdiskPlatform.TIANYI: "cloud.189.cn",
 }
 
 # 明确的登录弹窗域名：微信扫码与百度登录。

@@ -27,6 +27,7 @@ class NetdiskPlatform(StrEnum):
     :cvar GUANGYA: 光鸭云盘
     :cvar BAIDU: 百度网盘
     :cvar XUNLEI: 迅雷云盘
+    :cvar TIANYI: 天翼云盘（189）
     """
 
     QUARK = "quark"
@@ -37,6 +38,7 @@ class NetdiskPlatform(StrEnum):
     GUANGYA = "guangya"
     BAIDU = "baidu"
     XUNLEI = "xunlei"
+    TIANYI = "tianyi"
 
 
 class LinkPolicy(StrEnum):
@@ -105,6 +107,44 @@ class NetdiskError(Exception):
         self.platform = platform
         self.account_name = account_name
         self.message = message
+
+
+# 判定分享本身不可用的 UNSUPPORTED 消息片段；命中后分享在有效期内不再重试。
+_SHARE_LEVEL_MESSAGES = (
+    "没有可下载的视频文件",
+    "仅预览流",
+    "直链不完整",
+    "未返回可用下载链接",
+    "分享内没有",
+)
+
+
+def is_share_level_error(error: BaseException) -> bool:
+    """
+    判断异常是否说明分享本身不可用，可据此把分享加入黑名单。
+
+    沿 `error`、`error.__cause__`、`error.__context__` 逐层检查，避免
+    `DownloadError` 等外层包装漏判。网络失败、EMFILE、空间不足、取消与登录失效
+    都不属于分享级错误。
+
+    :param error: 待判定的异常
+    :return: 属于分享级错误返回 True
+    """
+    seen: set[int] = set()
+    current: Optional[BaseException] = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, NetdiskError):
+            if current.code is NetdiskErrorCode.SHARE_INVALID:
+                return True
+            # 部分平台把「分享无直链」这类分享级问题归为 UNKNOWN，仍按消息片段识别。
+            if current.code in (
+                NetdiskErrorCode.UNSUPPORTED,
+                NetdiskErrorCode.UNKNOWN,
+            ) and any(token in current.message for token in _SHARE_LEVEL_MESSAGES):
+                return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +366,10 @@ class AccountProbe:
     expires_at: Optional[datetime] = None
 
 
+# 已知但暂不支持取链的网盘平台：搜索结果保留并如实展示平台类型，下载时明确提示不支持。
+DISPLAY_ONLY_PLATFORMS: dict[str, str] = {}
+
+
 _PLATFORM_ALIASES: dict[str, NetdiskPlatform] = {
     "quark": NetdiskPlatform.QUARK,
     "uc": NetdiskPlatform.UC,
@@ -345,6 +389,9 @@ _PLATFORM_ALIASES: dict[str, NetdiskPlatform] = {
     "baidupan": NetdiskPlatform.BAIDU,
     "xunlei": NetdiskPlatform.XUNLEI,
     "thunder": NetdiskPlatform.XUNLEI,
+    "tianyi": NetdiskPlatform.TIANYI,
+    "189": NetdiskPlatform.TIANYI,
+    "cloud189": NetdiskPlatform.TIANYI,
 }
 
 
@@ -377,12 +424,17 @@ _UC_PATTERN = re.compile(r"drive\.uc\.cn/s/([A-Za-z0-9]+)", re.IGNORECASE)
 _XUNLEI_PATTERN = re.compile(r"pan\.xunlei\.com/s/([A-Za-z0-9_-]+)", re.IGNORECASE)
 _BAIDU_PATTERN = re.compile(r"pan\.baidu\.com/s/(1[A-Za-z0-9_-]+)", re.IGNORECASE)
 _C139_PATTERN = re.compile(r"yun\.139\.com/shareweb/.*?/w/i/([A-Za-z0-9_-]+)", re.IGNORECASE)
-_PAN123_PATTERN = re.compile(r"123(?:865|pan)\.(?:com|cn)/s/([A-Za-z0-9]+-[A-Za-z0-9]+)", re.IGNORECASE)
+_PAN123_PATTERN = re.compile(
+    r"123(?:865|pan|684|912)\.(?:com|cn)/s/([A-Za-z0-9]+-[A-Za-z0-9]+)", re.IGNORECASE
+)
 _PAN123_SUB_PATTERN = re.compile(r"share\.123pan\.cn/123pan/([A-Za-z0-9-]+)", re.IGNORECASE)
 _PAN123_SRR_PATTERN = re.compile(r"api/srr\?sk=([A-Za-z0-9-]+)", re.IGNORECASE)
 _PAN115_PATTERN = re.compile(r"115(?:cdn|rc)?\.com/s/(sw[A-Za-z0-9]+)", re.IGNORECASE)
 _PAN115_COMMAND_PATTERN = re.compile(r"115(?:cdn|rc)?\.com/(sw[A-Za-z0-9]{8,})-([A-Za-z0-9]{4,8})", re.IGNORECASE)
 _GUANGYA_PATTERN = re.compile(r"guangyapan\.com/s/([A-Za-z0-9_-]+)", re.IGNORECASE)
+_TIANYI_WEB_PATTERN = re.compile(r"cloud\.189\.cn/web/share\?[^\s]*?code=([A-Za-z0-9]+)", re.IGNORECASE)
+_TIANYI_H5_PATTERN = re.compile(r"h5\.cloud\.189\.cn/share\.html#/t/([A-Za-z0-9]+)", re.IGNORECASE)
+_TIANYI_SHORT_PATTERN = re.compile(r"cloud\.189\.cn/t/([A-Za-z0-9]+)", re.IGNORECASE)
 _PWD_IN_URL_PATTERN = re.compile(r"[?&](?:pwd|password|passcode|pass)=([A-Za-z0-9]+)", re.IGNORECASE)
 _PWD_IN_TEXT_PATTERN = re.compile(r"(?:提取码|访问码|密码)[：:]\s*([A-Za-z0-9]{2,16})")
 
@@ -428,6 +480,9 @@ def parse_share_link(text: str, password: Optional[str] = None) -> Optional[Shar
         (_PAN123_SUB_PATTERN, NetdiskPlatform.PAN123),
         (_PAN123_SRR_PATTERN, NetdiskPlatform.PAN123),
         (_PAN115_PATTERN, NetdiskPlatform.PAN115),
+        (_TIANYI_WEB_PATTERN, NetdiskPlatform.TIANYI),
+        (_TIANYI_H5_PATTERN, NetdiskPlatform.TIANYI),
+        (_TIANYI_SHORT_PATTERN, NetdiskPlatform.TIANYI),
         (_GUANGYA_PATTERN, NetdiskPlatform.GUANGYA),
     ):
         found = pattern.search(url)

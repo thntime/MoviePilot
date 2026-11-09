@@ -2,7 +2,10 @@
 网盘领域模型与分享链接解析的单元测试。
 """
 
+import pytest
+
 from app.domain.netdisk import (
+    DISPLAY_ONLY_PLATFORMS,
     NetdiskPlatform,
     normalize_platform,
     parse_share_link,
@@ -51,6 +54,20 @@ def test_parse_139_and_123_and_115():
     assert pan115 is not None and pan115.password == "abcd"
 
 
+def test_parse_123_other_domains_and_tianyi():
+    """
+    123 云盘的 684/912 域名可识别；天翼云盘 189 独立映射，不能落到移动 139。
+    """
+    pan123 = parse_share_link("https://www.123912.com/s/pbeojv-9Nnbh")
+    assert pan123 is not None
+    assert pan123.platform is NetdiskPlatform.PAN123
+    assert pan123.share_id == "pbeojv-9Nnbh"
+    tianyi = parse_share_link("https://cloud.189.cn/t/i2Un6rRzIVVn")
+    assert tianyi is not None
+    assert tianyi.platform is NetdiskPlatform.TIANYI
+    assert tianyi.share_id == "i2Un6rRzIVVn"
+
+
 def test_parse_115_command_form_priority():
     """
     115 口令形式优先解析出分享码与提取码。
@@ -93,3 +110,30 @@ def test_platform_c139_renamed_to_pan139():
     assert NetdiskPlatform.PAN139.value == "pan139"
     assert normalize_platform("pan139") is NetdiskPlatform.PAN139
     assert normalize_platform("c139") is NetdiskPlatform.PAN139
+
+
+@pytest.mark.parametrize(
+    ("url", "share_id", "password"),
+    [
+        ("https://cloud.189.cn/web/share?code=bYB3q2UbIBJb", "bYB3q2UbIBJb", None),
+        ("https://cloud.189.cn/t/AbCdEf123", "AbCdEf123", None),
+        ("https://h5.cloud.189.cn/share.html#/t/XyZ987", "XyZ987", None),
+        ("https://cloud.189.cn/web/share?code=abc123&pwd=9k2m", "abc123", "9k2m"),
+        ("天翼分享 https://cloud.189.cn/t/AbCdEf123 访问码：7u8i", "AbCdEf123", "7u8i"),
+    ],
+)
+def test_parse_tianyi_share_link(url: str, share_id: str, password: str | None) -> None:
+    """天翼分享链接的三种形态与提取码都要能解析。"""
+    ref = parse_share_link(url)
+    assert ref is not None
+    assert ref.platform is NetdiskPlatform.TIANYI
+    assert ref.share_id == share_id
+    assert ref.password == password
+
+
+def test_tianyi_platform_is_not_display_only() -> None:
+    """天翼已有适配器，不再属于仅展示平台。"""
+    assert normalize_platform("tianyi") is NetdiskPlatform.TIANYI
+    assert normalize_platform("189") is NetdiskPlatform.TIANYI
+    assert normalize_platform("cloud189") is NetdiskPlatform.TIANYI
+    assert "tianyi" not in DISPLAY_ONLY_PLATFORMS

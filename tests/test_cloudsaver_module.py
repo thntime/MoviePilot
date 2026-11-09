@@ -1358,7 +1358,7 @@ def test_netdisk_platform_is_canonical_and_not_duplicated_in_labels(monkeypatch:
     ("raw", "expected"),
     [
         ("baiduPan", "baidu"),
-        ("tianyi", _C139_PLATFORM_ID),
+        ("tianyi", "tianyi"),
         ("yidong", _C139_PLATFORM_ID),
         ("ucdrive", "uc"),
         ("pan115", "pan115"),
@@ -1417,8 +1417,8 @@ def test_139_share_is_inspected_without_quark_share_code(monkeypatch: pytest.Mon
         {
             "title": "移动云盘资源",
             "content": "简介",
-            "cloudType": "tianyi",
-            "cloudLinks": [{"link": url, "cloudType": "tianyi"}],
+            "cloudType": "yidong",
+            "cloudLinks": [{"link": url, "cloudType": "yidong"}],
         },
     ]))]
     install_server(monkeypatch, server)
@@ -1429,6 +1429,70 @@ def test_139_share_is_inspected_without_quark_share_code(monkeypatch: pytest.Mon
     assert calls == [url]
     assert results[0].netdisk_platform == _C139_PLATFORM_ID
     assert results[0].size == 800 * 1024 * 1024
+
+
+def test_tianyi_share_keeps_its_own_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    天翼云盘（cloud.189.cn）与中国移动云盘（139）是不同平台，且已注册适配器可正常下载。
+    """
+    from app.domain.netdisk import ShareFile
+    from app.modules.cloudsaver import _platform_supported
+
+    _install_fake_walk(monkeypatch, [
+        ShareFile(file_id="1", name="S01E01.mp4", size=600 * 1024 * 1024),
+    ])
+    server = FakeCloudSaverServer()
+    url = "https://cloud.189.cn/web/share?code=bYB3q2UbIBJb"
+    server.search_results = [(200, make_payload([
+        {
+            "title": "天翼云盘资源",
+            "content": "简介",
+            "cloudType": "tianyi",
+            "cloudLinks": [{"link": url, "cloudType": "tianyi"}],
+        },
+    ]))]
+    install_server(monkeypatch, server)
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
+
+    assert results is not None
+    assert _platform_supported("tianyi") is True
+    assert results[0].netdisk_platform == "tianyi"
+    assert results[0].netdisk_platform != _C139_PLATFORM_ID
+
+
+def test_tianyi_shares_with_different_codes_are_not_deduplicated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    天翼云盘分享码在查询串里，去重必须按完整链接，否则不同分享会被合并成一条。
+    """
+    from app.domain.netdisk import ShareFile
+
+    _install_fake_walk(monkeypatch, [
+        ShareFile(file_id="1", name="S01E01.mp4", size=500 * 1024 * 1024),
+    ])
+    first = "https://cloud.189.cn/web/share?code=aaa111"
+    second = "https://cloud.189.cn/web/share?code=bbb222"
+    server = FakeCloudSaverServer()
+    server.search_results = [(200, make_payload([
+        {
+            "title": "天翼资源A",
+            "content": "简介",
+            "cloudType": "tianyi",
+            "cloudLinks": [{"link": first, "cloudType": "tianyi"}],
+        },
+        {
+            "title": "天翼资源B",
+            "content": "简介",
+            "cloudType": "tianyi",
+            "cloudLinks": [{"link": second, "cloudType": "tianyi"}],
+        },
+    ]))]
+    install_server(monkeypatch, server)
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
+
+    assert results is not None
+    assert [item.enclosure for item in results] == [first, second]
 
 
 def test_platform_inferred_from_url_is_canonical(monkeypatch: pytest.MonkeyPatch) -> None:
