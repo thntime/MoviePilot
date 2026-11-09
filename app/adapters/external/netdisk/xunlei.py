@@ -891,48 +891,53 @@ class XunleiAdapter(BaseNetdiskAdapter):
         last_error = None
         # 同一个文件详情接口按 usage 返回不同链接；PLAY 对部分 mkv 会返回空 links，
         # 必须再试 DOWNLOAD 才能拿到原始文件直链。某个 usage 直接报错时继续试下一个。
-        for usage in ("DOWNLOAD", "PLAY"):
-            try:
-                payload = self.http.get_json(
-                    f"{_FILES_URL}/{file_id}",
-                    params={
-                        "_magic": "2021",
-                        "usage": usage,
-                        "thumbnail_size": "SIZE_LARGE",
-                        "with": "hdr10",
-                    },
-                    headers=self._api_headers(account),
-                )
-                self._check_payload(payload, "获取迅雷云盘下载链接")
-            except NetdiskError as error:
-                if error.code is NetdiskErrorCode.AUTH_EXPIRED:
-                    raise
-                last_error = error
-                continue
-            data = self._data(payload)
-            links = data.get("links")
-            url = _first_link_url(links)
-            if not url:
-                url = (
-                    as_text(data.get("web_content_link"))
-                    or as_text(data.get("original_url"))
-                    or as_text(data.get("url"))
-                )
-            if not url:
-                medias = data.get("medias")
-                if isinstance(medias, list):
-                    for media in medias:
-                        if not isinstance(media, Mapping):
-                            continue
-                        link = media.get("link")
-                        if isinstance(link, Mapping):
-                            url = as_text(link.get("url"))
-                        if not url:
-                            url = as_text(media.get("url"))
-                        if url:
-                            break
+        # 转存后直链生成有延迟，空链接时按 1s/2s/4s 退避重试，共 3 轮。
+        for attempt in range(3):
+            for usage in ("DOWNLOAD", "PLAY"):
+                try:
+                    payload = self.http.get_json(
+                        f"{_FILES_URL}/{file_id}",
+                        params={
+                            "_magic": "2021",
+                            "usage": usage,
+                            "thumbnail_size": "SIZE_LARGE",
+                            "with": "hdr10",
+                        },
+                        headers=self._api_headers(account),
+                    )
+                    self._check_payload(payload, "获取迅雷云盘下载链接")
+                except NetdiskError as error:
+                    if error.code is NetdiskErrorCode.AUTH_EXPIRED:
+                        raise
+                    last_error = error
+                    continue
+                data = self._data(payload)
+                links = data.get("links")
+                url = _first_link_url(links)
+                if not url:
+                    url = (
+                        as_text(data.get("web_content_link"))
+                        or as_text(data.get("original_url"))
+                        or as_text(data.get("url"))
+                    )
+                if not url:
+                    medias = data.get("medias")
+                    if isinstance(medias, list):
+                        for media in medias:
+                            if not isinstance(media, Mapping):
+                                continue
+                            link = media.get("link")
+                            if isinstance(link, Mapping):
+                                url = as_text(link.get("url"))
+                            if not url:
+                                url = as_text(media.get("url"))
+                            if url:
+                                break
+                if url:
+                    break
             if url:
                 break
+            time.sleep(2 ** attempt)
         if not url:
             if last_error is not None and not data:
                 raise last_error
@@ -944,8 +949,8 @@ class XunleiAdapter(BaseNetdiskAdapter):
                 f"medias={len(data.get('medias') or []) if isinstance(data.get('medias'), list) else type(data.get('medias')).__name__}"
             )
             raise NetdiskError(
-                NetdiskErrorCode.UNKNOWN,
-                "迅雷云盘未返回可用下载链接",
+                NetdiskErrorCode.LINK_NOT_READY,
+                "迅雷直链尚未就绪",
                 platform=self.platform,
             )
         return url, as_int(data.get("size"))

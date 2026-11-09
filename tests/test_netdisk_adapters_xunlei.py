@@ -649,3 +649,43 @@ def test_fresh_captcha_reinitializes_when_stored_expired(monkeypatch: pytest.Mon
 
     assert first == "fresh-captcha"
     assert second == "fresh-captcha"
+
+
+def test_file_link_retries_until_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    首次取链返回空 links 时按退避重试，第二次拿到直链即返回。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    monkeypatch.setattr(xunlei.time, "sleep", lambda _seconds: None)
+    responses[("GET", f"{xunlei._FILES_URL}/f1")] = [
+        {"id": "f1", "size": 2048, "links": {}},
+        {"id": "f1", "size": 2048, "links": {}},
+        {
+            "id": "f1",
+            "size": 2048,
+            "links": {"application/octet-stream": {"url": "https://cdn/x"}},
+        },
+    ]
+
+    url, size = adapter._file_link("f1", _account())  # pylint: disable=protected-access
+
+    assert url == "https://cdn/x"
+    assert size == 2048
+    assert len(calls) == 3
+
+
+def test_file_link_raises_not_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    多次重试后仍没有直链时抛出 LINK_NOT_READY，而不是笼统的 UNKNOWN。
+    """
+    adapter, _calls, responses = _install(monkeypatch)
+    monkeypatch.setattr(xunlei.time, "sleep", lambda _seconds: None)
+    responses[("GET", f"{xunlei._FILES_URL}/f1")] = [
+        {"id": "f1", "size": 2048, "links": {}}
+        for _ in range(6)
+    ]
+
+    with pytest.raises(NetdiskError) as error:
+        adapter._file_link("f1", _account())  # pylint: disable=protected-access
+
+    assert error.value.code is NetdiskErrorCode.LINK_NOT_READY

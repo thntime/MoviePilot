@@ -64,6 +64,7 @@ class NetdiskErrorCode(StrEnum):
     :cvar RATE_LIMITED: 平台限流或频控
     :cvar RISK_BLOCKED: 风控、验证码或设备异常
     :cvar LINK_EXPIRED: 直链过期或防盗链拦截
+    :cvar LINK_NOT_READY: 平台尚未生成可用直链，重试后仍为空
     :cvar UNSUPPORTED: 平台或分享类型未实现
     :cvar SPACE_INSUFFICIENT: 转存时网盘空间不足
     :cvar UNKNOWN: 无法归类的失败
@@ -74,6 +75,7 @@ class NetdiskErrorCode(StrEnum):
     RATE_LIMITED = "rate_limited"
     RISK_BLOCKED = "risk_blocked"
     LINK_EXPIRED = "link_expired"
+    LINK_NOT_READY = "link_not_ready"
     UNSUPPORTED = "unsupported"
     SPACE_INSUFFICIENT = "space_insufficient"
     UNKNOWN = "unknown"
