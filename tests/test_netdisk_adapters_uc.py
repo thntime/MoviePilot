@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional
 import pytest
 
 from app.adapters.external.netdisk import base as base_module
+from app.adapters.external.netdisk import uc as uc_module
 from app.adapters.external.netdisk.uc import (
     UC_ACCOUNT_INFO_URL,
     UCAdapter,
@@ -677,3 +678,128 @@ def test_uc_http_404_is_share_invalid() -> None:
 
     error = NetdiskHttp(platform=NetdiskPlatform.UC).error_for_status(404)
     assert error.code is NetdiskErrorCode.SHARE_INVALID
+
+
+class _FakeStreamResponse:
+    """
+    供 `_probe_total` 使用的流式响应替身。
+    """
+
+    def __init__(self, status_code: int, headers: dict[str, str]) -> None:
+        """
+        保存状态码与响应头。
+
+        :param status_code: HTTP 状态码
+        :param headers: 响应头
+        """
+        self.status_code = status_code
+        self.headers = headers
+
+    def __enter__(self) -> "_FakeStreamResponse":
+        """
+        进入上下文时返回自身。
+        """
+        return self
+
+    def __exit__(self, *exc_info: Any) -> bool:
+        """
+        退出上下文时不吞异常。
+
+        :param exc_info: 异常信息
+        :return: 始终 False
+        """
+        return False
+
+
+def _install_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    responses: list[_FakeStreamResponse],
+) -> list[dict[str, Any]]:
+    """
+    按顺序返回流式响应替身，并记录探测调用。
+
+    :param monkeypatch: pytest 打桩工具
+    :param responses: 预设的响应序列，会被依次弹出
+    :return: 调用记录列表
+    """
+    calls: list[dict[str, Any]] = []
+
+    def fake(self: Any, url: str, **kwargs: Any) -> _FakeStreamResponse:  # noqa: ARG001
+        calls.append({"url": url, "kwargs": kwargs})
+        if not responses:
+            raise AssertionError(f"未预期的探测请求：{url}")
+        return responses.pop(0)
+
+    monkeypatch.setattr(uc_module.RequestUtils, "get_stream", fake)
+    return calls
+
+
+def test_probe_total_skips_hls(
+    adapter: UCAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    HLS 播放列表不做总长探测，直接返回 None 且不发请求。
+    """
+    calls = _install_stream(
+        monkeypatch,
+        [_FakeStreamResponse(206, {"Content-Range": "bytes 0-0/1"})],
+    )
+
+    assert adapter._probe_total("https://cdn.uc.cn/v/index.m3u8", {}) is None
+    assert calls == []
+
+
+def test_probe_total_weak_content_length_retries(
+    adapter: UCAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    200 的 Content-Length 只作弱证据：再探测一次并以 206 的 Content-Range 为准。
+    """
+    responses = [
+        _FakeStreamResponse(200, {"Content-Length": "15340287"}),
+        _FakeStreamResponse(206, {"Content-Range": "bytes 0-0/763025717"}),
+    ]
+    calls = _install_stream(monkeypatch, responses)
+
+    total = adapter._probe_total("https://cdn.uc.cn/v.mp4", {})
+
+    assert total == 763025717
+    assert len(calls) == 2
+
+
+def test_resolve_accepts_hls_without_size_check(
+    adapter: UCAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    HLS 直链无法可靠探测总长，不应因大小差异判定为受限流。
+    """
+    preview_payload = {
+        "status": 200,
+        "code": 0,
+        "data": {"play_info": {"url": "https://cdn.uc.cn/v/index.m3u8", "size": 0}},
+    }
+    _install(
+        monkeypatch,
+        [
+            ("sharepage/token", TOKEN_PAYLOAD),
+            ("sharepage/video_preview", preview_payload),
+        ],
+    )
+    calls = _install_stream(
+        monkeypatch,
+        [_FakeStreamResponse(206, {"Content-Range": "bytes 0-0/1"})],
+    )
+
+    link = adapter.resolve(
+        REF,
+        ShareFile(file_id="f9", name="影片.mp4", size=763025717, token="tok-9"),
+        ACCOUNT,
+    )
+
+    assert link.url == "https://cdn.uc.cn/v/index.m3u8"
+    assert link.is_hls is True
+    assert calls == []
+

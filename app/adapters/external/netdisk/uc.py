@@ -648,34 +648,44 @@ class UCAdapter(BaseNetdiskAdapter):
         """
         用 ``Range: bytes=0-0`` 探测直链真实总长。
 
-        只采信 206 的 Content-Range；200 退回 Content-Length；探测失败返回 None，
-        避免把偶发网络问题放大成不可用。
+        HLS 播放列表无法用总长判断完整度，直接返回 None。206 的 Content-Range
+        最可信；200 的 Content-Length 仅作弱证据，会再探测一次，仍无 206 才采信。
+        探测失败返回 None，避免把偶发网络问题放大成不可用。
 
         :param url: 直链
         :param headers: 请求头
         :return: 真实总字节数；无法判断时为 None
         """
-        probe = {**headers, "Range": "bytes=0-0", "Accept": "*/*"}
-        try:
-            with RequestUtils(timeout=30, proxies=self.http.proxies).get_stream(
-                url, headers=probe, raise_exception=True
-            ) as response:
-                if response is None:
-                    return None
-                status = int(getattr(response, "status_code", 0) or 0)
-                response_headers = getattr(response, "headers", {}) or {}
-                if status == 206:
-                    match = re.match(
-                        r"bytes\s+0-0/(\d+)",
-                        str(response_headers.get("Content-Range") or ""),
-                    )
-                    return int(match.group(1)) if match else None
-                if status == 200:
-                    length = str(response_headers.get("Content-Length") or "")
-                    return int(length) if length.isdigit() else None
-        except Exception:  # noqa: BLE001 - 探测失败按未知处理
+        if _is_hls_url(url):
             return None
-        return None
+        probe = {**headers, "Range": "bytes=0-0", "Accept": "*/*"}
+        weak_total: Optional[int] = None
+        for attempt in range(2):
+            try:
+                with RequestUtils(timeout=30, proxies=self.http.proxies).get_stream(
+                    url, headers=probe, raise_exception=True
+                ) as response:
+                    if response is None:
+                        return weak_total
+                    status = int(getattr(response, "status_code", 0) or 0)
+                    response_headers = getattr(response, "headers", {}) or {}
+                    if status == 206:
+                        match = re.match(
+                            r"bytes\s+0-0/(\d+)",
+                            str(response_headers.get("Content-Range") or ""),
+                        )
+                        return int(match.group(1)) if match else weak_total
+                    if status == 200:
+                        length = str(response_headers.get("Content-Length") or "")
+                        if not length.isdigit():
+                            return weak_total
+                        weak_total = int(length)
+                        if attempt == 0:
+                            continue
+                        return weak_total
+            except Exception:  # noqa: BLE001 - 探测失败按未知处理
+                return weak_total
+        return weak_total
 
     def _video_preview(
         self,
