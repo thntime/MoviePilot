@@ -148,6 +148,7 @@ class NetdiskPlatformInfo(BaseModel):
     cookie_required_keys: list[str] = Field(default_factory=list, description="凭据必填字段")
     supports_password_login: bool = Field(..., description="是否支持账号密码登录")
     supports_refresh: bool = Field(False, description="是否支持刷新令牌")
+    recycle_bin: bool = Field(False, description="是否支持读取与清空回收站")
     login_url: str = Field(..., description="平台登录页地址")
 
 

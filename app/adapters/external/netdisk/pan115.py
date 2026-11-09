@@ -704,6 +704,7 @@ class Pan115Adapter(BaseNetdiskAdapter):
         move=True,
         rename=True,
         delete=True,
+        recycle_bin=True,
     )
     max_concurrency: int = 512
     cookie_required_keys: tuple[str, ...] = ("UID", "SEID")

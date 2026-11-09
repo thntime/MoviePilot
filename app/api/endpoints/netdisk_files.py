@@ -128,6 +128,7 @@ async def drive_capabilities(
                 move=caps.move,
                 rename=caps.rename,
                 delete=caps.delete,
+                recycle_bin=caps.recycle_bin,
             )
         ),
     )

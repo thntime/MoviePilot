@@ -52,6 +52,7 @@ class NetdiskDriveCapabilitiesModel(BaseModel):
     move: bool = False
     rename: bool = False
     delete: bool = False
+    recycle_bin: bool = False
 
 
 class NetdiskShareRequest(BaseModel):

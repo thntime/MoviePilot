@@ -2,6 +2,7 @@
 验证通用网盘下载器模块的下载分流、任务抽象、取链编排与存储迁移。
 """
 
+import asyncio
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,9 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 import app.modules.netdisk as netdisk_module
-from app.application.netdisk import share_blacklist
+from app.adapters.external.netdisk.pan115 import Pan115Adapter
+from app.api.endpoints import netdisk as netdisk_api
+from app.application.netdisk import registry, share_blacklist
 from app.application.netdisk.batch_judge import BatchDecision
 from app.application.netdisk.contract import NetdiskTuning
 from app.application.netdisk.resolve import ResolvedShare
@@ -1807,3 +1810,15 @@ def test_run_task_resume_reads_source_from_task_record(
     record = store.get_task("t-partial-resume")
     assert record is not None
     assert record["ai_decision"]["decision"] == "retry_missing"
+
+
+def test_platform_info_exposes_pan115_recycle_bin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """平台信息接口把 115 的回收站能力透传给前端。"""
+    monkeypatch.setattr(registry, "_adapters", {NetdiskPlatform.PAN115: Pan115Adapter()})
+
+    payload = asyncio.run(netdisk_api.list_platforms(None))
+
+    info = next(
+        item for item in payload.data.platforms if item.platform == NetdiskPlatform.PAN115.value
+    )
+    assert info.recycle_bin is True

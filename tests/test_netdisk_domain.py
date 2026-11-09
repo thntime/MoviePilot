@@ -4,8 +4,11 @@
 
 import pytest
 
+from app.adapters.external.netdisk.pan115 import Pan115Adapter
+from app.adapters.external.netdisk.quark import QuarkAdapter
 from app.domain.netdisk import (
     DISPLAY_ONLY_PLATFORMS,
+    DriveCapabilities,
     NetdiskError,
     NetdiskErrorCode,
     NetdiskPlatform,
@@ -151,3 +154,14 @@ def test_share_level_error_by_code() -> None:
     assert not is_share_level_error(
         NetdiskError(NetdiskErrorCode.UNSUPPORTED, "UC 直链不完整（1/2）")
     )
+
+
+def test_drive_capabilities_recycle_bin_defaults_to_false() -> None:
+    """未声明回收站能力的平台默认不具备自动清空能力。"""
+    assert DriveCapabilities().recycle_bin is False
+
+
+def test_only_pan115_declares_recycle_bin() -> None:
+    """115 声明回收站清理能力，其他平台保持不支持。"""
+    assert Pan115Adapter.drive_capabilities.recycle_bin is True
+    assert QuarkAdapter.drive_capabilities.recycle_bin is False

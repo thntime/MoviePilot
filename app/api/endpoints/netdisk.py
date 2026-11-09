@@ -152,6 +152,7 @@ async def list_platforms(
                 cookie_required_keys=list(adapter.cookie_required_keys),
                 supports_password_login=adapter.supports_password_login,
                 supports_refresh=adapter.supports_refresh,
+                recycle_bin=adapter.drive_capabilities.recycle_bin,
                 login_url=adapter.login_url,
             )
         )

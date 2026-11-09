@@ -566,6 +566,7 @@ class DriveCapabilities:
     :param move: 是否支持移动
     :param rename: 是否支持重命名
     :param delete: 是否支持删除
+    :param recycle_bin: 是否支持读取与清空回收站
     """
 
     quota: bool = False
@@ -575,3 +576,4 @@ class DriveCapabilities:
     move: bool = False
     rename: bool = False
     delete: bool = False
+    recycle_bin: bool = False
