@@ -6,7 +6,10 @@ import pytest
 
 from app.domain.netdisk import (
     DISPLAY_ONLY_PLATFORMS,
+    NetdiskError,
+    NetdiskErrorCode,
     NetdiskPlatform,
+    is_share_level_error,
     normalize_platform,
     parse_share_link,
 )
@@ -137,3 +140,14 @@ def test_tianyi_platform_is_not_display_only() -> None:
     assert normalize_platform("189") is NetdiskPlatform.TIANYI
     assert normalize_platform("cloud189") is NetdiskPlatform.TIANYI
     assert "tianyi" not in DISPLAY_ONLY_PLATFORMS
+
+
+def test_share_level_error_by_code() -> None:
+    """分享级判定以错误码优先，直链未就绪不再拉黑分享。"""
+    assert is_share_level_error(NetdiskError(NetdiskErrorCode.SHARE_INVALID, "分享不存在"))
+    assert not is_share_level_error(
+        NetdiskError(NetdiskErrorCode.LINK_NOT_READY, "迅雷直链尚未就绪")
+    )
+    assert not is_share_level_error(
+        NetdiskError(NetdiskErrorCode.UNSUPPORTED, "UC 直链不完整（1/2）")
+    )

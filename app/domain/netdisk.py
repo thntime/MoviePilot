@@ -111,12 +111,10 @@ class NetdiskError(Exception):
         self.message = message
 
 
-# 判定分享本身不可用的 UNSUPPORTED 消息片段；命中后分享在有效期内不再重试。
+# 判定分享本身不可用的 UNSUPPORTED/UNKNOWN 消息片段；命中后分享在有效期内不再重试。
 _SHARE_LEVEL_MESSAGES = (
     "没有可下载的视频文件",
     "仅预览流",
-    "直链不完整",
-    "未返回可用下载链接",
     "分享内没有",
 )
 
@@ -124,6 +122,11 @@ _SHARE_LEVEL_MESSAGES = (
 def is_share_level_error(error: BaseException) -> bool:
     """
     判断异常是否说明分享本身不可用，可据此把分享加入黑名单。
+
+    优先按 `NetdiskError.code` 判定：`SHARE_INVALID` 直接视为分享级；
+    `UNSUPPORTED`/`UNKNOWN` 仅在消息命中残留的分享级片段时成立；其余错误码
+    （如 `LINK_NOT_READY`、`RATE_LIMITED`、`AUTH_EXPIRED`）一律不拉黑分享。
+    整条异常链都没有分类异常时，才对顶层消息做文案兜底。
 
     沿 `error`、`error.__cause__`、`error.__context__` 逐层检查，避免
     `DownloadError` 等外层包装漏判。网络失败、EMFILE、空间不足、取消与登录失效
@@ -134,18 +137,23 @@ def is_share_level_error(error: BaseException) -> bool:
     """
     seen: set[int] = set()
     current: Optional[BaseException] = error
+    classified = False
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         if isinstance(current, NetdiskError):
+            classified = True
             if current.code is NetdiskErrorCode.SHARE_INVALID:
                 return True
-            # 部分平台把「分享无直链」这类分享级问题归为 UNKNOWN，仍按消息片段识别。
+            # 部分平台把「分享无直链」这类分享级问题归为 UNKNOWN/UNSUPPORTED，
+            # 仍按残留消息片段识别；直链不完整、未返回直链已改为按错误码判定。
             if current.code in (
                 NetdiskErrorCode.UNSUPPORTED,
                 NetdiskErrorCode.UNKNOWN,
             ) and any(token in current.message for token in _SHARE_LEVEL_MESSAGES):
                 return True
         current = current.__cause__ or current.__context__
+    if not classified:
+        return any(token in str(error) for token in _SHARE_LEVEL_MESSAGES)
     return False
 
 

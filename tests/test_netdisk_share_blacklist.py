@@ -31,12 +31,16 @@ def test_blacklist_expires_and_prunes(tmp_path: Path) -> None:
 
 def test_share_level_error_classification() -> None:
     """
-    只有分享失效与分享内容不可用算分享级错误，其余错误不拉黑分享。
+    只有分享失效与分享内容不可用算分享级错误，直链未就绪不拉黑分享。
     """
     assert is_share_level_error(NetdiskError(NetdiskErrorCode.SHARE_INVALID, "分享已失效"))
-    assert is_share_level_error(NetdiskError(NetdiskErrorCode.UNSUPPORTED, "UC 直链不完整（1/2）"))
-    # 迅雷/百度把「分享无直链」归为 UNKNOWN，仍需按消息片段识别为分享级失败。
-    assert is_share_level_error(NetdiskError(NetdiskErrorCode.UNKNOWN, "迅雷云盘未返回可用下载链接"))
+    # 直链不完整、未返回直链属于取链就绪问题，改为按错误码判定，不再拉黑分享。
+    assert not is_share_level_error(
+        NetdiskError(NetdiskErrorCode.UNSUPPORTED, "UC 直链不完整（1/2）")
+    )
+    assert not is_share_level_error(
+        NetdiskError(NetdiskErrorCode.UNKNOWN, "迅雷云盘未返回可用下载链接")
+    )
     assert not is_share_level_error(NetdiskError(NetdiskErrorCode.UNKNOWN, "网络不可达"))
     assert not is_share_level_error(NetdiskError(NetdiskErrorCode.SPACE_INSUFFICIENT, "空间不足"))
 
