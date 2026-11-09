@@ -86,7 +86,7 @@ def test_list_recycle_bin_reads_page_and_reports_safe_password(monkeypatch) -> N
         "aid": "7",
         "cid": "0",
         "offset": "0",
-        "limit": "100",
+        "limit": "1",
         "format": "json",
     }
     assert result["count"] == 2
@@ -112,6 +112,77 @@ def test_list_recycle_bin_accepts_numeric_state(monkeypatch) -> None:
     assert result["items"] == []
 
 
+def test_list_recycle_bin_falls_back_to_data_fields(monkeypatch) -> None:
+    """
+    开放平台把 count/rb_pass 放在 data 内时仍能读取。
+    """
+
+    def handler(method, http, url, account, params, body, headers):
+        """
+        返回 data 字典形式的摘要。
+        """
+        return {
+            "state": True,
+            "data": {
+                "count": 4,
+                "rb_pass": 0,
+                "list": [{"id": "1"}, {"id": "2"}],
+            },
+        }
+
+    _patch_http(monkeypatch, handler)
+    result = pan115_module.Pan115Adapter().list_recycle_bin(_account())
+
+    assert result["count"] == 4
+    assert result["rb_pass"] == 0
+    assert [item["id"] for item in result["items"]] == ["1", "2"]
+
+
+def test_clear_recycle_bin_skips_when_safe_password_inside_data(monkeypatch) -> None:
+    """
+    data 内标记开启安全密钥时同样拒绝清空。
+    """
+    posts = []
+
+    def handler(method, http, url, account, params, body, headers):
+        """
+        GET 在 data 内标记安全密钥；POST 不应被调用。
+        """
+        if method == "GET":
+            return {"state": True, "data": {"count": 1, "rb_pass": 1}}
+        posts.append(url)
+        return {"state": True}
+
+    _patch_http(monkeypatch, handler)
+
+    with pytest.raises(NetdiskError) as error:
+        pan115_module.Pan115Adapter().clear_recycle_bin(_account())
+
+    assert error.value.code is NetdiskErrorCode.UNSUPPORTED
+    assert "安全密钥" in error.value.message
+    assert posts == []
+
+
+def test_check_state_rejects_zero_state(monkeypatch) -> None:
+    """
+    `state` 为 0 时即使带 data 也必须报错。
+    """
+
+    def handler(method, http, url, account, params, body, headers):
+        """
+        返回失败状态。
+        """
+        return {"state": 0, "errno": 999999, "error": "失败原因", "data": {"count": 0}}
+
+    _patch_http(monkeypatch, handler)
+
+    with pytest.raises(NetdiskError) as error:
+        pan115_module.Pan115Adapter().list_recycle_bin(_account())
+
+    assert error.value.code is NetdiskErrorCode.UNKNOWN
+    assert "失败原因" in error.value.message
+
+
 def test_clear_recycle_bin_posts_empty_form_after_reading_password_flag(monkeypatch) -> None:
     """
     未开启安全密钥时先读回收站再提交空表单清空。
@@ -131,7 +202,7 @@ def test_clear_recycle_bin_posts_empty_form_after_reading_password_flag(monkeypa
     _patch_http(monkeypatch, handler)
     result = pan115_module.Pan115Adapter().clear_recycle_bin(_account())
 
-    assert posts == [(pan115_module._RECYCLE_CLEAN_URL, {})]
+    assert posts == [(pan115_module._RECYCLE_CLEAN_URL, {"password": "000000"})]
     assert result == {"cleared": True, "count": 2}
 
 

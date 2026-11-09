@@ -826,6 +826,32 @@ class BaseNetdiskAdapter:
         del account, files
         raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "该平台不支持删除", platform=self.platform)
 
+    def list_recycle_bin(self, account: NetdiskAccountRecord) -> dict[str, Any]:
+        """
+        读取个人回收站摘要。
+
+        :param account: 账号
+        :return: 回收站摘要
+        :raises NetdiskError: 平台不支持时抛出 UNSUPPORTED
+        """
+        del account
+        raise NetdiskError(
+            NetdiskErrorCode.UNSUPPORTED, "该平台不支持回收站操作", platform=self.platform
+        )
+
+    def clear_recycle_bin(self, account: NetdiskAccountRecord) -> dict[str, Any]:
+        """
+        清空个人回收站。
+
+        :param account: 账号
+        :return: 清空结果
+        :raises NetdiskError: 平台不支持时抛出 UNSUPPORTED
+        """
+        del account
+        raise NetdiskError(
+            NetdiskErrorCode.UNSUPPORTED, "该平台不支持回收站操作", platform=self.platform
+        )
+
     def login_ready(self, credential: Mapping[str, str]) -> bool:
         """
         判断网页登录是否已拿到可保存的登录态。

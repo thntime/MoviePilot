@@ -57,6 +57,8 @@ _FILE_ADD_URL = f"{_API_BASE}/files/add"
 _FILE_DELETE_URL = f"{_API_BASE}/rb/delete"
 _RECYCLE_LIST_URL = f"{_API_BASE}/rb"
 _RECYCLE_CLEAN_URL = f"{_API_BASE}/rb/clean"
+# 未开启安全密钥时上游始终提交该默认口令；它不是账号密钥，也不参与配置。
+_RECYCLE_DEFAULT_PASSWORD = "000000"
 _FILE_DOWNLOAD_URL = f"{_API_BASE}/files/download"
 _APP_DOWNLOAD_URL = "https://proapi.115.com/app/chrome/downurl"
 _INDEX_INFO_URL = f"{_API_BASE}/files/index_info?count_space_nums=1"
@@ -356,7 +358,7 @@ def _error_for_errno(errno: int, message: str, action: str) -> NetdiskError:
     if errno == _ERRNO_SAFE_PWD:
         return NetdiskError(
             NetdiskErrorCode.UNSUPPORTED,
-            "115 回收站安全密钥不正确，暂不支持自动清空",
+            "115 安全密钥校验失败",
             platform=NetdiskPlatform.PAN115,
         )
     suffix = f"（errno={errno}）" if errno and str(errno) not in text else ""
@@ -1343,7 +1345,9 @@ class Pan115Adapter(BaseNetdiskAdapter):
 
     def list_recycle_bin(self, account: NetdiskAccountRecord) -> dict[str, Any]:
         """
-        读取 115 回收站首页条目。
+        读取 115 回收站摘要。
+
+        只需要总数与安全密钥标记，因此单页只取一条；顶层缺失时从 `data` 内兜底读取。
 
         :param account: 账号记录
         :return: 含 `count`、`rb_pass` 与 `items` 的字典
@@ -1355,20 +1359,27 @@ class Pan115Adapter(BaseNetdiskAdapter):
                 "aid": _AID_RECYCLE,
                 "cid": _ROOT_CID,
                 "offset": "0",
-                "limit": str(_FILE_PAGE_LIMIT),
+                "limit": "1",
                 "format": "json",
             },
             action="读取 115 回收站",
         )
         raw = payload.get("data")
-        items = (
-            [dict(item) for item in raw if isinstance(item, dict)]
-            if isinstance(raw, list)
-            else []
-        )
+        data = raw if isinstance(raw, Mapping) else {}
+        if isinstance(raw, list):
+            items = [dict(item) for item in raw if isinstance(item, dict)]
+        else:
+            raw_items = data.get("list") or data.get("data") or []
+            items = (
+                [dict(item) for item in raw_items if isinstance(item, dict)]
+                if isinstance(raw_items, list)
+                else []
+            )
+        count = payload.get("count")
+        rb_pass = payload.get("rb_pass")
         return {
-            "count": as_int(payload.get("count")),
-            "rb_pass": as_int(payload.get("rb_pass")),
+            "count": as_int(count if count is not None else data.get("count")),
+            "rb_pass": as_int(rb_pass if rb_pass is not None else data.get("rb_pass")),
             "items": items,
         }
 
@@ -1389,7 +1400,12 @@ class Pan115Adapter(BaseNetdiskAdapter):
             )
         if not listing["count"]:
             return {"cleared": False, "count": 0}
-        self._post_form(_RECYCLE_CLEAN_URL, {}, account=account, action="清空 115 回收站")
+        self._post_form(
+            _RECYCLE_CLEAN_URL,
+            {"password": _RECYCLE_DEFAULT_PASSWORD},
+            account=account,
+            action="清空 115 回收站",
+        )
         return {"cleared": True, "count": listing["count"]}
 
     # ---- 账号 ----

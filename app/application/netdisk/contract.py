@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Mapping, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from app.domain.netdisk import (
     AccountProbe,
@@ -327,6 +327,24 @@ class NetdiskAdapter(Protocol):
     def delete_files(self, account: NetdiskAccountRecord, files: list[DriveFile]) -> None:
         """
         删除文件。
+        """
+        ...
+
+    def list_recycle_bin(self, account: NetdiskAccountRecord) -> dict[str, Any]:
+        """
+        读取个人回收站摘要。
+
+        :param account: 账号
+        :return: 含 `count`、`rb_pass` 与 `items` 的摘要
+        """
+        ...
+
+    def clear_recycle_bin(self, account: NetdiskAccountRecord) -> dict[str, Any]:
+        """
+        清空个人回收站。
+
+        :param account: 账号
+        :return: 含 `cleared` 与 `count` 的结果
         """
         ...
 

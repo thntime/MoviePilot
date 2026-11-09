@@ -13,7 +13,7 @@ import pytz
 
 from app.application.configuration import SchedulerRuntimeConfig
 from app.application.netdisk.contract import NetdiskAccountView
-from app.domain.netdisk import NetdiskPlatform
+from app.domain.netdisk import NetdiskError, NetdiskErrorCode, NetdiskPlatform
 from app.scheduler import catalog as scheduler_catalog
 from app.scheduler import chain as scheduler_chain
 from app.scheduler.facade import Scheduler
@@ -112,7 +112,7 @@ def test_recycle_bin_job_registered_hourly_after_five_minutes(monkeypatch) -> No
 
 def test_clear_recycle_bins_only_active_pan115_and_isolates_failures(monkeypatch) -> None:
     """
-    只清理 115 且状态为 active 的账号，单账号异常不中断其余账号。
+    只清理 115 且状态为 active 的账号；安全密钥跳过，真实异常计入失败。
     """
     views = [
         NetdiskAccountView(
@@ -122,7 +122,13 @@ def test_clear_recycle_bins_only_active_pan115_and_isolates_failures(monkeypatch
             id=2, platform="pan115", name="乙", is_primary=False, status="active"
         ),
         NetdiskAccountView(
-            id=3, platform="pan115", name="丙", is_primary=False, status="expired"
+            id=3, platform="pan115", name="丙", is_primary=False, status="active"
+        ),
+        NetdiskAccountView(
+            id=4, platform="pan115", name="丁", is_primary=False, status="active"
+        ),
+        NetdiskAccountView(
+            id=5, platform="pan115", name="戊", is_primary=False, status="expired"
         ),
     ]
     calls: list[int] = []
@@ -141,7 +147,7 @@ def test_clear_recycle_bins_only_active_pan115_and_isolates_failures(monkeypatch
 
     class _Service:
         """
-        账号服务替身：第二个账号抛异常。
+        账号服务替身：第二个账号真实异常，第三个账号开启安全密钥。
         """
 
         def __init__(self) -> None:
@@ -152,11 +158,17 @@ def test_clear_recycle_bins_only_active_pan115_and_isolates_failures(monkeypatch
 
         def clear_recycle_bin(self, account_id: int) -> dict:
             """
-            记录调用并模拟单账号失败。
+            记录调用并模拟失败、跳过与成功。
             """
             calls.append(account_id)
             if account_id == 2:
                 raise RuntimeError("boom")
+            if account_id == 3:
+                raise NetdiskError(
+                    NetdiskErrorCode.UNSUPPORTED,
+                    "账号开启回收站安全密钥，暂不支持自动清空",
+                    platform=NetdiskPlatform.PAN115,
+                )
             return {"account_id": account_id, "cleared": True, "message": "回收站已清空"}
 
     monkeypatch.setattr(scheduler_chain, "NetdiskAccountService", lambda: _Service())
@@ -164,5 +176,5 @@ def test_clear_recycle_bins_only_active_pan115_and_isolates_failures(monkeypatch
 
     result = chain.clear_netdisk_recycle_bins()
 
-    assert calls == [1, 2]
-    assert result == {"checked": 2, "cleared": 1, "failed": 1}
+    assert calls == [1, 2, 3, 4]
+    assert result == {"checked": 4, "cleared": 2, "skipped": 1, "failed": 1}
