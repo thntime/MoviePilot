@@ -325,6 +325,57 @@ def test_resolve_restores_and_cleans(monkeypatch: pytest.MonkeyPatch) -> None:
     assert set(delete["json"]["ids"]) == {"new-1", "dir-1"}
 
 
+@pytest.mark.parametrize(
+    "restore_payload",
+    [
+        {"file_ids": "new-1"},
+        {"file_ids": ["", "new-1"]},
+        {"ids": ["new-1"]},
+        {"params": {"trace_file_ids": json.dumps({"f1": ["new-1"]})}},
+    ],
+)
+def test_resolve_extracts_new_file_id_variants(
+    monkeypatch: pytest.MonkeyPatch, restore_payload: dict
+) -> None:
+    """
+    转存响应把新文件标识放在 file_ids、ids 或 trace 列表值时仍能取到。
+    """
+    adapter, _calls, responses = _install(monkeypatch)
+    responses[("GET", xunlei._ABOUT_URL)] = [{"quota": {"limit": 10_000_000, "usage": 0}}]
+    responses[("POST", xunlei._FILES_URL)] = [{"id": "dir-1"}]
+    responses[("POST", xunlei._RESTORE_URL)] = [restore_payload]
+    responses[("GET", f"{xunlei._FILES_URL}/new-1")] = [
+        {
+            "id": "new-1",
+            "name": "a.mkv",
+            "size": 2048,
+            "links": {"application/octet-stream": {"url": "https://cdn.xunlei.com/a.mkv"}},
+        }
+    ]
+    responses[("POST", xunlei._BATCH_DELETE_URL)] = [{"id": "ok"}]
+
+    link = adapter.resolve(_ref(), _file(), _account())
+
+    assert link.cleanup_handle is not None
+    assert link.cleanup_handle.file_ids == ("new-1",)
+
+
+def test_resolve_missing_new_file_id_keeps_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    转存响应完全没有新文件标识时保留原有错误文案。
+    """
+    adapter, _calls, responses = _install(monkeypatch)
+    responses[("GET", xunlei._ABOUT_URL)] = [{"quota": {"limit": 10_000_000, "usage": 0}}]
+    responses[("POST", xunlei._FILES_URL)] = [{"id": "dir-1"}]
+    responses[("POST", xunlei._RESTORE_URL)] = [{"task_id": "t-1"}]
+    responses[("POST", xunlei._BATCH_DELETE_URL)] = [{"id": "ok"}]
+
+    with pytest.raises(NetdiskError) as error:
+        adapter.resolve(_ref(), _file(), _account())
+
+    assert str(error.value) == "迅雷云盘转存完成但未返回新文件标识"
+
+
 def test_resolve_accepts_file_object_temp_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     当前迅雷接口把新目录放在 `file` 对象里，仍应取到目录标识并继续转存。
@@ -352,6 +403,92 @@ def test_resolve_accepts_file_object_temp_dir(monkeypatch: pytest.MonkeyPatch) -
     assert link.url == "https://cdn.xunlei.com/a.mkv"
     restore = next(call for call in calls if call["url"] == xunlei._RESTORE_URL)
     assert restore["json"]["parent_id"] == "dir-file"
+
+
+def test_resolve_accepts_medias_link_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    迅雷文件详情把直链放在 medias[].link.url 时也应能取到。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    responses[("GET", xunlei._ABOUT_URL)] = [{"quota": {"limit": 10_000_000, "usage": 0}}]
+    responses[("POST", xunlei._FILES_URL)] = [
+        {"file": {"id": "dir-file"}, "task": None, "upload_type": "UPLOAD_TYPE_UNKNOWN"}
+    ]
+    responses[("POST", xunlei._RESTORE_URL)] = [
+        {"params": {"trace_file_ids": json.dumps({"f1": "new-1"})}}
+    ]
+    responses[("GET", f"{xunlei._FILES_URL}/new-1")] = [
+        {
+            "id": "new-1",
+            "name": "a.mkv",
+            "size": 2048,
+            "medias": [{"link": {"url": "https://cdn.xunlei.com/a.mkv"}}],
+        }
+    ]
+    responses[("POST", xunlei._BATCH_DELETE_URL)] = [{"id": "ok"}]
+
+    link = adapter.resolve(_ref(), _file(), _account())
+
+    assert link.url == "https://cdn.xunlei.com/a.mkv"
+
+
+def test_resolve_accepts_original_url_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    迅雷文件详情只给 original_url 时也应能取到直链。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    responses[("GET", xunlei._ABOUT_URL)] = [{"quota": {"limit": 10_000_000, "usage": 0}}]
+    responses[("POST", xunlei._FILES_URL)] = [
+        {"file": {"id": "dir-file"}, "task": None, "upload_type": "UPLOAD_TYPE_UNKNOWN"}
+    ]
+    responses[("POST", xunlei._RESTORE_URL)] = [
+        {"params": {"trace_file_ids": json.dumps({"f1": "new-1"})}}
+    ]
+    responses[("GET", f"{xunlei._FILES_URL}/new-1")] = [
+        {
+            "id": "new-1",
+            "name": "a.mkv",
+            "size": 2048,
+            "original_url": "https://cdn.xunlei.com/a.mkv",
+        }
+    ]
+    responses[("POST", xunlei._BATCH_DELETE_URL)] = [{"id": "ok"}]
+
+    link = adapter.resolve(_ref(), _file(), _account())
+
+    assert link.url == "https://cdn.xunlei.com/a.mkv"
+
+
+def test_resolve_retries_with_play_when_download_has_no_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    usage=DOWNLOAD 返回空 links 时应继续用 PLAY 再取一次。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    responses[("GET", xunlei._ABOUT_URL)] = [{"quota": {"limit": 10_000_000, "usage": 0}}]
+    responses[("POST", xunlei._FILES_URL)] = [
+        {"file": {"id": "dir-file"}, "task": None, "upload_type": "UPLOAD_TYPE_UNKNOWN"}
+    ]
+    responses[("POST", xunlei._RESTORE_URL)] = [
+        {"params": {"trace_file_ids": json.dumps({"f1": "new-1"})}}
+    ]
+    responses[("GET", f"{xunlei._FILES_URL}/new-1")] = [
+        {"id": "new-1", "name": "a.mkv", "size": 2048, "links": {}},
+        {
+            "id": "new-1",
+            "name": "a.mkv",
+            "size": 2048,
+            "links": {"application/octet-stream": {"url": "https://cdn.xunlei.com/a.mkv"}},
+        },
+    ]
+    responses[("POST", xunlei._BATCH_DELETE_URL)] = [{"id": "ok"}]
+
+    link = adapter.resolve(_ref(), _file(), _account())
+
+    assert link.url == "https://cdn.xunlei.com/a.mkv"
+    file_calls = [call for call in calls if call["url"] == f"{xunlei._FILES_URL}/new-1"]
+    assert len(file_calls) == 2
 
 
 def test_resolve_failure_cleans_temp_dir(monkeypatch: pytest.MonkeyPatch) -> None:

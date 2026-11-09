@@ -358,9 +358,9 @@ class BaiduAdapter(BaseNetdiskAdapter):
             data={"pwd": password, "vcode_str": "", "vcode": ""},
             headers=headers,
         )
-        if _errno(payload) in (-12, 200025):
+        if _errno(payload) in (-12, 200025, 105):
             # 带账号 Cookie 校验可能被风控拒绝（同一提取码公开校验可通过），
-            # 去掉 Cookie 重试一次；分享密码本身正确时仍能拿到 randsk。
+            # 105 也会在带 Cookie 时出现；去掉 Cookie 重试一次，密码正确时仍能拿到 randsk。
             retry_headers = {
                 key: value for key, value in headers.items() if key.lower() != "cookie"
             }

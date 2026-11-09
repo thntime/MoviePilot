@@ -7,10 +7,13 @@ UC 与夸克同源但域名、UA 与查询参数不同：分享取链全程免�
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
 
+from app.adapters.network.http import RequestUtils
+from app.runtime.log import logger
 from app.adapters.external.netdisk.base import (
     BaseNetdiskAdapter,
     NetdiskHttp,
@@ -40,6 +43,16 @@ UC_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
+
+def _is_hls_url(url: str) -> bool:
+    """
+    判断直链是否为 HLS 播放列表。
+
+    :param url: 直链
+    :return: m3u8 返回 True
+    """
+    return str(url or "").lower().split("?", 1)[0].endswith(".m3u8")
 UC_WEB_ORIGIN = "https://drive.uc.cn"
 UC_DOWNLOAD_REFERER = f"{UC_WEB_ORIGIN}/"
 UC_ACCOUNT_INFO_URL = f"{UC_WEB_ORIGIN}/account/info"
@@ -327,26 +340,41 @@ class UCAdapter(BaseNetdiskAdapter):
                 platform=self.platform,
             )
         stoken = self._stoken_for(ref, account)
-        headers = self.http.headers(account)
+        headers = self.http.headers(account, extra={"Origin": UC_WEB_ORIGIN})
         account_id = account.id if account else 0
         if is_video_name(file.name):
             preview = self._video_preview(ref, file, stoken, account)
             if preview is not None:
                 url, size = preview
-                return DirectLink(
-                    url=url,
-                    headers=headers,
-                    size=size or file.size,
-                    account_id=account_id,
-                    is_hls=False,
+                # 不能只信 play_info.size：UC 可能虚报原文件大小但实际只给限长
+                # 预览流。用 Range 0-0 探测真实总长，探测不到时保持现状。
+                total = self._probe_total(url, headers)
+                if total is None or not file.size or total >= int(file.size * 0.98):
+                    return DirectLink(
+                        url=url,
+                        headers=headers,
+                        size=size or file.size,
+                        account_id=account_id,
+                        is_hls=_is_hls_url(url),
+                    )
+                logger.warning(
+                    f"UC 预览流受限：{total}/{file.size} 字节，回退 file/download：{file.name}"
                 )
         url, size = self._download_link(ref, file, stoken, account)
+        if is_video_name(file.name):
+            total = self._probe_total(url, headers)
+            if total is not None and file.size and total < int(file.size * 0.98):
+                raise NetdiskError(
+                    NetdiskErrorCode.UNSUPPORTED,
+                    f"UC 直链不完整（{total}/{file.size}），疑似非会员试看限制",
+                    platform=self.platform,
+                )
         return DirectLink(
             url=url,
             headers=headers,
             size=size or file.size,
             account_id=account_id,
-            is_hls=False,
+            is_hls=_is_hls_url(url),
         )
 
     def cleanup(self, handle: TransferHandle, account: Optional[NetdiskAccountRecord]) -> None:
@@ -615,6 +643,39 @@ class UCAdapter(BaseNetdiskAdapter):
                 platform=self.platform,
             )
         return url, as_int(item.get("size"))
+
+    def _probe_total(self, url: str, headers: Mapping[str, str]) -> Optional[int]:
+        """
+        用 ``Range: bytes=0-0`` 探测直链真实总长。
+
+        只采信 206 的 Content-Range；200 退回 Content-Length；探测失败返回 None，
+        避免把偶发网络问题放大成不可用。
+
+        :param url: 直链
+        :param headers: 请求头
+        :return: 真实总字节数；无法判断时为 None
+        """
+        probe = {**headers, "Range": "bytes=0-0", "Accept": "*/*"}
+        try:
+            with RequestUtils(timeout=30, proxies=self.http.proxies).get_stream(
+                url, headers=probe, raise_exception=True
+            ) as response:
+                if response is None:
+                    return None
+                status = int(getattr(response, "status_code", 0) or 0)
+                response_headers = getattr(response, "headers", {}) or {}
+                if status == 206:
+                    match = re.match(
+                        r"bytes\s+0-0/(\d+)",
+                        str(response_headers.get("Content-Range") or ""),
+                    )
+                    return int(match.group(1)) if match else None
+                if status == 200:
+                    length = str(response_headers.get("Content-Length") or "")
+                    return int(length) if length.isdigit() else None
+        except Exception:  # noqa: BLE001 - 探测失败按未知处理
+            return None
+        return None
 
     def _video_preview(
         self,

@@ -43,6 +43,7 @@ from app.domain.netdisk import (
     ShareRef,
     TransferHandle,
 )
+from app.runtime.log import logger
 
 # 云盘接口主机。
 _PAN_BASE = "https://api-pan.xunlei.com"
@@ -338,6 +339,55 @@ def _parse_files(data: Mapping[str, Any]) -> list[ShareFile]:
             )
         )
     return files
+
+
+def _link_url(value: Any) -> str:
+    """
+    从单个 links 值中取出 url；兼容 mapping 与 list。
+
+    :param value: links 字段下的单个值
+    :return: 直链；没有时为空串
+    """
+    if isinstance(value, Mapping):
+        return as_text(value.get("url"))
+    if isinstance(value, list):
+        for item in value:
+            url = _link_url(item)
+            if url:
+                return url
+    return ""
+
+
+def _first_link_url(links: Any) -> str:
+    """
+    从迅雷文件详情的 links 中取第一个可用直链。
+
+    线上 links 既可能是 mapping（按 MIME 分键），也可能是 list；
+    优先取原始文件类型，取不到再遍历全部值。
+
+    :param links: 文件详情中的 links 字段
+    :return: 直链；没有时为空串
+    """
+    if isinstance(links, Mapping):
+        for key in (
+            "application/octet-stream",
+            "application/octet-stream; charset=utf-8",
+            "video/mp4",
+            "video/x-matroska",
+        ):
+            url = _link_url(links.get(key))
+            if url:
+                return url
+        for value in links.values():
+            url = _link_url(value)
+            if url:
+                return url
+    elif isinstance(links, list):
+        for value in links:
+            url = _link_url(value)
+            if url:
+                return url
+    return ""
 
 
 class XunleiAdapter(BaseNetdiskAdapter):
@@ -781,6 +831,19 @@ class XunleiAdapter(BaseNetdiskAdapter):
         )
         self._check_payload(payload, "转存迅雷云盘分享文件")
         data = self._data(payload)
+
+        def first_id(value: Any) -> str:
+            """
+            从字符串、列表或映射值中取第一个非空文件标识。
+            """
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    text = as_text(item)
+                    if text:
+                        return text
+                return ""
+            return as_text(value)
+
         trace = (data.get("params") or {}).get("trace_file_ids")
         mapping: dict[str, Any] = {}
         if isinstance(trace, str) and trace:
@@ -792,8 +855,16 @@ class XunleiAdapter(BaseNetdiskAdapter):
                 mapping = dict(parsed)
         elif isinstance(trace, Mapping):
             mapping = dict(trace)
-        new_id = as_text(mapping.get(file.file_id)) or as_text(data.get("file_id"))
+        new_id = (
+            as_text(data.get("file_id"))
+            or first_id(data.get("file_ids"))
+            or first_id(data.get("ids"))
+            or first_id(mapping.get(file.file_id))
+        )
         if not new_id:
+            logger.warning(
+                f"迅雷云盘转存未返回新文件标识：file_id={file.file_id} keys={sorted(data.keys())}"
+            )
             raise NetdiskError(
                 NetdiskErrorCode.UNKNOWN,
                 "迅雷云盘转存完成但未返回新文件标识",
@@ -814,24 +885,64 @@ class XunleiAdapter(BaseNetdiskAdapter):
         :return: `(直链, 文件大小)`
         :raises NetdiskError: 接口失败或未返回直链时抛出
         """
-        payload = self.http.get_json(
-            f"{_FILES_URL}/{file_id}",
-            params={
-                "_magic": "2021",
-                "usage": "PLAY",
-                "thumbnail_size": "SIZE_LARGE",
-                "with": "hdr10",
-            },
-            headers=self._api_headers(account),
-        )
-        self._check_payload(payload, "获取迅雷云盘下载链接")
-        data = self._data(payload)
-        links = data.get("links")
-        stream = links.get("application/octet-stream") if isinstance(links, Mapping) else None
-        url = as_text(stream.get("url")) if isinstance(stream, Mapping) else ""
+        data: dict[str, Any] = {}
+        links: Any = {}
+        url = ""
+        last_error = None
+        # 同一个文件详情接口按 usage 返回不同链接；PLAY 对部分 mkv 会返回空 links，
+        # 必须再试 DOWNLOAD 才能拿到原始文件直链。某个 usage 直接报错时继续试下一个。
+        for usage in ("DOWNLOAD", "PLAY"):
+            try:
+                payload = self.http.get_json(
+                    f"{_FILES_URL}/{file_id}",
+                    params={
+                        "_magic": "2021",
+                        "usage": usage,
+                        "thumbnail_size": "SIZE_LARGE",
+                        "with": "hdr10",
+                    },
+                    headers=self._api_headers(account),
+                )
+                self._check_payload(payload, "获取迅雷云盘下载链接")
+            except NetdiskError as error:
+                if error.code is NetdiskErrorCode.AUTH_EXPIRED:
+                    raise
+                last_error = error
+                continue
+            data = self._data(payload)
+            links = data.get("links")
+            url = _first_link_url(links)
+            if not url:
+                url = (
+                    as_text(data.get("web_content_link"))
+                    or as_text(data.get("original_url"))
+                    or as_text(data.get("url"))
+                )
+            if not url:
+                medias = data.get("medias")
+                if isinstance(medias, list):
+                    for media in medias:
+                        if not isinstance(media, Mapping):
+                            continue
+                        link = media.get("link")
+                        if isinstance(link, Mapping):
+                            url = as_text(link.get("url"))
+                        if not url:
+                            url = as_text(media.get("url"))
+                        if url:
+                            break
+            if url:
+                break
         if not url:
-            url = as_text(data.get("web_content_link"))
-        if not url:
+            if last_error is not None and not data:
+                raise last_error
+            logger.warning(
+                f"迅雷文件详情未返回直链：phase={data.get('phase')} space={data.get('space')} "
+                f"original_url={bool(as_text(data.get('original_url')))} "
+                f"web_content_link={bool(as_text(data.get('web_content_link')))} "
+                f"links={list(links.keys()) if isinstance(links, Mapping) else type(links).__name__} "
+                f"medias={len(data.get('medias') or []) if isinstance(data.get('medias'), list) else type(data.get('medias')).__name__}"
+            )
             raise NetdiskError(
                 NetdiskErrorCode.UNKNOWN,
                 "迅雷云盘未返回可用下载链接",

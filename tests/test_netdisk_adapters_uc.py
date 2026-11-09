@@ -302,6 +302,7 @@ def test_resolve_video_prefers_direct_preview(
             ("sharepage/video_preview", preview_payload),
         ],
     )
+    monkeypatch.setattr(adapter, "_probe_total", lambda *args: None)
 
     link = adapter.resolve(REF, ShareFile(file_id="f9", name="影片.mp4", size=1024, token="tok-9"), ACCOUNT)
 
@@ -309,6 +310,142 @@ def test_resolve_video_prefers_direct_preview(
     assert link.is_hls is False
     assert link.size == 2048
     assert not any("file/download" in call["url"] for call in calls)
+
+
+def test_resolve_video_preview_limited_falls_back_to_download(
+    adapter: UCAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    预览探测到真实总长明显小于原文件时，回退 file/download。
+    """
+    preview_payload = {
+        "status": 200,
+        "code": 0,
+        "data": {"play_info": {"url": "https://cdn.uc.cn/preview.mp4", "size": 15340287}},
+    }
+    download_payload = {
+        "status": 200,
+        "code": 0,
+        "data": [{"download_url": "https://cdn.uc.cn/original.mp4", "size": 763025717}],
+    }
+    _install(
+        monkeypatch,
+        [
+            ("sharepage/token", TOKEN_PAYLOAD),
+            ("sharepage/video_preview", preview_payload),
+            ("file/download", download_payload),
+        ],
+    )
+    monkeypatch.setattr(
+        adapter, "_probe_total",
+        lambda url, headers: 15340287 if "preview" in url else 763025717,
+    )
+
+    link = adapter.resolve(
+        REF,
+        ShareFile(file_id="f9", name="S01E257 257 4K.mp4", size=763025717, token="tok-9"),
+        ACCOUNT,
+    )
+
+    assert link.url == "https://cdn.uc.cn/original.mp4"
+
+
+def test_resolve_video_preview_full_keeps_preview(
+    adapter: UCAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    预览探测到的真实总长等于原文件时保持 preview 直链。
+    """
+    preview_payload = {
+        "status": 200,
+        "code": 0,
+        "data": {"play_info": {"url": "https://cdn.uc.cn/preview.mp4", "size": 763025717}},
+    }
+    _install(
+        monkeypatch,
+        [
+            ("sharepage/token", TOKEN_PAYLOAD),
+            ("sharepage/video_preview", preview_payload),
+        ],
+    )
+    monkeypatch.setattr(adapter, "_probe_total", lambda url, headers: 763025717)
+
+    link = adapter.resolve(
+        REF,
+        ShareFile(file_id="f9", name="S01E257 257 4K.mp4", size=763025717, token="tok-9"),
+        ACCOUNT,
+    )
+
+    assert link.url == "https://cdn.uc.cn/preview.mp4"
+
+
+def test_resolve_video_download_short_size_raises_unsupported(
+    adapter: UCAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    预览受限且 file/download 也只返回短流时，明确报 UNSUPPORTED。
+    """
+    preview_payload = {
+        "status": 200,
+        "code": 0,
+        "data": {"play_info": {"url": "https://cdn.uc.cn/preview.mp4", "size": 15340287}},
+    }
+    download_payload = {
+        "status": 200,
+        "code": 0,
+        "data": [{"download_url": "https://cdn.uc.cn/original.mp4", "size": 15340287}],
+    }
+    _install(
+        monkeypatch,
+        [
+            ("sharepage/token", TOKEN_PAYLOAD),
+            ("sharepage/video_preview", preview_payload),
+            ("file/download", download_payload),
+        ],
+    )
+    monkeypatch.setattr(adapter, "_probe_total", lambda url, headers: 15340287)
+
+    with pytest.raises(NetdiskError) as error:
+        adapter.resolve(
+            REF,
+            ShareFile(file_id="f9", name="S01E257 257 4K.mp4", size=763025717, token="tok-9"),
+            ACCOUNT,
+        )
+
+    assert error.value.code is NetdiskErrorCode.UNSUPPORTED
+
+
+def test_resolve_video_probe_none_keeps_preview(
+    adapter: UCAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    探测失败时保持现状使用 preview，避免把偶发网络问题放大成不可用。
+    """
+    preview_payload = {
+        "status": 200,
+        "code": 0,
+        "data": {"play_info": {"url": "https://cdn.uc.cn/preview.mp4", "size": 15340287}},
+    }
+    _install(
+        monkeypatch,
+        [
+            ("sharepage/token", TOKEN_PAYLOAD),
+            ("sharepage/video_preview", preview_payload),
+        ],
+    )
+    monkeypatch.setattr(adapter, "_probe_total", lambda url, headers: None)
+
+    link = adapter.resolve(
+        REF,
+        ShareFile(file_id="f9", name="S01E257 257 4K.mp4", size=763025717, token="tok-9"),
+        ACCOUNT,
+    )
+
+    assert link.url == "https://cdn.uc.cn/preview.mp4"
 
 
 def test_resolve_video_falls_back_to_download(
@@ -331,6 +468,7 @@ def test_resolve_video_falls_back_to_download(
             ("file/download", download_payload),
         ],
     )
+    monkeypatch.setattr(adapter, "_probe_total", lambda *args: None)
 
     link = adapter.resolve(REF, ShareFile(file_id="f9", name="影片.mp4", size=1024, token="tok-9"), ACCOUNT)
 

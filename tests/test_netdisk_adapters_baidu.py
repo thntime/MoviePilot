@@ -465,6 +465,28 @@ def test_verify_retries_without_cookie_on_risk_control(
     assert "Cookie" not in calls[1]["headers"]
 
 
+def test_verify_retries_without_cookie_on_105(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    带账号 Cookie 校验返回 105 时，去掉 Cookie 公开校验仍可拿到 sekey。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    responses[("POST", baidu._VERIFY_URL)] = [
+        {"errno": 105, "err_msg": "分享链接已失效"},
+        {"errno": 0, "randsk": "sekey-1"},
+    ]
+    ref = ShareRef(platform=NetdiskPlatform.BAIDU, share_id="12rXsgfr8r9x1QuTdpis-lg", password="6666")
+    account = NetdiskAccountRecord(
+        id=1, platform=NetdiskPlatform.BAIDU, name="百度测试账号",
+        credential={"cookie": "BDUSS=fake"},
+    )
+
+    sekey = adapter._secret(ref, account)  # pylint: disable=protected-access
+
+    assert sekey == "sekey-1"
+    assert "Cookie" in calls[0]["headers"]
+    assert "Cookie" not in calls[1]["headers"]
+
+
 def test_baidu_share_surl_strips_leading_one() -> None:
     """
     百度校验接口的 surl 必须去掉分享码首位的 1。
