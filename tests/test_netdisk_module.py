@@ -10,10 +10,15 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 import app.modules.netdisk as netdisk_module
+from app.application.netdisk import share_blacklist
+from app.application.netdisk.batch_judge import BatchDecision
 from app.application.netdisk.contract import NetdiskTuning
 from app.application.netdisk.resolve import ResolvedShare
+from app.application.netdisk.share_blacklist import ShareBlacklistStore
 from app.domain.netdisk import (
     DirectLink,
+    NetdiskError,
+    NetdiskErrorCode,
     NetdiskPlatform,
     ShareDetail,
     ShareFile,
@@ -31,6 +36,15 @@ def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     把任务存储指向临时目录，避免污染真实配置。
     """
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _skip_ffprobe(monkeypatch: pytest.MonkeyPatch):
+    """
+    单测不调用真实 ffprobe：默认视为探测不到时长，需要时由用例自行覆盖。
+    """
+    monkeypatch.setattr(netdisk_module, "_probe_video_duration", lambda _target: None)
     yield
 
 
@@ -103,6 +117,27 @@ def test_download_requires_instance() -> None:
     assert result[3] == "未配置网盘下载器实例"
 
 
+def test_download_blocked_by_share_blacklist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    已拉黑的分享在入口直接拒绝，且不创建下载任务。
+    """
+    blacklist = ShareBlacklistStore(tmp_path / "blacklist.json")
+    blacklist.add("quark", "abc", "UC 直链不完整（1/2）")
+    monkeypatch.setattr(share_blacklist, "_store", blacklist)
+
+    module = NetdiskModule()
+    result = module.download(
+        "https://pan.quark.cn/s/abc", tmp_path, "", download_type="netdisk",
+        netdisk_platform="quark",
+    )
+
+    assert result is not None
+    assert "黑名单" in result[3]
+    assert store.find_by_share_code("abc") is None
+
+
 def test_download_accepts_share_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """
     候选透传的分享令牌不应影响任务提交。
@@ -136,9 +171,10 @@ def test_download_accepts_episode_targets(monkeypatch: pytest.MonkeyPatch, tmp_p
     started = threading.Event()
     recorded: Dict[str, Any] = {}
 
-    def fake_run_task(*args: Any) -> None:
+    def fake_run_task(*args: Any, **kwargs: Any) -> None:
         """记录后台任务参数并立即结束。"""
         recorded["args"] = args
+        recorded["kwargs"] = kwargs
         started.set()
 
     monkeypatch.setattr(module, "_run_task", fake_run_task)
@@ -515,6 +551,67 @@ def test_run_task_reports_internal_failure_as_error(
     assert record["dlspeed"] is None
 
 
+class _ShareLevelFailResolver:
+    """
+    walk 抛出分享级错误的取链服务替身。
+    """
+
+    tuning = NetdiskTuning()
+
+    def walk(self, *args: Any, **kwargs: Any) -> Any:
+        """
+        模拟分享内容不可用（仅预览流）。
+        """
+        raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "仅预览流")
+
+
+def test_run_task_blacklists_share_level_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    分享级错误仍落失败记录，同时把分享加入黑名单。
+    """
+    blacklist = ShareBlacklistStore(tmp_path / "blacklist.json")
+    monkeypatch.setattr(share_blacklist, "_store", blacklist)
+    monkeypatch.setattr(
+        netdisk_module, "NetdiskResolveService", lambda: _ShareLevelFailResolver()
+    )
+    module = NetdiskModule()
+    store.upsert_task("t9", {"state": "downloading"})
+
+    module._run_task(  # pylint: disable=protected-access
+        "t9", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None,
+    )
+
+    entry = blacklist.is_blacklisted("quark", "abc")
+    assert entry is not None
+    assert entry.reason == "仅预览流"
+    record = store.get_task("t9")
+    assert record is not None
+    assert record["state"] == "error"
+
+
+def test_run_task_does_not_blacklist_generic_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    普通内部异常不拉黑分享，避免网络抖动导致分享被长期封禁。
+    """
+    blacklist = ShareBlacklistStore(tmp_path / "blacklist.json")
+    monkeypatch.setattr(share_blacklist, "_store", blacklist)
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda: _FailingResolver())
+    module = NetdiskModule()
+    store.upsert_task("t10", {"state": "downloading"})
+
+    module._run_task(  # pylint: disable=protected-access
+        "t10", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None,
+    )
+
+    assert blacklist.is_blacklisted("quark", "abc") is None
+
+
 def test_run_task_reports_stop_signal_as_paused(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -715,6 +812,74 @@ def test_run_task_downloads_files_in_parallel(
     record = store.get_task("t-parallel")
     assert record is not None
     assert record["state"] == "completed"
+
+
+def test_run_task_isolates_file_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    单个文件下载失败不应拖垮整个任务：删除残片，其余文件正常入库并标记部分完成。
+    """
+    files = [ShareFile(file_id=str(i), name=f"{i:02d}.mkv", size=1) for i in range(3)]
+    links = tuple(DirectLink(url=f"https://cdn/{i}", headers={}, size=1) for i in range(3))
+    resolver = FakeResolver(files, links)
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda **kwargs: resolver)
+    module = NetdiskModule()
+
+    def fake_download(*args: Any, **kwargs: Any) -> None:
+        """模拟 02.mkv 写入残片后失败，其余文件正常完成。"""
+        del kwargs
+        item = args[4]
+        if item.name == "02.mkv":
+            (Path(args[5]) / item.name).write_bytes(b"partial")
+            raise DownloadError("模拟损坏")
+        target = Path(args[5]) / item.name
+        target.write_bytes(b"x")
+        target.with_name(target.name + ".done").write_text("1", encoding="utf-8")
+
+    monkeypatch.setattr(module, "_download_one", fake_download)
+    module._run_task(  # pylint: disable=protected-access
+        "t-partial", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None, None, "", NetdiskTuning(max_tasks=1),
+    )
+    record = store.get_task("t-partial")
+    assert record is not None
+    assert record["state"] == "completed"
+    assert record["partial"] is True
+    assert record["failed_files"][0]["name"] == "02.mkv"
+    assert not (tmp_path / "02.mkv").exists()
+
+
+def test_run_task_reports_reasons_when_all_files_fail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    全部文件失败时，错误文案必须带上前 3 个文件的原因，而不只是文件名。
+    """
+    files = [ShareFile(file_id=str(i), name=f"{i:02d}.mkv", size=1) for i in range(3)]
+    links = tuple(DirectLink(url=f"https://cdn/{i}", headers={}, size=1) for i in range(3))
+    resolver = FakeResolver(files, links)
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda **kwargs: resolver)
+    module = NetdiskModule()
+
+    def fake_download(*args: Any, **kwargs: Any) -> None:
+        """模拟所有文件写入残片后失败。"""
+        del kwargs
+        item = args[4]
+        (Path(args[5]) / item.name).write_bytes(b"partial")
+        raise DownloadError("模拟损坏")
+
+    monkeypatch.setattr(module, "_download_one", fake_download)
+    module._run_task(  # pylint: disable=protected-access
+        "t-all-fail", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None, None, "", NetdiskTuning(max_tasks=1),
+    )
+
+    record = store.get_task("t-all-fail")
+    assert record is not None
+    assert record["state"] == "error"
+    assert "01.mkv" in record["error"]
+    assert "模拟损坏" in record["error"]
 
 
 def test_instance_tuning_allows_64_files() -> None:
@@ -1226,3 +1391,419 @@ def test_platform_total_connection_cap() -> None:
     assert netdisk_module._cap_platform_workers(NetdiskPlatform.XUNLEI, 2, 8) == 1
     assert netdisk_module._cap_platform_workers(NetdiskPlatform.XUNLEI, 2, 4) == 2
     assert netdisk_module._cap_platform_workers(NetdiskPlatform.QUARK, 8, 64) == 8
+
+
+def test_probe_video_duration_rejects_short_video(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    探测时长不足 5 分钟的文件应删除并判为不可用。
+    """
+    target = tmp_path / "a.mkv"
+    target.write_bytes(b"x")
+    monkeypatch.setattr(netdisk_module, "_probe_video_duration", lambda _p: 120.0)
+    with pytest.raises(NetdiskError):
+        netdisk_module._validate_video_duration(target, expected=None)
+    assert not target.exists()
+
+
+def test_validate_video_duration_accepts_expected_range(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    时长落在期望值 ±30% 内时保留文件。
+    """
+    target = tmp_path / "b.mkv"
+    target.write_bytes(b"x")
+    monkeypatch.setattr(netdisk_module, "_probe_video_duration", lambda _p: 1400.0)
+    netdisk_module._validate_video_duration(target, expected=1500)
+    assert target.exists()
+
+
+def test_validate_video_duration_rejects_mismatched_expected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    时长明显短于期望值时删除目标、完成标记与分片计划。
+    """
+    target = tmp_path / "c.mkv"
+    target.write_bytes(b"x")
+    done = target.with_name(target.name + ".done")
+    plan = target.with_suffix(target.suffix + ".plan.json")
+    done.write_text("1", encoding="utf-8")
+    plan.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(netdisk_module, "_probe_video_duration", lambda _p: 600.0)
+    with pytest.raises(NetdiskError):
+        netdisk_module._validate_video_duration(target, expected=1500)
+    assert not target.exists()
+    assert not done.exists()
+    assert not plan.exists()
+
+
+def test_validate_video_duration_keeps_file_when_probe_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    探测不到时长时只告警，不误删文件。
+    """
+    target = tmp_path / "d.mkv"
+    target.write_bytes(b"x")
+    monkeypatch.setattr(netdisk_module, "_probe_video_duration", lambda _p: None)
+    netdisk_module._validate_video_duration(target, expected=1500)
+    assert target.exists()
+
+
+def test_download_one_rejects_short_file_after_download(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    下载成功后时长不达标时，单文件下载应删除产物并抛网盘错误。
+    """
+    item = ShareFile(file_id="1", name="short.mkv", size=4)
+    links = (DirectLink(url="https://cdn/x", headers={}, size=4),)
+    resolver = FakeResolver([item], links)
+    monkeypatch.setattr(netdisk_module, "ChunkedDownloader", FakeChunkedDownloader)
+    FakeChunkedDownloader.calls = []
+    monkeypatch.setattr(netdisk_module, "_probe_video_duration", lambda _p: 60.0)
+    module = NetdiskModule()
+
+    with pytest.raises(NetdiskError):
+        module._download_one(  # pylint: disable=protected-access
+            resolver, NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "",
+            item, tmp_path, "t-short", threading.Event(),
+        )
+
+    assert not (tmp_path / "short.mkv").exists()
+    assert not (tmp_path / "short.mkv.done").exists()
+
+
+def test_run_task_derives_episode_runtimes_from_media_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    media_runtime 以分钟传入，应按文件展开为秒级期望时长。
+    """
+    files = [ShareFile(file_id="1", name="01.mkv", size=1)]
+    links = (DirectLink(url="https://cdn/1", headers={}, size=1),)
+    resolver = FakeResolver(files, links)
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda **kwargs: resolver)
+    module = NetdiskModule()
+    captured: Dict[str, Any] = {}
+
+    def fake_download(*args: Any, **kwargs: Any) -> None:
+        """记录单文件参数并写出完成标记。"""
+        captured.update(kwargs)
+        item = args[4]
+        target = Path(args[5]) / item.name
+        target.write_bytes(b"x")
+        target.with_name(target.name + ".done").write_text("1", encoding="utf-8")
+
+    monkeypatch.setattr(module, "_download_one", fake_download)
+    module._run_task(  # pylint: disable=protected-access
+        "t-runtime", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None, None, "", NetdiskTuning(max_tasks=1), None, None,
+        media_runtime=20,
+    )
+
+    assert captured["episode_runtimes"] == {"01.mkv": 1200}
+
+
+def test_run_task_prefers_explicit_episode_runtimes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    显式集时长优先于 media_runtime 的整批回退值。
+    """
+    files = [
+        ShareFile(file_id="1", name="01.mkv", size=1),
+        ShareFile(file_id="2", name="02.mkv", size=1),
+    ]
+    links = (
+        DirectLink(url="https://cdn/1", headers={}, size=1),
+        DirectLink(url="https://cdn/2", headers={}, size=1),
+    )
+    resolver = FakeResolver(files, links)
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda **kwargs: resolver)
+    module = NetdiskModule()
+    captured: Dict[str, Any] = {}
+
+    def fake_download(*args: Any, **kwargs: Any) -> None:
+        """记录单文件参数并写出完成标记。"""
+        captured.update(kwargs)
+        item = args[4]
+        target = Path(args[5]) / item.name
+        target.write_bytes(b"x")
+        target.with_name(target.name + ".done").write_text("1", encoding="utf-8")
+
+    monkeypatch.setattr(module, "_download_one", fake_download)
+    module._run_task(  # pylint: disable=protected-access
+        "t-explicit", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None, None, "", NetdiskTuning(max_tasks=1), None, None,
+        episode_runtimes={"01.mkv": 600}, media_runtime=20,
+    )
+
+    assert captured["episode_runtimes"] == {"01.mkv": 600, "02.mkv": 1200}
+
+
+def test_download_forwards_media_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    下载入口应把媒体时长透传给后台任务。
+    """
+    module = NetdiskModule()
+    config = SimpleNamespace(name="网盘", default=True, config={})
+    monkeypatch.setattr(module, "get_configs", lambda: {"网盘": config})
+    started = threading.Event()
+    recorded: Dict[str, Any] = {}
+
+    def fake_run_task(*args: Any, **kwargs: Any) -> None:
+        """记录后台任务参数并立即结束。"""
+        recorded["kwargs"] = kwargs
+        started.set()
+
+    monkeypatch.setattr(module, "_run_task", fake_run_task)
+
+    result = module.download(
+        "https://pan.quark.cn/s/abc", tmp_path, "", download_type="netdisk",
+        netdisk_platform="quark", media_runtime=25,
+    )
+
+    assert result is not None
+    assert started.wait(2)
+    assert recorded["kwargs"]["media_runtime"] == 25
+
+
+def _partial_three_file_resolver(
+    monkeypatch: pytest.MonkeyPatch, fail_name: str = "02.mkv"
+) -> NetdiskModule:
+    """
+    构造三文件批次替身：指定文件写入残片后失败，其余文件正常完成。
+
+    :param monkeypatch: pytest 替换工具
+    :param fail_name: 需要失败的文件名
+    :return: 已挂载替身取链服务与单文件下载的模块实例
+    """
+    files = [ShareFile(file_id=str(i), name=f"{i:02d}.mkv", size=1) for i in range(1, 4)]
+    links = tuple(DirectLink(url=f"https://cdn/{i}", headers={}, size=1) for i in range(3))
+    resolver = FakeResolver(files, links)
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda **kwargs: resolver)
+    module = NetdiskModule()
+
+    def fake_download(*args: Any, **kwargs: Any) -> None:
+        """模拟指定文件失败，其余文件写出完成标记。"""
+        del kwargs
+        item = args[4]
+        target = Path(args[5]) / item.name
+        if item.name == fail_name:
+            target.write_bytes(b"partial")
+            raise DownloadError("模拟损坏")
+        target.write_bytes(b"x")
+        target.with_name(target.name + ".done").write_text("1", encoding="utf-8")
+
+    monkeypatch.setattr(module, "_download_one", fake_download)
+    return module
+
+
+def test_run_task_partial_records_ai_decision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    部分完成时调用批次 AI 决策并落库，订阅来源保留 retry_missing 建议。
+    """
+    module = _partial_three_file_resolver(monkeypatch)
+    captured: Dict[str, Any] = {}
+
+    def fake_judge(summary: Dict[str, Any]) -> BatchDecision:
+        """记录摘要并返回补下缺失集的建议。"""
+        captured.update(summary)
+        return BatchDecision("retry_missing", "缺 2 集", [2])
+
+    monkeypatch.setattr(netdisk_module, "judge_batch", fake_judge)
+
+    module._run_task(  # pylint: disable=protected-access
+        "t-partial", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None, None, "", NetdiskTuning(max_tasks=1),
+        source="Subscribe|test",
+    )
+
+    record = store.get_task("t-partial")
+    assert record is not None
+    assert record["partial"] is True
+    assert record["missing_episodes"] == [2]
+    assert record["ai_decision"]["decision"] == "retry_missing"
+    assert record["warning"].startswith("部分完成")
+    assert captured["source"] == "Subscribe|test"
+    assert captured["failed_files"] == [{"name": "02.mkv", "reason": "模拟损坏"}]
+
+
+def test_run_task_manual_downgrades_retry_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    手动来源不接受 retry_missing，必须降级为只做说明。
+    """
+    module = _partial_three_file_resolver(monkeypatch)
+    monkeypatch.setattr(
+        netdisk_module,
+        "judge_batch",
+        lambda summary: BatchDecision("retry_missing", "缺 2 集", [2]),
+    )
+
+    module._run_task(  # pylint: disable=protected-access
+        "t-partial-manual", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None, None, "", NetdiskTuning(max_tasks=1),
+    )
+
+    record = store.get_task("t-partial-manual")
+    assert record is not None
+    assert record["ai_decision"]["decision"] == "explain_only"
+    assert record["ai_decision"]["reason"] == "缺 2 集"
+
+
+def test_run_task_all_share_level_failures_blacklist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    每个文件都因分享失效失败时，任务错误应保留原因链并把分享拉黑。
+    """
+    blacklist = ShareBlacklistStore(tmp_path / "blacklist.json")
+    monkeypatch.setattr(share_blacklist, "_store", blacklist)
+    files = [ShareFile(file_id=str(i), name=f"{i:02d}.mkv", size=1) for i in range(1, 4)]
+    links = tuple(DirectLink(url=f"https://cdn/{i}", headers={}, size=1) for i in range(3))
+    resolver = FakeResolver(files, links)
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda **kwargs: resolver)
+    module = NetdiskModule()
+
+    def fake_download(*args: Any, **kwargs: Any) -> None:
+        """模拟所有文件都因分享失效失败。"""
+        del kwargs
+        item = args[4]
+        (Path(args[5]) / item.name).write_bytes(b"partial")
+        raise NetdiskError(NetdiskErrorCode.SHARE_INVALID, "分享已失效")
+
+    monkeypatch.setattr(module, "_download_one", fake_download)
+
+    module._run_task(  # pylint: disable=protected-access
+        "t-all-share-invalid", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None, None, "", NetdiskTuning(max_tasks=1),
+    )
+
+    assert blacklist.is_blacklisted("quark", "abc") is not None
+    record = store.get_task("t-all-share-invalid")
+    assert record is not None
+    assert record["state"] == "error"
+
+
+
+def test_run_task_partial_share_level_failure_blacklists_share(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    部分完成时若失败文件是分享级错误，仍要拉黑分享，避免补集反复选中坏分享。
+    """
+    blacklist = ShareBlacklistStore(tmp_path / "blacklist.json")
+    monkeypatch.setattr(share_blacklist, "_store", blacklist)
+    module = _partial_three_file_resolver(monkeypatch, fail_name="02.mkv")
+    original = module._download_one  # pylint: disable=protected-access
+
+    def share_level_failure(*args: Any, **kwargs: Any) -> None:
+        """把 02.mkv 的失败替换为仅预览流。"""
+        item = args[4]
+        if item.name == "02.mkv":
+            (Path(args[5]) / item.name).write_bytes(b"partial")
+            raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, "仅预览流，无法完整下载")
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_download_one", share_level_failure)
+    monkeypatch.setattr(
+        netdisk_module,
+        "judge_batch",
+        lambda summary: BatchDecision("retry_missing", "缺 2 集", [2]),
+    )
+
+    module._run_task(  # pylint: disable=protected-access
+        "t-partial-share-level", NetdiskPlatform.QUARK,
+        "https://pan.quark.cn/s/abc", "abc", "", tmp_path, None, None, "",
+        NetdiskTuning(max_tasks=1), source="Subscribe|test",
+    )
+
+    record = store.get_task("t-partial-share-level")
+    assert record is not None
+    assert record["state"] == "completed"
+    assert record["partial"] is True
+    assert blacklist.is_blacklisted("quark", "abc") is not None
+
+
+def test_run_task_empty_share_blacklists_share(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    空分享/无目标集数按分享级错误处理并拉黑，这是最常见的坏分享形态。
+    """
+    blacklist = ShareBlacklistStore(tmp_path / "blacklist.json")
+    monkeypatch.setattr(share_blacklist, "_store", blacklist)
+    resolver = FakeResolver([], ())
+    monkeypatch.setattr(netdisk_module, "NetdiskResolveService", lambda **kwargs: resolver)
+    module = NetdiskModule()
+
+    module._run_task(  # pylint: disable=protected-access
+        "t-empty-share", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None, None, "", NetdiskTuning(max_tasks=1),
+    )
+
+    record = store.get_task("t-empty-share")
+    assert record is not None
+    assert record["state"] == "error"
+    assert "分享内没有" in record["error"]
+    assert blacklist.is_blacklisted("quark", "abc") is not None
+
+
+def test_list_torrents_projects_partial_fields() -> None:
+    """
+    任务列表必须透传部分完成标记、缺失集与 AI 决策，任务页才能看出差别。
+    """
+    store.upsert_task("t-partial-projection", {
+        "state": "completed",
+        "netdisk_platform": "quark",
+        "share_code": "abc",
+        "partial": True,
+        "warning": "部分完成：10 个有效，2 个失败",
+        "missing_episodes": [2, 7],
+        "ai_decision": {"decision": "retry_missing", "reason": "缺 2 集"},
+    })
+
+    torrents = NetdiskModule().list_torrents()
+
+    assert torrents is not None
+    task = next(item for item in torrents if item.hash == "t-partial-projection")
+    assert task.partial is True
+    assert task.warning == "部分完成：10 个有效，2 个失败"
+    assert task.missing_episodes == [2, 7]
+    assert task.ai_decision is not None
+    assert task.ai_decision.decision == "retry_missing"
+    assert task.ai_decision.reason == "缺 2 集"
+
+
+def test_run_task_resume_reads_source_from_task_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    进程重启后的恢复任务没有内存来源，应从任务记录还原订阅来源，保留补集建议。
+    """
+    module = _partial_three_file_resolver(monkeypatch)
+    store.upsert_task("t-partial-resume", {"source": "Subscribe|test"})
+    monkeypatch.setattr(
+        netdisk_module,
+        "judge_batch",
+        lambda summary: BatchDecision("retry_missing", "缺 2 集", [2]),
+    )
+
+    module._run_task(  # pylint: disable=protected-access
+        "t-partial-resume", NetdiskPlatform.QUARK, "https://pan.quark.cn/s/abc", "abc", "",
+        tmp_path, None, None, "", NetdiskTuning(max_tasks=1),
+    )
+
+    record = store.get_task("t-partial-resume")
+    assert record is not None
+    assert record["ai_decision"]["decision"] == "retry_missing"

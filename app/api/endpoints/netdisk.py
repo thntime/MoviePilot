@@ -25,11 +25,13 @@ from app.application.netdisk.ai_selection import select_share_files
 from app.application.netdisk.contract import NetdiskAccountDetail, NetdiskAccountView
 from app.application.netdisk.login import NetdiskLoginService
 from app.application.netdisk.resolve import NetdiskResolveService
+from app.application.netdisk.share_blacklist import get_share_blacklist
 from app.domain.netdisk import NetdiskError, NetdiskErrorCode, ShareFile
 from app.schemas.netdisk import (
     NetdiskAccountDetailView,
     NetdiskData,
     NetdiskPlatformInfo,
+    NetdiskShareBlacklistEntry,
     NetdiskAccountUpdateRequest,
     NetdiskCookieCloudRequest,
     NetdiskCookieRequest,
@@ -154,6 +156,50 @@ async def list_platforms(
             )
         )
     return _SchemaResponse(success=True, data=NetdiskData(platforms=platforms))
+
+
+@router.get("/share-blacklist", summary="查询网盘分享黑名单")
+async def list_share_blacklist(
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> _SchemaResponse[NetdiskData]:
+    """
+    返回当前有效的分享黑名单，便于手动核对与清除误拉黑的分享。
+    """
+    entries = await run_in_threadpool(get_share_blacklist().list_entries)
+    return _SchemaResponse(
+        success=True,
+        data=NetdiskData(
+            share_blacklist=[
+                NetdiskShareBlacklistEntry(
+                    platform=entry.platform,
+                    share_code=entry.share_code,
+                    reason=entry.reason,
+                    created_at=entry.created_at,
+                    expires_at=entry.expires_at,
+                )
+                for entry in entries
+            ]
+        ),
+    )
+
+
+@router.delete("/share-blacklist/{platform}/{share_code}", summary="清除网盘分享黑名单")
+async def delete_share_blacklist(
+    platform: str,
+    share_code: str,
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> _SchemaResponse[NetdiskData]:
+    """
+    按平台与分享码移除一条黑名单记录。
+    """
+    deleted = await run_in_threadpool(
+        get_share_blacklist().remove, platform, share_code
+    )
+    return _SchemaResponse(
+        success=deleted,
+        message="" if deleted else "黑名单条目不存在",
+        data=NetdiskData(deleted=deleted),
+    )
 
 
 @router.post("/share/preview", summary="预览分享文件并生成 AI 预选")

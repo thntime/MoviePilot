@@ -180,6 +180,18 @@ class NetdiskAccountDetailView(NetdiskAccountView):
     credential: dict[str, str] = Field(default_factory=dict, description="明文凭据字段，仅详情接口返回")
 
 
+class NetdiskShareBlacklistEntry(BaseModel):
+    """
+    分享黑名单条目。
+    """
+
+    platform: str = Field(..., description="网盘平台标识")
+    share_code: str = Field(..., description="分享码")
+    reason: str = Field(..., description="加入黑名单的原因")
+    created_at: str = Field(..., description="写入时间")
+    expires_at: str = Field(..., description="过期时间")
+
+
 class NetdiskData(BaseModel):
     """
     网盘接口的统一数据体，按操作填充对应字段。
@@ -187,6 +199,9 @@ class NetdiskData(BaseModel):
 
     platforms: list[NetdiskPlatformInfo] = Field(default_factory=list, description="平台列表")
     accounts: list[NetdiskAccountView] = Field(default_factory=list, description="账号列表")
+    share_blacklist: list[NetdiskShareBlacklistEntry] = Field(
+        default_factory=list, description="当前有效的分享黑名单"
+    )
     account: Optional[NetdiskAccountDetailView] = Field(default=None, description="单个账号；详情接口附带明文凭据")
     checked: int = Field(0, description="本次检测的账号总数")
     active: int = Field(0, description="检测为有效的账号数")

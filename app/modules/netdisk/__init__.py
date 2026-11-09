@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,10 +21,13 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 
 from app.application.netdisk import selection
 from app.application.netdisk.accounts import NetdiskAccountService
+from app.application.netdisk.batch_judge import BatchDecision, judge_batch
 from app.application.netdisk.registry import find_adapter
 from app.application.netdisk.resolve import NetdiskResolveService
+from app.application.netdisk.share_blacklist import get_share_blacklist
 from app.domain.episode import episode_numbers, is_special_name
 from app.domain.netdisk import (
+    DISPLAY_ONLY_PLATFORMS,
     DirectLink,
     LinkPolicy,
     NetdiskError,
@@ -32,6 +36,7 @@ from app.domain.netdisk import (
     NetdiskTuning,
     ShareFile,
     TransferHandle,
+    is_share_level_error,
     normalize_platform,
     parse_share_link,
 )
@@ -131,6 +136,8 @@ _TASK_SLOTS = _TaskSlots()
 # 进度写入最小间隔与最小百分比变化，避免每个网络分片都全量重写任务索引。
 _PROGRESS_INTERVAL_SECONDS = 1.0
 _PROGRESS_DELTA_PERCENT = 0.5
+# 没有期望时长时只要求视频至少 5 分钟，过滤预告片、花絮与空壳文件。
+_MIN_VIDEO_DURATION_SECONDS = 300.0
 
 
 def _as_text(value: Any) -> str:
@@ -164,6 +171,55 @@ def _is_completed_file(target: Path, expected: int) -> bool:
     if target.with_suffix(target.suffix + ".plan.json").exists():
         return False
     return target.with_name(target.name + ".done").exists()
+
+
+def _probe_video_duration(target: Path, timeout: float = 30.0) -> Optional[float]:
+    """
+    用 ffprobe 读取视频容器时长。
+
+    :param target: 视频文件
+    :param timeout: 探测超时秒数
+    :return: 时长（秒）；探测失败或结果不可解析时返回 None
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(target)],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        return float(result.stdout.strip())
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+
+
+def _validate_video_duration(target: Path, expected: Optional[float] = None) -> None:
+    """
+    校验下载完成的视频时长，剔除空壳、截断或与预期明显不符的文件。
+
+    :param target: 已下载完成的目标文件
+    :param expected: 期望时长（秒）；为空时只校验最短时长
+    :raises NetdiskError: 时长不达标时删除目标与附属文件后抛出
+    """
+    duration = _probe_video_duration(target)
+    if duration is None:
+        logger.warning(f"无法读取视频时长，跳过校验：{target.name}")
+        return
+    if expected:
+        # 同集不同清晰度与片头片尾差异都会影响时长，允许 ±30% 偏差。
+        valid = 0.7 * expected <= duration <= 1.3 * expected
+    else:
+        valid = duration >= _MIN_VIDEO_DURATION_SECONDS
+    if valid:
+        return
+    for path in (target, target.with_name(target.name + ".done"),
+                 target.with_suffix(target.suffix + ".plan.json")):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    raise NetdiskError(NetdiskErrorCode.UNSUPPORTED, f"时长异常：{duration:.0f}s")
 
 
 def _cap_platform_workers(platform: NetdiskPlatform, workers: int, threads: int) -> int:
@@ -523,6 +579,9 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                  netdisk_share_token: Optional[str] = None,
                  season: Optional[Union[int, str, Sequence[int]]] = None,
                  episode_targets: Optional[Dict[int, Set[int]]] = None,
+                 episode_runtimes: Optional[Dict[str, int]] = None,
+                 media_runtime: Optional[int] = None,
+                 source: Optional[str] = None,
                  ) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], str]]:
         """
         提交网盘下载任务，立即返回并在后台执行。
@@ -541,18 +600,25 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         :param netdisk_share_token: 候选透传的分享令牌，当前由适配器重新解析
         :param season: 订阅目标季；为空时按文件名中的季集标记过滤
         :param episode_targets: 按季划分的目标集数；存在时优先于 episodes 过滤
+        :param episode_runtimes: 文件名到期望时长的映射，单位为秒
+        :param media_runtime: 单集时长（分钟），用于下载完成后的时长校验
+        :param source: 下载来源标识，`Subscribe|` 前缀表示订阅来源
         :return: 下载器名称、任务标识、内容布局与说明；非网盘内容返回 None
         """
         if _as_text(download_type) != "netdisk":
             return None
         url = _as_text(content)
         passcode = _as_text(share_password)
+        declared = _as_text(netdisk_platform)
+        platform = normalize_platform(declared) if declared else None
+        if declared and platform is None:
+            # 已知但不支持取链的平台用中文名提示，其余保留原始标识便于排查。
+            return None, None, None, f"暂不支持 {DISPLAY_ONLY_PLATFORMS.get(declared, declared)} 网盘下载"
         ref = parse_share_link(url, passcode)
         if ref is None:
             return None, None, None, "无法从分享链接中解析分享码"
-        platform = normalize_platform(netdisk_platform) if _as_text(netdisk_platform) else ref.platform
         if platform is None:
-            return None, None, None, f"暂不支持 {_as_text(netdisk_platform)} 网盘下载"
+            platform = ref.platform
         if platform != ref.platform:
             return None, None, None, "分享链接与候选平台不一致"
         if selection.is_platform_cooled(platform):
@@ -562,6 +628,11 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             # 令牌只在候选透传时存在，取链仍以适配器解析结果为准。
             logger.debug(f"收到候选分享令牌：{ref.share_id}")
         code = ref.share_id
+        blocked = get_share_blacklist().is_blacklisted(platform.value, code)
+        if blocked is not None:
+            return None, None, None, (
+                f"分享已加入黑名单（至 {blocked.expires_at}）：{blocked.reason}"
+            )
         config = self._select_config(downloader)
         if config is None:
             return None, None, None, "未配置网盘下载器实例"
@@ -641,12 +712,18 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 {str(key): sorted(value) for key, value in targets.items()} if targets else None
             ),
             "season": season,
+            "source": source,
         })
         thread = threading.Thread(
             target=self._run_task,
             args=(task_key, platform, url, code, passcode, task_dir, label,
                   target_episodes or None, _as_text(netdisk_share_token),
                   task_tuning, season, targets),
+            kwargs={
+                "episode_runtimes": episode_runtimes,
+                "media_runtime": media_runtime,
+                "source": source,
+            },
             daemon=True,
             name=f"netdisk-download-{task_key}",
         )
@@ -753,7 +830,10 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                   share_token: str = "",
                   tuning: Optional[NetdiskTuning] = None,
                   season: Optional[Union[int, str, Sequence[int]]] = None,
-                  episode_targets: Optional[Dict[int, Set[int]]] = None) -> None:
+                  episode_targets: Optional[Dict[int, Set[int]]] = None,
+                  episode_runtimes: Optional[Dict[str, int]] = None,
+                  media_runtime: Optional[int] = None,
+                  source: Optional[str] = None) -> None:
         """
         后台执行分享解析、取链与下载。
 
@@ -769,16 +849,22 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         :param tuning: 下载器实例覆盖后的参数快照
         :param season: 订阅目标季
         :param episode_targets: 按季划分的目标集数，优先于 episodes 过滤
+        :param episode_runtimes: 文件名到期望时长的映射，单位为秒
+        :param media_runtime: 单集时长（分钟），用于为本次任务的所有文件生成期望时长
+        :param source: 下载来源标识，`Subscribe|` 前缀表示订阅来源
         """
         task_dir = download_dir
         stop_event = self._stops.get(task_key) or threading.Event()
+        if not source:
+            # 进程重启后的恢复任务没有内存来源，从任务记录取提交时写入的来源，
+            # 否则订阅任务会被误判为手动下载而放弃补集。
+            source = _as_text((store.get_task(task_key) or {}).get("source")) or None
         # 实例配置必须进入取链服务，否则 transfer_first / auto_transfer 只在下载引擎生效。
         resolver = (
             NetdiskResolveService(settings=tuning)
             if tuning is not None
             else NetdiskResolveService()
         )
-        failed = False
         with _TASK_SLOTS:
             try:
                 resolved = resolver.walk(
@@ -793,14 +879,18 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                         wanted = sorted({
                             number for numbers in episode_targets.values() for number in numbers
                         })
-                        raise DownloadError(
-                            f"分享内没有目标集数（{wanted}）对应的文件"
+                        raise NetdiskError(
+                            NetdiskErrorCode.UNSUPPORTED,
+                            f"分享内没有目标集数（{wanted}）对应的文件",
                         )
                     if episodes:
-                        raise DownloadError(
-                            f"分享内没有目标集数（{sorted(episodes)}）对应的文件"
+                        raise NetdiskError(
+                            NetdiskErrorCode.UNSUPPORTED,
+                            f"分享内没有目标集数（{sorted(episodes)}）对应的文件",
                         )
-                    raise DownloadError("分享内没有可下载的视频文件")
+                    raise NetdiskError(
+                        NetdiskErrorCode.UNSUPPORTED, "分享内没有可下载的视频文件"
+                    )
                 total_size = sum(int(item.size or 0) for item in files)
                 self._ensure_local_space(task_dir, total_size)
                 store.upsert_task(task_key, {
@@ -872,6 +962,12 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 account_map = self._assign_accounts(platform, pending)
                 per_file_threads = max(1, int(task_tuning.threads))
                 workers = _cap_platform_workers(platform, workers, per_file_threads)
+                # 期望时长只服务时长校验：显式单集时长优先，其余文件回落到整批单集时长。
+                runtimes: Dict[str, int] = dict(episode_runtimes or {})
+                if media_runtime and int(media_runtime) > 0:
+                    runtime_seconds = int(media_runtime) * 60
+                    for item in files:
+                        runtimes.setdefault(item.name, runtime_seconds)
                 with ThreadPoolExecutor(
                     max_workers=workers, thread_name_prefix=f"netdisk-file-{task_key}"
                 ) as pool:
@@ -883,44 +979,142 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                             on_file_progress, threads=per_file_threads,
                             concurrency=workers,
                             account_id=account_map.get(item.name),
+                            episode_runtimes=runtimes,
                         ): item
                         for item in pending
                     }
-                    try:
-                        for future in as_completed(futures):
+                    file_errors: Dict[str, str] = {}
+                    # 保留原始异常，全批失败时用 `raise ... from` 保住分享级错误的判定链。
+                    file_exceptions: Dict[str, BaseException] = {}
+                    for future in as_completed(futures):
+                        item = futures[future]
+                        try:
                             future.result()
-                            item = futures[future]
+                        except DownloadCancelled:
+                            # 用户暂停：保持 paused，不能被后续的「内部异常」分支记成失败。
+                            for pending_future in futures:
+                                pending_future.cancel()
+                            raise
+                        except Exception as err:  # noqa: BLE001
+                            # 单文件失败只记账，不打断其他文件，也不让整个任务失败。
+                            file_errors[item.name] = _friendly_download_error(err)
+                            file_exceptions[item.name] = err
+                            logger.warning(
+                                f"网盘文件失败，继续其他文件：{item.name} - "
+                                f"{file_errors[item.name]}"
+                            )
                             with progress_lock:
-                                progress_state["completed"] += float(item.size or 0)
                                 progress_state["active"].pop(item.name, None)
-                    except DownloadCancelled:
-                        # 用户暂停：保持 paused，不能被后续的「内部异常」分支记成失败。
-                        for future in futures:
-                            future.cancel()
-                        raise
-                    except Exception:
-                        failed = True
-                        stop_event.set()
-                        for future in futures:
-                            future.cancel()
-                        raise
+                            continue
+                        with progress_lock:
+                            progress_state["completed"] += float(item.size or 0)
+                            progress_state["active"].pop(item.name, None)
                 # 只有每个文件都写了 .done 才算完成，防止预分配的空壳文件被整理入库。
                 missing = [
-                    item.name for item in pending
+                    item for item in pending
                     if not _is_completed_file(task_dir / item.name, int(item.size or 0))
                 ]
-                if missing:
-                    raise DownloadError(f"下载未完成：{', '.join(missing[:3])}")
-                if task_key not in self._discarded:
-                    store.upsert_task(task_key, {
-                        "state": "completed", "progress": 100.0,
-                        "error": None, "dlspeed": None, "dlspeed_bytes": 0,
-                    })
+                # 失败文件的残片（目标、完成标记、分片计划）必须清掉，
+                # 否则下次重试会把残缺文件当成可续传的基础。
+                for item in missing:
+                    target = task_dir / item.name
+                    for path in (target, target.with_name(target.name + ".done"),
+                                 target.with_suffix(target.suffix + ".plan.json")):
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                if not missing:
+                    if task_key not in self._discarded:
+                        store.upsert_task(task_key, {
+                            "state": "completed", "progress": 100.0,
+                            "error": None, "dlspeed": None, "dlspeed_bytes": 0,
+                        })
+                elif any(
+                    _is_completed_file(task_dir / item.name, int(item.size or 0))
+                    for item in pending
+                ):
+                    # 至少有一个有效文件：按部分完成入库，交给上层决定是否补齐。
+                    # 分享级文件失败（仅预览流、直链不完整）仍要拉黑分享，
+                    # 否则补集搜索会反复选中同一个坏分享；有效文件已有 .done，不受影响。
+                    for name, err in file_exceptions.items():
+                        if is_share_level_error(err):
+                            reason = _friendly_download_error(err)
+                            logger.warning(
+                                f"网盘文件分享级失败，拉黑分享："
+                                f"{platform.value}:{share_code} - {name} - {reason}"
+                            )
+                            get_share_blacklist().add(platform.value, share_code, reason)
+                    if task_key not in self._discarded:
+                        valid_files = [
+                            item for item in pending
+                            if _is_completed_file(task_dir / item.name, int(item.size or 0))
+                        ]
+                        missing_episodes = sorted({
+                            number for item in missing
+                            for number in episode_numbers(item.name)
+                        })
+                        target_episodes = set(episodes or ())
+                        if not target_episodes:
+                            target_episodes = set().union(
+                                *(_normalize_episode_targets(episode_targets) or {}).values()
+                            )
+                        summary = {
+                            "media": {
+                                "title": resolved.detail.title or label or share_code,
+                                "season": season,
+                            },
+                            "target_episodes": sorted(target_episodes),
+                            "valid_files": [
+                                {"name": item.name, "size": int(item.size or 0)}
+                                for item in valid_files
+                            ],
+                            "failed_files": [
+                                {"name": item.name, "reason": file_errors.get(item.name, "未完成")}
+                                for item in missing
+                            ],
+                            "missing_episodes": missing_episodes,
+                            "source": source or "",
+                        }
+                        decision = judge_batch(summary)
+                        is_subscription = bool(
+                            source and str(source).startswith("Subscribe|")
+                        )
+                        if decision.decision == "retry_missing" and not is_subscription:
+                            # 手动下载没有下一次订阅搜索，补下建议只会造成误导。
+                            decision = BatchDecision("explain_only", decision.reason, [])
+                        store.upsert_task(task_key, {
+                            "state": "completed", "progress": 100.0,
+                            "error": None, "dlspeed": None, "dlspeed_bytes": 0,
+                            "partial": True,
+                            "failed_files": summary["failed_files"],
+                            # 补集只信本地确定性解析；AI 给出的集数仅保留在 ai_decision 展示。
+                            "missing_episodes": missing_episodes,
+                            "ai_decision": {
+                                "decision": decision.decision,
+                                "reason": decision.reason,
+                                "missing_episodes": list(decision.missing_episodes),
+                            },
+                            "warning": f"部分完成：{len(valid_files)} 个有效，{len(missing)} 个失败",
+                        })
+                else:
+                    # 全批失败时把原因一起带出来，否则用户只看到文件名，
+                    # 无法区分是时长异常、直链失效还是磁盘写入失败。
+                    reasons = "; ".join(
+                        f"{item.name}（{file_errors.get(item.name, '未完成')}）"
+                        for item in missing[:3]
+                    )
+                    error = DownloadError(f"下载未完成：{reasons}")
+                    first_exception = next(iter(file_exceptions.values()), None)
+                    if first_exception is not None:
+                        # 保留原因链，外层才能识别「每个文件都因分享级错误失败」的分享。
+                        raise error from first_exception
+                    raise error
                 logger.info(f"网盘下载完成：{platform.value}:{share_code}")
             except Exception as err:  # noqa: BLE001
                 # 只有外部停止信号置位才算用户暂停；内部异常中止一律按失败记录，
                 # 否则引擎的「下载已取消」会掩盖真实错误，前端表现为任务自动暂停。
-                if stop_event.is_set() and not failed:
+                if stop_event.is_set():
                     logger.info(f"网盘下载已暂停：{share_code}")
                     if task_key not in self._discarded:
                         store.upsert_task(task_key, {
@@ -929,6 +1123,10 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                         })
                 else:
                     error_text = _friendly_download_error(err)
+                    if is_share_level_error(err):
+                        # 分享本身不可用（失效、仅预览流、直链不完整）时拉黑，
+                        # 避免订阅反复重试同一个坏分享。
+                        get_share_blacklist().add(platform.value, share_code, error_text)
                     capacity_error = error_text if (
                         isinstance(err, NetdiskError)
                         and err.code is NetdiskErrorCode.SPACE_INSUFFICIENT
@@ -1054,7 +1252,9 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
 
         放行规则（任一命中即保留，宁可多下也不漏集）：
         没有目标集数、文件名解析不出唯一集数、集数在目标集合内则保留。
-        文件名带明确季号且与目标季不一致时，始终排除，避免 S02E05 被当作 S01E05。
+        文件名带明确季号且与目标季不一致时默认排除；只有目标季唯一且分享内没有
+        任何目标季精确命中时，同集号的其它季文件才作为兜底候选，处理上传方把
+        连续集数误标成另一季的情况。
 
         :param files: 分享内的文件条目
         :param episodes: 目标集数集合
@@ -1067,8 +1267,10 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             return NetdiskModule._filter_by_episode_targets(files, targets)
         wanted = set(episodes or ())
         seasons = _normalize_seasons(season)
+        single_season = next(iter(seasons)) if seasons and len(seasons) == 1 else None
         kept: List[ShareFile] = []
         fallback: List[ShareFile] = []
+        cross_season: List[ShareFile] = []
         for item in files:
             if is_special_name(item.name):
                 continue
@@ -1079,6 +1281,13 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                     else NetdiskModule._season_from_path(getattr(item, "path", ""))
                 )
                 if file_season is not None and file_season not in seasons:
+                    # 目标季唯一且集号命中时先记为候选，只有目标季完全没有
+                    # 精确命中才会被选中，避免正常多季分享被跨季替代。
+                    numbers = episode_numbers(item.name)
+                    if single_season is not None and wanted \
+                            and any(number in wanted for number in numbers):
+                        fallback.append(item)
+                        cross_season.append(item)
                     continue
             if not wanted:
                 kept.append(item)
@@ -1097,6 +1306,11 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 f"目标季 {season} 目标集数 {sorted(wanted)}，分享内 {len(files)} 个文件，"
                 f"精确命中 {len(kept)} 个，兜底候选 {len(fallback)} 个，选中 {len(selected)} 个"
             )
+            if not kept and cross_season:
+                logger.warning(
+                    f"目标季 {single_season} 没有精确命中，使用其它季同集号文件兜底："
+                    f"{[item.name for item in cross_season]}"
+                )
             return selected
         return kept
 
@@ -1106,12 +1320,17 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         """
         按文件季号取该季目标集过滤，未知季号只在单季目标下用该季集号兜底。
 
+        单季目标下，目标季没有任何精确命中时，其它季的同集号文件作为兜底候选，
+        处理上传方把连续集数误标成另一季的情况；多季目标保持只按目标季匹配。
+
         :param files: 分享内的文件条目
         :param targets: 已归一化的季号到目标集号映射
         :return: 过滤后的文件条目
         """
         kept: List[ShareFile] = []
         fallback: List[ShareFile] = []
+        cross_season: List[ShareFile] = []
+        single_target = next(iter(targets.values())) if len(targets) == 1 else None
         for item in files:
             if is_special_name(item.name):
                 continue
@@ -1121,13 +1340,18 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 else NetdiskModule._season_from_path(getattr(item, "path", ""))
             )
             if file_season is None:
-                if len(targets) != 1:
+                if single_target is None:
                     logger.info(f"无法识别季号，多季目标下跳过文件：{item.name}")
                     continue
-                wanted = next(iter(targets.values()))
+                wanted = single_target
             else:
                 season_target = targets.get(file_season)
                 if not season_target:
+                    numbers = episode_numbers(item.name)
+                    if single_target is not None \
+                            and any(number in single_target for number in numbers):
+                        fallback.append(item)
+                        cross_season.append(item)
                     continue
                 wanted = season_target
             numbers = episode_numbers(item.name)
@@ -1144,6 +1368,11 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             f"目标季 {summary}，分享内 {len(files)} 个文件，精确命中 {len(kept)} 个，"
             f"兜底候选 {len(fallback)} 个，选中 {len(selected)} 个"
         )
+        if not kept and cross_season:
+            logger.warning(
+                f"目标季 {summary} 没有精确命中，使用其它季同集号文件兜底："
+                f"{[item.name for item in cross_season]}"
+            )
         return selected
 
     @staticmethod
@@ -1168,20 +1397,29 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
 
         分享里的文件名常见 `164 4K.mkv`、`01~4K.mp4`，MetaInfo 无法识别季集，
         整理会以「未识别到文件集数」拒绝。补前缀后 `S01E164 164 4K.mkv` 可正常解析。
-        候选集数不唯一、或文件名已带标记时原样返回，绝不猜测。
+        候选集数不唯一时原样返回，绝不猜测。已带季集标记的文件在单季目标下若季号
+        不一致，按目标季改写季号：跨季兜底选中的文件不能被整理阶段归到别的季。
 
         :param name: 分享内的原始文件名
+        :param path: 相对分享根的路径，用于从目录名识别季号
+        :param season: 订阅目标季；只有唯一季时才用于补前缀或改写季号
         :return: 补好集数前缀的文件名
         """
         numbers = episode_numbers(name)
         if len(numbers) != 1:
             return name
-        if re.search(r"[Ss]\d{1,2}\s*[Ee]\d{1,4}", name):
-            return name
         target = cls._season_from_path(path)
         if target is None:
             normalized = _normalize_seasons(season)
-            target = next(iter(normalized), None) if normalized else None
+            target = next(iter(normalized)) if normalized and len(normalized) == 1 else None
+        matched = re.search(r"[Ss](\d{1,2})\s*[Ee](\d{1,4})", name)
+        if matched:
+            if target is None or int(matched.group(1)) == target:
+                return name
+            return (
+                f"{name[:matched.start()]}S{target:02d}E{int(matched.group(2)):03d}"
+                f"{name[matched.end():]}"
+            )
         if target is None:
             # 无季信息时不再硬编码 S01，避免把 S02 文件标成第一季。
             return name
@@ -1299,7 +1537,8 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                       share_token: str = "", tuning: Optional[NetdiskTuning] = None,
                       on_file_progress: Optional[Callable[[str, float, int], None]] = None,
                       threads: int = 0, concurrency: int = 1,
-                      account_id: Optional[int] = None) -> None:
+                      account_id: Optional[int] = None,
+                      episode_runtimes: Optional[Dict[str, int]] = None) -> None:
         """
         下载单个文件：按多源开关取链，直链失效时重新取链。
 
@@ -1317,6 +1556,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         :param threads: 该文件的分片并发数；为空时使用实例配置
         :param concurrency: 同时下载的文件数，用于计算转存峰值空间
         :param account_id: 分配到的账号主键；为空时自动选号
+        :param episode_runtimes: 文件名到期望时长的映射，单位为秒
         """
         tuning = tuning or resolver.tuning
         multi_source = bool(tuning.multi_source)
@@ -1361,6 +1601,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
 
         adapter = find_adapter(platform)
         max_concurrency = int(getattr(adapter, "max_concurrency", 0) or 0)
+        single_stream = bool(getattr(adapter, "single_stream", False))
         try:
             links = tuple(resolver.resolve_file(
                 share_url, passcode, item, platform, account_id=account_id,
@@ -1400,7 +1641,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                     target=target,
                     total=size,
                     links=links,
-                    threads=threads or tuning.threads,
+                    threads=1 if single_stream else (threads or tuning.threads),
                     rate_limit_bytes=tuning.rate_limit,
                     preempt=tuning.preempt_enabled,
                     buffer_size=tuning.buffer_size,
@@ -1411,7 +1652,10 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                     max_concurrency=max_concurrency,
                     on_progress=on_progress,
                     stop_event=stop_event,
+                    single_stream=single_stream,
                 ).run(url_provider)
+            # 下载器只保证字节完整；空壳、截断或错集必须在这里拦下，避免入库。
+            _validate_video_duration(target, (episode_runtimes or {}).get(item.name))
         finally:
             self._cleanup_links(resolver, seen, task_key)
             account_id = int(getattr(links[0], "account_id", 0) or 0) if links else 0
@@ -1544,6 +1788,10 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 account_id=record.get("account_id"),
                 strategy=record.get("strategy"),
                 capacity_error=record.get("capacity_error"),
+                partial=bool(record.get("partial")),
+                warning=record.get("warning"),
+                missing_episodes=record.get("missing_episodes"),
+                ai_decision=record.get("ai_decision"),
                 save_path=record.get("save_path"),
                 content_path=record.get("path"),
                 category=record.get("category"),

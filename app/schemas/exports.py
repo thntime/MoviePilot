@@ -165,6 +165,7 @@ SCHEMA_EXPORTS = {
     'DownloaderFile': ('app.schemas.transfer', 'DownloaderFile'),
     'DownloaderInfo': ('app.schemas.dashboard', 'DownloaderInfo'),
     'DownloaderTorrent': ('app.schemas.transfer', 'DownloaderTorrent'),
+    'DownloaderTorrentAIDecision': ('app.schemas.transfer', 'DownloaderTorrentAIDecision'),
     'DownloadingTorrent': ('app.schemas.transfer', 'DownloadingTorrent'),
     'EmptyEventData': ('app.schemas.event', 'EmptyEventData'),
     'EndpointStats': ('app.schemas.monitoring', 'EndpointStats'),

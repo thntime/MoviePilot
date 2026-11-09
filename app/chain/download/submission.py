@@ -829,6 +829,8 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             share_password=getattr(prepared.torrent, "share_password", None),
             netdisk_share_token=getattr(prepared.torrent, "netdisk_share_token", None),
             season=getattr(getattr(prepared, "meta", None), "season_list", None),
+            source=source,
+            media_runtime=getattr(prepared.media, "runtime", None),
         )
         actual_downloader, download_hash, layout, error_msg = (
             result if result else (None, None, None, "未找到下载器")

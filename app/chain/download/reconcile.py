@@ -50,9 +50,11 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         for torrent in torrents:
             if not getattr(torrent, "netdisk_platform", None):
                 continue
-            if str(getattr(torrent, "state", "")) != "error":
-                continue
             if getattr(torrent, "reconciled", False):
+                continue
+            state = str(getattr(torrent, "state", ""))
+            partial_missing = self._partial_retry_episodes(torrent, state)
+            if state != "error" and partial_missing is None:
                 continue
             history = self.download_history_repository.get_by_hash(str(torrent.hash))
             if history is None:
@@ -66,10 +68,42 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
             )
             if season is not None and history_season is not None and history_season != int(season):
                 continue
+            if partial_missing is not None:
+                # 部分完成的订阅任务只把缺失集视为未下载，其余有效集仍算已交付。
+                failed.update(partial_missing)
+                continue
             failed.update(episode_rules.parse_episode_selection(
                 str(getattr(history, "episodes", "") or "")
             ))
         return failed
+
+    @staticmethod
+    def _partial_retry_episodes(torrent: Any, state: Optional[str] = None) -> Optional[Set[int]]:
+        """
+        读取「部分完成且 AI 建议补集」任务的确定性缺失集。
+
+        只有 ``completed + partial`` 且批次决策为 ``retry_missing`` 的任务才需要
+        回滚订阅事实；AI 给出的集数不可信，一律使用本地解析的 ``missing_episodes``。
+
+        :param torrent: 下载器任务投影
+        :param state: 已读取的任务状态；缺省时从投影读取
+        :return: 缺失集集合；任务不属于该形态时返回 None
+        """
+        task_state = str(
+            state if state is not None else getattr(torrent, "state", "")
+        )
+        if task_state != "completed" or not bool(getattr(torrent, "partial", False)):
+            return None
+        decision = getattr(torrent, "ai_decision", None)
+        if isinstance(decision, dict):
+            decision_value = decision.get("decision")
+        else:
+            decision_value = getattr(decision, "decision", None)
+        if str(decision_value or "") != "retry_missing":
+            return None
+        return {
+            int(item) for item in (getattr(torrent, "missing_episodes", None) or [])
+        }
 
     def is_download_file_transferred(self, fullpath: str) -> bool:
         """
@@ -123,9 +157,13 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         for torrent in self.list_torrents() or []:
             if not getattr(torrent, "netdisk_platform", None):
                 continue
-            if str(getattr(torrent, "state", "")) != "error":
-                continue
             if getattr(torrent, "reconciled", False):
+                continue
+            state = str(getattr(torrent, "state", ""))
+            partial_missing = self._partial_retry_episodes(torrent, state)
+            is_partial = partial_missing is not None
+            # 失败任务与「部分完成且需要补集」的订阅任务都走同一套回滚/换源流程。
+            if state != "error" and not is_partial:
                 continue
             task_hash = str(getattr(torrent, "hash", "") or "")
             platform = normalize_platform(getattr(torrent, "netdisk_platform", None))
@@ -133,33 +171,46 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
             # 让一次代码异常演变成整个平台在冷却期内全部无法提交是不可接受的。
             account_id = int(getattr(torrent, "account_id", 0) or 0)
             if (
-                platform is not None
+                not is_partial
+                and platform is not None
                 and account_id > 0
                 and self._is_capacity_error(getattr(torrent, "error", ""))
             ):
                 selection.cool_account(account_id)
             history = self.download_history_repository.get_by_hash(task_hash) if task_hash else None
             if history is not None:
+                # 恢复任务可能没有内存来源，订阅标识一律以提交时写入的历史备注为准。
                 note = getattr(history, "note", None)
                 source = note.get("source") if isinstance(note, dict) else None
                 parsed = SubscribeChain.parse_subscribe_source_keyword(str(source or ""))
-                episodes = episode_rules.parse_episode_selection(
-                    str(getattr(history, "episodes", "") or "")
-                )
+                if is_partial:
+                    episodes = set(partial_missing or set())
+                else:
+                    episodes = episode_rules.parse_episode_selection(
+                        str(getattr(history, "episodes", "") or "")
+                    )
                 if parsed and episodes:
                     subscribe_id = parsed.get("id")
                     SubscribeChain().rollback_download_facts(subscribe_id, episodes)
-                    capacity_error = self._is_capacity_error(getattr(torrent, "error", ""))
-                    if capacity_error:
-                        self._record_capacity_failure(history, torrent, source)
-                    else:
-                        # 分享失效、鉴权/解析失败也要冷却，避免重搜反复选中同一失效资源。
+                    if is_partial:
+                        # 缺失集没有 error 文案，用瞬时冷却记录同一资源，
+                        # 避免下一次搜索立刻再次选中这个已判定不完整的分享。
                         self._record_capacity_failure(
                             history, torrent, source,
-                            self._download_failure_ttl(getattr(torrent, "error", "")),
+                            self._download_failure_ttl(None),
                         )
-                    if capacity_error:
-                        self._alert_netdisk_capacity(torrent, platform)
+                    else:
+                        capacity_error = self._is_capacity_error(getattr(torrent, "error", ""))
+                        if capacity_error:
+                            self._record_capacity_failure(history, torrent, source)
+                        else:
+                            # 分享失效、鉴权/解析失败也要冷却，避免重搜反复选中同一失效资源。
+                            self._record_capacity_failure(
+                                history, torrent, source,
+                                self._download_failure_ttl(getattr(torrent, "error", "")),
+                            )
+                        if capacity_error:
+                            self._alert_netdisk_capacity(torrent, platform)
                     threading.Thread(
                         target=SubscribeChain().search,
                         kwargs={"sid": subscribe_id},

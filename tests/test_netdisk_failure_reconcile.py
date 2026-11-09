@@ -231,3 +231,88 @@ def test_failed_episodes_skips_reconciled_tasks() -> None:
     chain = _ReconcileChain([torrent], history)
 
     assert chain.failed_netdisk_episodes("tmdb", "100", 1) == set()
+
+
+def test_partial_retry_task_contributes_missing_episodes() -> None:
+    """
+    部分完成且 AI 建议补集的任务只把缺失集视为未下载，有效集仍算已交付。
+    """
+    torrent = SimpleNamespace(
+        netdisk_platform="quark", state="completed", hash="hp", reconciled=False,
+        partial=True, missing_episodes=[2, 7],
+        ai_decision={"decision": "retry_missing", "reason": "缺 2 集"},
+    )
+    history = SimpleNamespace(
+        media_source="tmdb", media_id="100", seasons="S01", episodes="E01-E03",
+        note={"source": 'Subscribe|{"id": 7}'},
+    )
+    chain = _ReconcileChain([torrent], history)
+
+    assert chain.failed_netdisk_episodes("tmdb", "100", 1) == {2, 7}
+
+
+def test_partial_organize_now_does_not_contribute_failed_episodes() -> None:
+    """
+    部分完成但 AI 选择立即整理时，不把缺失集当成下载失败。
+    """
+    torrent = SimpleNamespace(
+        netdisk_platform="quark", state="completed", hash="hp2", reconciled=False,
+        partial=True, missing_episodes=[2],
+        ai_decision={"decision": "organize_now", "reason": "先整理"},
+    )
+    history = SimpleNamespace(
+        media_source="tmdb", media_id="100", seasons="S01", episodes="E01-E03",
+        note={"source": 'Subscribe|{"id": 7}'},
+    )
+    chain = _ReconcileChain([torrent], history)
+
+    assert chain.failed_netdisk_episodes("tmdb", "100", 1) == set()
+
+
+def test_reconcile_partial_retry_rolls_back_missing_and_searches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    部分完成的订阅任务只回滚缺失集，记录资源冷却并触发补集搜索。
+    """
+    torrent = SimpleNamespace(
+        netdisk_platform="quark", state="completed", hash="hp3", reconciled=False,
+        partial=True, missing_episodes=[2], error=None,
+        ai_decision={"decision": "retry_missing", "reason": "缺 2 集"},
+        title="示例", account_id=7,
+    )
+    history = SimpleNamespace(
+        media_source="tmdb", media_id="100", seasons="S01", episodes="E01-E03",
+        note={"source": 'Subscribe|{"id": 7}'},
+    )
+    chain = _ReconcileChain([torrent], history)
+    rolled = []
+    searched = []
+    finished = threading.Event()
+
+    class FakeSubscribeChain:
+        """记录回滚与搜索调用。"""
+
+        @staticmethod
+        def parse_subscribe_source_keyword(source: str):
+            """解析测试来源。"""
+            return {"id": 7} if source.startswith("Subscribe|") else None
+
+        def rollback_download_facts(self, subscribe_id, episodes):
+            """记录回滚集数。"""
+            rolled.append((subscribe_id, list(episodes)))
+            return True
+
+        def search(self, sid=None, **kwargs):
+            """记录搜索并通知测试。"""
+            searched.append(sid)
+            finished.set()
+
+    monkeypatch.setattr("app.chain.subscribe.facade.SubscribeChain", FakeSubscribeChain)
+
+    assert chain.reconcile_netdisk_failures() == 1
+    assert rolled == [(7, [2])]
+    assert finished.wait(1.0)
+    assert searched == [7]
+    assert not selection.is_account_cooled(7)
+    assert ("mark_reconciled", {"hashs": ["hp3"]}) in chain.marked

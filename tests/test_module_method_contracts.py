@@ -10,6 +10,7 @@ from app.runtime.extensions.module.contracts import (
     ModuleExecutionMode,
     ModuleResultAggregation,
     ModuleResultShape,
+    compatible_module_kwargs,
     diagnose_module_callable,
     diagnose_module_result,
     get_module_method_contract,
@@ -456,6 +457,41 @@ def test_downloader_action_contracts_freeze_shared_provider_signatures() -> None
         assert contract.family == "downloader"
         assert contract.aggregation is ModuleResultAggregation.FIRST_NON_EMPTY
         assert contract.required_parameters == parameters
+
+
+def test_download_filters_netdisk_only_optional_kwargs() -> None:
+    """
+    source/media_runtime 只服务网盘下载器，旧下载器签名必须被兼容过滤。
+    """
+    def provider(content, download_dir, cookie, episodes=None,
+                 category=None, label=None, downloader=None):
+        """
+        模拟不接受网盘可选参数的旧下载器。
+
+        :param content: 下载内容
+        :param download_dir: 下载目录
+        :param cookie: 站点 Cookie
+        :param episodes: 目标集数
+        :param category: 分类
+        :param label: 标签
+        :param downloader: 下载器名称
+        :return: 首个与第二个入参
+        """
+        del cookie, episodes, category, label, downloader
+        return content, download_dir
+
+    kwargs = {
+        "content": "magnet:?xt=urn:btih:abc",
+        "download_dir": "downloads",
+        "cookie": "",
+        "source": "Subscribe|test",
+        "media_runtime": 45,
+    }
+    filtered = compatible_module_kwargs("download", provider, kwargs)
+
+    assert "source" not in filtered
+    assert "media_runtime" not in filtered
+    assert provider(**filtered) == ("magnet:?xt=urn:btih:abc", "downloads")
 
 
 def test_sync_and_async_media_capabilities_share_contracts() -> None:

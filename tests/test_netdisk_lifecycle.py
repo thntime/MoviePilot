@@ -43,6 +43,52 @@ def test_collect_files_filters_other_season() -> None:
     assert [item.name for item in selected] == ["剧名.S01E01.mkv"]
 
 
+def test_collect_files_falls_back_to_mislabeled_season() -> None:
+    """
+    上传方把后续集标成 S02 时，目标季无精确命中应兜底选中并改写季号。
+    """
+    files = [
+        _file("41.mp4", "a"),
+        _file("S02E47.2026.2160p.HQ.WEB-DL.H265.AAC.mp4", "b"),
+    ]
+    selected = NetdiskModule()._collect_files(files, {47}, season=1)
+    assert [item.name for item in selected] == [
+        "S01E047.2026.2160p.HQ.WEB-DL.H265.AAC.mp4"
+    ]
+
+
+def test_collect_files_falls_back_to_mislabeled_season_with_targets() -> None:
+    """
+    季级目标（episode_targets）同样支持跨季误标兜底并改写季号。
+    """
+    files = [_file("S02E47.2160p.mp4", "b")]
+    selected = NetdiskModule()._collect_files(
+        files, None, season=1, episode_targets={1: {47}},
+    )
+    assert [item.name for item in selected] == ["S01E047.2160p.mp4"]
+
+
+def test_collect_files_does_not_fall_back_across_multiple_target_seasons() -> None:
+    """
+    多季目标下不允许跨季兜底，避免其他季同集号被误认成目标季。
+    """
+    files = [_file("S02E47.2160p.mp4", "b")]
+    selected = NetdiskModule()._collect_files(files, {47}, season=[1, 3])
+    assert selected == []
+
+
+def test_episode_name_rewrites_season_only_for_single_target() -> None:
+    """
+    单季目标下已带季号的文件改写为目标季，多季目标保持原样。
+    """
+    assert NetdiskModule._episode_name(
+        "S02E47.2160p.mp4", season=1,
+    ) == "S01E047.2160p.mp4"
+    assert NetdiskModule._episode_name(
+        "S02E47.2160p.mp4", season=[1, 2],
+    ) == "S02E47.2160p.mp4"
+
+
 def test_collect_files_prefixes_duplicate_names() -> None:
     """
     递归目录拍平后的同名文件必须保留唯一前缀，不能静默覆盖。
@@ -167,10 +213,11 @@ def test_cleanup_links_continues_after_single_failure(tmp_path: Path) -> None:
 
 def test_engine_skips_completed_file(tmp_path: Path) -> None:
     """
-    目标文件已存在且大小匹配时，不重新下载。
+    目标文件已存在且大小匹配、完成标记齐全时，不重新下载。
     """
     target = tmp_path / "done.mkv"
     target.write_bytes(b"12345")
+    target.with_name(target.name + ".done").write_text("5", encoding="utf-8")
     progress = []
     downloader = ChunkedDownloader(
         target=target,

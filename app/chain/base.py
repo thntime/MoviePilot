@@ -921,6 +921,8 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
         share_password: Optional[str] = None,
         netdisk_share_token: Optional[str] = None,
         season: Optional[Union[int, str, Sequence[int]]] = None,
+        source: Optional[str] = None,
+        media_runtime: Optional[int] = None,
     ) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], str]]:
         """
         根据种子文件，选择并添加下载任务
@@ -939,6 +941,8 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
         :param share_password: 网盘分享提取码
         :param netdisk_share_token: 网盘分享令牌，供取链复用
         :param season: 订阅目标季，供网盘按季过滤
+        :param source: 下载来源标识，`Subscribe|` 前缀表示订阅来源
+        :param media_runtime: 单集时长（分钟），供网盘下载后校验
         :return: 下载器名称、种子Hash、种子文件布局、错误原因
         """
         return cast(Optional[Tuple[Optional[str], Optional[str], Optional[str], str]], self.run_module(
@@ -957,6 +961,8 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
             share_password=share_password,
             netdisk_share_token=netdisk_share_token,
             season=season,
+            source=source,
+            media_runtime=media_runtime,
         ))
 
     def download_added(

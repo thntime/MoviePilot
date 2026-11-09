@@ -15,6 +15,16 @@ from app.schemas.music import MusicInfo, MusicMeta
 from app.schemas.types import MediaSource, MusicTargetEntityType
 
 
+class DownloaderTorrentAIDecision(BaseModel):
+    """
+    网盘批次 AI 决策摘要。
+    """
+
+    decision: Optional[str] = Field(default=None, description="决策：organize_now、retry_missing 或 explain_only")
+    reason: Optional[str] = Field(default=None, description="决策原因")
+    missing_episodes: Optional[List[int]] = Field(default=None, description="AI 建议补下的集数")
+
+
 class DownloaderTorrent(BaseModel):
     """
     下载器任务信息。
@@ -38,6 +48,10 @@ class DownloaderTorrent(BaseModel):
     account_id: Optional[int] = Field(default=None, description="网盘取链使用的账号主键")
     strategy: Optional[str] = Field(default=None, description="网盘取链策略：transfer、direct 或 direct_fallback")
     capacity_error: Optional[str] = Field(default=None, description="容量不足导致的失败原因")
+    partial: bool = Field(default=False, description="网盘任务是否部分完成")
+    warning: Optional[str] = Field(default=None, description="部分完成的提示文本")
+    missing_episodes: Optional[List[int]] = Field(default=None, description="部分完成时缺失的集数")
+    ai_decision: Optional[DownloaderTorrentAIDecision] = Field(default=None, description="网盘批次 AI 决策")
     upspeed: Optional[str] = Field(default=None, description="当前上传速度的格式化展示文本")
     dlspeed: Optional[str] = Field(default=None, description="当前下载速度的格式化展示文本")
     tags: Optional[str] = Field(default=None, description="下载器返回的任务标签文本")
