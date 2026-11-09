@@ -20,6 +20,7 @@ from app.application.netdisk.resolve import ResolvedShare
 from app.application.netdisk.share_blacklist import ShareBlacklistStore
 from app.domain.netdisk import (
     DirectLink,
+    DriveFile,
     NetdiskError,
     NetdiskErrorCode,
     NetdiskPlatform,
@@ -195,6 +196,89 @@ def test_download_accepts_episode_targets(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert record is not None
     assert record["episodes"] == [1]
     assert record["episode_targets"] == {"1": [1]}
+
+
+def test_download_existing_creates_task_without_share(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    个人盘已有文件入口应直接登记任务，不解析分享链接、不写 share_url。
+    """
+    module = NetdiskModule()
+    config = SimpleNamespace(name="网盘", default=True, config={})
+    monkeypatch.setattr(module, "get_configs", lambda: {"网盘": config})
+    started = threading.Event()
+
+    def fake_run_existing(*args: Any, **kwargs: Any) -> None:
+        """记录后台任务启动并立即结束。"""
+        started.set()
+
+    monkeypatch.setattr(module, "_run_existing_task", fake_run_existing)
+
+    class FakeFilesService:
+        """只提供账号平台信息的个人盘服务替身。"""
+
+        def account(self, account_id: int):
+            """返回任务账号的平台。"""
+            return SimpleNamespace(platform="quark")
+
+    monkeypatch.setattr(netdisk_module, "NetdiskFilesService", FakeFilesService)
+
+    result = module.download_existing(
+        account_id=7,
+        files=[DriveFile(file_id="f1", name="Show.S01E01.mkv", size=10)],
+        download_dir=tmp_path,
+        episodes={1},
+        season=1,
+        source='Subscribe|{"id": 7, "existing": true}',
+    )
+
+    assert result is not None
+    assert result[1]
+    assert started.wait(2)
+    record = store.get_task(result[1])
+    assert record is not None
+    assert record["account_id"] == 7
+    assert record["netdisk_platform"] == "quark"
+    assert record["source"] == 'Subscribe|{"id": 7, "existing": true}'
+    assert record["files"] == [{"name": "Show.S01E01.mkv", "size": 10, "progress": 0.0}]
+    assert not record.get("share_url")
+
+
+def test_run_existing_task_downloads_personal_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    个人盘已有文件任务应逐文件取链下载并写入完成标记。
+    """
+    module = NetdiskModule()
+
+    class FakeFilesService:
+        """返回固定直链的个人盘服务替身。"""
+
+        def download(self, account_id: int, item: DriveFile) -> DirectLink:
+            """校验账号并返回直链。"""
+            assert account_id == 7
+            return DirectLink(url="https://cdn/x", headers={}, size=4)
+
+    monkeypatch.setattr(netdisk_module, "NetdiskFilesService", FakeFilesService)
+    monkeypatch.setattr(netdisk_module, "ChunkedDownloader", FakeChunkedDownloader)
+    FakeChunkedDownloader.calls = []
+
+    module._run_existing_task(  # pylint: disable=protected-access
+        "t-existing",
+        NetdiskPlatform.QUARK,
+        7,
+        [DriveFile(file_id="f1", name="Show.S01E01.mkv", size=4)],
+        tmp_path,
+        NetdiskTuning(),
+    )
+
+    record = store.get_task("t-existing")
+    assert record is not None
+    assert record["state"] == "completed"
+    assert (tmp_path / "Show.S01E01.mkv").read_bytes() == b"dddd"
+    assert (tmp_path / "Show.S01E01.mkv.done").exists()
 
 
 def test_task_store_and_list_torrents() -> None:

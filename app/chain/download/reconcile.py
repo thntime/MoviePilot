@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -192,8 +193,8 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
                     ))
                 # 已有完整文件优先于回滚与换源：网盘个人盘命中后重新取链下载，
                 # 本地命中后直接标记整理完成，两种情况都不冷却账号。
-                if parsed and episodes and self._try_existing_files(
-                    history, torrent, platform, account_id, episodes,
+                if episodes and self._try_existing_files(
+                    history, torrent, platform, account_id, episodes, source, parsed,
                 ):
                     processed += 1
                     continue
@@ -248,6 +249,8 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         platform: Optional[NetdiskPlatform],
         account_id: int,
         episodes: Set[int],
+        source: Any,
+        parsed: Any,
     ) -> bool:
         """
         尝试复用网盘个人盘或本地已有的完整文件。
@@ -260,8 +263,14 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         :param platform: 任务所属网盘平台
         :param account_id: 任务使用的账号主键
         :param episodes: 需要覆盖的集数
+        :param source: 原下载来源
+        :param parsed: 订阅来源解析结果
         :return: 命中并处理成功返回 True
         """
+        if (isinstance(parsed, dict) and bool(parsed.get("existing"))) \
+                or str(source or "") == "existing":
+            # 复用任务只允许执行一次：再次失败必须回到回滚换源，避免死循环。
+            return False
         title = str(getattr(history, "title", "") or "").strip()
         season = episode_rules.parse_season_number(
             str(getattr(history, "seasons", "") or "")
@@ -279,7 +288,7 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
                     logger.debug(f"网盘个人盘已有文件查询失败：{type(error).__name__}")
                     hit = None
                 if hit is not None and self._resubmit_existing(
-                    torrent, history, platform, episodes, season,
+                    torrent, history, episodes, season, hit, source,
                 ):
                     logger.info(
                         f"网盘个人盘已有完整文件，重新提交下载：{title} "
@@ -427,25 +436,27 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         self,
         torrent: Any,
         history: Any,
-        platform: NetdiskPlatform,
         episodes: Set[int],
         season: Optional[int],
+        hit: Any,
+        source: Any,
     ) -> bool:
         """
-        复用原分享重新提交网盘下载任务。
+        用个人盘已有文件重新提交下载任务。
 
-        模块没有按个人盘 file_id 提交的入口，这里沿用原分享地址重新取链，
-        并先删除旧任务记录以清理残留转存句柄。
+        先删除旧任务记录以清理残留转存句柄，再调用网盘模块的个人盘下载入口，
+        不解析分享链接、不转存。
 
         :param torrent: 下载器任务投影
         :param history: 下载历史快照
-        :param platform: 网盘平台
         :param episodes: 需要覆盖的集数
         :param season: 目标季
-        :return: 已提交返回 True；缺少分享地址时返回 False
+        :param hit: 已有文件命中结果
+        :param source: 原下载来源
+        :return: 已提交返回 True；缺少必要信息时返回 False
         """
-        share_url = str(getattr(torrent, "share_url", "") or "").strip()
-        if not share_url:
+        files = list(getattr(hit, "files", None) or [])
+        if not files:
             return False
         task_hash = str(getattr(torrent, "hash", "") or "")
         if task_hash:
@@ -458,25 +469,112 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
             or getattr(history, "path", None)
         )
         download_dir = Path(str(base)).parent if base else Path(".")
-        self.run_module(
-            "download",
-            content=share_url,
+        source_marker = self._existing_source(source)
+        result = self.run_module(
+            "download_existing",
+            account_id=int(getattr(hit, "account_id", 0) or 0),
+            files=files,
             download_dir=download_dir,
-            cookie=None,
-            episodes=set(episodes),
             category=getattr(history, "media_category", None),
-            label=None,
-            downloader=getattr(torrent, "downloader", None),
-            custom_words=getattr(history, "custom_words", None),
-            download_type="netdisk",
-            netdisk_platform=platform.value,
-            share_password=None,
-            netdisk_share_token=None,
+            episodes=set(episodes),
             season=season,
-            source="existing",
+            source=source_marker,
             media_runtime=None,
+            downloader=getattr(torrent, "downloader", None),
+            label=None,
         )
+        new_hash = ""
+        if isinstance(result, tuple) and len(result) > 1:
+            new_hash = str(result[1] or "")
+        if new_hash:
+            self._record_existing_history(
+                history, torrent, new_hash, source_marker,
+                download_dir, int(getattr(hit, "account_id", 0) or 0),
+            )
         return True
+
+    def _record_existing_history(
+        self,
+        history: Any,
+        torrent: Any,
+        download_hash: str,
+        source_marker: str,
+        download_dir: Path,
+        account_id: int,
+    ) -> None:
+        """
+        为复用任务补写下载历史，供下一次失败对账读取 `existing` 标记。
+
+        :param history: 原下载历史快照
+        :param torrent: 原下载器任务投影
+        :param download_hash: 新任务标识
+        :param source_marker: 带 `existing` 标记的来源
+        :param download_dir: 新任务下载根目录
+        :param account_id: 文件所在账号主键
+        """
+        from app.application.history import DownloadHistoryWrite
+
+        repository = getattr(self, "download_history_repository", None)
+        add = getattr(repository, "add", None)
+        if add is None:
+            return
+        note = getattr(history, "note", None)
+        payload = dict(note) if isinstance(note, dict) else {}
+        payload["source"] = source_marker
+        task_dir = download_dir / f"existing-{account_id}-{download_hash[:6]}"
+        try:
+            add(DownloadHistoryWrite(
+                path=str(task_dir),
+                type=str(getattr(history, "type", "") or ""),
+                title=str(getattr(history, "title", "") or ""),
+                year=getattr(history, "year", None),
+                media_source=getattr(history, "media_source", None),
+                media_id=getattr(history, "media_id", None),
+                music_type=getattr(history, "music_type", None),
+                seasons=getattr(history, "seasons", None),
+                episodes=getattr(history, "episodes", None),
+                image=getattr(history, "image", None),
+                poster=getattr(history, "poster", None),
+                downloader=getattr(torrent, "downloader", None),
+                download_hash=download_hash,
+                torrent_name=getattr(history, "torrent_name", None),
+                torrent_description=getattr(history, "torrent_description", None),
+                torrent_site=getattr(history, "torrent_site", None),
+                userid=getattr(history, "userid", None),
+                username=getattr(history, "username", None),
+                channel=getattr(history, "channel", None),
+                date=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                note=payload,
+                media_category_id=getattr(history, "media_category_id", None),
+                media_category=getattr(history, "media_category", None),
+                classification_rule_id=getattr(history, "classification_rule_id", None),
+                classification_policy_revision=getattr(
+                    history, "classification_policy_revision", None,
+                ),
+                classification_source=getattr(history, "classification_source", None),
+                episode_group=getattr(history, "episode_group", None),
+                custom_words=getattr(history, "custom_words", None),
+            ))
+        except Exception as error:  # noqa: BLE001 - 历史补写失败不影响下载提交
+            logger.debug(f"补写复用任务下载历史失败：{type(error).__name__}")
+
+    @staticmethod
+    def _existing_source(source: Any) -> str:
+        """
+        构造复用任务来源标记，供下一次失败对账识别并避免重复复用。
+
+        :param source: 原下载来源
+        :return: 订阅来源追加 `existing` 字段；其他来源使用 `existing`
+        """
+        from app.chain.subscribe.facade import SubscribeChain
+
+        text = str(source or "").strip()
+        parsed = SubscribeChain.parse_subscribe_source_keyword(text)
+        if parsed:
+            payload = dict(parsed)
+            payload["existing"] = True
+            return "Subscribe|" + json.dumps(payload, ensure_ascii=False)
+        return "existing"
 
     def _record_capacity_failure(
         self,

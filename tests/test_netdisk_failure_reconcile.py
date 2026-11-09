@@ -2,6 +2,7 @@
 验证网盘后台失败对账、订阅事实回滚与换源触发。
 """
 
+import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,9 +44,9 @@ class _ReconcileChain(DownloadFailureReconcileOwner):
         return self._torrents
 
     def run_module(self, method, **kwargs):
-        """记录模块调用。"""
+        """记录模块调用，并返回用例预设的模块结果。"""
         self.marked.append((method, kwargs))
-        return None
+        return getattr(self, "module_result", None)
 
     def post_message(self, message):
         """记录告警消息。"""
@@ -349,8 +350,13 @@ def _patch_subscribe_chain(monkeypatch: pytest.MonkeyPatch, rolled, searched, fi
 
         @staticmethod
         def parse_subscribe_source_keyword(source: str):
-            """解析测试来源。"""
-            return {"id": 7} if source.startswith("Subscribe|") else None
+            """按真实格式解析测试来源，保留 existing 等扩展字段。"""
+            if not str(source or "").startswith("Subscribe|"):
+                return None
+            try:
+                return json.loads(str(source).split("|", 1)[1])
+            except (IndexError, ValueError):
+                return {"id": 7}
 
         def rollback_download_facts(self, subscribe_id, episodes):
             """记录回滚集数。"""
@@ -395,10 +401,23 @@ def test_reconcile_uses_cloud_existing(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     网盘个人盘命中时重新提交下载，不回滚订阅也不触发换源搜索。
     """
-    chain = _ReconcileChain([_failed_torrent()], _failed_history())
+    history = _failed_history()
+    chain = _ReconcileChain([_failed_torrent()], history)
     _patch_accounts(monkeypatch)
     queried = []
     local_calls = []
+    added = []
+
+    def _add(payload):
+        """记录补写的下载历史。"""
+        added.append(payload)
+        return 1
+
+    chain.download_history_repository = SimpleNamespace(
+        get_by_hash=lambda _hash: history,
+        add=_add,
+    )
+    chain.module_result = ("Netdisk", "newhash", None, "")
 
     def _find_media(accounts, title, season, episodes, **kwargs):
         """记录查询参数并返回命中。"""
@@ -422,9 +441,52 @@ def test_reconcile_uses_cloud_existing(monkeypatch: pytest.MonkeyPatch) -> None:
     assert rolled == [] and searched == []
     assert local_calls == []
     assert queried and queried[0][0][0][0] == 7
-    assert any(
-        method == "download" and kwargs.get("source") == "existing"
-        for method, kwargs in chain.marked
+    submit = next(
+        kwargs for method, kwargs in chain.marked if method == "download_existing"
+    )
+    assert submit["account_id"] == 7
+    assert [item.file_id for item in submit["files"]] == ["f1"]
+    assert "existing" in submit["source"]
+    assert not any(method == "download" for method, _ in chain.marked)
+    assert added
+    recorded = json.loads(str(added[0].note["source"]).split("|", 1)[1])
+    assert recorded["id"] == 7
+    assert recorded["existing"] is True
+
+
+def test_reconcile_existing_task_failure_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    已标记 existing 的复用任务再次失败时不重复查已有文件，直接回滚并换源。
+    """
+    chain = _ReconcileChain(
+        [_failed_torrent()],
+        _failed_history(note={"source": 'Subscribe|{"id": 7, "existing": true}'}),
+    )
+    _patch_accounts(monkeypatch)
+    queried = []
+    local_calls = []
+
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.find_complete_media",
+        lambda *args, **kwargs: queried.append(True),
+    )
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.find_local_complete",
+        lambda *args, **kwargs: local_calls.append(True),
+    )
+    rolled, searched = [], []
+    finished = threading.Event()
+    _patch_subscribe_chain(monkeypatch, rolled, searched, finished)
+
+    assert chain.reconcile_netdisk_failures() == 1
+    assert queried == [] and local_calls == []
+    assert finished.wait(1.0)
+    assert rolled == [(7, [1, 2])]
+    assert searched == [7]
+    assert not any(
+        method in {"download", "download_existing"} for method, _ in chain.marked
     )
 
 

@@ -1397,6 +1397,14 @@ _METHOD_CONTRACTS = {
         required_parameters=("content", "download_dir", "cookie", "episodes", "category", "label", "downloader"),
         optional_parameters=("custom_words", "download_type", "netdisk_platform", "share_password", "netdisk_share_token", "season", "episode_targets", "source", "media_runtime"),
     ),
+    "download_existing": ModuleMethodContract(
+        family="downloader",
+        input_contract="NetdiskExistingDownloadRequest",
+        result_contract="DownloadTaskResult | None",
+        aggregation=ModuleResultAggregation.FIRST_NON_EMPTY,
+        required_parameters=("account_id", "files", "download_dir"),
+        optional_parameters=("category", "episodes", "season", "source", "media_runtime", "downloader", "label"),
+    ),
     "download_added": ModuleMethodContract(
         family="downloader",
         input_contract="DownloadAddedHook",

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
@@ -22,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 from app.application.netdisk import selection
 from app.application.netdisk.accounts import NetdiskAccountService
 from app.application.netdisk.batch_judge import BatchDecision, judge_batch
+from app.application.netdisk.files import NetdiskFilesService
 from app.application.netdisk.registry import find_adapter
 from app.application.netdisk.resolve import NetdiskResolveService
 from app.application.netdisk.share_blacklist import get_share_blacklist
@@ -29,6 +31,7 @@ from app.domain.episode import episode_numbers, is_special_name
 from app.domain.netdisk import (
     DISPLAY_ONLY_PLATFORMS,
     DirectLink,
+    DriveFile,
     LinkPolicy,
     NetdiskError,
     NetdiskErrorCode,
@@ -487,7 +490,36 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         share_url = _as_text(record.get("share_url"))
         share_code = _as_text(record.get("share_code"))
         save_path = _as_text(record.get("save_path"))
-        if platform is None or not share_url or not share_code or not save_path:
+        if platform is None or not save_path:
+            return False
+        existing_files = record.get("existing_files") or []
+        if existing_files:
+            account_id = int(record.get("account_id") or 0)
+            entries = self._existing_entries(existing_files)
+            if account_id <= 0 or not entries:
+                return False
+            config = self._select_config(_as_text(record.get("downloader")) or None)
+            if config is None:
+                return False
+            tuning = self._instance_tuning(config, platform)
+            stop_event = threading.Event()
+            with self._lock:
+                self._stops[task_hash] = stop_event
+                self._tasks[task_hash] = {"stop": stop_event}
+                self._discarded.discard(task_hash)
+            thread = threading.Thread(
+                target=self._run_existing_task,
+                args=(
+                    task_hash, platform, account_id, entries, Path(save_path),
+                    tuning, record.get("media_runtime"),
+                ),
+                daemon=True,
+                name=f"netdisk-existing-{task_hash}",
+            )
+            thread.start()
+            logger.info(f"网盘已有文件任务已恢复下载：{task_hash}")
+            return True
+        if not share_url or not share_code:
             return False
         config = self._select_config(_as_text(record.get("downloader")) or None)
         if config is None:
@@ -729,6 +761,383 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         )
         thread.start()
         return name, task_key, None, ""
+
+    def download_existing(
+        self,
+        account_id: int,
+        files: Sequence[Any],
+        download_dir: Path,
+        category: Optional[str] = None,
+        episodes: Optional[Set[int]] = None,
+        season: Optional[Union[int, str, Sequence[int]]] = None,
+        source: Optional[str] = None,
+        media_runtime: Optional[int] = None,
+        downloader: Optional[str] = None,
+        label: Optional[str] = None,
+    ) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], str]]:
+        """
+        提交个人盘已有文件下载任务，不解析分享链接也不转存。
+
+        :param account_id: 文件所在网盘账号主键
+        :param files: 个人盘文件条目，支持 `DriveFile` 或含 `file_id`/`name`/`size` 的映射
+        :param download_dir: 下载根目录
+        :param category: 下载分类子目录
+        :param episodes: 目标集数集合
+        :param season: 订阅目标季
+        :param source: 下载来源标识，复用任务会带 `existing` 标记
+        :param media_runtime: 单集时长（分钟），用于下载完成后的时长校验
+        :param downloader: 下载器实例名称
+        :param label: 任务标签
+        :return: 下载器名称、任务标识、内容布局与说明；无有效文件时返回错误原因
+        """
+        entries = self._existing_entries(files)
+        if not entries:
+            return None, None, None, "没有可下载的个人盘文件"
+        service = NetdiskFilesService()
+        try:
+            record = service.account(int(account_id))
+        except Exception as error:  # noqa: BLE001 - 账号不可用时直接返回可展示原因
+            return None, None, None, _friendly_download_error(error)
+        platform = normalize_platform(getattr(record, "platform", None))
+        if platform is None:
+            return None, None, None, "未知的网盘平台"
+        config = self._select_config(downloader)
+        if config is None:
+            return None, None, None, "未配置网盘下载器实例"
+        name = _as_text(getattr(config, "name", "")) or "Netdisk"
+        task_tuning = self._instance_tuning(config, platform)
+        target_episodes = set(episodes or ())
+        task_key = _task_hash(
+            f"existing:{int(account_id)}",
+            "|".join(sorted(item.file_id for item in entries)),
+        )
+        with self._lock:
+            if task_key in self._tasks:
+                return name, task_key, None, DOWNLOAD_TASK_ALREADY_EXISTS
+            stop_event = threading.Event()
+            self._stops[task_key] = stop_event
+            self._tasks[task_key] = {"stop": stop_event}
+            self._discarded.discard(task_key)
+        task_dir = self._task_dir(
+            Path(download_dir), f"existing-{int(account_id)}-{task_key[:6]}",
+        )
+        try:
+            task_dir.mkdir(parents=True, exist_ok=True)
+            (task_dir / _TASK_MARKER).touch(exist_ok=True)
+        except Exception as err:  # noqa: BLE001
+            logger.warn(f"创建网盘已有文件下载目录失败：{task_dir} - {err}")
+        store.upsert_task(task_key, {
+            "title": f"{platform.value}:{int(account_id)}",
+            "name": entries[0].name,
+            "downloader": name,
+            "state": "downloading",
+            "error": None,
+            "progress": 0.0,
+            "size": float(sum(int(item.size or 0) for item in entries)),
+            "dlspeed": None,
+            "dlspeed_bytes": 0,
+            "save_path": str(task_dir),
+            "path": str(task_dir),
+            "category": category or label,
+            "files": [
+                {"name": item.name, "size": int(item.size or 0), "progress": 0.0}
+                for item in entries
+            ],
+            "netdisk_platform": platform.value,
+            "account_id": int(account_id),
+            "episodes": sorted(target_episodes),
+            "season": season,
+            "source": source,
+            "media_runtime": media_runtime,
+            "existing_files": [
+                {
+                    "file_id": item.file_id,
+                    "name": item.name,
+                    "size": int(item.size or 0),
+                    "parent_id": item.parent_id,
+                }
+                for item in entries
+            ],
+        })
+        thread = threading.Thread(
+            target=self._run_existing_task,
+            args=(
+                task_key, platform, int(account_id), entries, task_dir,
+                task_tuning, media_runtime,
+            ),
+            daemon=True,
+            name=f"netdisk-existing-{task_key}",
+        )
+        thread.start()
+        return name, task_key, None, ""
+
+    @staticmethod
+    def _existing_entries(files: Sequence[Any]) -> List[DriveFile]:
+        """
+        把个人盘文件输入规范化为可下载条目，并去掉非法或重复文件名。
+
+        :param files: `DriveFile` 或映射形式的文件列表
+        :return: 安全文件名后的文件条目
+        """
+        entries: List[DriveFile] = []
+        used: Set[str] = set()
+        for raw in files or []:
+            if isinstance(raw, DriveFile):
+                item = raw
+            elif isinstance(raw, Mapping):
+                item = DriveFile(
+                    file_id=_as_text(raw.get("file_id")),
+                    name=_as_text(raw.get("name")),
+                    size=int(raw.get("size") or 0),
+                    is_dir=bool(raw.get("is_dir")),
+                    parent_id=_as_text(raw.get("parent_id")),
+                )
+            else:
+                item = DriveFile(
+                    file_id=_as_text(getattr(raw, "file_id", "")),
+                    name=_as_text(getattr(raw, "name", "")),
+                    size=int(getattr(raw, "size", 0) or 0),
+                    is_dir=bool(getattr(raw, "is_dir", False)),
+                    parent_id=_as_text(getattr(raw, "parent_id", "")),
+                )
+            if item.is_dir or not item.file_id:
+                continue
+            filename = _safe_filename(item.name)
+            if not filename:
+                continue
+            if filename in used:
+                prefix = item.file_id[:6] or "dup"
+                candidate = f"{prefix}_{filename}"
+                while candidate in used:
+                    candidate = f"_{candidate}"
+                filename = candidate
+            used.add(filename)
+            entries.append(replace(item, name=filename))
+        return entries
+
+    def _run_existing_task(
+        self,
+        task_key: str,
+        platform: NetdiskPlatform,
+        account_id: int,
+        entries: Sequence[DriveFile],
+        task_dir: Path,
+        tuning: NetdiskTuning,
+        media_runtime: Optional[int] = None,
+    ) -> None:
+        """
+        后台下载个人盘已有文件，并维护与普通网盘任务一致的状态记录。
+
+        :param task_key: 任务标识
+        :param platform: 网盘平台
+        :param account_id: 文件所在账号主键
+        :param entries: 待下载文件条目
+        :param task_dir: 任务落盘目录
+        :param tuning: 下载器实例参数快照
+        :param media_runtime: 单集时长（分钟）
+        """
+        stop_event = self._stops.get(task_key) or threading.Event()
+        total_size = sum(int(item.size or 0) for item in entries)
+        progress_lock = threading.Lock()
+        completed = 0.0
+        progress_state = {"percent": -100.0, "write_at": 0.0}
+
+        def on_progress(_name: str, percent: float, size: int) -> None:
+            """把单文件进度折算为任务总进度并节流写入。"""
+            overall = (
+                (completed + size * max(min(float(percent), 100.0), 0.0) / 100.0)
+                / total_size * 100.0
+                if total_size > 0 else 0.0
+            )
+            now = time.monotonic()
+            with progress_lock:
+                if (
+                    now - float(progress_state["write_at"]) < _PROGRESS_INTERVAL_SECONDS
+                    and abs(overall - float(progress_state["percent"])) < _PROGRESS_DELTA_PERCENT
+                ):
+                    return
+                progress_state["write_at"] = now
+                progress_state["percent"] = overall
+            store.update_progress(task_key, overall)
+
+        try:
+            self._ensure_local_space(task_dir, total_size)
+            service = NetdiskFilesService()
+            errors: Dict[str, str] = {}
+            for item in entries:
+                if stop_event.is_set():
+                    raise DownloadCancelled("网盘已有文件下载已取消")
+                target = task_dir / item.name
+                expected = int(item.size or 0)
+                if _is_completed_file(target, expected):
+                    completed += float(expected)
+                    continue
+                try:
+                    self._download_existing_one(
+                        service, account_id, platform, item, target,
+                        tuning, stop_event, on_progress, media_runtime,
+                    )
+                    completed += float(expected)
+                except DownloadCancelled:
+                    raise
+                except Exception as err:  # noqa: BLE001
+                    errors[item.name] = _friendly_download_error(err)
+                    for path in (
+                        target,
+                        target.with_name(target.name + ".done"),
+                        target.with_suffix(target.suffix + ".plan.json"),
+                        target.with_suffix(target.suffix + ".hls.json"),
+                        target.with_suffix(target.suffix + ".hls.part"),
+                    ):
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    logger.warning(
+                        f"网盘已有文件下载失败，继续其他文件：{item.name} - "
+                        f"{errors[item.name]}"
+                    )
+            missing = [
+                item for item in entries
+                if item.name in errors
+                or not _is_completed_file(task_dir / item.name, int(item.size or 0))
+            ]
+            if not missing:
+                if task_key not in self._discarded:
+                    store.upsert_task(task_key, {
+                        "state": "completed", "progress": 100.0,
+                        "error": None, "dlspeed": None, "dlspeed_bytes": 0,
+                    })
+            elif len(missing) == len(entries):
+                reasons = "; ".join(
+                    f"{item.name}（{errors.get(item.name, '未完成')}）"
+                    for item in missing[:3]
+                )
+                if task_key not in self._discarded:
+                    store.upsert_task(task_key, {
+                        "state": "error",
+                        "error": _friendly_download_error(DownloadError(
+                            f"下载未完成：{reasons}"
+                        )),
+                        "dlspeed": None, "dlspeed_bytes": 0,
+                    })
+            else:
+                missing_episodes = sorted({
+                    number for item in missing
+                    for number in episode_numbers(item.name)
+                })
+                if task_key not in self._discarded:
+                    store.upsert_task(task_key, {
+                        "state": "completed", "progress": 100.0,
+                        "error": None, "dlspeed": None, "dlspeed_bytes": 0,
+                        "partial": True,
+                        "missing_episodes": missing_episodes,
+                        "warning": f"部分完成：{len(entries) - len(missing)} 个有效，"
+                                   f"{len(missing)} 个失败",
+                    })
+            logger.info(f"网盘已有文件下载完成：{platform.value}:{account_id}")
+        except DownloadCancelled:
+            if task_key not in self._discarded:
+                store.upsert_task(task_key, {
+                    "state": "paused", "error": None,
+                    "dlspeed": None, "dlspeed_bytes": 0,
+                })
+        except Exception as err:  # noqa: BLE001
+            error_text = _friendly_download_error(err)
+            logger.warn(f"网盘已有文件下载失败：{account_id} - {error_text}")
+            if task_key not in self._discarded:
+                store.upsert_task(task_key, {
+                    "state": "error", "error": error_text,
+                    "dlspeed": None, "dlspeed_bytes": 0,
+                })
+        finally:
+            _remove_empty_dir(task_dir)
+            with self._lock:
+                self._stops.pop(task_key, None)
+                self._tasks.pop(task_key, None)
+
+    def _download_existing_one(
+        self,
+        service: NetdiskFilesService,
+        account_id: int,
+        platform: NetdiskPlatform,
+        item: DriveFile,
+        target: Path,
+        tuning: NetdiskTuning,
+        stop_event: threading.Event,
+        on_progress: Callable[[str, float, int], None],
+        media_runtime: Optional[int],
+    ) -> None:
+        """
+        下载单个个人盘文件，直链失效时重新取链。
+
+        :param service: 个人盘文件服务
+        :param account_id: 文件所在账号主键
+        :param platform: 网盘平台
+        :param item: 文件条目
+        :param target: 目标文件路径
+        :param tuning: 下载器实例参数快照
+        :param stop_event: 停止信号
+        :param on_progress: 单文件进度回调
+        :param media_runtime: 单集时长（分钟）
+        """
+        links: Tuple[DirectLink, ...] = (service.download(account_id, item),)
+
+        def url_provider(refresh: bool = False) -> Sequence[DirectLink]:
+            """返回直链集合；刷新时重新向个人盘取链。"""
+            nonlocal links
+            if refresh:
+                links = (service.download(account_id, item),)
+            return links
+
+        link = links[0]
+        size = int(item.size or link.size or 0)
+
+        def report(percent: float) -> None:
+            """把下载器百分比回调转交任务级汇总。"""
+            on_progress(item.name, percent, size)
+
+        adapter = find_adapter(platform)
+        max_concurrency = int(getattr(adapter, "max_concurrency", 0) or 0)
+        single_stream = bool(getattr(adapter, "single_stream", False))
+        is_hls = bool(link.is_hls)
+        if is_hls:
+            try:
+                HlsDownloader(
+                    target=target,
+                    links=links,
+                    retries=tuning.retries,
+                    buffer_size=tuning.buffer_size,
+                    on_progress=report,
+                    stop_event=stop_event,
+                ).run(url_provider)
+            except NotHls:
+                logger.warning(f"个人盘直链不是 m3u8，回退普通下载：{item.name}")
+                is_hls = False
+        if not is_hls:
+            if size <= 0:
+                raise DownloadError(f"无法确定文件大小：{item.name}")
+            ChunkedDownloader(
+                target=target,
+                total=size,
+                links=links,
+                threads=1 if single_stream else tuning.threads,
+                rate_limit_bytes=tuning.rate_limit,
+                preempt=tuning.preempt_enabled,
+                buffer_size=tuning.buffer_size,
+                retries=tuning.retries,
+                preempt_bps=tuning.preempt_bps,
+                preempt_age_seconds=tuning.preempt_age_seconds,
+                refresh_seconds=tuning.refresh_seconds,
+                max_concurrency=max_concurrency,
+                on_progress=report,
+                stop_event=stop_event,
+                single_stream=single_stream,
+            ).run(url_provider)
+        _validate_video_duration(
+            target,
+            int(media_runtime) * 60 if media_runtime and int(media_runtime) > 0 else None,
+        )
 
     def _select_config(self, downloader: Optional[str]) -> Optional[Any]:
         """
