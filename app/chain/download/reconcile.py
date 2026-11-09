@@ -9,17 +9,24 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from typing import Any, Optional, Set
 
 from app.application.download.failures import DownloadFailureWrite
 from app.application.netdisk import selection
+from app.application.netdisk.accounts import NetdiskAccountService
+from app.application.netdisk.existing import find_complete_media
 from app.chain.download.contract import _DownloadOwnerBase
 from app.chain.download.failure import DOWNLOAD_FAILURE_CAPACITY_TTL_SECONDS
+from app.chain.download.local_existing import LocalExistingHit, find_local_complete
 from app.domain import episode as episode_rules
+from app.domain.context import MediaInfo
+from app.domain.meta.metabase import MetaBase
 from app.domain.netdisk import NetdiskPlatform, normalize_platform
 from app.runtime.log import logger
+from app.schemas.media import normalize_media_source
 from app.schemas.message import Message
-from app.schemas.types import MessageType
+from app.schemas.types import MediaType, MessageType
 
 
 class DownloadFailureReconcileOwner(_DownloadOwnerBase):
@@ -167,17 +174,11 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
                 continue
             task_hash = str(getattr(torrent, "hash", "") or "")
             platform = normalize_platform(getattr(torrent, "netdisk_platform", None))
-            # 容量不足只冷却实际使用的账号；解析、网络或鉴权失败不冷却任何对象，
-            # 让一次代码异常演变成整个平台在冷却期内全部无法提交是不可接受的。
             account_id = int(getattr(torrent, "account_id", 0) or 0)
-            if (
-                not is_partial
-                and platform is not None
-                and account_id > 0
-                and self._is_capacity_error(getattr(torrent, "error", ""))
-            ):
-                selection.cool_account(account_id)
             history = self.download_history_repository.get_by_hash(task_hash) if task_hash else None
+            source = None
+            parsed = None
+            episodes: Set[int] = set()
             if history is not None:
                 # 恢复任务可能没有内存来源，订阅标识一律以提交时写入的历史备注为准。
                 note = getattr(history, "note", None)
@@ -186,43 +187,296 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
                 if is_partial:
                     episodes = set(partial_missing or set())
                 else:
-                    episodes = episode_rules.parse_episode_selection(
+                    episodes = set(episode_rules.parse_episode_selection(
                         str(getattr(history, "episodes", "") or "")
+                    ))
+                # 已有完整文件优先于回滚与换源：网盘个人盘命中后重新取链下载，
+                # 本地命中后直接标记整理完成，两种情况都不冷却账号。
+                if parsed and episodes and self._try_existing_files(
+                    history, torrent, platform, account_id, episodes,
+                ):
+                    processed += 1
+                    continue
+            # 容量不足只冷却实际使用的账号；解析、网络或鉴权失败不冷却任何对象，
+            # 让一次代码异常演变成整个平台在冷却期内全部无法提交是不可接受的。
+            if (
+                not is_partial
+                and platform is not None
+                and account_id > 0
+                and self._is_capacity_error(getattr(torrent, "error", ""))
+            ):
+                selection.cool_account(account_id)
+            if history is not None and parsed and episodes:
+                subscribe_id = parsed.get("id")
+                SubscribeChain().rollback_download_facts(subscribe_id, episodes)
+                if is_partial:
+                    # 缺失集没有 error 文案，用瞬时冷却记录同一资源，
+                    # 避免下一次搜索立刻再次选中这个已判定不完整的分享。
+                    self._record_capacity_failure(
+                        history, torrent, source,
+                        self._download_failure_ttl(None),
                     )
-                if parsed and episodes:
-                    subscribe_id = parsed.get("id")
-                    SubscribeChain().rollback_download_facts(subscribe_id, episodes)
-                    if is_partial:
-                        # 缺失集没有 error 文案，用瞬时冷却记录同一资源，
-                        # 避免下一次搜索立刻再次选中这个已判定不完整的分享。
+                else:
+                    capacity_error = self._is_capacity_error(getattr(torrent, "error", ""))
+                    if capacity_error:
+                        self._record_capacity_failure(history, torrent, source)
+                    else:
+                        # 分享失效、鉴权/解析失败也要冷却，避免重搜反复选中同一失效资源。
                         self._record_capacity_failure(
                             history, torrent, source,
-                            self._download_failure_ttl(None),
+                            self._download_failure_ttl(getattr(torrent, "error", "")),
                         )
-                    else:
-                        capacity_error = self._is_capacity_error(getattr(torrent, "error", ""))
-                        if capacity_error:
-                            self._record_capacity_failure(history, torrent, source)
-                        else:
-                            # 分享失效、鉴权/解析失败也要冷却，避免重搜反复选中同一失效资源。
-                            self._record_capacity_failure(
-                                history, torrent, source,
-                                self._download_failure_ttl(getattr(torrent, "error", "")),
-                            )
-                        if capacity_error:
-                            self._alert_netdisk_capacity(torrent, platform)
-                    threading.Thread(
-                        target=SubscribeChain().search,
-                        kwargs={"sid": subscribe_id},
-                        daemon=True,
-                        name=f"netdisk-reconcile-search-{subscribe_id}",
-                    ).start()
+                    if capacity_error:
+                        self._alert_netdisk_capacity(torrent, platform)
+                threading.Thread(
+                    target=SubscribeChain().search,
+                    kwargs={"sid": subscribe_id},
+                    daemon=True,
+                    name=f"netdisk-reconcile-search-{subscribe_id}",
+                ).start()
             if task_hash:
                 self.run_module("mark_reconciled", hashs=[task_hash])
             processed += 1
         if processed:
             logger.info(f"网盘失败任务对账完成：{processed} 个")
         return processed
+
+    def _try_existing_files(
+        self,
+        history: Any,
+        torrent: Any,
+        platform: Optional[NetdiskPlatform],
+        account_id: int,
+        episodes: Set[int],
+    ) -> bool:
+        """
+        尝试复用网盘个人盘或本地已有的完整文件。
+
+        先按平台查询个人盘，命中后重新提交下载；再查媒体库与下载目录，
+        命中后标记整理完成。任一命中都返回 True，调用方不再回滚换源。
+
+        :param history: 下载历史快照
+        :param torrent: 下载器任务投影
+        :param platform: 任务所属网盘平台
+        :param account_id: 任务使用的账号主键
+        :param episodes: 需要覆盖的集数
+        :return: 命中并处理成功返回 True
+        """
+        title = str(getattr(history, "title", "") or "").strip()
+        season = episode_rules.parse_season_number(
+            str(getattr(history, "seasons", "") or "")
+        )
+        if not title or not episodes:
+            return False
+        if platform is not None:
+            accounts = self._existing_accounts(platform, account_id)
+            if accounts:
+                try:
+                    hit = find_complete_media(
+                        accounts, title, season, set(episodes),
+                    )
+                except Exception as error:  # noqa: BLE001 - 查询失败继续查本地
+                    logger.debug(f"网盘个人盘已有文件查询失败：{type(error).__name__}")
+                    hit = None
+                if hit is not None and self._resubmit_existing(
+                    torrent, history, platform, episodes, season,
+                ):
+                    logger.info(
+                        f"网盘个人盘已有完整文件，重新提交下载：{title} "
+                        f"{sorted(episodes)}（账号 {hit.account_id}）"
+                    )
+                    return True
+        local = self._find_local_existing(history, torrent, season, episodes)
+        if local is None:
+            return False
+        task_hash = str(getattr(torrent, "hash", "") or "")
+        if task_hash:
+            self.run_module("transfer_completed", hashs=[task_hash])
+            self.run_module("mark_reconciled", hashs=[task_hash])
+        logger.info(
+            f"本地已有完整文件，标记整理完成：{title} {sorted(episodes)}"
+            + ("（媒体库）" if local.in_library else "")
+        )
+        return True
+
+    def _existing_accounts(
+        self,
+        platform: NetdiskPlatform,
+        account_id: int,
+    ) -> list[tuple[int, str]]:
+        """
+        按任务账号优先返回同平台可用账号。
+
+        :param platform: 网盘平台
+        :param account_id: 任务使用的账号主键
+        :return: 账号主键与展示名列表；查询失败时返回空列表
+        """
+        try:
+            views = NetdiskAccountService().list(platform)
+        except Exception as error:  # noqa: BLE001 - 账号查询失败按未命中处理
+            logger.debug(f"查询网盘账号失败：{type(error).__name__}")
+            return []
+        accounts = [
+            (int(view.id), str(view.name))
+            for view in views
+            if str(getattr(view, "status", "active") or "active") != "expired"
+        ]
+        accounts.sort(key=lambda item: item[0] != account_id)
+        return accounts
+
+    def _find_local_existing(
+        self,
+        history: Any,
+        torrent: Any,
+        season: Optional[int],
+        episodes: Set[int],
+    ) -> Optional[LocalExistingHit]:
+        """
+        检查媒体库与任务相关下载目录是否已有完整文件。
+
+        :param history: 下载历史快照
+        :param torrent: 下载器任务投影
+        :param season: 目标季
+        :param episodes: 需要覆盖的集数
+        :return: 命中结果；未命中或查询失败时返回 None
+        """
+        try:
+            return find_local_complete(
+                str(getattr(history, "title", "") or ""),
+                season,
+                set(episodes),
+                self._download_dirs(history, torrent),
+                media_exists=lambda: self._media_library_exists(
+                    history, season, episodes,
+                ),
+            )
+        except Exception as error:  # noqa: BLE001 - 本地扫描失败按未命中处理
+            logger.debug(f"本地已有文件查询失败：{type(error).__name__}")
+            return None
+
+    def _media_library_exists(
+        self,
+        history: Any,
+        season: Optional[int],
+        episodes: Set[int],
+    ) -> bool:
+        """
+        用下载历史构造最小媒体身份，查询媒体库是否已有目标集数。
+
+        :param history: 下载历史快照
+        :param season: 目标季
+        :param episodes: 需要覆盖的集数
+        :return: 媒体库已存在目标集数返回 True
+        """
+        getter = getattr(self, "get_no_exists_info", None)
+        if getter is None or season is None:
+            return False
+        media_source = normalize_media_source(getattr(history, "media_source", None))
+        media_id = str(getattr(history, "media_id", "") or "").strip()
+        title = str(getattr(history, "title", "") or "").strip()
+        if media_source is None or not media_id or not title:
+            return False
+        try:
+            meta = MetaBase(title=title)
+            meta.type = MediaType.TV
+            meta.begin_season = int(season)
+            meta.end_season = int(season)
+            meta.begin_episode = min(episodes)
+            meta.end_episode = max(episodes)
+            mediainfo = MediaInfo(
+                type=MediaType.TV,
+                title=title,
+                media_source=media_source,
+                media_id=media_id,
+                season=int(season),
+                seasons={int(season): sorted(episodes)},
+            )
+            exists, _ = getter(meta, mediainfo)
+            return bool(exists)
+        except Exception as error:  # noqa: BLE001 - 媒体库查询失败按未命中处理
+            logger.debug(f"媒体库存在性查询失败：{type(error).__name__}")
+            return False
+
+    @staticmethod
+    def _download_dirs(history: Any, torrent: Any) -> list[str]:
+        """
+        收集任务相关的下载目录。
+
+        :param history: 下载历史快照
+        :param torrent: 下载器任务投影
+        :return: 去重后的目录路径列表
+        """
+        result: list[str] = []
+        for value in (
+            getattr(torrent, "save_path", None),
+            getattr(torrent, "path", None),
+            getattr(history, "path", None),
+        ):
+            raw = str(value or "").strip()
+            if not raw:
+                continue
+            path = Path(raw)
+            if path.is_file():
+                path = path.parent
+            text = str(path)
+            if text not in result:
+                result.append(text)
+        return result
+
+    def _resubmit_existing(
+        self,
+        torrent: Any,
+        history: Any,
+        platform: NetdiskPlatform,
+        episodes: Set[int],
+        season: Optional[int],
+    ) -> bool:
+        """
+        复用原分享重新提交网盘下载任务。
+
+        模块没有按个人盘 file_id 提交的入口，这里沿用原分享地址重新取链，
+        并先删除旧任务记录以清理残留转存句柄。
+
+        :param torrent: 下载器任务投影
+        :param history: 下载历史快照
+        :param platform: 网盘平台
+        :param episodes: 需要覆盖的集数
+        :param season: 目标季
+        :return: 已提交返回 True；缺少分享地址时返回 False
+        """
+        share_url = str(getattr(torrent, "share_url", "") or "").strip()
+        if not share_url:
+            return False
+        task_hash = str(getattr(torrent, "hash", "") or "")
+        if task_hash:
+            self.run_module(
+                "remove_torrents", hashs=[task_hash], delete_file=False,
+            )
+        base = (
+            getattr(torrent, "save_path", None)
+            or getattr(torrent, "path", None)
+            or getattr(history, "path", None)
+        )
+        download_dir = Path(str(base)).parent if base else Path(".")
+        self.run_module(
+            "download",
+            content=share_url,
+            download_dir=download_dir,
+            cookie=None,
+            episodes=set(episodes),
+            category=getattr(history, "media_category", None),
+            label=None,
+            downloader=getattr(torrent, "downloader", None),
+            custom_words=getattr(history, "custom_words", None),
+            download_type="netdisk",
+            netdisk_platform=platform.value,
+            share_password=None,
+            netdisk_share_token=None,
+            season=season,
+            source="existing",
+            media_runtime=None,
+        )
+        return True
 
     def _record_capacity_failure(
         self,

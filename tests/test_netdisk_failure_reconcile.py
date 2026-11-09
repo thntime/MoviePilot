@@ -3,14 +3,18 @@
 """
 
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from app.application.netdisk import selection
+from app.application.netdisk.existing import ExistingHit
+from app.chain.download import local_existing
+from app.chain.download.local_existing import LocalExistingHit
 from app.chain.download.reconcile import DownloadFailureReconcileOwner
 from app.chain.subscribe.completion import SubscribeCompletionOwner
-from app.domain.netdisk import NetdiskPlatform
+from app.domain.netdisk import DriveFile, NetdiskPlatform
 
 
 @pytest.fixture(autouse=True)
@@ -316,3 +320,184 @@ def test_reconcile_partial_retry_rolls_back_missing_and_searches(
     assert searched == [7]
     assert not selection.is_account_cooled(7)
     assert ("mark_reconciled", {"hashs": ["hp3"]}) in chain.marked
+
+
+def _patch_accounts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    用固定账号投影替代真实账号仓储，避免测试访问数据库。
+    """
+
+    class _FakeAccountService:
+        """返回单个主账号。"""
+
+        def list(self, platform=None):
+            """忽略平台过滤。"""
+            return [SimpleNamespace(id=7, name="主账号")]
+
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.NetdiskAccountService", _FakeAccountService,
+    )
+
+
+def _patch_subscribe_chain(monkeypatch: pytest.MonkeyPatch, rolled, searched, finished=None):
+    """
+    记录订阅回滚与重搜调用，避免触发真实订阅搜索。
+    """
+
+    class FakeSubscribeChain:
+        """最小订阅门面替身。"""
+
+        @staticmethod
+        def parse_subscribe_source_keyword(source: str):
+            """解析测试来源。"""
+            return {"id": 7} if source.startswith("Subscribe|") else None
+
+        def rollback_download_facts(self, subscribe_id, episodes):
+            """记录回滚集数。"""
+            rolled.append((subscribe_id, list(episodes)))
+            return True
+
+        def search(self, sid=None, **kwargs):
+            """记录搜索。"""
+            searched.append(sid)
+            if finished is not None:
+                finished.set()
+
+    monkeypatch.setattr("app.chain.subscribe.facade.SubscribeChain", FakeSubscribeChain)
+
+
+def _failed_torrent(**overrides):
+    """构造一条失败网盘任务投影。"""
+    values = {
+        "netdisk_platform": "quark", "state": "error", "hash": "hx",
+        "reconciled": False, "error": "网盘未返回可用下载链接",
+        "title": "示例", "account_id": 7, "downloader": "Netdisk",
+        "share_url": "https://pan.quark.cn/s/abc",
+        "save_path": "/downloads/quark/abc", "path": "/downloads/quark/abc",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _failed_history(**overrides):
+    """构造一条失败任务下载历史快照。"""
+    values = {
+        "media_source": "tmdb", "media_id": "100", "title": "示例",
+        "seasons": "S01", "episodes": "E01-E02",
+        "note": {"source": 'Subscribe|{"id": 7}'},
+        "path": "/downloads/quark/abc", "custom_words": None, "media_category": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_reconcile_uses_cloud_existing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    网盘个人盘命中时重新提交下载，不回滚订阅也不触发换源搜索。
+    """
+    chain = _ReconcileChain([_failed_torrent()], _failed_history())
+    _patch_accounts(monkeypatch)
+    queried = []
+    local_calls = []
+
+    def _find_media(accounts, title, season, episodes, **kwargs):
+        """记录查询参数并返回命中。"""
+        queried.append((accounts, title, season, set(episodes)))
+        return ExistingHit(
+            account_id=7,
+            files=[DriveFile(file_id="f1", name="示例.S01E01.mkv")],
+        )
+
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.find_complete_media", _find_media,
+    )
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.find_local_complete",
+        lambda *args, **kwargs: local_calls.append(True),
+    )
+    rolled, searched = [], []
+    _patch_subscribe_chain(monkeypatch, rolled, searched)
+
+    assert chain.reconcile_netdisk_failures() == 1
+    assert rolled == [] and searched == []
+    assert local_calls == []
+    assert queried and queried[0][0][0][0] == 7
+    assert any(
+        method == "download" and kwargs.get("source") == "existing"
+        for method, kwargs in chain.marked
+    )
+
+
+def test_reconcile_uses_local_existing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    本地命中时标记整理完成并结束任务，不换源。
+    """
+    chain = _ReconcileChain([_failed_torrent()], _failed_history())
+    _patch_accounts(monkeypatch)
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.find_complete_media", lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.find_local_complete",
+        lambda *a, **k: LocalExistingHit(path=Path("/downloads/quark/abc/示例.S01E01.mkv")),
+    )
+    rolled, searched = [], []
+    _patch_subscribe_chain(monkeypatch, rolled, searched)
+
+    assert chain.reconcile_netdisk_failures() == 1
+    assert rolled == [] and searched == []
+    assert ("transfer_completed", {"hashs": ["hx"]}) in chain.marked
+    assert ("mark_reconciled", {"hashs": ["hx"]}) in chain.marked
+
+
+def test_reconcile_falls_back_to_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    网盘与本地都未命中时沿用回滚并触发订阅重搜。
+    """
+    chain = _ReconcileChain([_failed_torrent()], _failed_history())
+    _patch_accounts(monkeypatch)
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.find_complete_media", lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.find_local_complete", lambda *a, **k: None,
+    )
+    rolled, searched = [], []
+    finished = threading.Event()
+    _patch_subscribe_chain(monkeypatch, rolled, searched, finished)
+
+    assert chain.reconcile_netdisk_failures() == 1
+    assert finished.wait(1.0)
+    assert rolled == [(7, [1, 2])]
+    assert searched == [7]
+    assert not any(method == "download" for method, _ in chain.marked)
+    assert not any(method == "transfer_completed" for method, _ in chain.marked)
+
+
+def test_reconcile_skips_shell_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    本地零字节空壳文件不视为完整，继续走回滚换源。
+    """
+    local_existing._CACHE.clear()
+    target = tmp_path / "示例.S01E01.mkv"
+    target.write_bytes(b"")
+    target.with_name(target.name + ".done").touch()
+    chain = _ReconcileChain(
+        [_failed_torrent(save_path=str(tmp_path), path=str(tmp_path))],
+        _failed_history(path=str(tmp_path)),
+    )
+    _patch_accounts(monkeypatch)
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.find_complete_media", lambda *a, **k: None,
+    )
+    rolled, searched = [], []
+    finished = threading.Event()
+    _patch_subscribe_chain(monkeypatch, rolled, searched, finished)
+
+    assert chain.reconcile_netdisk_failures() == 1
+    assert finished.wait(1.0)
+    assert searched == [7]
+    assert not any(method == "transfer_completed" for method, _ in chain.marked)
