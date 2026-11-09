@@ -33,6 +33,7 @@ class SchedulerServices:
     :param refresh_netdisk_accounts: 刷新并探测个人网盘账号登录态的任务入口
     :param refresh_netdisk_quotas: 刷新个人网盘账号空间信息的任务入口
     :param cleanup_netdisk_artifacts: 清理孤儿网盘下载目录与过期任务记录的任务入口
+    :param clear_netdisk_recycle_bins: 清理个人网盘账号回收站的任务入口
     :param reconcile_netdisk_failures: 对账网盘后台失败任务并触发换源的任务入口
     :param refresh_recommend: 刷新推荐资料的任务入口
     :param cache_subscribe_calendar: 缓存订阅日历的任务入口
@@ -60,6 +61,7 @@ class SchedulerServices:
     refresh_netdisk_accounts: JobCallable
     refresh_netdisk_quotas: JobCallable
     cleanup_netdisk_artifacts: JobCallable
+    clear_netdisk_recycle_bins: JobCallable
     reconcile_netdisk_failures: JobCallable
     refresh_recommend: JobCallable
     cache_subscribe_calendar: JobCallable

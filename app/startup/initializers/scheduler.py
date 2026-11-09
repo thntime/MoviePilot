@@ -91,6 +91,7 @@ def configure_scheduler_services() -> None:
             refresh_netdisk_accounts=scheduler_chain.refresh_netdisk_accounts,
             refresh_netdisk_quotas=scheduler_chain.refresh_netdisk_quotas,
             cleanup_netdisk_artifacts=download_chain.cleanup_netdisk_artifacts,
+            clear_netdisk_recycle_bins=scheduler_chain.clear_netdisk_recycle_bins,
             reconcile_netdisk_failures=download_chain.reconcile_netdisk_failures,
             refresh_recommend=recommend_chain.refresh_recommend,
             cache_subscribe_calendar=subscribe_chain.cache_calendar,

@@ -273,6 +273,12 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
                     "module",
                 ),
                 JobSpec(
+                    "netdisk_recycle_bin_clean",
+                    "网盘回收站清理",
+                    services.clear_netdisk_recycle_bins,
+                    "module",
+                ),
+                JobSpec(
                     "netdisk_failure_reconcile",
                     "网盘下载失败对账",
                     services.reconcile_netdisk_failures,
@@ -551,6 +557,17 @@ class SchedulerCatalogOwner(_SchedulerOwnerBase):
             name="网盘下载失败对账",
             minutes=5,
             kwargs={"job_id": "netdisk_failure_reconcile"},
+        )
+
+        # 网盘回收站清理：每小时一次，启动后延迟 5 分钟首跑
+        self._scheduler.add_job(
+            self.start,
+            "interval",
+            id="netdisk_recycle_bin_clean",
+            name="网盘回收站清理",
+            hours=1,
+            next_run_time=datetime.now(pytz.timezone(config.timezone)) + timedelta(minutes=5),
+            kwargs={"job_id": "netdisk_recycle_bin_clean"},
         )
 
         # 推荐缓存
