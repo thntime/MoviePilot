@@ -5721,10 +5721,12 @@
         "custom_words",
         "download_type",
         "episode_targets",
+        "media_runtime",
         "netdisk_platform",
         "netdisk_share_token",
         "season",
-        "share_password"
+        "share_password",
+        "source"
       ],
       "plugin_short_circuit": true,
       "public_to_plugins": true,
