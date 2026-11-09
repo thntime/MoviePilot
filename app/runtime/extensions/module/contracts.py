@@ -1399,11 +1399,11 @@ _METHOD_CONTRACTS = {
     ),
     "download_existing": ModuleMethodContract(
         family="downloader",
-        input_contract="NetdiskExistingDownloadRequest",
+        input_contract="DownloadTaskRequest",
         result_contract="DownloadTaskResult | None",
         aggregation=ModuleResultAggregation.FIRST_NON_EMPTY,
         required_parameters=("account_id", "files", "download_dir"),
-        optional_parameters=("category", "episodes", "season", "source", "media_runtime", "downloader", "label"),
+        optional_parameters=("category", "episodes", "season", "source", "media_runtime", "downloader", "title"),
     ),
     "download_added": ModuleMethodContract(
         family="downloader",

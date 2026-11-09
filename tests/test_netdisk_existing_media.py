@@ -124,3 +124,55 @@ def test_budget_exceeded_returns_none(
 
     assert hit is None
     assert "超出预算" in capsys.readouterr().err
+
+
+def test_same_title_season_different_episodes_not_reused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    同标题同季不同目标集数不能复用上一次的命中结果。
+    """
+    trees = {
+        1: {
+            "": [_dir("Example Show", "d1")],
+            "d1": [
+                _file("Example.Show.S01E01.mkv"),
+                _file("Example.Show.S01E02.mkv"),
+            ],
+        },
+    }
+    _install(monkeypatch, trees)
+
+    first = existing.find_complete_media(
+        [(1, "主账号")], "Example Show", 1, {1},
+    )
+    second = existing.find_complete_media(
+        [(1, "主账号")], "Example Show", 1, {2},
+    )
+
+    assert first is not None
+    assert [item.name for item in first.files] == ["Example.Show.S01E01.mkv"]
+    assert second is not None
+    assert [item.name for item in second.files] == ["Example.Show.S01E02.mkv"]
+
+
+def test_negative_result_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    未命中结果也进入短 TTL 缓存，避免连续对账重复扫盘。
+    """
+    trees = {
+        1: {
+            "": [_dir("Example Show", "d1")],
+            "d1": [_file("Example.Show.S01E01.mkv")],
+        },
+    }
+    service = _install(monkeypatch, trees)
+
+    assert existing.find_complete_media(
+        [(1, "主账号")], "Example Show", 1, {2},
+    ) is None
+    calls = len(service.calls)
+    assert existing.find_complete_media(
+        [(1, "主账号")], "Example Show", 1, {2},
+    ) is None
+    assert len(service.calls) == calls

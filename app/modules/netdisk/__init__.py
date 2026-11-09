@@ -511,7 +511,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 target=self._run_existing_task,
                 args=(
                     task_hash, platform, account_id, entries, Path(save_path),
-                    tuning, record.get("media_runtime"),
+                    tuning, record.get("media_runtime"), record.get("source"),
                 ),
                 daemon=True,
                 name=f"netdisk-existing-{task_hash}",
@@ -773,7 +773,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         source: Optional[str] = None,
         media_runtime: Optional[int] = None,
         downloader: Optional[str] = None,
-        label: Optional[str] = None,
+        title: Optional[str] = None,
     ) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], str]]:
         """
         提交个人盘已有文件下载任务，不解析分享链接也不转存。
@@ -787,7 +787,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         :param source: 下载来源标识，复用任务会带 `existing` 标记
         :param media_runtime: 单集时长（分钟），用于下载完成后的时长校验
         :param downloader: 下载器实例名称
-        :param label: 任务标签
+        :param title: 媒体标题，用于任务展示
         :return: 下载器名称、任务标识、内容布局与说明；无有效文件时返回错误原因
         """
         entries = self._existing_entries(files)
@@ -827,7 +827,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         except Exception as err:  # noqa: BLE001
             logger.warn(f"创建网盘已有文件下载目录失败：{task_dir} - {err}")
         store.upsert_task(task_key, {
-            "title": f"{platform.value}:{int(account_id)}",
+            "title": _as_text(title) or entries[0].name,
             "name": entries[0].name,
             "downloader": name,
             "state": "downloading",
@@ -838,7 +838,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             "dlspeed_bytes": 0,
             "save_path": str(task_dir),
             "path": str(task_dir),
-            "category": category or label,
+            "category": category,
             "files": [
                 {"name": item.name, "size": int(item.size or 0), "progress": 0.0}
                 for item in entries
@@ -863,7 +863,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             target=self._run_existing_task,
             args=(
                 task_key, platform, int(account_id), entries, task_dir,
-                task_tuning, media_runtime,
+                task_tuning, media_runtime, source,
             ),
             daemon=True,
             name=f"netdisk-existing-{task_key}",
@@ -924,6 +924,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         task_dir: Path,
         tuning: NetdiskTuning,
         media_runtime: Optional[int] = None,
+        source: Optional[str] = None,
     ) -> None:
         """
         后台下载个人盘已有文件，并维护与普通网盘任务一致的状态记录。
@@ -935,6 +936,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         :param task_dir: 任务落盘目录
         :param tuning: 下载器实例参数快照
         :param media_runtime: 单集时长（分钟）
+        :param source: 下载来源标识，用于判断是否需要补集
         """
         stop_event = self._stops.get(task_key) or threading.Event()
         total_size = sum(int(item.size or 0) for item in entries)
@@ -1026,12 +1028,26 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                     number for item in missing
                     for number in episode_numbers(item.name)
                 })
+                is_subscription = bool(
+                    source and str(source).startswith("Subscribe|")
+                )
+                decision = BatchDecision(
+                    "retry_missing" if is_subscription else "explain_only",
+                    "个人盘已有文件部分失败，按缺失集补下" if is_subscription
+                    else "手动下载没有下一次订阅搜索，仅做说明",
+                    missing_episodes,
+                )
                 if task_key not in self._discarded:
                     store.upsert_task(task_key, {
                         "state": "completed", "progress": 100.0,
                         "error": None, "dlspeed": None, "dlspeed_bytes": 0,
                         "partial": True,
                         "missing_episodes": missing_episodes,
+                        "ai_decision": {
+                            "decision": decision.decision,
+                            "reason": decision.reason,
+                            "missing_episodes": list(decision.missing_episodes),
+                        },
                         "warning": f"部分完成：{len(entries) - len(missing)} 个有效，"
                                    f"{len(missing)} 个失败",
                     })

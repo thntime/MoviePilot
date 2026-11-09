@@ -11,12 +11,13 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional, Set
+from typing import Any, Optional, Sequence, Set
 
 from app.application.download.failures import DownloadFailureWrite
 from app.application.netdisk import selection
 from app.application.netdisk.accounts import NetdiskAccountService
 from app.application.netdisk.existing import find_complete_media
+from app.application.netdisk.integrity import probe_video_duration
 from app.chain.download.contract import _DownloadOwnerBase
 from app.chain.download.failure import DOWNLOAD_FAILURE_CAPACITY_TTL_SECONDS
 from app.chain.download.local_existing import LocalExistingHit, find_local_complete
@@ -193,7 +194,7 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
                     ))
                 # 已有完整文件优先于回滚与换源：网盘个人盘命中后重新取链下载，
                 # 本地命中后直接标记整理完成，两种情况都不冷却账号。
-                if episodes and self._try_existing_files(
+                if parsed and episodes and self._try_existing_files(
                     history, torrent, platform, account_id, episodes, source, parsed,
                 ):
                     processed += 1
@@ -298,6 +299,9 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         local = self._find_local_existing(history, torrent, season, episodes)
         if local is None:
             return False
+        if local.path is not None:
+            if not self._transfer_local_path(local.path, history, torrent):
+                return False
         task_hash = str(getattr(torrent, "hash", "") or "")
         if task_hash:
             self.run_module("transfer_completed", hashs=[task_hash])
@@ -306,6 +310,56 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
             f"本地已有完整文件，标记整理完成：{title} {sorted(episodes)}"
             + ("（媒体库）" if local.in_library else "")
         )
+        return True
+
+    def _transfer_local_path(
+        self,
+        path: Path,
+        history: Any,
+        torrent: Any,
+    ) -> bool:
+        """
+        触发真实整理入口；整理失败时不标记完成，让流程回落到换源。
+
+        :param path: 下载目录中命中的完整文件
+        :param history: 下载历史快照
+        :param torrent: 下载器任务投影
+        :return: 整理成功返回 True
+        """
+        from app.chain.transfer.facade import TransferChain
+        from app.schemas.file import FileItem
+
+        target = Path(path)
+        try:
+            stat = target.stat()
+        except OSError as error:
+            logger.debug(f"本地命中文件不可读，跳过整理：{target} - {type(error).__name__}")
+            return False
+        fileitem = FileItem(
+            path=str(target),
+            storage="local",
+            type="file",
+            name=target.name,
+            basename=target.stem,
+            extension=target.suffix[1:],
+            size=stat.st_size,
+            modify_time=stat.st_mtime,
+        )
+        mtype = MediaType.from_agent(str(getattr(history, "type", "") or ""))
+        try:
+            success, message = TransferChain().do_transfer(
+                fileitem=fileitem,
+                mtype=mtype,
+                downloader=getattr(torrent, "downloader", None),
+                download_hash=str(getattr(torrent, "hash", "") or ""),
+                background=False,
+            )
+        except Exception as error:  # noqa: BLE001 - 整理失败按未命中处理
+            logger.warning(f"本地命中文件整理失败：{target} - {type(error).__name__}")
+            return False
+        if not success:
+            logger.warning(f"本地命中文件整理未成功：{target} - {message}")
+            return False
         return True
 
     def _existing_accounts(
@@ -328,7 +382,8 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         accounts = [
             (int(view.id), str(view.name))
             for view in views
-            if str(getattr(view, "status", "active") or "active") != "expired"
+            if str(getattr(view, "status", "active") or "active")
+            not in {"expired", "disabled"}
         ]
         accounts.sort(key=lambda item: item[0] != account_id)
         return accounts
@@ -358,6 +413,7 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
                 media_exists=lambda: self._media_library_exists(
                     history, season, episodes,
                 ),
+                probe=probe_video_duration,
             )
         except Exception as error:  # noqa: BLE001 - 本地扫描失败按未命中处理
             logger.debug(f"本地已有文件查询失败：{type(error).__name__}")
@@ -458,11 +514,6 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         files = list(getattr(hit, "files", None) or [])
         if not files:
             return False
-        task_hash = str(getattr(torrent, "hash", "") or "")
-        if task_hash:
-            self.run_module(
-                "remove_torrents", hashs=[task_hash], delete_file=False,
-            )
         base = (
             getattr(torrent, "save_path", None)
             or getattr(torrent, "path", None)
@@ -470,28 +521,59 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         )
         download_dir = Path(str(base)).parent if base else Path(".")
         source_marker = self._existing_source(source)
-        result = self.run_module(
-            "download_existing",
-            account_id=int(getattr(hit, "account_id", 0) or 0),
-            files=files,
-            download_dir=download_dir,
-            category=getattr(history, "media_category", None),
-            episodes=set(episodes),
-            season=season,
-            source=source_marker,
-            media_runtime=None,
-            downloader=getattr(torrent, "downloader", None),
-            label=None,
-        )
+        try:
+            result = self.run_module(
+                "download_existing",
+                account_id=int(getattr(hit, "account_id", 0) or 0),
+                files=files,
+                download_dir=download_dir,
+                category=getattr(history, "media_category", None),
+                episodes=set(episodes),
+                season=season,
+                source=source_marker,
+                media_runtime=self._history_media_runtime(history),
+                downloader=getattr(torrent, "downloader", None),
+                title=getattr(history, "title", None),
+            )
+        except Exception as error:  # noqa: BLE001 - 提交失败回落到换源
+            logger.warning(f"复用已有文件提交失败：{type(error).__name__}")
+            return False
         new_hash = ""
         if isinstance(result, tuple) and len(result) > 1:
             new_hash = str(result[1] or "")
-        if new_hash:
-            self._record_existing_history(
-                history, torrent, new_hash, source_marker,
-                download_dir, int(getattr(hit, "account_id", 0) or 0),
-            )
+        if not new_hash:
+            logger.warning("复用已有文件提交未返回任务标识，回落到换源")
+            return False
+        task_hash = str(getattr(torrent, "hash", "") or "")
+        if task_hash and task_hash != new_hash:
+            try:
+                self.run_module(
+                    "remove_torrents", hashs=[task_hash], delete_file=False,
+                )
+            except Exception as error:  # noqa: BLE001 - 旧任务清理失败不阻断新任务
+                logger.warning(f"清理旧网盘任务失败：{type(error).__name__}")
+        self._record_existing_history(
+            history, torrent, new_hash, source_marker,
+            download_dir, int(getattr(hit, "account_id", 0) or 0), files,
+        )
         return True
+
+    @staticmethod
+    def _history_media_runtime(history: Any) -> Optional[int]:
+        """
+        从下载历史备注中读取单集时长，避免复用任务跳过时长校验。
+
+        :param history: 下载历史快照
+        :return: 单集时长（分钟）；未知时返回 None
+        """
+        note = getattr(history, "note", None)
+        if not isinstance(note, dict):
+            return None
+        value = note.get("media_runtime")
+        try:
+            return int(value) if value else None
+        except (TypeError, ValueError):
+            return None
 
     def _record_existing_history(
         self,
@@ -501,9 +583,10 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         source_marker: str,
         download_dir: Path,
         account_id: int,
+        files: Sequence[Any],
     ) -> None:
         """
-        为复用任务补写下载历史，供下一次失败对账读取 `existing` 标记。
+        为复用任务补写下载历史与文件行，供下一次失败对账读取 `existing` 标记。
 
         :param history: 原下载历史快照
         :param torrent: 原下载器任务投影
@@ -511,8 +594,9 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         :param source_marker: 带 `existing` 标记的来源
         :param download_dir: 新任务下载根目录
         :param account_id: 文件所在账号主键
+        :param files: 复用任务的文件条目
         """
-        from app.application.history import DownloadHistoryWrite
+        from app.application.history import DownloadFileWrite, DownloadHistoryWrite
 
         repository = getattr(self, "download_history_repository", None)
         add = getattr(repository, "add", None)
@@ -522,6 +606,18 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         payload = dict(note) if isinstance(note, dict) else {}
         payload["source"] = source_marker
         task_dir = download_dir / f"existing-{account_id}-{download_hash[:6]}"
+        file_rows = tuple(
+            DownloadFileWrite(
+                downloader=getattr(torrent, "downloader", None),
+                download_hash=download_hash,
+                fullpath=str(task_dir / str(getattr(item, "name", "") or "")),
+                savepath=str(task_dir),
+                filepath=str(getattr(item, "name", "") or ""),
+                torrentname=str(getattr(item, "name", "") or ""),
+            )
+            for item in files
+            if str(getattr(item, "name", "") or "").strip()
+        )
         try:
             add(DownloadHistoryWrite(
                 path=str(task_dir),
@@ -554,7 +650,7 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
                 classification_source=getattr(history, "classification_source", None),
                 episode_group=getattr(history, "episode_group", None),
                 custom_words=getattr(history, "custom_words", None),
-            ))
+            ), file_rows)
         except Exception as error:  # noqa: BLE001 - 历史补写失败不影响下载提交
             logger.debug(f"补写复用任务下载历史失败：{type(error).__name__}")
 

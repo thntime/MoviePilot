@@ -1906,3 +1906,45 @@ def test_platform_info_exposes_pan115_recycle_bin(monkeypatch: pytest.MonkeyPatc
         item for item in payload.data.platforms if item.platform == NetdiskPlatform.PAN115.value
     )
     assert info.recycle_bin is True
+
+
+def test_run_existing_partial_writes_retry_decision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    订阅来源的个人盘任务部分失败时写入 retry_missing，供对账补集换源。
+    """
+    module = NetdiskModule()
+    entries = [
+        DriveFile(file_id="f1", name="Show.S01E01.mkv", size=1),
+        DriveFile(file_id="f2", name="Show.S01E02.mkv", size=1),
+    ]
+
+    def fake_download(
+        _service, _account_id, _platform, item, target,
+        _tuning, _stop_event, _on_progress, _media_runtime,
+    ) -> None:
+        """第一集成功，第二集失败。"""
+        if item.name.endswith("E02.mkv"):
+            raise DownloadError("直链失效")
+        target.write_bytes(b"x")
+        target.with_name(target.name + ".done").write_text("1", encoding="utf-8")
+
+    monkeypatch.setattr(module, "_download_existing_one", fake_download)
+
+    module._run_existing_task(  # pylint: disable=protected-access
+        "t-partial",
+        NetdiskPlatform.QUARK,
+        7,
+        entries,
+        tmp_path,
+        NetdiskTuning(),
+        None,
+        'Subscribe|{"id": 7}',
+    )
+
+    record = store.get_task("t-partial")
+    assert record is not None
+    assert record["partial"] is True
+    assert record["missing_episodes"] == [2]
+    assert record["ai_decision"]["decision"] == "retry_missing"

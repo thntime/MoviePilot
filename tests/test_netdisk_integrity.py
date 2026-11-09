@@ -53,3 +53,14 @@ def test_probe_failure_without_marker_is_incomplete(tmp_path: Path) -> None:
     target = _write(tmp_path / "video.mkv")
 
     assert is_complete_file(target, probe=lambda _path: None) is False
+
+
+def test_done_marker_with_pending_plan_is_incomplete(tmp_path: Path) -> None:
+    """
+    存在未完成分片计划文件时，即使有 .done 也视为空壳。
+    """
+    target = _write(tmp_path / "video.mkv")
+    target.with_name(target.name + ".done").touch()
+    target.with_suffix(target.suffix + ".plan.json").write_text("{}", encoding="utf-8")
+
+    assert is_complete_file(target) is False

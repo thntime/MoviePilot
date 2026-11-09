@@ -67,3 +67,26 @@ def test_local_hit_from_mediaserver() -> None:
     assert hit is not None
     assert hit.in_library is True
     assert hit.path is None
+
+
+def test_local_negative_result_is_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    本地未命中结果也进入短 TTL 缓存，避免连续对账重复扫盘。
+    """
+    calls = []
+    original = local_existing._scan_dir
+
+    def _counting_scan(*args, **kwargs):
+        """记录目录扫描次数。"""
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(local_existing, "_scan_dir", _counting_scan)
+    (tmp_path / "empty").mkdir()
+
+    assert find_local_complete("Example Show", 1, {1}, [str(tmp_path)]) is None
+    assert find_local_complete("Example Show", 1, {1}, [str(tmp_path)]) is None
+    assert len(calls) == 1

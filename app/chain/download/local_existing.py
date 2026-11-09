@@ -26,6 +26,10 @@ _VIDEO_SUFFIXES = frozenset({
 })
 # 单次扫描的短 TTL，避免同一失败任务在连续对账轮次内重复遍历目录。
 _CACHE_TTL_SECONDS = 60.0
+# 缓存条目上限，超出时优先清理已过期项。
+_CACHE_MAX_ENTRIES = 512
+# 未命中缓存的哨兵，区分「没有缓存」与「缓存了负结果」。
+_MISS = object()
 # (title, season, episodes, dirs) -> (expires_at, result)
 _CACHE: dict[
     Tuple[str, Optional[int], Tuple[int, ...], Tuple[str, ...]],
@@ -108,16 +112,31 @@ def _cache_key(
     return (title, season, tuple(sorted(episodes)), tuple(download_dirs))
 
 
-def _cached(key) -> Optional[LocalExistingHit]:
-    """读取未过期的缓存；未命中或已过期时返回 None。"""
+def _cached(key) -> object:
+    """读取未过期的缓存；没有缓存时返回 `_MISS`，负结果返回 None。"""
     entry = _CACHE.get(key)
     if entry is None:
-        return None
+        return _MISS
     expires_at, result = entry
     if time.monotonic() > expires_at:
         _CACHE.pop(key, None)
-        return None
+        return _MISS
     return result
+
+
+def _prune_cache() -> None:
+    """在缓存达到上限时清理过期项，仍超限则丢弃最早过期的条目。"""
+    if len(_CACHE) < _CACHE_MAX_ENTRIES:
+        return
+    now = time.monotonic()
+    expired = [key for key, (expires_at, _) in _CACHE.items() if expires_at <= now]
+    for key in expired:
+        _CACHE.pop(key, None)
+    if len(_CACHE) < _CACHE_MAX_ENTRIES:
+        return
+    oldest = sorted(_CACHE.items(), key=lambda item: item[1][0])
+    for key, _ in oldest[:len(_CACHE) - _CACHE_MAX_ENTRIES + 1]:
+        _CACHE.pop(key, None)
 
 
 def _scan_file(
@@ -215,7 +234,7 @@ def find_local_complete(
             logger.debug(f"媒体库存在性查询失败：{type(error).__name__}")
     key = _cache_key(str(title or ""), season, episodes, download_dirs)
     cached = _cached(key)
-    if cached is not None:
+    if cached is not _MISS:
         return cached
     found: Dict[int, Path] = {}
     budget = _Budget(max_dirs, max_files, timeout_seconds)
@@ -236,5 +255,6 @@ def find_local_complete(
     hit = None
     if episodes.issubset(found):
         hit = LocalExistingHit(path=found[min(episodes)])
+    _prune_cache()
     _CACHE[key] = (time.monotonic() + _CACHE_TTL_SECONDS, hit)
     return hit

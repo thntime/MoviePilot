@@ -21,8 +21,15 @@ from app.runtime.log import logger
 _MAX_DEPTH = 4
 # 查询结果短 TTL，避免同一失败任务在连续对账轮次内反复扫盘。
 _CACHE_TTL_SECONDS = 60.0
-# (account_id, title, season) -> (expires_at, result)
-_CACHE: dict[Tuple[int, str, Optional[int]], Tuple[float, Optional["ExistingHit"]]] = {}
+# 缓存条目上限，超出时优先清理已过期项，避免进程内无限增长。
+_CACHE_MAX_ENTRIES = 512
+# 未命中缓存的哨兵，区分「没有缓存」与「缓存了负结果」。
+_MISS = object()
+# (account_id, title, season, episodes) -> (expires_at, result)
+_CACHE: dict[
+    Tuple[int, str, Optional[int], Tuple[int, ...]],
+    Tuple[float, Optional["ExistingHit"]],
+] = {}
 # 目录名或文件名中的显式季号写法。
 _SEASON_PATTERNS = (
     re.compile(r"[Ss](\d{1,2})"),
@@ -110,26 +117,52 @@ def _file_matches(name: str, season: Optional[int]) -> bool:
     return detected is None or detected == season
 
 
-def _cached(account_id: int, title: str, season: Optional[int]) -> Optional[ExistingHit]:
-    """读取未过期的账号级缓存；未命中或已过期时返回 None。"""
-    entry = _CACHE.get((account_id, title, season))
-    if entry is None:
-        return None
-    expires_at, result = entry
-    if time.monotonic() > expires_at:
-        _CACHE.pop((account_id, title, season), None)
-        return None
-    return result
-
-
-def _remember(
+def _cache_key(
     account_id: int,
     title: str,
     season: Optional[int],
+    episodes: Set[int],
+) -> Tuple[int, str, Optional[int], Tuple[int, ...]]:
+    """构造包含目标集数的稳定缓存键。"""
+    return (account_id, title, season, tuple(sorted(episodes)))
+
+
+def _cached(
+    key: Tuple[int, str, Optional[int], Tuple[int, ...]],
+) -> object:
+    """读取未过期的缓存；没有缓存时返回 `_MISS`，负结果返回 None。"""
+    entry = _CACHE.get(key)
+    if entry is None:
+        return _MISS
+    expires_at, result = entry
+    if time.monotonic() > expires_at:
+        _CACHE.pop(key, None)
+        return _MISS
+    return result
+
+
+def _prune_cache() -> None:
+    """在缓存达到上限时清理过期项，仍超限则丢弃最早过期的条目。"""
+    if len(_CACHE) < _CACHE_MAX_ENTRIES:
+        return
+    now = time.monotonic()
+    expired = [key for key, (expires_at, _) in _CACHE.items() if expires_at <= now]
+    for key in expired:
+        _CACHE.pop(key, None)
+    if len(_CACHE) < _CACHE_MAX_ENTRIES:
+        return
+    oldest = sorted(_CACHE.items(), key=lambda item: item[1][0])
+    for key, _ in oldest[:len(_CACHE) - _CACHE_MAX_ENTRIES + 1]:
+        _CACHE.pop(key, None)
+
+
+def _remember(
+    key: Tuple[int, str, Optional[int], Tuple[int, ...]],
     result: Optional[ExistingHit],
 ) -> None:
-    """写入账号级短 TTL 缓存。"""
-    _CACHE[(account_id, title, season)] = (time.monotonic() + _CACHE_TTL_SECONDS, result)
+    """写入账号级短 TTL 缓存，包括未命中的负结果。"""
+    _prune_cache()
+    _CACHE[key] = (time.monotonic() + _CACHE_TTL_SECONDS, result)
 
 
 def _warn_budget(reason: str) -> None:
@@ -207,15 +240,19 @@ def find_complete_media(
         return None
     service = NetdiskFilesService()
     budget = _Budget(max_dirs, max_files, timeout_seconds)
+    target_episodes = tuple(sorted(episodes))
     for account_id, _name in accounts:
-        cached = _cached(account_id, title, season)
-        if cached is not None:
-            return cached
+        key = _cache_key(account_id, title, season, set(target_episodes))
+        cached = _cached(key)
+        if cached is not _MISS:
+            if cached is not None:
+                return cached
+            continue
         if budget.timed_out():
             _warn_budget("耗时")
             return None
         hit = _search_account(service, account_id, title, season, set(episodes), budget)
-        _remember(account_id, title, season, hit)
+        _remember(key, hit)
         if hit is not None:
             return hit
     return None
