@@ -803,3 +803,38 @@ def test_resolve_accepts_hls_without_size_check(
     assert link.is_hls is True
     assert calls == []
 
+
+def test_download_link_matches_target_fid(
+    adapter: UCAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    下载接口返回多条时，应按目标 fid 取对应条目而非首条。
+    """
+    download_payload = {
+        "status": 200,
+        "code": 0,
+        "data": {
+            "list": [
+                {"fid": "other", "download_url": "https://cdn.uc.cn/other.zip", "size": 1},
+                {"fid": "f9", "download_url": "https://cdn.uc.cn/target.zip", "size": 763025717},
+            ]
+        },
+    }
+    _install(
+        monkeypatch,
+        [
+            ("sharepage/token", TOKEN_PAYLOAD),
+            ("file/download", download_payload),
+        ],
+    )
+
+    link = adapter.resolve(
+        REF,
+        ShareFile(file_id="f9", name="合集.zip", size=763025717, token="tok-9"),
+        ACCOUNT,
+    )
+
+    assert link.url == "https://cdn.uc.cn/target.zip"
+    assert link.size == 763025717
+

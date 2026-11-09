@@ -634,7 +634,7 @@ class UCAdapter(BaseNetdiskAdapter):
             },
         )
         self._ensure_success(payload, "获取下载直链")
-        item = self._first_item(payload.get("data"))
+        item = self._first_item(payload.get("data"), fid=file.file_id, token=file.token)
         url = as_text(item.get("download_url"))
         if not url:
             raise NetdiskError(
@@ -787,17 +787,37 @@ class UCAdapter(BaseNetdiskAdapter):
         return []
 
     @staticmethod
-    def _first_item(data: Any) -> dict[str, Any]:
+    def _first_item(data: Any, *, fid: str = "", token: str = "") -> dict[str, Any]:
         """
-        取出下载接口返回的首个条目，兼容数组与 `list` 字段。
+        取出下载接口返回的目标条目，兼容数组与 `list` 字段。
+
+        优先按 `fid`/`file_id` 匹配，其次按 `token` 匹配，都匹配不到才回退首条。
 
         :param data: 响应 `data` 字段
+        :param fid: 目标文件标识
+        :param token: 目标文件令牌
         :return: 条目字典，缺失时为空字典
         """
         items = data.get("list") if isinstance(data, dict) else data
-        if isinstance(items, list) and items and isinstance(items[0], dict):
-            return items[0]
-        return {}
+        if not isinstance(items, list):
+            return {}
+        candidates = [item for item in items if isinstance(item, dict)]
+        if not candidates:
+            return {}
+        if fid:
+            for item in candidates:
+                if fid in (as_text(item.get("fid")), as_text(item.get("file_id"))):
+                    return item
+        if token:
+            for item in candidates:
+                fields = (
+                    as_text(item.get("fid_token")),
+                    as_text(item.get("share_fid_token")),
+                    as_text(item.get("token")),
+                )
+                if token in fields:
+                    return item
+        return candidates[0]
 
     @staticmethod
     def _total_size(data: Mapping[str, Any]) -> int:
