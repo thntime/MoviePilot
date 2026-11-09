@@ -707,3 +707,72 @@ def test_first_link_url_medias_download_url() -> None:
     links = {"medias": [{"download_url": "u2"}]}
 
     assert xunlei._first_link_url(links) == "u2"
+
+
+def test_file_link_error_round_does_not_mask_as_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    首轮两个 usage 都报错时立即抛原错误，不被后续空 links 掩盖成未就绪。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    sleeps: list[float] = []
+    monkeypatch.setattr(xunlei.time, "sleep", lambda seconds: sleeps.append(seconds))
+    responses[("GET", f"{xunlei._FILES_URL}/f1")] = [
+        {"error": "rate_limited"},
+        {"error": "rate_limited"},
+        {"id": "f1", "size": 2048, "links": {}},
+    ]
+
+    with pytest.raises(NetdiskError) as error:
+        adapter._file_link("f1", _account())  # pylint: disable=protected-access
+
+    assert error.value.code is NetdiskErrorCode.RATE_LIMITED
+    assert len(calls) == 2
+    assert sleeps == []
+
+
+def test_file_link_all_requests_failed_raises_last_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    一轮内所有请求都报错时抛最后一个错误，不进入额外轮次。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    sleeps: list[float] = []
+    monkeypatch.setattr(xunlei.time, "sleep", lambda seconds: sleeps.append(seconds))
+    responses[("GET", f"{xunlei._FILES_URL}/f1")] = [
+        {"error": "captcha_invalid"},
+        {"error": "captcha_invalid"},
+        {"id": "f1", "size": 2048, "links": {}},
+        {"id": "f1", "size": 2048, "links": {}},
+        {"id": "f1", "size": 2048, "links": {}},
+        {"id": "f1", "size": 2048, "links": {}},
+    ]
+
+    with pytest.raises(NetdiskError) as error:
+        adapter._file_link("f1", _account())  # pylint: disable=protected-access
+
+    assert error.value.code is NetdiskErrorCode.RISK_BLOCKED
+    assert len(calls) == 2
+    assert sleeps == []
+
+
+def test_file_link_last_round_does_not_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    三轮都有响应但没有直链时只在轮间退避，末轮不再 sleep。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    sleeps: list[float] = []
+    monkeypatch.setattr(xunlei.time, "sleep", lambda seconds: sleeps.append(seconds))
+    responses[("GET", f"{xunlei._FILES_URL}/f1")] = [
+        {"id": "f1", "size": 2048, "links": {}}
+        for _ in range(6)
+    ]
+
+    with pytest.raises(NetdiskError) as error:
+        adapter._file_link("f1", _account())  # pylint: disable=protected-access
+
+    assert error.value.code is NetdiskErrorCode.LINK_NOT_READY
+    assert len(calls) == 6
+    assert sleeps == [1, 2]

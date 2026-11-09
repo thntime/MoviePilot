@@ -1035,7 +1035,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                     for item in pending
                 ):
                     # 至少有一个有效文件：按部分完成入库，交给上层决定是否补齐。
-                    # 分享级文件失败（仅预览流、直链不完整）仍要拉黑分享，
+                    # 分享级文件失败（如仅预览流）仍要拉黑分享，
                     # 否则补集搜索会反复选中同一个坏分享；有效文件已有 .done，不受影响。
                     for name, err in file_exceptions.items():
                         if is_share_level_error(err):
@@ -1124,7 +1124,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 else:
                     error_text = _friendly_download_error(err)
                     if is_share_level_error(err):
-                        # 分享本身不可用（失效、仅预览流、直链不完整）时拉黑，
+                        # 分享本身不可用（失效、仅预览流等）时拉黑，
                         # 避免订阅反复重试同一个坏分享。
                         get_share_blacklist().add(platform.value, share_code, error_text)
                     capacity_error = error_text if (

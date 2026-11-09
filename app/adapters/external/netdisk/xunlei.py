@@ -890,6 +890,32 @@ class XunleiAdapter(BaseNetdiskAdapter):
             )
         return new_id
 
+    @staticmethod
+    def _extract_link(data: Mapping[str, Any]) -> Optional[tuple[str, int]]:
+        """
+        从文件详情响应中解析直链与文件大小。
+
+        :param data: 文件详情业务数据
+        :return: `(直链, 文件大小)`；响应中没有直链时返回 None
+        """
+        url = _first_link_url(data.get("links"))
+        if not url:
+            url = (
+                as_text(data.get("web_content_link"))
+                or as_text(data.get("original_url"))
+                or as_text(data.get("url"))
+            )
+        if not url:
+            medias = data.get("medias")
+            if isinstance(medias, list):
+                for media in medias:
+                    url = _link_url(media)
+                    if url:
+                        break
+        if not url:
+            return None
+        return url, as_int(data.get("size"))
+
     def _file_link(
         self,
         file_id: str,
@@ -901,16 +927,17 @@ class XunleiAdapter(BaseNetdiskAdapter):
         :param file_id: 文件标识
         :param account: 取链账号
         :return: `(直链, 文件大小)`
-        :raises NetdiskError: 接口失败或未返回直链时抛出
+        :raises NetdiskError: 请求失败时抛出原错误；有成功响应但始终无直链时抛 LINK_NOT_READY
         """
         data: dict[str, Any] = {}
         links: Any = {}
-        url = ""
-        last_error = None
+        last_error: Optional[NetdiskError] = None
         # 同一个文件详情接口按 usage 返回不同链接；PLAY 对部分 mkv 会返回空 links，
         # 必须再试 DOWNLOAD 才能拿到原始文件直链。某个 usage 直接报错时继续试下一个。
-        # 转存后直链生成有延迟，空链接时按 1s/2s/4s 退避重试，共 3 轮。
+        # 只有「至少一次成功响应但 links 为空」才按 1s/2s 退避重试，共 3 轮；
+        # 一轮内两次请求都报错时立即抛原错误，避免限流/风控被掩盖成「未就绪」。
         for attempt in range(3):
+            succeeded = False
             for usage in ("DOWNLOAD", "PLAY"):
                 try:
                     payload = self.http.get_json(
@@ -929,49 +956,28 @@ class XunleiAdapter(BaseNetdiskAdapter):
                         raise
                     last_error = error
                     continue
+                succeeded = True
                 data = self._data(payload)
                 links = data.get("links")
-                url = _first_link_url(links)
-                if not url:
-                    url = (
-                        as_text(data.get("web_content_link"))
-                        or as_text(data.get("original_url"))
-                        or as_text(data.get("url"))
-                    )
-                if not url:
-                    medias = data.get("medias")
-                    if isinstance(medias, list):
-                        for media in medias:
-                            if not isinstance(media, Mapping):
-                                continue
-                            link = media.get("link")
-                            if isinstance(link, Mapping):
-                                url = as_text(link.get("url"))
-                            if not url:
-                                url = as_text(media.get("url"))
-                            if url:
-                                break
-                if url:
-                    break
-            if url:
-                break
-            time.sleep(2 ** attempt)
-        if not url:
-            if last_error is not None and not data:
+                link = self._extract_link(data)
+                if link is not None:
+                    return link
+            if not succeeded and last_error is not None:
                 raise last_error
-            logger.warning(
-                f"迅雷文件详情未返回直链：phase={data.get('phase')} space={data.get('space')} "
-                f"original_url={bool(as_text(data.get('original_url')))} "
-                f"web_content_link={bool(as_text(data.get('web_content_link')))} "
-                f"links={list(links.keys()) if isinstance(links, Mapping) else type(links).__name__} "
-                f"medias={len(data.get('medias') or []) if isinstance(data.get('medias'), list) else type(data.get('medias')).__name__}"
-            )
-            raise NetdiskError(
-                NetdiskErrorCode.LINK_NOT_READY,
-                "迅雷直链尚未就绪",
-                platform=self.platform,
-            )
-        return url, as_int(data.get("size"))
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+        logger.warning(
+            f"迅雷文件详情未返回直链：phase={data.get('phase')} space={data.get('space')} "
+            f"original_url={bool(as_text(data.get('original_url')))} "
+            f"web_content_link={bool(as_text(data.get('web_content_link')))} "
+            f"links={list(links.keys()) if isinstance(links, Mapping) else type(links).__name__} "
+            f"medias={len(data.get('medias') or []) if isinstance(data.get('medias'), list) else type(data.get('medias')).__name__}"
+        )
+        raise NetdiskError(
+            NetdiskErrorCode.LINK_NOT_READY,
+            "迅雷直链尚未就绪",
+            platform=self.platform,
+        )
 
     def _batch_delete(
         self,
