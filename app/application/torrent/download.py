@@ -681,6 +681,18 @@ class TorrentHelper:
         return file_name
 
     @staticmethod
+    def _netdisk_platform_rank(torrent: TorrentInfo) -> str:
+        """
+        获取网盘候选的平台优先级等级，数值越小表示越优先。
+
+        :param torrent: 候选资源信息
+        :return: 夸克网盘返回 "0"，其他候选返回 "1"
+        """
+        if torrent.download_type == "netdisk" and torrent.netdisk_platform == "quark":
+            return "0"
+        return "1"
+
+    @staticmethod
     def sort_torrents(torrent_list: List[Context]) -> List[Context]:
         """
         对种子对行排序：torrent、site、upload、seeder
@@ -714,7 +726,9 @@ class TorrentHelper:
                 # 集数越多的排越前面
                 _season_episode = "%s%s" % (str(len(_meta.season_list)).rjust(3, '0'),
                                             str(len(_meta.episode_list)).rjust(4, '0'))
-            _sort_str = _title
+            # 平台优先级放在标题之前：夸克候选必须先于其他候选，标题差异不再压过平台偏好。
+            _platform_rank = TorrentHelper._netdisk_platform_rank(_torrent)
+            _sort_str = str(1 - int(_platform_rank)) + _title
             for rule in priority_rule:
                 if rule == "torrent":
                     _sort_str += _torrent_order
