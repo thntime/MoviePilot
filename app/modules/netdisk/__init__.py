@@ -938,6 +938,10 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         :param media_runtime: 单集时长（分钟）
         :param source: 下载来源标识，用于判断是否需要补集
         """
+        try:
+            task_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as err:
+            logger.warning(f"创建网盘已有文件下载目录失败：{task_dir} - {err}")
         stop_event = self._stops.get(task_key) or threading.Event()
         total_size = sum(int(item.size or 0) for item in entries)
         progress_lock = threading.Lock()

@@ -15,6 +15,26 @@ from enum import StrEnum
 from typing import Mapping, Optional
 
 
+# 可入库的视频文件后缀；网盘与本地已有文件检查共用同一判定。
+_VIDEO_SUFFIXES = frozenset({
+    "mp4", "mkv", "avi", "ts", "m2ts", "mov", "flv", "wmv", "webm",
+    "rmvb", "rm", "mpg", "mpeg", "m4v", "iso",
+})
+
+
+def is_video_file_name(name: str) -> bool:
+    """
+    按扩展名判断文件名是否为可入库视频。
+
+    :param name: 文件名或路径文本
+    :return: 视频文件返回 True
+    """
+    text = str(name or "").strip()
+    if "." not in text:
+        return False
+    return text.rsplit(".", 1)[-1].casefold() in _VIDEO_SUFFIXES
+
+
 class NetdiskPlatform(StrEnum):
     """
     已支持取链的网盘平台。

@@ -281,6 +281,40 @@ def test_run_existing_task_downloads_personal_files(
     assert (tmp_path / "Show.S01E01.mkv.done").exists()
 
 
+def test_run_existing_task_creates_missing_task_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    恢复任务可能传入尚未创建的目录，下载前必须自行创建。
+    """
+    module = NetdiskModule()
+    task_dir = tmp_path / "nested" / "task"
+
+    class FakeFilesService:
+        """返回固定直链的个人盘服务替身。"""
+
+        def download(self, account_id: int, item: DriveFile) -> DirectLink:
+            """返回可下载直链。"""
+            return DirectLink(url="https://cdn/x", headers={}, size=4)
+
+    monkeypatch.setattr(netdisk_module, "NetdiskFilesService", FakeFilesService)
+    monkeypatch.setattr(netdisk_module, "ChunkedDownloader", FakeChunkedDownloader)
+
+    module._run_existing_task(  # pylint: disable=protected-access
+        "t-mkdir",
+        NetdiskPlatform.QUARK,
+        7,
+        [DriveFile(file_id="f1", name="Show.S01E01.mkv", size=4)],
+        task_dir,
+        NetdiskTuning(),
+    )
+
+    record = store.get_task("t-mkdir")
+    assert record is not None
+    assert record["state"] == "completed"
+    assert (task_dir / "Show.S01E01.mkv").exists()
+
+
 def test_task_store_and_list_torrents() -> None:
     """
     任务写入后应能被任务列表与文件清单读到，删除后消失。

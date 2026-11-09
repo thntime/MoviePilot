@@ -17,13 +17,9 @@ from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from app.application.netdisk.integrity import is_complete_file
 from app.domain.episode import episode_numbers
+from app.domain.netdisk import is_video_file_name
 from app.runtime.log import logger
 
-# 只把这些后缀视为可入库的视频文件。
-_VIDEO_SUFFIXES = frozenset({
-    ".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".mov", ".flv", ".wmv", ".webm",
-    ".rmvb", ".rm", ".mpg", ".mpeg", ".m4v", ".iso",
-})
 # 单次扫描的短 TTL，避免同一失败任务在连续对账轮次内重复遍历目录。
 _CACHE_TTL_SECONDS = 60.0
 # 缓存条目上限，超出时优先清理已过期项。
@@ -49,10 +45,12 @@ class LocalExistingHit:
     本地已有完整文件的命中结果。
 
     :param path: 下载目录中命中的首个完整文件；媒体库命中时为空
+    :param paths: 覆盖目标集数的全部完整文件路径，按集号排序去重
     :param in_library: 是否由媒体库存在性判定命中
     """
 
     path: Optional[Path] = None
+    paths: Tuple[Path, ...] = ()
     in_library: bool = False
 
 
@@ -99,7 +97,7 @@ def _season_number(name: str) -> Optional[int]:
 
 def _is_video(name: str) -> bool:
     """判断文件名后缀是否为可入库视频。"""
-    return Path(name).suffix.casefold() in _VIDEO_SUFFIXES
+    return is_video_file_name(name)
 
 
 def _cache_key(
@@ -254,7 +252,8 @@ def find_local_complete(
             break
     hit = None
     if episodes.issubset(found):
-        hit = LocalExistingHit(path=found[min(episodes)])
+        paths = tuple(dict.fromkeys(found[number] for number in sorted(found)))
+        hit = LocalExistingHit(path=paths[0], paths=paths)
     _prune_cache()
     _CACHE[key] = (time.monotonic() + _CACHE_TTL_SECONDS, hit)
     return hit

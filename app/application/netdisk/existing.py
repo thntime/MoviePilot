@@ -14,7 +14,7 @@ from typing import List, Optional, Sequence, Set, Tuple
 
 from app.application.netdisk.files import NetdiskFilesService
 from app.domain.episode import episode_numbers
-from app.domain.netdisk import DriveFile
+from app.domain.netdisk import DriveFile, is_video_file_name
 from app.runtime.log import logger
 
 # 单次查询最多下钻的目录层级，避免误入极深的相册/备份目录。
@@ -100,12 +100,14 @@ def _season_number(name: str) -> Optional[int]:
 
 
 def _dir_matches(name: str, title: str, season: Optional[int]) -> bool:
-    """判断目录是否值得继续下钻。"""
+    """判断目录是否值得继续下钻；显式季号冲突时不进入。"""
+    detected = _season_number(name)
+    if season is not None and detected is not None and detected != season:
+        return False
     if title and _normalize_title(title) in _normalize_title(name):
         return True
     if season is None:
         return False
-    detected = _season_number(name)
     return detected is not None and detected == season
 
 
@@ -170,6 +172,29 @@ def _warn_budget(reason: str) -> None:
     logger.warning(f"网盘已有文件查询超出预算（{reason}），按未命中处理")
 
 
+def _usable_file(entry: DriveFile) -> bool:
+    """
+    判断网盘文件是否可作为已有完整视频复用。
+
+    :param entry: 个人盘文件条目
+    :return: 视频且大小有效时返回 True
+    """
+    if not is_video_file_name(entry.name):
+        return False
+    size = getattr(entry, "size", None)
+    if size is None:
+        logger.debug(f"网盘已有文件缺少大小信息，按可用处理：{entry.name}")
+        return True
+    try:
+        value = int(size)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        logger.debug(f"网盘已有文件大小无效，跳过：{entry.name}")
+        return False
+    return True
+
+
 def _search_account(
     service: NetdiskFilesService,
     account_id: int,
@@ -202,6 +227,8 @@ def _search_account(
             if not budget.take_file():
                 _warn_budget("文件数或耗时")
                 return None
+            if not _usable_file(entry):
+                continue
             if not _file_matches(entry.name, season):
                 continue
             numbers = set(episode_numbers(entry.name))

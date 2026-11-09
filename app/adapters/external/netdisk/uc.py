@@ -666,7 +666,7 @@ class UCAdapter(BaseNetdiskAdapter):
                     url, headers=probe, raise_exception=True
                 ) as response:
                     if response is None:
-                        return weak_total
+                        return None
                     status = int(getattr(response, "status_code", 0) or 0)
                     response_headers = getattr(response, "headers", {}) or {}
                     if status == 206:
@@ -674,18 +674,19 @@ class UCAdapter(BaseNetdiskAdapter):
                             r"bytes\s+0-0/(\d+)",
                             str(response_headers.get("Content-Range") or ""),
                         )
-                        return int(match.group(1)) if match else weak_total
+                        return int(match.group(1)) if match else None
                     if status == 200:
                         length = str(response_headers.get("Content-Length") or "")
                         if not length.isdigit():
-                            return weak_total
+                            return None
                         weak_total = int(length)
                         if attempt == 0:
                             continue
                         return weak_total
+                    return None
             except Exception:  # noqa: BLE001 - 探测失败按未知处理
-                return weak_total
-        return weak_total
+                return None
+        return None
 
     def _video_preview(
         self,

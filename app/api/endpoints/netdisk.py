@@ -840,7 +840,10 @@ async def clear_recycle_bin(
     return _SchemaResponse(
         success=True,
         message=result["message"],
-        data=NetdiskData(cleared=result["cleared"]),
+        data=NetdiskData(
+            cleared=result["cleared"],
+            cleared_at=result.get("cleared_at"),
+        ),
     )
 
 

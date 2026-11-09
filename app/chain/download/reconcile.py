@@ -299,8 +299,9 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         local = self._find_local_existing(history, torrent, season, episodes)
         if local is None:
             return False
-        if local.path is not None:
-            if not self._transfer_local_path(local.path, history, torrent):
+        paths = local.paths or ((local.path,) if local.path is not None else ())
+        for path in paths:
+            if not self._transfer_local_path(path, history, torrent):
                 return False
         task_hash = str(getattr(torrent, "hash", "") or "")
         if task_hash:
@@ -488,6 +489,30 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
                 result.append(text)
         return result
 
+    @staticmethod
+    def _existing_download_dir(torrent: Any, history: Any) -> Optional[Path]:
+        """
+        确定复用任务的下载根目录，缺少任务路径时回退到配置的下载目录。
+
+        :param torrent: 下载器任务投影
+        :param history: 下载历史快照
+        :return: 下载目录；无法确定时返回 None
+        """
+        base = (
+            getattr(torrent, "save_path", None)
+            or getattr(torrent, "path", None)
+            or getattr(history, "path", None)
+        )
+        if base:
+            return Path(str(base)).parent
+        from app.application.directory import DirectoryHelper
+
+        for conf in DirectoryHelper().get_download_dirs():
+            raw = str(getattr(conf, "download_path", "") or "").strip()
+            if raw:
+                return Path(raw)
+        return None
+
     def _resubmit_existing(
         self,
         torrent: Any,
@@ -514,12 +539,10 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         files = list(getattr(hit, "files", None) or [])
         if not files:
             return False
-        base = (
-            getattr(torrent, "save_path", None)
-            or getattr(torrent, "path", None)
-            or getattr(history, "path", None)
-        )
-        download_dir = Path(str(base)).parent if base else Path(".")
+        download_dir = self._existing_download_dir(torrent, history)
+        if download_dir is None:
+            logger.warning("无法确定复用任务下载目录，回落到换源")
+            return False
         source_marker = self._existing_source(source)
         try:
             result = self.run_module(
@@ -546,15 +569,24 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
             return False
         task_hash = str(getattr(torrent, "hash", "") or "")
         if task_hash and task_hash != new_hash:
+            removed = False
             try:
-                self.run_module(
+                removed = bool(self.run_module(
                     "remove_torrents", hashs=[task_hash], delete_file=False,
-                )
+                ))
             except Exception as error:  # noqa: BLE001 - 旧任务清理失败不阻断新任务
                 logger.warning(f"清理旧网盘任务失败：{type(error).__name__}")
+            if not removed:
+                # 旧任务记录仍在时标记已对账，避免下一轮再次复用同一失败任务。
+                logger.warning(f"清理旧网盘任务未成功，标记已对账：{task_hash}")
+                try:
+                    self.run_module("mark_reconciled", hashs=[task_hash])
+                except Exception as error:  # noqa: BLE001 - 标记失败不影响新任务
+                    logger.warning(f"标记旧网盘任务已对账失败：{type(error).__name__}")
         self._record_existing_history(
             history, torrent, new_hash, source_marker,
             download_dir, int(getattr(hit, "account_id", 0) or 0), files,
+            episodes,
         )
         return True
 
@@ -584,6 +616,7 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         download_dir: Path,
         account_id: int,
         files: Sequence[Any],
+        episodes: Set[int],
     ) -> None:
         """
         为复用任务补写下载历史与文件行，供下一次失败对账读取 `existing` 标记。
@@ -595,6 +628,7 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
         :param download_dir: 新任务下载根目录
         :param account_id: 文件所在账号主键
         :param files: 复用任务的文件条目
+        :param episodes: 本次实际重新提交的集数
         """
         from app.application.history import DownloadFileWrite, DownloadHistoryWrite
 
@@ -628,7 +662,7 @@ class DownloadFailureReconcileOwner(_DownloadOwnerBase):
                 media_id=getattr(history, "media_id", None),
                 music_type=getattr(history, "music_type", None),
                 seasons=getattr(history, "seasons", None),
-                episodes=getattr(history, "episodes", None),
+                episodes=episode_rules.format_ranges(sorted(episodes)),
                 image=getattr(history, "image", None),
                 poster=getattr(history, "poster", None),
                 downloader=getattr(torrent, "downloader", None),

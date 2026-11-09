@@ -220,6 +220,7 @@ class NetdiskData(BaseModel):
     expires_at: Optional[str] = Field(default=None, description="会话过期时间")
     deleted: Optional[bool] = Field(default=None, description="是否已删除")
     cleared: Optional[bool] = Field(default=None, description="回收站是否已清空")
+    cleared_at: Optional[str] = Field(default=None, description="回收站清理执行时间（ISO 8601）")
     refreshed: Optional[bool] = Field(default=None, description="是否已刷新")
     sms_verification_id: Optional[str] = Field(default=None, description="短信验证会话")
     sms_is_user: Optional[bool] = Field(default=None, description="手机号是否已注册")

@@ -348,6 +348,8 @@ def _link_url(value: Any) -> str:
     :param value: links 字段下的单个值
     :return: 直链；没有时为空串
     """
+    if isinstance(value, str):
+        return as_text(value)
     if isinstance(value, Mapping):
         url = as_text(value.get("url"))
         if url:

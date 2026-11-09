@@ -105,6 +105,79 @@ def test_find_miss_when_episode_missing(monkeypatch: pytest.MonkeyPatch) -> None
     ) is None
 
 
+def test_non_video_and_empty_files_are_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    非视频文件与零字节文件不能制造「已有完整文件」命中。
+    """
+    trees = {
+        1: {
+            "": [_dir("Example Show", "d1")],
+            "d1": [
+                _file("Example.Show.S01E01.txt"),
+                _file("Example.Show.S01E02.mkv", size=0),
+            ],
+        },
+    }
+    _install(monkeypatch, trees)
+
+    assert existing.find_complete_media(
+        [(1, "主账号")], "Example Show", 1, {1, 2},
+    ) is None
+
+
+def test_unknown_size_is_allowed_with_debug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    平台未返回大小时仍允许命中，但记录 debug 便于排查。
+    """
+    trees = {
+        1: {
+            "": [_dir("Example Show", "d1")],
+            "d1": [
+                DriveFile(
+                    file_id="f1", name="Example.Show.S01E01.mkv", size=None,
+                ),
+            ],
+        },
+    }
+    _install(monkeypatch, trees)
+    debug_messages = []
+    monkeypatch.setattr(
+        existing.logger,
+        "debug",
+        lambda message, *args, **kwargs: debug_messages.append(str(message)),
+    )
+
+    hit = existing.find_complete_media(
+        [(1, "主账号")], "Example Show", 1, {1},
+    )
+
+    assert hit is not None
+    assert any("缺少大小" in message for message in debug_messages)
+
+
+def test_directory_with_conflicting_season_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    目录名带其他季号时即使标题匹配也不下钻，避免复用错季文件。
+    """
+    trees = {
+        1: {
+            "": [_dir("Example Show S02", "d2")],
+            "d2": [_file("Example.Show.S02E01.mkv")],
+        },
+    }
+    _install(monkeypatch, trees)
+
+    assert existing.find_complete_media(
+        [(1, "主账号")], "Example Show", 1, {1},
+    ) is None
+
+
 def test_budget_exceeded_returns_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

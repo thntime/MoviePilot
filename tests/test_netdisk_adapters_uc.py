@@ -769,6 +769,22 @@ def test_probe_total_weak_content_length_retries(
     assert len(calls) == 2
 
 
+def test_probe_total_weak_length_not_trusted_on_second_failure(
+    adapter: UCAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    第二次探测不是 200 时不采信第一次的弱 Content-Length。
+    """
+    responses = [
+        _FakeStreamResponse(200, {"Content-Length": "15340287"}),
+        _FakeStreamResponse(403, {}),
+    ]
+    _install_stream(monkeypatch, responses)
+
+    assert adapter._probe_total("https://cdn.uc.cn/v.mp4", {}) is None
+
+
 def test_resolve_accepts_hls_without_size_check(
     adapter: UCAdapter,
     monkeypatch: pytest.MonkeyPatch,

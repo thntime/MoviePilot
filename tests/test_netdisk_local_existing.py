@@ -40,6 +40,20 @@ def test_local_hit_in_download_dir(tmp_path: Path) -> None:
     assert hit is not None
     assert hit.in_library is False
     assert hit.path == target
+    assert hit.paths == (target,)
+
+
+def test_local_hit_returns_all_episode_paths(tmp_path: Path) -> None:
+    """
+    多集命中时返回覆盖全部目标集数的文件路径，供对账逐个整理。
+    """
+    first = _episode_file(tmp_path / "Example Show", "Example.Show.S01E01.mkv")
+    second = _episode_file(tmp_path / "Example Show", "Example.Show.S01E02.mkv")
+
+    hit = find_local_complete("Example Show", 1, {1, 2}, [str(tmp_path)])
+
+    assert hit is not None
+    assert hit.paths == (first, second)
 
 
 def test_local_miss_when_shell_file(tmp_path: Path) -> None:

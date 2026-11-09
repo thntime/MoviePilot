@@ -540,6 +540,148 @@ def test_reconcile_local_transfer_failure_falls_back(
     assert not any(method == "transfer_completed" for method, _ in chain.marked)
 
 
+def test_reconcile_local_existing_transfers_all_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    本地多集命中时逐个整理全部文件，全部成功后才标记任务完成。
+    """
+    first = Path("/downloads/quark/abc/示例.S01E01.mkv")
+    second = Path("/downloads/quark/abc/示例.S01E02.mkv")
+    chain = _ReconcileChain([_failed_torrent()], _failed_history())
+    _patch_accounts(monkeypatch)
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.find_complete_media", lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.find_local_complete",
+        lambda *a, **k: LocalExistingHit(path=first, paths=(first, second)),
+    )
+    transferred = []
+    chain._transfer_local_path = lambda path, *args, **kwargs: transferred.append(path) or True
+    rolled, searched = [], []
+    _patch_subscribe_chain(monkeypatch, rolled, searched)
+
+    assert chain.reconcile_netdisk_failures() == 1
+    assert transferred == [first, second]
+    assert rolled == [] and searched == []
+    assert ("transfer_completed", {"hashs": ["hx"]}) in chain.marked
+    assert ("mark_reconciled", {"hashs": ["hx"]}) in chain.marked
+
+
+def test_reconcile_local_existing_partial_transfer_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    多集命中中任一文件整理失败时不得标记完成，应回落到换源。
+    """
+    first = Path("/downloads/quark/abc/示例.S01E01.mkv")
+    second = Path("/downloads/quark/abc/示例.S01E02.mkv")
+    chain = _ReconcileChain([_failed_torrent()], _failed_history())
+    _patch_accounts(monkeypatch)
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.find_complete_media", lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "app.chain.download.reconcile.find_local_complete",
+        lambda *a, **k: LocalExistingHit(path=first, paths=(first, second)),
+    )
+    chain._transfer_local_path = lambda path, *args, **kwargs: path != second
+    rolled, searched = [], []
+    finished = threading.Event()
+    _patch_subscribe_chain(monkeypatch, rolled, searched, finished)
+
+    assert chain.reconcile_netdisk_failures() == 1
+    assert finished.wait(1.0)
+    assert searched == [7]
+    assert not any(method == "transfer_completed" for method, _ in chain.marked)
+
+
+def test_resubmit_existing_records_actual_episodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    复用任务补写历史时只记录本次实际重投的集数，不写回完整集数。
+    """
+    history = _failed_history(episodes="E01-E03")
+    chain = _ReconcileChain([], history)
+    added = []
+    chain.download_history_repository = SimpleNamespace(
+        get_by_hash=lambda _hash: history,
+        add=lambda payload, files=(): added.append((payload, tuple(files))),
+    )
+    chain.module_result = ("Netdisk", "newhash", None, "")
+    hit = ExistingHit(
+        account_id=7, files=[DriveFile(file_id="f2", name="示例.S01E02.mkv")],
+    )
+
+    assert chain._resubmit_existing(  # pylint: disable=protected-access
+        _failed_torrent(), history, {2}, 1, hit, 'Subscribe|{"id": 7}',
+    ) is True
+    assert added and added[0][0].episodes == "E02"
+
+
+def test_resubmit_existing_marks_old_task_when_removal_fails() -> None:
+    """
+    旧任务删除失败时标记旧 hash 已对账，避免下一轮重复复用。
+    """
+    history = _failed_history()
+    chain = _ReconcileChain([], history)
+    chain.download_history_repository = SimpleNamespace(
+        get_by_hash=lambda _hash: history,
+        add=lambda payload, files=(): 1,
+    )
+
+    def _run_module(method, **kwargs):
+        """下载提交成功，但旧任务删除失败。"""
+        chain.marked.append((method, kwargs))
+        if method == "download_existing":
+            return ("Netdisk", "newhash", None, "")
+        if method == "remove_torrents":
+            return False
+        return True
+
+    chain.run_module = _run_module
+    hit = ExistingHit(
+        account_id=7, files=[DriveFile(file_id="f1", name="示例.S01E01.mkv")],
+    )
+
+    assert chain._resubmit_existing(  # pylint: disable=protected-access
+        _failed_torrent(), history, {1, 2}, 1, hit, 'Subscribe|{"id": 7}',
+    ) is True
+    assert ("mark_reconciled", {"hashs": ["hx"]}) in chain.marked
+
+
+def test_resubmit_existing_without_download_dir_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    无法确定下载目录时直接回落换源，不用当前工作目录兜底。
+    """
+    class _EmptyDirectoryHelper:
+        """返回空下载目录配置。"""
+
+        def get_download_dirs(self):
+            """没有配置任何下载目录。"""
+            return []
+
+    monkeypatch.setattr(
+        "app.application.directory.DirectoryHelper", _EmptyDirectoryHelper,
+    )
+    torrent = _failed_torrent(save_path=None, path=None)
+    history = _failed_history(path=None)
+    chain = _ReconcileChain([], history)
+    chain.run_module = lambda method, **kwargs: chain.marked.append((method, kwargs))
+    hit = ExistingHit(
+        account_id=7, files=[DriveFile(file_id="f1", name="示例.S01E01.mkv")],
+    )
+
+    assert chain._resubmit_existing(  # pylint: disable=protected-access
+        torrent, history, {1, 2}, 1, hit, 'Subscribe|{"id": 7}',
+    ) is False
+    assert not any(method == "download_existing" for method, _ in chain.marked)
+
+
 def test_reconcile_falls_back_to_search(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     网盘与本地都未命中时沿用回滚并触发订阅重搜。

@@ -6,6 +6,7 @@
 """
 
 from contextlib import contextmanager
+from datetime import datetime
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -127,6 +128,7 @@ def test_clear_recycle_bin_success(monkeypatch) -> None:
     body = response.json()
     assert body["success"] is True
     assert body["data"]["cleared"] is True
+    assert datetime.fromisoformat(body["data"]["cleared_at"])
     assert body["message"] == "回收站已清空"
     assert adapter.calls == [1]
 

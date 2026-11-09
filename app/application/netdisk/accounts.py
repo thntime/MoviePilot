@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, List, Mapping, Optional, Sequence
 
 from app.application.netdisk import registry, selection
@@ -467,7 +468,7 @@ class NetdiskAccountService:
         清空账号回收站；限流时返回未清空而不抛出。
 
         :param account_id: 账号主键
-        :return: 含 account_id、cleared 与 message 的字典
+        :return: 含 account_id、cleared、message 与 cleared_at 的字典
         :raises NetdiskError: 账号不存在、平台不支持或服务端拒绝时抛出
         """
         record = self._require_record(account_id)
@@ -489,6 +490,7 @@ class NetdiskAccountService:
                     "account_id": record.id,
                     "cleared": False,
                     "message": error.message,
+                    "cleared_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 }
             raise
         cleared = bool(result.get("cleared"))
@@ -500,6 +502,7 @@ class NetdiskAccountService:
             "account_id": record.id,
             "cleared": cleared,
             "message": "回收站已清空" if cleared else "回收站已为空",
+            "cleared_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
 
     def _refresh_record(self, record: NetdiskAccountRecord) -> tuple[NetdiskAccountRecord, str]:

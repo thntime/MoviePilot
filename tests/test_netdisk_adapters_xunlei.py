@@ -758,6 +758,15 @@ def test_file_link_all_requests_failed_raises_last_error(
     assert sleeps == []
 
 
+def test_link_url_accepts_plain_string() -> None:
+    """
+    links 中直接给出字符串直链时也应被识别。
+    """
+    assert xunlei._link_url(  # pylint: disable=protected-access
+        {"link": "https://cdn.xunlei.com/a.mkv"},
+    ) == "https://cdn.xunlei.com/a.mkv"
+
+
 def test_file_link_last_round_does_not_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     三轮都有响应但没有直链时只在轮间退避，末轮不再 sleep。
