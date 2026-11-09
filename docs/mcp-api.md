@@ -540,6 +540,18 @@ Telegram、Feishu；其他交互渠道因无法建立私聊而 fail closed，不
 网盘登录仍在 MoviePilot 网页完成。该技能不授权登录自动化、任意 HTTP 请求或 URL、Cookie、
 口令、令牌；调用方不得索取、传递或回显这些凭据，只使用网关返回的脱敏结构化结果。
 
+#### 回收站清理
+
+管理员端点 `POST /api/v1/netdisk/accounts/{account_id}/recycle-bin/clear` 清空账号回收站，
+请求无请求体。当前仅 115 声明该能力，其他平台返回 `code=unsupported`。成功响应的
+`data.cleared` 表示是否实际清空（回收站本已为空时为 `false`），`message` 给出可直接展示的结果。
+定时任务 `netdisk_recycle_bin_clean` 每小时遍历状态为 active 的 115 账号逐个清理，单账号失败只记录日志，
+不影响其余账号。
+
+清空不可恢复。115 账号开启回收站安全密钥（`rb_pass=1`）时端点返回 `code=unsupported` 与
+「账号开启回收站安全密钥，暂不支持自动清空」，不会猜测密码；平台限流时返回 `cleared=false`，
+调用方应稍后重试，不要连续重试。
+
 ### 4.6 手动下载的 AI 预选
 
 手动下载弹窗的网盘分享区域提供“AI 预选”按钮，调用管理员端点
