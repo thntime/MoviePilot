@@ -219,6 +219,7 @@ class NetdiskData(BaseModel):
     vnc_path: Optional[str] = Field(default=None, description="noVNC WebSocket 路径")
     expires_at: Optional[str] = Field(default=None, description="会话过期时间")
     deleted: Optional[bool] = Field(default=None, description="是否已删除")
+    cleared: Optional[bool] = Field(default=None, description="回收站是否已清空")
     refreshed: Optional[bool] = Field(default=None, description="是否已刷新")
     sms_verification_id: Optional[str] = Field(default=None, description="短信验证会话")
     sms_is_user: Optional[bool] = Field(default=None, description="手机号是否已注册")

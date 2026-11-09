@@ -825,6 +825,25 @@ async def probe_account(
     )
 
 
+@router.post("/accounts/{account_id}/recycle-bin/clear", summary="清空网盘回收站")
+async def clear_recycle_bin(
+    account_id: int,
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> _SchemaResponse[NetdiskData]:
+    """
+    清空账号回收站；仅支持声明该能力的平台，限流时返回未清空。
+    """
+    try:
+        result = await run_in_threadpool(_accounts().clear_recycle_bin, account_id)
+    except NetdiskError as error:
+        return _error_response(error)
+    return _SchemaResponse(
+        success=True,
+        message=result["message"],
+        data=NetdiskData(cleared=result["cleared"]),
+    )
+
+
 @router.post("/accounts/{account_id}/refresh", summary="刷新网盘账号令牌")
 async def refresh_account(
     account_id: int,

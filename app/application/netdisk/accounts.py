@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Mapping, Optional, Sequence
+from typing import Any, List, Mapping, Optional, Sequence
 
 from app.application.netdisk import registry, selection
 from app.application.netdisk.contract import (
@@ -461,6 +461,46 @@ class NetdiskAccountService:
                     f"account={view.name} error={type(error).__name__}"
                 )
         return {"checked": checked, "updated": updated, "failed": failed}
+
+    def clear_recycle_bin(self, account_id: int) -> dict[str, Any]:
+        """
+        清空账号回收站；限流时返回未清空而不抛出。
+
+        :param account_id: 账号主键
+        :return: 含 account_id、cleared 与 message 的字典
+        :raises NetdiskError: 账号不存在、平台不支持或服务端拒绝时抛出
+        """
+        record = self._require_record(account_id)
+        adapter = registry.get_adapter(record.platform)
+        if not adapter.drive_capabilities.recycle_bin:
+            raise NetdiskError(
+                NetdiskErrorCode.UNSUPPORTED,
+                "该平台不支持清空回收站",
+                platform=record.platform,
+            )
+        try:
+            result = adapter.clear_recycle_bin(record)
+        except NetdiskError as error:
+            if error.code is NetdiskErrorCode.RATE_LIMITED:
+                logger.warning(
+                    f"网盘回收站清理被限流：platform={record.platform.value} account={record.name}"
+                )
+                return {
+                    "account_id": record.id,
+                    "cleared": False,
+                    "message": error.message,
+                }
+            raise
+        cleared = bool(result.get("cleared"))
+        logger.info(
+            f"网盘回收站清理完成：platform={record.platform.value} "
+            f"account={record.name} cleared={cleared}"
+        )
+        return {
+            "account_id": record.id,
+            "cleared": cleared,
+            "message": "回收站已清空" if cleared else "回收站已为空",
+        }
 
     def _refresh_record(self, record: NetdiskAccountRecord) -> tuple[NetdiskAccountRecord, str]:
         """
