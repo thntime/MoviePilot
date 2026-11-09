@@ -55,6 +55,8 @@ _SHARE_RECEIVE_URL = f"{_API_BASE}/share/receive"
 _FILES_URL = f"{_API_BASE}/files"
 _FILE_ADD_URL = f"{_API_BASE}/files/add"
 _FILE_DELETE_URL = f"{_API_BASE}/rb/delete"
+_RECYCLE_LIST_URL = f"{_API_BASE}/rb"
+_RECYCLE_CLEAN_URL = f"{_API_BASE}/rb/clean"
 _FILE_DOWNLOAD_URL = f"{_API_BASE}/files/download"
 _APP_DOWNLOAD_URL = "https://proapi.115.com/app/chrome/downurl"
 _INDEX_INFO_URL = f"{_API_BASE}/files/index_info?count_space_nums=1"
@@ -76,6 +78,7 @@ _LOGIN_COOKIE_KEYS = ("UID", "CID", "SEID", "KID", "PHPSESSID", "GST", "USERSESS
 
 _ROOT_CID = "0"
 _AID_PERSONAL = "1"
+_AID_RECYCLE = "7"
 _SHARE_PAGE_LIMIT = 100
 _FILE_PAGE_LIMIT = 100
 _SHARE_MAX_PAGES = 50
@@ -97,6 +100,8 @@ _ERRNO_BUSY = 990009
 _ERRNO_WEB_SIZE_LIMIT = 50028
 _ERRNO_CLIENT_TOO_OLD = 50029
 _ERRNO_NEED_CONFIRM = 800007
+_ERRNO_TOO_FREQUENT = 590075
+_ERRNO_SAFE_PWD = 320001
 
 # 移动是异步任务：响应含 move_proid 时按固定间隔轮询进度。
 _MOVE_POLL_MAX = 20
@@ -342,6 +347,18 @@ def _error_for_errno(errno: int, message: str, action: str) -> NetdiskError:
             "115 上一次操作尚未完成，请稍后重试",
             platform=NetdiskPlatform.PAN115,
         )
+    if errno == _ERRNO_TOO_FREQUENT:
+        return NetdiskError(
+            NetdiskErrorCode.RATE_LIMITED,
+            "115 操作太频繁，请稍后重试",
+            platform=NetdiskPlatform.PAN115,
+        )
+    if errno == _ERRNO_SAFE_PWD:
+        return NetdiskError(
+            NetdiskErrorCode.UNSUPPORTED,
+            "115 回收站安全密钥不正确，暂不支持自动清空",
+            platform=NetdiskPlatform.PAN115,
+        )
     suffix = f"（errno={errno}）" if errno and str(errno) not in text else ""
     return NetdiskError(
         NetdiskErrorCode.UNKNOWN,
@@ -359,7 +376,8 @@ def _check_state(payload: Mapping[str, Any], action: str) -> dict[str, Any]:
     :return: 原响应 JSON
     :raises NetdiskError: 服务端返回失败状态时抛出
     """
-    if payload.get("state") is True:
+    state = payload.get("state")
+    if state is True or as_int(state) == 1:
         return dict(payload)
     errno = as_int(payload.get("errno") or payload.get("errNo"))
     message = as_text(payload.get("error") or payload.get("message") or payload.get("msg"))
@@ -1319,6 +1337,59 @@ class Pan115Adapter(BaseNetdiskAdapter):
             self._delete(fids, account)
         except Exception as error:  # noqa: BLE001 - 清理失败不阻断下载
             self.log_failure("清理临时目录", error, account)
+
+    # ---- 回收站 ----
+
+    def list_recycle_bin(self, account: NetdiskAccountRecord) -> dict[str, Any]:
+        """
+        读取 115 回收站首页条目。
+
+        :param account: 账号记录
+        :return: 含 `count`、`rb_pass` 与 `items` 的字典
+        """
+        payload = self._get_json(
+            _RECYCLE_LIST_URL,
+            account=account,
+            params={
+                "aid": _AID_RECYCLE,
+                "cid": _ROOT_CID,
+                "offset": "0",
+                "limit": str(_FILE_PAGE_LIMIT),
+                "format": "json",
+            },
+            action="读取 115 回收站",
+        )
+        raw = payload.get("data")
+        items = (
+            [dict(item) for item in raw if isinstance(item, dict)]
+            if isinstance(raw, list)
+            else []
+        )
+        return {
+            "count": as_int(payload.get("count")),
+            "rb_pass": as_int(payload.get("rb_pass")),
+            "items": items,
+        }
+
+    def clear_recycle_bin(self, account: NetdiskAccountRecord) -> dict[str, Any]:
+        """
+        清空 115 回收站；账号开启安全密钥时拒绝自动清空。
+
+        :param account: 账号记录
+        :return: 含 `cleared` 与 `count` 的字典
+        :raises NetdiskError: 安全密钥已开启或服务端拒绝时抛出
+        """
+        listing = self.list_recycle_bin(account)
+        if listing["rb_pass"] == 1:
+            raise NetdiskError(
+                NetdiskErrorCode.UNSUPPORTED,
+                "账号开启回收站安全密钥，暂不支持自动清空",
+                platform=self.platform,
+            )
+        if not listing["count"]:
+            return {"cleared": False, "count": 0}
+        self._post_form(_RECYCLE_CLEAN_URL, {}, account=account, action="清空 115 回收站")
+        return {"cleared": True, "count": listing["count"]}
 
     # ---- 账号 ----
 
