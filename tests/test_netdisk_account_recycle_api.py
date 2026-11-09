@@ -128,8 +128,27 @@ def test_clear_recycle_bin_success(monkeypatch) -> None:
     body = response.json()
     assert body["success"] is True
     assert body["data"]["cleared"] is True
+    assert body["data"]["empty"] is False
     assert datetime.fromisoformat(body["data"]["cleared_at"])
     assert body["message"] == "回收站已清空"
+    assert adapter.calls == [1]
+
+
+def test_clear_recycle_bin_reports_empty_when_already_empty(monkeypatch) -> None:
+    """
+    回收站本就为空时返回 empty=true、cleared=false，便于前端区分成功与空结果。
+    """
+    adapter = _RecycleAdapter(result={"cleared": False, "count": 0})
+
+    with _client(monkeypatch, adapter, [_record()]) as api:
+        response = api.client.post("/api/v1/netdisk/accounts/1/recycle-bin/clear")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["data"]["cleared"] is False
+    assert body["data"]["empty"] is True
+    assert body["message"] == "回收站已为空"
     assert adapter.calls == [1]
 
 
@@ -204,4 +223,5 @@ def test_clear_recycle_bin_swallows_rate_limit(monkeypatch) -> None:
     body = response.json()
     assert body["success"] is True
     assert body["data"]["cleared"] is False
+    assert body["data"]["empty"] is False
     assert "太频繁" in body["message"]

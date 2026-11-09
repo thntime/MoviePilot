@@ -842,6 +842,7 @@ async def clear_recycle_bin(
         message=result["message"],
         data=NetdiskData(
             cleared=result["cleared"],
+            empty=result.get("empty"),
             cleared_at=result.get("cleared_at"),
         ),
     )

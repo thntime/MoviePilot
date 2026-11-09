@@ -545,13 +545,15 @@ Telegram、Feishu；其他交互渠道因无法建立私聊而 fail closed，不
 管理员端点 `POST /api/v1/netdisk/accounts/{account_id}/recycle-bin/clear` 清空账号回收站，
 请求无请求体。该端点不注册为 Agent 操作，外部 MCP 客户端不能通过网关调用。当前仅 115 声明该能力，
 其他平台返回 `code=unsupported`。响应 `success=true` 只表示请求已处理，不代表已清空，必须读取
-`data.cleared` 判断是否实际清空（回收站本已为空时为 `false`），`message` 给出可直接展示的结果。
+`data.cleared` 与 `data.empty` 判断结果：`cleared=true` 表示本次实际清空；`cleared=false` 且
+`empty=true` 表示回收站本就为空；两者均为 `false` 表示限流跳过、未执行清空。`data.cleared_at`
+给出本次执行时间（ISO 8601），`message` 给出可直接展示的结果。
 定时任务 `netdisk_recycle_bin_clean` 每小时遍历状态为 active 的 115 账号逐个清理，单账号失败只记录日志，
 不影响其余账号。
 
 清空不可恢复。115 账号开启回收站安全密钥（`rb_pass=1`）时端点返回 `code=unsupported` 与
-「账号开启回收站安全密钥，暂不支持自动清空」，不会猜测密码；平台限流时返回 `cleared=false`，
-调用方应稍后重试，不要连续重试。
+「账号开启回收站安全密钥，暂不支持自动清空」，不会猜测密码；平台限流时返回 `cleared=false`、
+`empty=false`，调用方应稍后重试，不要连续重试。
 
 ### 4.6 手动下载的 AI 预选
 

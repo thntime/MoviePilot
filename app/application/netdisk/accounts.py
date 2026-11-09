@@ -468,7 +468,7 @@ class NetdiskAccountService:
         清空账号回收站；限流时返回未清空而不抛出。
 
         :param account_id: 账号主键
-        :return: 含 account_id、cleared、message 与 cleared_at 的字典
+        :return: 含 account_id、cleared、empty、message 与 cleared_at 的字典
         :raises NetdiskError: 账号不存在、平台不支持或服务端拒绝时抛出
         """
         record = self._require_record(account_id)
@@ -489,18 +489,21 @@ class NetdiskAccountService:
                 return {
                     "account_id": record.id,
                     "cleared": False,
+                    "empty": False,
                     "message": error.message,
                     "cleared_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 }
             raise
         cleared = bool(result.get("cleared"))
+        empty = not cleared and result.get("count") == 0
         logger.info(
             f"网盘回收站清理完成：platform={record.platform.value} "
-            f"account={record.name} cleared={cleared}"
+            f"account={record.name} cleared={cleared} empty={empty}"
         )
         return {
             "account_id": record.id,
             "cleared": cleared,
+            "empty": empty,
             "message": "回收站已清空" if cleared else "回收站已为空",
             "cleared_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
