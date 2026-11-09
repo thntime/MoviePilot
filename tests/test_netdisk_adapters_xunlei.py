@@ -689,3 +689,21 @@ def test_file_link_raises_not_ready(monkeypatch: pytest.MonkeyPatch) -> None:
         adapter._file_link("f1", _account())  # pylint: disable=protected-access
 
     assert error.value.code is NetdiskErrorCode.LINK_NOT_READY
+
+
+def test_first_link_url_nested_mapping() -> None:
+    """
+    links 值可能是 `{"link": {"url": ...}}` 的嵌套 mapping。
+    """
+    links = {"application/octet-stream": {"link": {"url": "u"}}}
+
+    assert xunlei._first_link_url(links) == "u"
+
+
+def test_first_link_url_medias_download_url() -> None:
+    """
+    medias 列表中的 download_url 也要能取到。
+    """
+    links = {"medias": [{"download_url": "u2"}]}
+
+    assert xunlei._first_link_url(links) == "u2"

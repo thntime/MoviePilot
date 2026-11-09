@@ -343,13 +343,21 @@ def _parse_files(data: Mapping[str, Any]) -> list[ShareFile]:
 
 def _link_url(value: Any) -> str:
     """
-    从单个 links 值中取出 url；兼容 mapping 与 list。
+    从单个 links 值中取出 url；兼容 mapping 嵌套与 list。
 
     :param value: links 字段下的单个值
     :return: 直链；没有时为空串
     """
     if isinstance(value, Mapping):
-        return as_text(value.get("url"))
+        url = as_text(value.get("url"))
+        if url:
+            return url
+        link = value.get("link")
+        if link is not None and link is not value:
+            url = _link_url(link)
+            if url:
+                return url
+        return as_text(value.get("download_url"))
     if isinstance(value, list):
         for item in value:
             url = _link_url(item)
@@ -363,7 +371,7 @@ def _first_link_url(links: Any) -> str:
     从迅雷文件详情的 links 中取第一个可用直链。
 
     线上 links 既可能是 mapping（按 MIME 分键），也可能是 list；
-    优先取原始文件类型，取不到再遍历全部值。
+    优先取原始文件类型，取不到再遍历全部值，并兼容 `medias` 列表结构。
 
     :param links: 文件详情中的 links 字段
     :return: 直链；没有时为空串
@@ -378,6 +386,12 @@ def _first_link_url(links: Any) -> str:
             url = _link_url(links.get(key))
             if url:
                 return url
+        medias = links.get("medias")
+        if isinstance(medias, list):
+            for media in medias:
+                url = _link_url(media)
+                if url:
+                    return url
         for value in links.values():
             url = _link_url(value)
             if url:
@@ -387,6 +401,10 @@ def _first_link_url(links: Any) -> str:
             url = _link_url(value)
             if url:
                 return url
+    logger.debug(
+        f"迅雷 links 未解析出直链：type={type(links).__name__} "
+        f"keys={list(links.keys()) if isinstance(links, Mapping) else '-'}"
+    )
     return ""
 
 
