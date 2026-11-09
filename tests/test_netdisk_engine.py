@@ -2,8 +2,12 @@
 验证通用分片下载引擎的规划、续传、校验、多源轮换与直链刷新。
 """
 
+import contextlib
+import errno
 import hashlib
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,7 +23,8 @@ class FakeStreamResponse:
     """
 
     def __init__(self, data: bytes, status_code: int = 206, content_range: str = "",
-                 content_type: str = "video/mp4") -> None:
+                 content_type: str = "video/mp4",
+                 content_length: Optional[int] = None) -> None:
         """
         保存响应体与头部。
         """
@@ -29,6 +34,8 @@ class FakeStreamResponse:
             "Content-Range": content_range,
             "Content-Type": content_type,
         }
+        if content_length is not None:
+            self.headers["Content-Length"] = str(content_length)
         self.closed = False
 
     def iter_content(self, chunk_size: int = 8192):
@@ -56,7 +63,8 @@ class FakeHttp:
                  content_type: str = "video/mp4",
                  status_by_url: Optional[Dict[str, int]] = None,
                  truncate_first_full: int = 0,
-                 fail_status: int = 0, fail_times: int = 0) -> None:
+                 fail_status: int = 0, fail_times: int = 0,
+                 content_length: Optional[int] = None) -> None:
         """
         保存完整内容与响应行为。
 
@@ -71,6 +79,7 @@ class FakeHttp:
         self._truncate = truncate_first_full
         self._fail_status = fail_status
         self._fail_times = fail_times
+        self._content_length = content_length
 
     def get_stream(self, url: str, headers: Optional[Dict[str, str]] = None, **_: Any):
         """
@@ -126,7 +135,10 @@ class FakeHttp:
 
             def __enter__(self_inner):
                 """返回响应对象。"""
-                return FakeStreamResponse(data, status, content_range, self.content_type)
+                return FakeStreamResponse(
+                    data, status, content_range, self.content_type,
+                    content_length=self._content_length,
+                )
 
             def __exit__(self_inner, *args):
                 """结束时不做额外处理。"""
@@ -410,6 +422,138 @@ def test_max_concurrency_caps_threads() -> None:
     assert downloader.threads == 4
 
 
+def test_single_stream_uses_one_connection(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    single_stream=True 时只发一次请求，且不带 Range 头。
+    """
+    payload = bytes(range(256)) * 4096  # 1MB
+    http = FakeHttp(payload, status_code=200)
+    install_http(monkeypatch, http)
+    target = tmp_path / "video.mp4"
+    progress: List[float] = []
+
+    downloader = engine.ChunkedDownloader(
+        target, len(payload), _links("https://cdn/file"), threads=8, single_stream=True,
+        on_progress=progress.append,
+    )
+    downloader.run(lambda refresh=False: _links("https://cdn/file"))
+
+    assert target.read_bytes() == payload
+    assert len(http.calls) == 1
+    assert http.calls[0]["range"] == ""
+    assert not downloader.plan_path.exists()
+    assert (tmp_path / "video.mp4.done").exists()
+    assert max(progress) == 100.0
+    assert progress[-1] >= 99.0
+
+
+def test_single_stream_forces_one_thread() -> None:
+    """
+    单流模式无论配置多少线程都只使用一条连接。
+    """
+    downloader = engine.ChunkedDownloader(
+        Path("/tmp/video.mp4"), 100, _links("https://cdn/file"),
+        threads=32, single_stream=True,
+    )
+    assert downloader.threads == 1
+
+
+def test_single_stream_cancel_closes_response(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    单流取消时响应被关闭，且不写完成标记。
+    """
+    payload = b"x" * 1024
+    http = FakeHttp(payload, status_code=200)
+    install_http(monkeypatch, http)
+    target = tmp_path / "video.mp4"
+    stop = __import__("threading").Event()
+    stop.set()
+
+    downloader = engine.ChunkedDownloader(
+        target, len(payload), _links("https://cdn/file"), single_stream=True, stop_event=stop,
+    )
+    with pytest.raises(engine.DownloadCancelled):
+        downloader.run(lambda refresh=False: _links("https://cdn/file"))
+    assert not (tmp_path / "video.mp4.done").exists()
+
+
+def test_single_stream_cancel_closes_hung_stream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    服务端不返回数据时，取消必须由 watchdog 关闭在飞响应，run 才能及时返回。
+    """
+    closed = threading.Event()
+    requested = threading.Event()
+
+    class _HungResponse:
+        """
+        模拟挂死的单流响应，只有外部 close 才结束读取。
+        """
+
+        status_code = 200
+        headers = {"Content-Type": "video/mp4"}
+
+        def iter_content(self, chunk_size: int = 8192):
+            """
+            阻塞到连接被关闭，再抛错模拟 requests 的中断行为。
+            """
+            closed.wait(5.0)
+            raise RuntimeError("连接已关闭")
+
+        def close(self) -> None:
+            """
+            关闭连接并唤醒阻塞的读取。
+            """
+            closed.set()
+
+    class _HungHttp:
+        """
+        只记录请求并返回挂死响应的假网络适配器。
+        """
+
+        def get_stream(self, url: str, headers: Optional[Dict[str, str]] = None, **_: Any):
+            """
+            登记请求后返回挂死响应。
+
+            :param url: 请求地址
+            :param headers: 请求头
+            :return: 响应上下文
+            """
+            requested.set()
+            return contextlib.nullcontext(_HungResponse())
+
+    target = tmp_path / "video.mp4"
+    stop = threading.Event()
+    downloader = engine.ChunkedDownloader(
+        target, 1024, _links("https://cdn/file"), single_stream=True, stop_event=stop,
+    )
+    monkeypatch.setattr(engine, "WATCHDOG_INTERVAL", 0.05)
+    monkeypatch.setattr(engine, "RequestUtils", lambda **kwargs: _HungHttp())
+    errors: List[BaseException] = []
+
+    def _run() -> None:
+        """在后台线程执行下载，模拟阻塞在读取上的下载线程。"""
+        try:
+            downloader.run(lambda refresh=False: _links("https://cdn/file"))
+        except BaseException as err:  # noqa: BLE001
+            errors.append(err)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    assert requested.wait(5.0)
+    for _ in range(200):
+        if downloader._chunks and downloader._chunks[0].response is not None:  # pylint: disable=protected-access
+            break
+        time.sleep(0.01)
+    stop.set()
+    thread.join(5.0)
+
+    assert not thread.is_alive()
+    assert closed.is_set()
+    assert isinstance(errors[0], engine.DownloadCancelled)
+
+
 def test_verify_detects_corruption(tmp_path: Path) -> None:
     """
     分片摘要不一致时校验失败。
@@ -450,6 +594,122 @@ def test_single_stream_short_read_resumes(monkeypatch: pytest.MonkeyPatch, tmp_p
 
     assert target.read_bytes() == payload
     assert any(call["range"] == "bytes=2097152-" for call in http.calls)
+
+
+def test_transient_chunk_failure_refills_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    单片重试耗尽后不应直接判整个文件失败，补齐缺失区间后仍应完成。
+    """
+    payload = b"r" * (2 * 1024 * 1024)
+    http = FakeHttp(payload, fail_status=503, fail_times=4)
+    install_http(monkeypatch, http)
+    monkeypatch.setattr(engine.time, "sleep", lambda *_: None)
+    target = tmp_path / "video.mp4"
+
+    engine.ChunkedDownloader(
+        target, len(payload), _links("https://cdn/file"), threads=1,
+        retries=1, refresh_seconds=0,
+    ).run(lambda refresh=False: _links("https://cdn/file"))
+
+    assert target.read_bytes() == payload
+    assert len(http.calls) > 4
+
+
+def test_single_stream_rejects_error_page(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    单流回退拿到 JSON 错误页时必须拒绝，不能把错误页写成视频数据。
+    """
+    import os
+
+    body = b'{"code":403,"msg":"forbidden"}'
+    http = FakeHttp(body, status_code=200, content_type="application/json")
+    install_http(monkeypatch, http)
+    target = tmp_path / "video.mp4"
+    downloader = engine.ChunkedDownloader(
+        target, 2 * 1024 * 1024, _links("https://cdn/file"), threads=1,
+    )
+    downloader.links = tuple(_links("https://cdn/file"))
+    downloader._fd = os.open(target, os.O_RDWR | os.O_CREAT, 0o644)  # pylint: disable=protected-access
+    try:
+        with pytest.raises(engine.DownloadError, match="非视频内容"):
+            downloader._single_stream(  # pylint: disable=protected-access
+                lambda refresh=False: _links("https://cdn/file")
+            )
+    finally:
+        os.close(downloader._fd)  # pylint: disable=protected-access
+
+    assert target.stat().st_size == 0
+
+
+def test_single_stream_no_progress_fails_fast(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    单流回退每次都在同一位置拿到同样长度的响应时，必须尽快失败而不是重试到次数耗尽。
+    """
+    import os
+
+    body = b"x" * 15131
+    http = FakeHttp(body, status_code=200, content_type="application/octet-stream")
+    install_http(monkeypatch, http)
+    target = tmp_path / "video.mp4"
+    downloader = engine.ChunkedDownloader(
+        target, 2 * 1024 * 1024, _links("https://cdn/file"), threads=1, retries=5,
+    )
+    downloader.links = tuple(_links("https://cdn/file"))
+    downloader._fd = os.open(target, os.O_RDWR | os.O_CREAT, 0o644)  # pylint: disable=protected-access
+    try:
+        with pytest.raises(engine.DownloadError, match="无进展"):
+            downloader._single_stream(  # pylint: disable=protected-access
+                lambda refresh=False: _links("https://cdn/file")
+            )
+    finally:
+        os.close(downloader._fd)  # pylint: disable=protected-access
+
+
+def test_single_stream_rejects_short_content_length(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    200 响应声明的 Content-Length 远小于目标大小时应快速失败，不写入短流。
+    """
+    import os
+
+    body = b"x" * 1024
+    http = FakeHttp(body, status_code=200, content_length=15340287)
+    install_http(monkeypatch, http)
+    target = tmp_path / "video.mp4"
+    downloader = engine.ChunkedDownloader(
+        target, 1_000_000_000, _links("https://cdn/file"), threads=1,
+    )
+    downloader.links = tuple(_links("https://cdn/file"))
+    downloader._fd = os.open(target, os.O_RDWR | os.O_CREAT, 0o644)  # pylint: disable=protected-access
+    try:
+        with pytest.raises(engine.DownloadError, match="长度不足"):
+            downloader._single_stream(  # pylint: disable=protected-access
+                lambda refresh=False: _links("https://cdn/file")
+            )
+    finally:
+        os.close(downloader._fd)  # pylint: disable=protected-access
+
+    assert target.stat().st_size == 0
+
+
+def test_emfile_maps_to_clear_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    文件描述符耗尽必须报成可操作的错误，而不是笼统的「网络不可达」。
+    """
+    class _EmfileHttp:
+        """始终抛出 EMFILE 的假网络适配器。"""
+
+        def get_stream(self, url: str, headers: Optional[Dict[str, str]] = None, **_: Any):
+            """模拟容器 nofile 上限耗尽。"""
+            raise ConnectionError(OSError(errno.EMFILE, "Too many open files"))
+
+    monkeypatch.setattr(engine, "RequestUtils", lambda **kwargs: _EmfileHttp())
+    monkeypatch.setattr(engine.time, "sleep", lambda *_: None)
+    target = tmp_path / "video.mp4"
+
+    with pytest.raises(engine.DownloadError, match="文件描述符不足"):
+        engine.ChunkedDownloader(
+            target, 2 * 1024 * 1024, _links("https://cdn/file"), threads=1, retries=1,
+        ).run(lambda refresh=False: _links("https://cdn/file"))
 
 
 def test_preallocated_file_without_marker_is_redownloaded(

@@ -238,6 +238,8 @@ class NetdiskAdapter(Protocol):
     单个网盘的协议适配器。
 
     适配器只负责协议，不访问数据库、不决定调度、不选择账号。
+
+    :cvar single_stream: 是否整文件单流下载，为真时每文件只用一条连接、不发 Range 分片请求
     """
 
     platform: NetdiskPlatform
@@ -245,6 +247,7 @@ class NetdiskAdapter(Protocol):
     requires_account: bool
     guest_supported: bool
     max_concurrency: int
+    single_stream: bool
     cookie_required_keys: tuple[str, ...]
     cookie_domains: tuple[str, ...]
     login_url: str

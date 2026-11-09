@@ -615,6 +615,8 @@ class BaseNetdiskAdapter:
     平台适配器的默认实现。
 
     子类至少需要覆盖 `share_detail`、`list_files` 与 `resolve`。
+
+    :cvar single_stream: 默认允许 Range 分片；单流平台在子类置为 True，引擎整文件只开一条连接
     """
 
     platform: NetdiskPlatform = NetdiskPlatform.QUARK
@@ -624,6 +626,7 @@ class BaseNetdiskAdapter:
     supports_refresh: bool = False
     drive_capabilities: DriveCapabilities = DriveCapabilities()
     max_concurrency: int = 512
+    single_stream: bool = False
     cookie_required_keys: tuple[str, ...] = ()
     cookie_domains: tuple[str, ...] = ()
     login_url: str = ""

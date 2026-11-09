@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -337,6 +338,28 @@ class _RateLimiter:
             time.sleep(min(expected - actual, 1.0))
 
 
+def _is_too_many_files(error: BaseException) -> bool:
+    """
+    判断异常链里是否包含文件描述符耗尽（EMFILE）。
+
+    容器默认 ``nofile=1024``，高并发时每个分片连接占一个 fd，超限后
+    ``requests`` 会把它包成 ConnectionError，必须沿异常链识别。
+
+    :param error: 原始异常
+    :return: 命中 EMFILE 返回 True
+    """
+    seen: set[int] = set()
+    current: Optional[BaseException] = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "errno", None) == errno.EMFILE:
+            return True
+        if "too many open files" in str(current).lower():
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 @contextmanager
 def _open_direct_stream(url: str, headers: Dict[str, str]):
     """
@@ -347,10 +370,17 @@ def _open_direct_stream(url: str, headers: Dict[str, str]):
     :return: 流式响应上下文
     """
     with _CHUNK_SLOTS:
-        with RequestUtils(timeout=30, proxies=_DIRECT_PROXIES).get_stream(
-            _sanitize_url(url), headers=headers
-        ) as response:
-            yield response
+        try:
+            with RequestUtils(timeout=30, proxies=_DIRECT_PROXIES).get_stream(
+                _sanitize_url(url), headers=headers, raise_exception=True
+            ) as response:
+                yield response
+        except Exception as error:  # noqa: BLE001
+            if _is_too_many_files(error):
+                raise DownloadError(
+                    "文件描述符不足：请提高容器 nofile 上限或降低并发"
+                ) from error
+            raise
 
 
 class ChunkedDownloader:
@@ -368,7 +398,8 @@ class ChunkedDownloader:
                  preempt_age_seconds: float = PREEMPT_MIN_ELAPSED,
                  refresh_seconds: int = 30, max_concurrency: int = 0,
                  on_progress: Optional[Callable[[float], None]] = None,
-                 stop_event: Optional[threading.Event] = None) -> None:
+                 stop_event: Optional[threading.Event] = None,
+                 single_stream: bool = False) -> None:
         """
         保存下载参数。
 
@@ -386,6 +417,7 @@ class ChunkedDownloader:
         :param max_concurrency: 平台并发上限，0 表示不限制
         :param on_progress: 进度回调，参数为完成百分比
         :param stop_event: 外部停止信号
+        :param single_stream: 是否整文件单流下载，为真时只用一条连接、不发 Range 分片请求
         """
         self.target = target
         self.total = total
@@ -393,6 +425,10 @@ class ChunkedDownloader:
         self.threads = max(int(threads), 1)
         if max_concurrency > 0:
             self.threads = min(self.threads, int(max_concurrency))
+        self.single_stream = bool(single_stream)
+        if self.single_stream:
+            # 单流平台不支持 Range 分片，整文件固定一条连接。
+            self.threads = 1
         self.preempt = preempt
         self.buffer_size = max(int(buffer_size), 1024)
         self.retries = max(int(retries), 1)
@@ -570,20 +606,30 @@ class ChunkedDownloader:
             _Chunk(index, start, end)
             for index, (start, end) in enumerate(plan_chunks(self.total, self.threads))
         ]
+        if self.single_stream and self.total > 0:
+            # 单流平台整文件一条连接，计划里只有一个覆盖全文件的区间。
+            self._chunks = [_Chunk(0, 0, self.total - 1)]
         elastic_start = self._chunks[-1].end + 1 if self._chunks else self.total
         self._fd = os.open(self.target, os.O_RDWR | os.O_CREAT, 0o644)
         try:
             self._restore()
             self._report()
             watchdog = threading.Thread(target=self._watchdog, daemon=True)
-            if self.preempt:
+            if self.preempt or self.single_stream:
                 watchdog.start()
             try:
-                self._run_main(url_provider)
-                self._run_elastic(url_provider, elastic_start)
+                if self.single_stream:
+                    self._run_single_stream(url_provider)
+                else:
+                    self._run_main(url_provider)
+                    self._run_elastic(url_provider, elastic_start)
             except Exception:  # noqa: BLE001
                 pass
-            if isinstance(self._error, RangeIgnored):
+            if self.single_stream:
+                # 单流失败不进入分片补齐，直接把真实错误抛给调用方。
+                if self._error is not None:
+                    raise self._error
+            elif isinstance(self._error, RangeIgnored):
                 # 服务端忽略 Range：整任务回退单流，绝不为单个分片下载整文件。
                 self._error = None
                 self._abort.clear()
@@ -597,6 +643,25 @@ class ChunkedDownloader:
                     except Exception as err:  # noqa: BLE001
                         self._error = err
                         self._abort.clear()
+            elif self._error is not None and not isinstance(self._error, DownloadCancelled):
+                # 单片失败不再直接判整个文件失败：先按缺失区间补一轮，
+                # 仍失败再回退单流，与 YunX 的降级顺序一致。
+                logger.warn(f"分片下载未完成，补齐缺失区间：{self._error}")
+                self._refill_missing(url_provider)
+                if self._error is not None:
+                    logger.warn(f"补齐缺失区间失败，回退单流：{self._error}")
+                    self._error = None
+                    self._abort.clear()
+                    attempts = 0
+                    while attempts < RANGE_IGNORED_TOLERANCE:
+                        attempts += 1
+                        try:
+                            self._single_stream(url_provider)
+                            self._error = None
+                            break
+                        except Exception as err:  # noqa: BLE001
+                            self._error = err
+                            self._abort.clear()
             if self._error is not None:
                 raise self._error
             if self.stop_event.is_set() and any(not chunk.done for chunk in self._chunks):
@@ -609,9 +674,40 @@ class ChunkedDownloader:
             self._save_plan()
             self.plan_path.unlink(missing_ok=True)
         finally:
+            # 任何退出路径都要停掉 watchdog，避免失败重试时累积后台线程。
+            self._done_event.set()
             if self._fd is not None:
                 os.close(self._fd)
                 self._fd = None
+
+    def _run_single_stream(self, url_provider: Callable[..., Sequence[DirectLink]]) -> None:
+        """
+        以整文件单流方式下载，失败时记录异常由 ``run`` 统一抛出。
+
+        单流平台不接受 Range 分片，整文件只保留一个覆盖全部字节的区间；
+        重试与续传由 ``_single_stream`` 内部处理，这里的重试只兜底整体失败。
+
+        :param url_provider: 直链回调
+        """
+        if not self._chunks:
+            raise DownloadError("单流下载缺少下载区间")
+        chunk = self._chunks[0]
+        attempts = 0
+        while attempts < RANGE_IGNORED_TOLERANCE:
+            attempts += 1
+            try:
+                self._single_stream(url_provider, chunk)
+                self._error = None
+                return
+            except DownloadCancelled as err:
+                self._error = err
+                return
+            except Exception as err:  # noqa: BLE001
+                self._error = err
+                self._abort.clear()
+            finally:
+                # 响应已由上下文管理器关闭，清掉引用避免 watchdog 误判为在飞连接。
+                chunk.response = None
 
     def _run_main(self, url_provider: Callable[..., Sequence[DirectLink]]) -> None:
         """
@@ -691,6 +787,41 @@ class ChunkedDownloader:
         block = int(speed / workers * ELASTIC_TARGET_SECONDS)
         return max(min(block, ELASTIC_MAX), ELASTIC_MIN)
 
+    def _refill_missing(self, url_provider: Callable[..., Sequence[DirectLink]]) -> None:
+        """
+        对首轮失败后仍未完成的分片补下一轮。
+
+        主池与弹性区共用同一个待办队列；任意分片再次失败会重新置位
+        ``_abort``，本轮立即停止，由调用方决定是否回退单流。
+
+        :param url_provider: 直链回调
+        """
+        missing = [chunk for chunk in self._chunks if not chunk.done]
+        self._error = None
+        self._abort.clear()
+        if not missing:
+            return
+        queue = list(missing)
+        queue_lock = threading.Lock()
+
+        def drain() -> None:
+            """持续领取缺失分片，直到补完或再次失败。"""
+            while not self._halted:
+                with queue_lock:
+                    if not queue:
+                        return
+                    chunk = queue.pop(0)
+                self._worker(chunk, url_provider)
+
+        threads = [
+            threading.Thread(target=drain, daemon=True)
+            for _ in range(min(self.threads, len(queue)))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
     def _record_error(self, error: Exception) -> None:
         """
         记录首个分片异常并停止其余分片。
@@ -769,6 +900,7 @@ class ChunkedDownloader:
         retries = 0
         while not chunk.done and not self._halted:
             generation = self._link_generation
+            before = chunk.position
             link = self._link_for(chunk)
             headers = dict(link.headers)
             headers["Range"] = f"bytes={chunk.position}-{chunk.end}"
@@ -779,13 +911,14 @@ class ChunkedDownloader:
             except RangeIgnored:
                 raise
             except LinkExpired as err:
-                retries += 1
+                # 已经续传成功一段后再次失效，不应累计到旧连接的重试次数。
+                retries = 1 if chunk.position > before else retries + 1
                 if retries > self.retries:
                     raise DownloadError(f"分片 {chunk.index} 直链多次失效：{err}")
                 # 直链与会话绑定，失效后必须刷新会话并重新取链，而不是重试旧 URL。
                 self._refresh_links(url_provider, force=True, seen_generation=generation)
             except TransientFailure as err:
-                retries += 1
+                retries = 1 if chunk.position > before else retries + 1
                 limit = max(self.retries * 2, self.retries + 2)
                 if retries > limit:
                     raise DownloadError(f"分片 {chunk.index} 重试次数超限：{err}")
@@ -794,9 +927,9 @@ class ChunkedDownloader:
                     self._refresh_links(url_provider, force=True, seen_generation=generation)
                 time.sleep(min(0.5 * retries, 5.0))
             except Exception as err:  # noqa: BLE001
-                retries += 1
                 if self._halted:
                     return
+                retries = 1 if chunk.position > before else retries + 1
                 if retries > self.retries:
                     raise DownloadError(f"分片 {chunk.index} 重试次数超限：{err}")
                 logger.debug(f"分片 {chunk.index} 中断，从 {chunk.position} 续传：{err}")
@@ -856,18 +989,26 @@ class ChunkedDownloader:
         if not chunk.done:
             raise DownloadError(f"分片 {chunk.index} 提前结束，剩余 {chunk.end - chunk.position + 1} 字节")
 
-    def _single_stream(self, url_provider: Callable[..., Sequence[DirectLink]]) -> None:
+    def _single_stream(self, url_provider: Callable[..., Sequence[DirectLink]],
+                       chunk: Optional[_Chunk] = None) -> None:
         """
-        服务端忽略 Range 时回退单流下载。
+        整文件单流下载，服务端忽略 Range 时的回退路径也复用它。
 
         连接提前断开时按已写字节续传（带 Range），避免整文件重下；只有重试次数
         耗尽仍不足目标大小时才判失败。
 
         :param url_provider: 直链回调
+        :param chunk: 需要登记在飞响应的整文件区间；为 None 表示不参与 watchdog 抢占
         """
         retries = 0
         position = 0
+        last_max = -1
         while True:
+            if self._halted:
+                # 挂死连接被 watchdog 关闭或外部取消后，不要在下一轮重新发起请求。
+                if self.stop_event.is_set():
+                    raise DownloadCancelled("下载已取消")
+                raise DownloadError("单流回退被内部异常中止")
             link = self.links[0] if self.links else None
             if link is None:
                 raise DownloadError("单流回退失败：没有可用直链")
@@ -879,6 +1020,9 @@ class ChunkedDownloader:
                 with _open_direct_stream(link.url, headers) as response:
                     if response is None:
                         raise DownloadError("单流回退失败：响应异常")
+                    if chunk is not None:
+                        # 登记在飞响应：watchdog 才能关闭挂死的连接并触发续传。
+                        chunk.response = response
                     status = int(getattr(response, "status_code", 0) or 0)
                     if position > 0 and status == 200:
                         # 服务端忽略 Range，只能从头覆盖写；必须截断旧尾部，
@@ -891,9 +1035,26 @@ class ChunkedDownloader:
                         position = 0
                     elif status not in (200, 206):
                         raise DownloadError("单流回退失败：响应异常")
-                    content_type = str(getattr(response, "headers", {}).get("Content-Type") or "")
-                    if "text/html" in content_type.lower():
-                        raise DownloadError("单流回退失败：直链返回 HTML 页面")
+                    response_headers = cast(Dict[str, Any], getattr(response, "headers", {}) or {})
+                    content_type = str(response_headers.get("Content-Type") or "").lower()
+                    if any(
+                        marker in content_type
+                        for marker in ("text/html", "application/json", "text/plain",
+                                       "text/xml", "application/xml")
+                    ):
+                        raise DownloadError(f"单流回退失败：直链返回非视频内容（{content_type}）")
+                    # 200 只说明服务端忽略了 Range；先写入已收到的字节，再用
+                    # Range 续传。若下一轮仍在同一位置（错误页/截断流），由
+                    # 下面的「无进展」检查快速失败，避免把错误页反复写进文件。
+                    try:
+                        content_length = int(response_headers.get("Content-Length") or 0)
+                    except (TypeError, ValueError):
+                        content_length = 0
+                    if position == 0 and content_length and content_length < self.total * 0.5:
+                        raise DownloadError(
+                            f"单流回退直链长度不足：Content-Length "
+                            f"{content_length}/{self.total}，疑似预览/试看流"
+                        )
                     self._written = position
                     for data in response.iter_content(chunk_size=self.buffer_size):
                         if self._halted:
@@ -907,12 +1068,23 @@ class ChunkedDownloader:
                             raise DownloadError("下载文件句柄已关闭")
                         os.pwrite(fd, data, position)
                         position += len(data)
+                        if chunk is not None:
+                            # watchdog 按区间进度计算速度，必须同步已写位置。
+                            chunk.position = position
                         with self._lock:
                             self._written = position
                         self.limiter.consume(len(data))
                         self._report()
+                if chunk is not None:
+                    chunk.response = None
                 if position >= self.total:
                     break
+                if position <= last_max:
+                    # 同一位置反复拿到同样长度的错误页，继续重试只会写坏文件。
+                    raise DownloadError(
+                        f"单流回退无进展：{position}/{self.total} 字节"
+                    )
+                last_max = max(last_max, position)
                 retries += 1
                 if retries > self.retries:
                     raise DownloadError("单流回退下载长度不足")
@@ -950,7 +1122,20 @@ class ChunkedDownloader:
         """
         while not self._done_event.wait(WATCHDOG_INTERVAL):
             if self._halted:
+                if self.single_stream:
+                    # 单流只有一条连接：取消时必须主动关闭挂死的响应，否则 run 无法返回。
+                    for chunk in self._chunks:
+                        response = chunk.response
+                        if response is None:
+                            continue
+                        try:
+                            response.close()
+                        except Exception:  # noqa: BLE001
+                            pass
                 return
+            if not self.preempt:
+                # 单流也会启动 watchdog 以便取消时关闭挂死连接，但不做慢连接抢占。
+                continue
             now = time.monotonic()
             active = [chunk for chunk in self._chunks if chunk.response is not None and not chunk.done]
             speeds = []
