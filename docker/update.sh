@@ -419,12 +419,12 @@ function stage_runtime_payload() {
     fi
     sites_file="sites.${python_version}-${arch_suffix}.so"
     download_staged_resource \
-        "$(github_download_url "https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/main/resources.v3/user.sites.v3.bin")" \
+        "$(github_download_url "https://raw.githubusercontent.com/thntime/MoviePilot-Resources/main/resources.v3/user.sites.v3.bin")" \
         "${stage_resource_dir}/user.sites.v3.bin" \
         "${resource_source_dir}/user.sites.v3.bin" \
         "user.sites.v3.bin" || return 1
     download_staged_resource \
-        "$(github_download_url "https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/main/resources.v3/${sites_file}")" \
+        "$(github_download_url "https://raw.githubusercontent.com/thntime/MoviePilot-Resources/main/resources.v3/${sites_file}")" \
         "${stage_resource_dir}/${sites_file}" \
         "${resource_source_dir}/${sites_file}" \
         "${sites_file}" || return 1
@@ -445,7 +445,7 @@ function swap_staged_payload() {
 
 # 通过规范化镜像地址准备前后端归档；$1 为后端版本路径，全部准备成功后才切换。
 function install_backend_and_download_resources() {
-    if ! download_and_unzip "$(github_download_url "https://github.com/jxxghp/MoviePilot/archive/refs/${1}")" "App"; then
+    if ! download_and_unzip "$(github_download_url "https://github.com/thntime/MoviePilot/archive/refs/${1}")" "App"; then
         WARN "后端程序下载失败，继续使用旧的程序来启动..."
         return 1
     fi
@@ -471,7 +471,7 @@ function install_backend_and_download_resources() {
     # 如果是"heads/v3.zip"，则查找v3开头的最新版本号
     if [[ "${1}" == "heads/v3.zip" ]]; then
         INFO "→ 正在获取前端最新版本号..."
-        releases=$(curl ${CURL_OPTIONS} "https://api.github.com/repos/jxxghp/MoviePilot-Frontend/releases" ${CURL_HEADERS} | jq -r '.[].tag_name' | grep "^v3\.")
+        releases=$(curl ${CURL_OPTIONS} "https://api.github.com/repos/thntime/MoviePilot/releases" ${CURL_HEADERS} | jq -r '.[].tag_name' | grep "^v3\.")
         if [ -z "$releases" ]; then
             WARN "未找到任何v3前端版本，继续启动..."
             return 1
@@ -489,7 +489,7 @@ function install_backend_and_download_resources() {
         fi
         INFO "前端版本号：${frontend_version}"
     fi
-    if ! download_and_unzip "$(github_download_url "https://github.com/jxxghp/MoviePilot-Frontend/releases/download/${frontend_version}/dist.zip")" "dist"; then
+    if ! download_and_unzip "$(github_download_url "https://github.com/thntime/MoviePilot/releases/download/${frontend_version}/dist.zip")" "dist"; then
         WARN "前端程序下载失败，继续使用旧的程序来启动..."
         return 1
     fi
@@ -619,7 +619,7 @@ function test_connectivity_github() {
     case "$1" in
     0)
         if [[ -n "${GITHUB_PROXY}" ]]; then
-            if curl -sL --connect-timeout 5 --max-time 10 "$(github_download_url "https://raw.githubusercontent.com/jxxghp/MoviePilot/main/README.md")" > /dev/null 2>&1; then
+            if curl -sL --connect-timeout 5 --max-time 10 "$(github_download_url "https://raw.githubusercontent.com/thntime/MoviePilot/main/README.md")" > /dev/null 2>&1; then
                 GITHUB_LOG="镜像代理模式"
                 return 0
             fi
@@ -628,7 +628,7 @@ function test_connectivity_github() {
         ;;
     1)
         if [[ -n "${PROXY_HOST}" ]]; then
-            if curl -sL --connect-timeout 5 --max-time 10 -x ${PROXY_HOST} https://raw.githubusercontent.com/jxxghp/MoviePilot/main/README.md > /dev/null 2>&1; then
+            if curl -sL --connect-timeout 5 --max-time 10 -x ${PROXY_HOST} https://raw.githubusercontent.com/thntime/MoviePilot/main/README.md > /dev/null 2>&1; then
                 CURL_OPTIONS="-sL -x ${PROXY_HOST}"
                 GITHUB_LOG="全局代理模式"
                 return 0

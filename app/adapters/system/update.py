@@ -64,12 +64,13 @@ class SystemUpdateManager(metaclass=SingletonClass):
     持久化两类升级状态，并保证同一时刻只有一个后台下载任务。
     """
 
-    _BACKEND_RELEASES_API = "https://api.github.com/repos/jxxghp/MoviePilot/releases"
+    # 主程序与前端制品均由本仓库 Release 提供，避免应用内更新拉取上游源码覆盖定制功能。
+    _BACKEND_RELEASES_API = "https://api.github.com/repos/thntime/MoviePilot/releases"
     _FRONTEND_RELEASE_API = (
         "https://api.github.com/repos/thntime/MoviePilot/releases/tags/{tag}"
     )
     _BACKEND_ARCHIVE_URL = (
-        "https://github.com/jxxghp/MoviePilot/archive/refs/tags/{tag}.zip"
+        "https://github.com/thntime/MoviePilot/archive/refs/tags/{tag}.zip"
     )
     _VERSION_PATTERN = re.compile(r"^v3\.\d+\.\d+(?:\.\d+)?(?:[-.](?:alpha|beta|rc)\d*)?$", re.I)
     # 镜像构建时写入的系统基线（ISO 日期），记录镜像系统软件包刷新到的安全基线。

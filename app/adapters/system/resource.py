@@ -84,10 +84,10 @@ class ResourceHelper:
     _version_flag = get_runtime_setting("RESOURCE_VERSION_FLAG")
     _repo = (
         "https://raw.githubusercontent.com/"
-        f"jxxghp/MoviePilot-Resources/main/package.{_version_flag}.json"
+        f"thntime/MoviePilot-Resources/main/package.{_version_flag}.json"
     )
     _files_api = (
-        "https://api.github.com/repos/jxxghp/"
+        "https://api.github.com/repos/thntime/"
         f"MoviePilot-Resources/contents/resources.{_version_flag}"
     )
 

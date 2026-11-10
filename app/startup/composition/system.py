@@ -322,7 +322,7 @@ class _ReleaseCatalogAdapter(ReleaseCatalogPort):
         response = await AsyncRequestUtils(
             proxies=self._settings.get("PROXY"),
             headers=self._settings.get("GITHUB_HEADERS"),
-        ).get_res("https://api.github.com/repos/jxxghp/MoviePilot/releases")
+        ).get_res("https://api.github.com/repos/thntime/MoviePilot/releases")
         if response is None or response.status_code != 200:
             return None
         payload = response.json()

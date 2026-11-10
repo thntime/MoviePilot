@@ -658,7 +658,7 @@ class SystemChain(_SystemUpdateChain):
         try:
             http, _ = _system_ports_snapshot()
             response = http.get(
-                "https://api.github.com/repos/jxxghp/MoviePilot/releases",
+                "https://api.github.com/repos/thntime/MoviePilot/releases",
                 proxies=get_chain_runtime_config_snapshot().proxy,
                 headers=get_chain_runtime_config_snapshot().github_headers,
             )

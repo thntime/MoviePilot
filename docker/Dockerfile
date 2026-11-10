@@ -283,7 +283,7 @@ ARG MOVIEPILOT_PLUGINS_REF="main"
 
 RUN set -eu; \
     test -n "${MOVIEPILOT_PLUGINS_REF}"; \
-    curl -fsSL "https://github.com/jxxghp/MoviePilot-Plugins/archive/${MOVIEPILOT_PLUGINS_REF}.zip" -o /tmp/plugins.zip; \
+    curl -fsSL "https://github.com/thntime/MoviePilot-Plugins/archive/${MOVIEPILOT_PLUGINS_REF}.zip" -o /tmp/plugins.zip; \
     busybox unzip -q /tmp/plugins.zip -d /tmp/plugins-src; \
     plugin_root="$(find /tmp/plugins-src -mindepth 1 -maxdepth 1 -type d -print -quit)"; \
     test -n "${plugin_root}"; \
@@ -312,8 +312,8 @@ RUN set -eu; \
         *) printf 'Unsupported architecture: %s\n' "${target_arch}" >&2; exit 1 ;; \
     esac; \
     mkdir -p /resources; \
-    curl -fsSL "https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/${MOVIEPILOT_RESOURCES_REF}/resources.v3/user.sites.v3.bin" -o /resources/user.sites.v3.bin; \
-    curl -fsSL "https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/${MOVIEPILOT_RESOURCES_REF}/resources.v3/sites.${python_ver}-${suffix}.so" -o "/resources/sites.${python_ver}-${suffix}.so"
+    curl -fsSL "https://raw.githubusercontent.com/thntime/MoviePilot-Resources/${MOVIEPILOT_RESOURCES_REF}/resources.v3/user.sites.v3.bin" -o /resources/user.sites.v3.bin; \
+    curl -fsSL "https://raw.githubusercontent.com/thntime/MoviePilot-Resources/${MOVIEPILOT_RESOURCES_REF}/resources.v3/sites.${python_ver}-${suffix}.so" -o "/resources/sites.${python_ver}-${suffix}.so"
 
 
 # 准备容器控制面
