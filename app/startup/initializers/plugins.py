@@ -465,7 +465,12 @@ def _prepare_legacy_plugin_import(*, plugin_id: str, plugin_dir: Path) -> None:
     """
     在执行旧插件顶层代码前准备其静态导入所需的宿主资源。
     """
-    for capability_id in scan_plugin_resource_imports(plugin_id, plugin_dir):
+    capabilities = scan_plugin_resource_imports(plugin_id, plugin_dir)
+    if "host.display" in capabilities:
+        from app.adapters.network.browser import configure_browser_queue
+
+        configure_browser_queue()
+    for capability_id in capabilities:
         acquire_managed_resource(
             capability_id,
             reason="legacy_plugin_import",
@@ -625,6 +630,11 @@ def configure_plugin_services() -> None:
             ratings=MoviePilotServerHelper.async_get_plugin_ratings,
             rating=MoviePilotServerHelper.async_get_plugin_rating,
             submit=MoviePilotServerHelper.async_submit_plugin_rating,
+            cache_scope=lambda: (
+                get_runtime_setting("MP_SERVER_HOST"),
+                MoviePilotServerHelper.get_user_uid(),
+                bool(get_runtime_setting("PLUGIN_STATISTIC_SHARE")),
+            ),
         )
     )
 
