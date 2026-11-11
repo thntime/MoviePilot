@@ -811,7 +811,7 @@ def test_link_url_accepts_plain_string() -> None:
 
 def test_file_link_last_round_does_not_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    五轮都有响应但没有直链时只在轮间退避，末轮不再 sleep。
+    六次请求都没有直链时只在轮间退避，末轮不再 sleep。
     """
     adapter, calls, responses = _install(monkeypatch)
     sleeps: list[float] = []

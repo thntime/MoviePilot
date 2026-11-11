@@ -794,14 +794,6 @@ class _BatchDownloadRun:
                 )
                 logger.info(f"季 {season} 剩余需要集：{needed}")
 
-    def _matches_partial_pack(
-            self, context: Context, media_key: str, season: int, effective: Set[int],
-    ) -> bool:
-        """
-        按媒体身份和单季范围预筛拆包候选，真实集数随后由种子核对。
-        """
-        return self._partial_pack_skip_reason(context, media_key, season, effective) is None
-
     def _partial_pack_skip_reason(
             self, context: Context, media_key: str, season: int, effective: Set[int],
     ) -> Optional[str]:
