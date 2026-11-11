@@ -81,13 +81,14 @@ def _submitted(chain) -> list[Context]:
     ]
 
 
-def _batch_run(chain, contexts=(), missing=None):
+def _batch_run(chain, contexts=(), missing=None, governance=None):
     """
     构造单次批量状态，便于直接核对阶段内部判定。
     """
     options = {
         "save_path": None, "channel": None, "source": None, "userid": None,
-        "username": None, "downloader": None, "custom_words": None, "governance": None,
+        "username": None, "downloader": None, "custom_words": None,
+        "governance": governance,
     }
     return download_batch._BatchDownloadRun(chain, list(contexts), missing or {}, options, None)
 
@@ -684,3 +685,64 @@ def test_partial_pack_does_not_submit_other_season_episode(batch, monkeypatch):
     run._download_season_partial_packs("tmdb:1", 1, [2])  # pylint: disable=protected-access
 
     batch.chain.download_single.assert_not_called()
+
+
+def _governance_stub() -> tuple[SimpleNamespace, list[tuple[str, str | None]]]:
+    """
+    记录治理回调的替身，便于断言跳过原因。
+    """
+    calls: list[tuple[str, str | None]] = []
+
+    def report(_context, decision, reason=None):
+        calls.append((decision, reason))
+
+    return SimpleNamespace(report=report), calls
+
+
+def test_episode_pack_candidate_reports_season_mismatch(batch):
+    """
+    候选季号与订阅目标不一致时，必须把原因写进治理记录。
+    """
+    candidate = _context("other-season", season=2)
+    candidate.torrent_info.download_type = "netdisk"
+    governance, calls = _governance_stub()
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing((1,), total=1)}}, governance)
+
+    assert run._episode_pack_candidate(  # pylint: disable=protected-access
+        candidate, "tmdb:1", 1, [1], _missing((1,), total=1),
+    ) == set()
+    assert calls and calls[0][0] == "rejected"
+    assert "季号" in (calls[0][1] or "")
+
+
+def test_episode_pack_candidate_reports_share_without_target_episodes(batch, monkeypatch):
+    """
+    分享内没有目标集数时，治理记录要给出具体原因而不是静默跳过。
+    """
+    candidate = _context("perfect-world")
+    candidate.torrent_info.download_type = "netdisk"
+    _patch_netdisk_paths(monkeypatch, ["S01/05.mp4"])
+    governance, calls = _governance_stub()
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing((1,), total=5)}}, governance)
+
+    assert run._episode_pack_candidate(  # pylint: disable=protected-access
+        candidate, "tmdb:1", 1, [1], _missing((1,), total=5),
+    ) == set()
+    assert calls and calls[0][0] == "rejected"
+    assert "目标集数" in (calls[0][1] or "")
+
+
+def test_partial_pack_reports_mismatch(batch):
+    """
+    拆包阶段的候选被跳过时同样要记录原因。
+    """
+    candidate = _context("other-season", season=2)
+    candidate.torrent_info.download_type = "netdisk"
+    governance, calls = _governance_stub()
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing((1,), total=1)}}, governance)
+
+    run._download_season_partial_packs("tmdb:1", 1, [1])  # pylint: disable=protected-access
+
+    assert batch.chain.download_single.call_count == 0
+    assert calls and calls[0][0] == "rejected"
+    assert "季号" in (calls[0][1] or "")

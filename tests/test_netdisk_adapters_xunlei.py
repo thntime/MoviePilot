@@ -459,11 +459,11 @@ def test_resolve_accepts_original_url_shape(monkeypatch: pytest.MonkeyPatch) -> 
     assert link.url == "https://cdn.xunlei.com/a.mkv"
 
 
-def test_resolve_retries_with_play_when_download_has_no_links(
+def test_resolve_retries_until_play_link_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    usage=DOWNLOAD 返回空 links 时应继续用 PLAY 再取一次。
+    首次 PLAY 返回空 links 时按退避重试，第二次拿到直链即返回。
     """
     adapter, calls, responses = _install(monkeypatch)
     responses[("GET", xunlei._ABOUT_URL)] = [{"quota": {"limit": 10_000_000, "usage": 0}}]
@@ -489,6 +489,7 @@ def test_resolve_retries_with_play_when_download_has_no_links(
     assert link.url == "https://cdn.xunlei.com/a.mkv"
     file_calls = [call for call in calls if call["url"] == f"{xunlei._FILES_URL}/new-1"]
     assert len(file_calls) == 2
+    assert all(call["params"]["usage"] == "PLAY" for call in file_calls)
 
 
 def test_resolve_failure_cleans_temp_dir(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -709,11 +710,52 @@ def test_first_link_url_medias_download_url() -> None:
     assert xunlei._first_link_url(links) == "u2"
 
 
+def test_file_link_requests_play_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    取链只请求 usage=PLAY，不再发送稳定返回 400 的 usage=DOWNLOAD。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    monkeypatch.setattr(xunlei.time, "sleep", lambda _seconds: None)
+    responses[("GET", f"{xunlei._FILES_URL}/f1")] = [
+        {"id": "f1", "size": 2048, "links": {"application/octet-stream": {"url": "https://cdn/x"}}},
+    ]
+
+    url, _size = adapter._file_link("f1", _account())  # pylint: disable=protected-access
+
+    assert url == "https://cdn/x"
+    assert len(calls) == 1
+    assert calls[0]["params"]["usage"] == "PLAY"
+
+
+def test_file_link_audit_restricted_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    重试耗尽且审核状态非正常时，错误信息要带出审核状态而不是笼统的未就绪。
+    """
+    adapter, _calls, responses = _install(monkeypatch)
+    monkeypatch.setattr(xunlei.time, "sleep", lambda _seconds: None)
+    responses[("GET", f"{xunlei._FILES_URL}/f1")] = [
+        {
+            "id": "f1",
+            "size": 2048,
+            "links": {},
+            "audit": {"status": "STATUS_BANNED", "message": "版权受限"},
+        }
+        for _ in range(6)
+    ]
+
+    with pytest.raises(NetdiskError) as error:
+        adapter._file_link("f1", _account())  # pylint: disable=protected-access
+
+    assert error.value.code is NetdiskErrorCode.LINK_NOT_READY
+    assert "审核" in error.value.message
+    assert "STATUS_BANNED" in error.value.message
+
+
 def test_file_link_error_round_does_not_mask_as_not_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    首轮两个 usage 都报错时立即抛原错误，不被后续空 links 掩盖成未就绪。
+    单轮请求报错时立即抛原错误，不被后续空 links 掩盖成未就绪。
     """
     adapter, calls, responses = _install(monkeypatch)
     sleeps: list[float] = []
@@ -728,7 +770,7 @@ def test_file_link_error_round_does_not_mask_as_not_ready(
         adapter._file_link("f1", _account())  # pylint: disable=protected-access
 
     assert error.value.code is NetdiskErrorCode.RATE_LIMITED
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert sleeps == []
 
 
@@ -736,7 +778,7 @@ def test_file_link_all_requests_failed_raises_last_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    一轮内所有请求都报错时抛最后一个错误，不进入额外轮次。
+    单轮请求都报错时抛该错误，不进入额外轮次。
     """
     adapter, calls, responses = _install(monkeypatch)
     sleeps: list[float] = []
@@ -754,7 +796,7 @@ def test_file_link_all_requests_failed_raises_last_error(
         adapter._file_link("f1", _account())  # pylint: disable=protected-access
 
     assert error.value.code is NetdiskErrorCode.RISK_BLOCKED
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert sleeps == []
 
 
@@ -769,7 +811,7 @@ def test_link_url_accepts_plain_string() -> None:
 
 def test_file_link_last_round_does_not_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    三轮都有响应但没有直链时只在轮间退避，末轮不再 sleep。
+    五轮都有响应但没有直链时只在轮间退避，末轮不再 sleep。
     """
     adapter, calls, responses = _install(monkeypatch)
     sleeps: list[float] = []
@@ -784,4 +826,30 @@ def test_file_link_last_round_does_not_sleep(monkeypatch: pytest.MonkeyPatch) ->
 
     assert error.value.code is NetdiskErrorCode.LINK_NOT_READY
     assert len(calls) == 6
-    assert sleeps == [1, 2]
+    assert sleeps == [1, 2, 4, 8, 16]
+
+
+def test_resolve_failure_logs_temp_directory_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    取链失败时记录临时目录内容，便于确认转存文件是否已经落盘。
+    """
+    warnings: list[str] = []
+    monkeypatch.setattr(xunlei.logger, "warning", lambda message, *a, **k: warnings.append(str(message)))
+    adapter, _calls, responses = _install(monkeypatch)
+    responses[("GET", xunlei._ABOUT_URL)] = [{"quota": {"limit": 10_000_000, "usage": 0}}]
+    responses[("POST", xunlei._FILES_URL)] = [{"id": "dir-1"}]
+    responses[("POST", xunlei._RESTORE_URL)] = [
+        {"params": {"trace_file_ids": json.dumps({"f1": "new-1"})}}
+    ]
+    responses[("GET", f"{xunlei._FILES_URL}/new-1")] = [{"error": "unauthenticated"}]
+    responses[("GET", xunlei._FILES_URL)] = [
+        {"files": [{"id": "new-1", "name": "a.mkv", "kind": "drive#file"}]}
+    ]
+    responses[("POST", xunlei._BATCH_DELETE_URL)] = [{"id": "ok"}]
+
+    with pytest.raises(NetdiskError):
+        adapter.resolve(_ref(), _file(), _account())
+
+    assert any("转存标识已落盘=True" in message for message in warnings)

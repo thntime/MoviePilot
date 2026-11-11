@@ -958,3 +958,18 @@ def test_unrecoverable_paused_task_does_not_contribute() -> None:
         [_paused_torrent(120, reason="unrecoverable")], _paused_history(),
     )
     assert chain.failed_netdisk_episodes("tmdb", "100", 1) == set()
+
+
+def test_share_level_ttl_is_three_minutes() -> None:
+    """
+    分享级失败已写黑名单，只做短暂冷却，便于下一轮立即换源。
+    """
+    from app.chain.download.failure import (
+        DOWNLOAD_FAILURE_SHARE_TTL_SECONDS,
+        DownloadFailureOwner,
+    )
+
+    assert DOWNLOAD_FAILURE_SHARE_TTL_SECONDS == 3 * 60
+    assert DownloadFailureOwner._download_failure_ttl(
+        "分享内没有目标集数（[96, 98]）对应的文件"
+    ) == DOWNLOAD_FAILURE_SHARE_TTL_SECONDS

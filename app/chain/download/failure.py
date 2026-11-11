@@ -22,6 +22,7 @@ from app.domain.context import (
     TorrentInfo,
 )
 from app.domain.meta.metabase import MetaBase
+from app.domain.netdisk import is_share_level_message
 from app.runtime.log import logger
 from app.schemas.media import build_media_key, resolve_media_identity
 
@@ -32,6 +33,8 @@ DOWNLOAD_FAILURE_DUPLICATE_TTL_SECONDS = 7 * 24 * 60 * 60
 # 容量不足属于可恢复的账号/空间状态，冷却 30 分钟后再参与候选。
 DOWNLOAD_FAILURE_CAPACITY_TTL_SECONDS = 30 * 60
 DOWNLOAD_FAILURE_CAPACITY_KEYWORDS = ("空间不足", "容量不足", "SPACE_INSUFFICIENT")
+# 分享级失败（分享为空/失效/仅预览流）已写黑名单，只需短暂冷却即可换源重试。
+DOWNLOAD_FAILURE_SHARE_TTL_SECONDS = 3 * 60
 # 退避记录写入台账的成因说明，候选跳过日志直接引用它，不能再假设这是一次失败。
 DOWNLOAD_FAILURE_DUPLICATE_MESSAGE = "下载器已存在同一任务且本次无新增文件明细"
 DOWNLOAD_FAILURE_RESOURCE_ERROR_KEYWORDS = (
@@ -158,6 +161,8 @@ class DownloadFailureOwner(_DownloadOwnerBase):
         rate_limit_ttl = torrent_rules.rate_limit_cooldown(error_msg)
         if rate_limit_ttl is not None:
             return rate_limit_ttl
+        if is_share_level_message(error_msg):
+            return DOWNLOAD_FAILURE_SHARE_TTL_SECONDS
         if any(keyword in error_text for keyword in DOWNLOAD_FAILURE_RESOURCE_ERROR_KEYWORDS):
             return DOWNLOAD_FAILURE_RESOURCE_TTL_SECONDS
         return DOWNLOAD_FAILURE_TRANSIENT_TTL_SECONDS

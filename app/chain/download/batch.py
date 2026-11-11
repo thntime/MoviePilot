@@ -175,6 +175,8 @@ class _BatchDownloadRun:
         self.allowed_episodes = set(allowed_episodes) if allowed_episodes is not None else None
         self.downloaded: List[Context] = []
         self.failures: Dict[str, Optional[DownloadFailureSnapshot]] = {}
+        # 同一候选可能在多个阶段被跳过，只保留第一条原因，避免前端重复行。
+        self._reported_skips: Set[int] = set()
         words = options["custom_words"]
         self.custom_words = words.splitlines() if words else None
 
@@ -220,6 +222,22 @@ class _BatchDownloadRun:
         fingerprint = self.owner._build_download_failure_fingerprint(context)
         if fingerprint:
             self.failures[fingerprint] = None
+
+    def _report_skip(self, context: Context, reason: str) -> None:
+        """
+        记录候选未提交的具体原因，供订阅活动展示。
+
+        :param context: 候选上下文
+        :param reason: 跳过原因
+        """
+        key = id(context)
+        if key in self._reported_skips:
+            return
+        self._reported_skips.add(key)
+        governance = self.options.get("governance")
+        report = getattr(governance, "report", None)
+        if callable(report):
+            report(context, "rejected", reason)
 
     def _netdisk_episodes(self, torrent: TorrentInfo) -> Optional[List[int]]:
         """
@@ -682,30 +700,33 @@ class _BatchDownloadRun:
         if media is None or meta is None or media.type != MediaType.TV:
             return set()
         if not self.owner._matches_media_identity(media, media_key):
+            self._report_skip(context, "媒体身份与订阅目标不一致")
             return set()
         if context in self.downloaded or self._in_failure_cooldown(context):
+            self._report_skip(context, "候选已下载或处于失败冷却中")
             return set()
         if len(meta.season_list) != 1 or meta.season_list[0] != season:
+            self._report_skip(context, f"季号与订阅目标不一致（目标 S{season}）")
             return set()
         torrent = context.torrent_info
         is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
         effective = _selection.apply_allowed_episodes(set(needed), context)
         if not effective:
+            self._report_skip(context, "本批目标集数为空")
             return set()
         if is_netdisk and torrent is not None:
             season_episodes = self._netdisk_season_episodes(torrent) or {}
             share_episodes = self._netdisk_target_season_episodes(season_episodes, season)
             if not share_episodes:
+                self._report_skip(context, f"分享内没有可解析的目标季 S{season} 集数")
                 logger.info(f"{meta.org_string} 网盘分享内没有目标季 {season} 的集数")
                 return set()
             target = share_episodes.intersection(effective)
             if not target:
+                self._report_skip(context, "分享内没有目标集数")
                 logger.info(
                     f"{meta.org_string} 分享内没有目标集，"
                     f"目标 {episode_rules.format_ranges(sorted(effective))}")
-                governance = self.options.get("governance")
-                if governance:
-                    governance.report(context, "failed", "网盘分享内没有目标集")
                 return set()
             logger.info(
                 f"{meta.org_string} 目标集数 {episode_rules.format_ranges(sorted(target))}，"
@@ -713,6 +734,7 @@ class _BatchDownloadRun:
             return target
         episodes = set(meta.episode_list)
         if not episodes:
+            self._report_skip(context, "候选元数据缺少集数")
             return set()
         if _selection.requires_complete_coverage(info):
             required = _selection.get_required_episodes(self.no_exists, media_key, season)
@@ -720,7 +742,10 @@ class _BatchDownloadRun:
                 and _selection.allows_full_pack(episodes, context)
         else:
             matches = episodes.issubset(effective)
-        return episodes if matches else set()
+        if not matches:
+            self._report_skip(context, "种子集数不满足目标范围")
+            return set()
+        return episodes
 
     def _download_partial_packs(self) -> None:
         """
@@ -751,11 +776,16 @@ class _BatchDownloadRun:
                 continue
             # 拆包阶段沿用先检查重复/冷却、再检查缺集与媒体身份的顺序。
             if context in self.downloaded or self._in_failure_cooldown(context):
+                self._report_skip(context, "候选已下载或处于失败冷却中")
                 continue
             if not needed:
                 break
             effective = _selection.apply_allowed_episodes(set(needed), context)
-            if not effective or not self._matches_partial_pack(context, media_key, season, effective):
+            if not effective:
+                continue
+            reason = self._partial_pack_skip_reason(context, media_key, season, effective)
+            if reason:
+                self._report_skip(context, reason)
                 continue
             selected = self._submit_partial_pack(context, effective, season)
             if selected:
@@ -770,11 +800,29 @@ class _BatchDownloadRun:
         """
         按媒体身份和单季范围预筛拆包候选，真实集数随后由种子核对。
         """
+        return self._partial_pack_skip_reason(context, media_key, season, effective) is None
+
+    def _partial_pack_skip_reason(
+            self, context: Context, media_key: str, season: int, effective: Set[int],
+    ) -> Optional[str]:
+        """
+        返回拆包候选不满足提交条件的原因，满足时返回 None。
+
+        :param context: 候选上下文
+        :param media_key: 媒体键
+        :param season: 目标季
+        :param effective: 本批允许下载的目标集数
+        :return: 跳过原因或 None
+        """
         meta = context.meta_info
         assert meta is not None
-        return self.owner._matches_media_identity(context.media_info, media_key) \
-            and (not meta.episode_list or bool(set(meta.episode_list).intersection(effective))) \
-            and len(meta.season_list) == 1 and meta.season_list[0] == season
+        if not self.owner._matches_media_identity(context.media_info, media_key):
+            return "媒体身份与订阅目标不一致"
+        if meta.episode_list and not set(meta.episode_list).intersection(effective):
+            return "候选集数与目标集数无交集"
+        if len(meta.season_list) != 1 or meta.season_list[0] != season:
+            return f"季号与订阅目标不一致（目标 S{season}）"
+        return None
 
     def _submit_partial_pack(
             self, context: Context, effective: Set[int], season: Optional[int] = None,
@@ -796,6 +844,7 @@ class _BatchDownloadRun:
                 season_episodes = self._netdisk_season_episodes(torrent) or {}
                 episodes = self._netdisk_target_season_episodes(season_episodes, season)
             if not episodes:
+                self._report_skip(context, f"分享内没有可解析的目标季 S{season} 集数")
                 logger.info(
                     f"{torrent.site_name} - {torrent.title} 网盘分享内没有目标季 {season} 的集数"
                     if season is not None
@@ -811,6 +860,7 @@ class _BatchDownloadRun:
             episodes = set(parsed_episodes)
         selected = set(episodes).intersection(effective)
         if not selected:
+            self._report_skip(context, "分享内没有需要的集数")
             logger.info(f"{torrent.site_name} - {torrent.title} 没有需要的集，跳过...")
             return set()
         logger.info(f"{torrent.site_name} - {torrent.title} 选中集数：{selected}")

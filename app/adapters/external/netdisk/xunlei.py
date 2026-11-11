@@ -104,6 +104,12 @@ _MAX_PAGES = 100
 # 个人盘文件列表单页条数（对齐 YunX 抓包）。
 _DRIVE_PAGE_LIMIT = 50
 
+# 取链只请求 usage=PLAY（DOWNLOAD 已被接口废弃并返回 400），轮间按指数退避等待转码就绪。
+# 元组是「轮间等待」序列，因此总请求次数比它多一次（1+2+4+8+16≈31s，共 6 次请求）。
+_LINK_RETRY_DELAYS = (1, 2, 4, 8, 16)
+# 文件审核状态为正常时，取链失败才按「未就绪」处理。
+_LINK_AUDIT_OK = "STATUS_OK"
+
 # 云盘业务接口均为国内直连域名，显式关闭宿主代理。
 _DIRECT_PROXIES = {"http": "", "https": ""}
 
@@ -932,53 +938,77 @@ class XunleiAdapter(BaseNetdiskAdapter):
         :raises NetdiskError: 请求失败时抛出原错误；有成功响应但始终无直链时抛 LINK_NOT_READY
         """
         data: dict[str, Any] = {}
-        links: Any = {}
-        last_error: Optional[NetdiskError] = None
-        # 同一个文件详情接口按 usage 返回不同链接；PLAY 对部分 mkv 会返回空 links，
-        # 必须再试 DOWNLOAD 才能拿到原始文件直链。某个 usage 直接报错时继续试下一个。
-        # 只有「至少一次成功响应但 links 为空」才按 1s/2s 退避重试，共 3 轮；
-        # 一轮内两次请求都报错时立即抛原错误，避免限流/风控被掩盖成「未就绪」。
-        for attempt in range(3):
-            succeeded = False
-            for usage in ("DOWNLOAD", "PLAY"):
-                try:
-                    payload = self.http.get_json(
-                        f"{_FILES_URL}/{file_id}",
-                        params={
-                            "_magic": "2021",
-                            "usage": usage,
-                            "thumbnail_size": "SIZE_LARGE",
-                            "with": "hdr10",
-                        },
-                        headers=self._api_headers(account),
-                    )
-                    self._check_payload(payload, "获取迅雷云盘下载链接")
-                except NetdiskError as error:
-                    if error.code is NetdiskErrorCode.AUTH_EXPIRED:
-                        raise
-                    last_error = error
-                    continue
-                succeeded = True
-                data = self._data(payload)
-                links = data.get("links")
-                link = self._extract_link(data)
-                if link is not None:
-                    return link
-            if not succeeded and last_error is not None:
-                raise last_error
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-        logger.warning(
-            f"迅雷文件详情未返回直链：phase={data.get('phase')} space={data.get('space')} "
-            f"original_url={bool(as_text(data.get('original_url')))} "
-            f"web_content_link={bool(as_text(data.get('web_content_link')))} "
-            f"links={list(links.keys()) if isinstance(links, Mapping) else type(links).__name__} "
-            f"medias={len(data.get('medias') or []) if isinstance(data.get('medias'), list) else type(data.get('medias')).__name__}"
-        )
+        outcomes: list[str] = []
+        # 文件详情接口已不接受 usage=DOWNLOAD（稳定返回 400），只按 PLAY 取链；
+        # 转存后迅雷需要时间生成直链，对「HTTP 200 但无直链」按指数退避重试，
+        # 请求本身报错时立即上抛，避免把限流/风控掩盖成「未就绪」。
+        attempts = len(_LINK_RETRY_DELAYS) + 1
+        for attempt in range(1, attempts + 1):
+            payload = self.http.get_json(
+                f"{_FILES_URL}/{file_id}",
+                params={
+                    "_magic": "2021",
+                    "usage": "PLAY",
+                    "thumbnail_size": "SIZE_LARGE",
+                    "with": "hdr10",
+                },
+                headers=self._api_headers(account),
+            )
+            self._check_payload(payload, "获取迅雷云盘下载链接")
+            data = self._data(payload)
+            link = self._extract_link(data)
+            if link is not None:
+                return link
+            outcomes.append(f"r{attempt}:{self._detail_diagnosis(data)}")
+            if attempt < attempts:
+                time.sleep(_LINK_RETRY_DELAYS[attempt - 1])
+        logger.warning(f"迅雷文件详情未返回直链；尝试明细={outcomes}")
         raise NetdiskError(
             NetdiskErrorCode.LINK_NOT_READY,
-            "迅雷直链尚未就绪",
+            self._link_not_ready_message(data),
             platform=self.platform,
+        )
+
+    @staticmethod
+    def _link_not_ready_message(data: Mapping[str, Any]) -> str:
+        """
+        生成取链失败提示；审核状态异常时带出具体状态，便于区分未就绪与受限。
+
+        :param data: 文件详情业务数据
+        :return: 错误提示
+        """
+        audit = data.get("audit")
+        if isinstance(audit, Mapping):
+            status = as_text(audit.get("status"))
+            if status and status != _LINK_AUDIT_OK:
+                detail = " ".join(part for part in (status, as_text(audit.get("message"))) if part)
+                return f"迅雷直链尚未就绪（审核状态：{detail}）"
+        return "迅雷直链尚未就绪"
+
+    @staticmethod
+    def _detail_diagnosis(data: Mapping[str, Any]) -> str:
+        """
+        汇总文件详情响应中与取链相关的状态，便于定位空直链。
+
+        只输出状态、类型与数量，不输出直链或令牌。
+
+        :param data: 文件详情业务数据
+        :return: 诊断摘要
+        """
+        audit = data.get("audit")
+        if isinstance(audit, Mapping):
+            audit_state = f"{audit.get('status')}/{audit.get('audit_status')}"
+        else:
+            audit_state = type(audit).__name__ if audit is not None else "-"
+        links = data.get("links")
+        medias = data.get("medias")
+        link_count = len(links) if isinstance(links, Mapping) else type(links).__name__
+        media_count = len(medias) if isinstance(medias, list) else type(medias).__name__
+        return (
+            f"phase={data.get('phase')} space={data.get('space')!r} kind={data.get('kind')} "
+            f"category={data.get('file_category')} audit={audit_state} links={link_count} "
+            f"medias={media_count} web_content_link={bool(data.get('web_content_link'))} "
+            f"original_url={bool(data.get('original_url'))}"
         )
 
     def _batch_delete(
@@ -1020,6 +1050,31 @@ class XunleiAdapter(BaseNetdiskAdapter):
         except Exception as error:  # noqa: BLE001 - 清理失败不阻断下载
             self.log_failure("清理迅雷云盘转存内容", error, account)
 
+    def _log_directory_state(
+        self,
+        directory: str,
+        new_id: str,
+        account: NetdiskAccountRecord,
+    ) -> None:
+        """
+        取链失败后记录临时目录的实际内容，用于判断转存是否已落盘。
+
+        :param directory: 临时目录标识
+        :param new_id: 转存响应给出的文件标识
+        :param account: 取链账号
+        """
+        try:
+            entries = self.list_dir(account, directory)
+        except Exception as error:  # noqa: BLE001 - 诊断失败不阻断清理
+            logger.warning(f"迅雷取链失败后无法读取临时目录：{error}")
+            return
+        present = any(item.file_id == new_id for item in entries)
+        names = [f"{item.name}({item.file_id[:10]})" for item in entries[:5]]
+        logger.warning(
+            f"迅雷取链失败时的临时目录状态：目录={directory[:10]} 条目数={len(entries)} "
+            f"转存标识已落盘={present} 条目={names}"
+        )
+
     def resolve(
         self,
         ref: ShareRef,
@@ -1058,10 +1113,13 @@ class XunleiAdapter(BaseNetdiskAdapter):
         assert account is not None
         self._ensure_space(file, account)
         directory = self._create_temp_dir(account)
+        new_id = ""
         try:
             new_id = self._restore(ref, file, directory, account)
             url, size = self._file_link(new_id, account)
         except Exception:
+            if new_id:
+                self._log_directory_state(directory, new_id, account)
             self._safe_delete([directory], account)
             raise
         handle = TransferHandle(

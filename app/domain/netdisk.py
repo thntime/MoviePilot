@@ -139,6 +139,17 @@ _SHARE_LEVEL_MESSAGES = (
 )
 
 
+def is_share_level_message(text: object) -> bool:
+    """
+    判断错误文本是否命中分享级失败特征。
+
+    :param text: 错误文本或异常
+    :return: 命中任一分享级片段时返回 True
+    """
+    value = str(text or "")
+    return any(token in value for token in _SHARE_LEVEL_MESSAGES)
+
+
 def is_share_level_error(error: BaseException) -> bool:
     """
     判断异常是否说明分享本身不可用，可据此把分享加入黑名单。
@@ -173,7 +184,7 @@ def is_share_level_error(error: BaseException) -> bool:
                 return True
         current = current.__cause__ or current.__context__
     if not classified:
-        return any(token in str(error) for token in _SHARE_LEVEL_MESSAGES)
+        return is_share_level_message(error)
     return False
 
 
