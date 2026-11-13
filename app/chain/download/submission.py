@@ -18,6 +18,7 @@ from app.application.directory import (
     validate_download_save_path,
 )
 from app.application.download.admission import SubscriptionDownloadGovernance, subscription_download_label
+from app.application.netdisk.settings import enabled_platforms
 
 # 站点资源包在启动时加载，静态检查环境可能无法解析其实现。
 from app.application.site.sites import SitesHelper  # pylint: disable=import-error,no-name-in-module
@@ -39,6 +40,7 @@ from app.domain.context import (
     TorrentInfo,
 )
 from app.domain.meta.metabase import MetaBase
+from app.domain.netdisk import normalize_platform
 from app.runtime.cache import FileCache
 from app.runtime.events import eventmanager
 from app.runtime.log import logger
@@ -690,6 +692,12 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
         torrent, media, meta = context.torrent_info, context.media_info, context.meta_info
         if torrent is None or media is None or meta is None:
             return None, "下载上下文缺少媒体、元数据或种子信息"
+        is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
+        if is_netdisk:
+            # 禁用平台在准备阶段直接拒绝：不写失败冷却，后续不会因冷却到期而重试或换源重投。
+            platform = normalize_platform(getattr(torrent, "netdisk_platform", None))
+            if platform is not None and platform not in enabled_platforms():
+                return None, f"网盘平台已禁用：{platform.value}"
         site_downloader = torrent.site_downloader
         supplemented_media = MediaChain().supplement_tmdb_info(media, meta)
         if not isinstance(supplemented_media, (MediaInfo, MusicInfo)):
@@ -717,7 +725,6 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             nonlocal download_error
             download_error = error_msg
 
-        is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
         if is_netdisk:
             # 网盘候选的 enclosure 是分享链接而不是种子，跳过抓取与种子解析。
             torrent_content = torrent.enclosure or ""

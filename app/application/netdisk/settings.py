@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from app.application.configuration import get_configured_system_config
 from app.application.netdisk.contract import NetdiskTuning
+from app.domain.netdisk import NetdiskPlatform, normalize_platform
 from app.schemas.types import SystemConfigKey
 
 # 参数边界：线程数允许到 512，其余参数按服务端资源与风控保守收敛。
@@ -58,6 +59,31 @@ def _flag(value: Any, default: bool) -> bool:
     if text in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def enabled_platforms() -> frozenset[NetdiskPlatform]:
+    """
+    读取当前启用的网盘平台集合。
+
+    配置键缺失时返回全部已支持平台；配置为空列表时返回空集合，表示全部禁用。
+
+    :return: 启用平台集合
+    """
+    raw = get_configured_system_config().get(SystemConfigKey.NetdiskEnabledPlatforms)
+    if raw is None:
+        return frozenset(NetdiskPlatform)
+    if isinstance(raw, str):
+        items: list[Any] = [raw]
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        items = list(raw)
+    else:
+        return frozenset(NetdiskPlatform)
+    enabled: set[NetdiskPlatform] = set()
+    for item in items:
+        platform = normalize_platform(item)
+        if platform is not None:
+            enabled.add(platform)
+    return frozenset(enabled)
 
 
 class SystemNetdiskSettings:

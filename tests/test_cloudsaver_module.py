@@ -4,6 +4,7 @@
 
 import asyncio
 import time
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -1548,3 +1549,55 @@ def test_non_quark_cached_detail_skips_repeated_walk(monkeypatch: pytest.MonkeyP
     assert first and second
     assert len(calls) == 1
     assert second[0].size == 400 * 1024 * 1024
+
+
+def _patch_enabled_platforms(monkeypatch: pytest.MonkeyPatch, platforms: Optional[List[str]]) -> None:
+    """
+    把网盘平台启用集合替换为固定配置。
+
+    :param monkeypatch: pytest 补丁工具
+    :param platforms: `NetdiskEnabledPlatforms` 的配置值
+    """
+    from app.application.netdisk import settings as netdisk_settings
+    from app.schemas.types import SystemConfigKey
+
+    def _get(key: SystemConfigKey) -> Any:
+        """
+        按配置键返回平台启用值。
+
+        :param key: 配置键
+        :return: 仅对平台启用键返回配置值
+        """
+        return platforms if key == SystemConfigKey.NetdiskEnabledPlatforms else None
+
+    monkeypatch.setattr(
+        netdisk_settings,
+        "get_configured_system_config",
+        lambda: SimpleNamespace(get=_get),
+    )
+
+
+def test_search_drops_disabled_platforms(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    未启用平台的分享不进入候选，启用平台保留且只对保留项做有效性校验。
+    """
+    _patch_enabled_platforms(monkeypatch, ["quark"])
+    server = FakeCloudSaverServer()
+    server.search_results = [(200, make_payload([
+        {
+            "title": "多平台资源",
+            "content": "简介",
+            "cloudType": "quark",
+            "cloudLinks": [
+                {"link": "https://pan.quark.cn/s/enabledshare", "cloudType": "quark"},
+                {"link": "https://115.com/s/disabledshare", "cloudType": "pan115"},
+            ],
+        },
+    ]))]
+    install_server(monkeypatch, server)
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
+
+    assert results is not None
+    assert [item.netdisk_platform for item in results] == ["quark"]
+    assert len(FakeWalk.calls) == 1

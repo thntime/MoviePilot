@@ -492,6 +492,8 @@ class SystemConfigKey(Enum):
     NetdiskProbeBudgetSeconds = "NetdiskProbeBudgetSeconds"
     # 网盘单次搜索最多检查候选数
     NetdiskProbeLimit = "NetdiskProbeLimit"
+    # 网盘平台启用集合：未配置表示全部启用，空列表表示全部禁用
+    NetdiskEnabledPlatforms = "NetdiskEnabledPlatforms"
     # 订阅默认过滤规则组
     SubscribeFilterRuleGroups = "SubscribeFilterRuleGroups"
     # 补全搜索策略：smart 默认、full 全量、single_page 仅第一页；洗版始终全量

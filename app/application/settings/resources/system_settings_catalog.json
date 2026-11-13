@@ -1498,6 +1498,11 @@
       "enum_name": "NetdiskDownloadThreads",
       "source_file": "app/schemas/types.py"
     },
+    "NetdiskEnabledPlatforms": {
+      "description": "网盘平台启用集合：未配置表示全部启用，空列表表示全部禁用",
+      "enum_name": "NetdiskEnabledPlatforms",
+      "source_file": "app/schemas/types.py"
+    },
     "NetdiskLinkRefreshSeconds": {
       "description": "网盘直链刷新节流（秒）",
       "enum_name": "NetdiskLinkRefreshSeconds",

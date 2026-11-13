@@ -67,6 +67,24 @@ def _platform_supported(platform: str) -> bool:
     return normalize_platform(platform) is not None
 
 
+def _platform_enabled(platform: str) -> bool:
+    """
+    判断平台是否在系统设置启用的网盘平台集合中。
+
+    无法归一的平台不参与开关判断，交由 `_platform_supported` 决定去留。
+
+    :param platform: 平台标识
+    :return: 需要保留返回 True
+    """
+    from app.application.netdisk.settings import enabled_platforms
+    from app.domain.netdisk import normalize_platform
+
+    normalized = normalize_platform(platform)
+    if normalized is None:
+        return True
+    return normalized in enabled_platforms()
+
+
 # 集数标记只统计视频文件，避免字幕/图片把候选标题改错。
 _VIDEO_SUFFIXES = {
     ".mp4", ".mkv", ".avi", ".ts", ".mov", ".flv", ".wmv", ".m4v", ".rmvb", ".webm", ".mpg", ".mpeg",
@@ -249,7 +267,7 @@ class CloudSaverModule(_ModuleBase):
                 if not url:
                     continue
                 platform = self._as_text(link.get("platform"))
-                if not _platform_supported(platform):
+                if not _platform_supported(platform) or not _platform_enabled(platform):
                     continue
                 # 同一分享可能以不同链接形式重复出现，按分享码去重；没有可解析分享码的链接
                 # （如天翼云盘的 code 在查询串里）保留完整链接，避免不同分享被合并。

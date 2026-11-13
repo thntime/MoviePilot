@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 from app.application.configuration import get_configured_system_config
+from app.application.netdisk.settings import enabled_platforms
 from app.application.subscription.activity import current_activity_run
 from app.application.torrent.download import TorrentHelper
 from app.chain.media import MediaChain
@@ -17,6 +18,7 @@ from app.domain.meta.metabase import MetaBase
 from app.domain.meta.metamusic import MetaMusic
 from app.domain.metainfo import MetaInfo
 from app.domain.music import MusicMatch, match_music_resource
+from app.domain.netdisk import normalize_platform
 from app.domain.search import SearchResourceEvidence, search_resource_id
 from app.runtime.log import logger
 from app.runtime.progress import ProgressHelper
@@ -43,6 +45,26 @@ class MatchedTorrent:
     meta: MetaBase
     source: str
     music_match: Optional[MusicMatch] = None
+
+
+def _filter_disabled_netdisk(torrents: List[TorrentInfo]) -> List[TorrentInfo]:
+    """
+    丢弃未启用平台的网盘候选。
+
+    只处理已标注且可归一化的网盘平台；PT 候选与未标注平台的候选原样保留。
+
+    :param torrents: 待过滤的资源列表
+    :return: 保留的资源列表
+    """
+    enabled = enabled_platforms()
+    kept: List[TorrentInfo] = []
+    for torrent in torrents:
+        if torrent.download_type == "netdisk" and torrent.netdisk_platform:
+            platform = normalize_platform(torrent.netdisk_platform)
+            if platform is not None and platform not in enabled:
+                continue
+        kept.append(torrent)
+    return kept
 
 
 def _site_torrents(torrents: List[TorrentInfo]) -> Dict[SiteKey, List[TorrentInfo]]:
@@ -470,7 +492,7 @@ class SearchResultOwner(_SearchOwnerBase):
             logger.warning(f"{keyword or mediainfo.title} 未搜索到资源")
             return []
 
-        source_torrents = [copy.copy(torrent) for torrent in torrents]
+        source_torrents = _filter_disabled_netdisk([copy.copy(torrent) for torrent in torrents])
         counts = diagnostics if diagnostics is not None else Counter()
         effective_rules = rule_groups
         if effective_rules is None:

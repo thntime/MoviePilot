@@ -48,7 +48,7 @@ class DownloaderTorrent(BaseModel):
     account_id: Optional[int] = Field(default=None, description="网盘取链使用的账号主键")
     strategy: Optional[str] = Field(default=None, description="网盘取链策略：transfer、direct 或 direct_fallback")
     capacity_error: Optional[str] = Field(default=None, description="容量不足导致的失败原因")
-    paused_reason: Optional[str] = Field(default=None, description="网盘任务暂停原因：shutdown、user 或 unrecoverable")
+    paused_reason: Optional[str] = Field(default=None, description="网盘任务暂停原因：shutdown、user、platform_disabled 或 unrecoverable")
     paused_at: Optional[str] = Field(default=None, description="网盘任务暂停时间，ISO8601 字符串")
     partial: bool = Field(default=False, description="网盘任务是否部分完成")
     warning: Optional[str] = Field(default=None, description="部分完成的提示文本")

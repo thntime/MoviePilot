@@ -478,6 +478,12 @@ SYSTEMCONFIG_CONTRACTS: dict[SystemConfigKey, _SystemConfigContract] = {
         unit="条",
         examples=(200,),
     ),
+    SystemConfigKey.NetdiskEnabledPlatforms: _contract(
+        "netdisk",
+        Optional[list[str]],
+        operations=_LIST_SCALAR_OPERATIONS,
+        examples=(["quark", "pan115"],),
+    ),
     SystemConfigKey.SearchFilterRuleGroups: _contract(
         "filter_defaults",
         Optional[list[str]],

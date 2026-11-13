@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional, cast
 from uuid import uuid4
 
 from app.application.configuration import get_configured_system_config
+from app.application.netdisk.settings import enabled_platforms
 from app.application.subscription.activity import current_activity_run, subscription_activity_scope
 from app.application.subscription.contract import (
     SubscriptionRepository,
@@ -60,6 +61,7 @@ from app.domain.context import (
     MusicInfo,
 )
 from app.domain.meta.metabase import MetaBase
+from app.domain.netdisk import NetdiskPlatform, normalize_platform
 from app.runtime.execution import await_task_to_terminal
 from app.runtime.log import logger
 from app.runtime.stop import runtime_stop_state
@@ -128,6 +130,29 @@ def _best_version_target_episodes(
     start_episode = subscribe.start_episode or 1
     total_episode = subscribe.total_episode or 0
     return set(range(start_episode, total_episode + 1)) if total_episode >= start_episode else set()
+
+
+def _netdisk_platform_allowed(
+    torrent_info: Any,
+    enabled: frozenset[NetdiskPlatform],
+) -> bool:
+    """
+    判断候选是否来自当前启用的网盘平台。
+
+    种子候选与平台无法识别的网盘候选不在订阅侧排除，避免误伤无法归类的资源。
+
+    :param torrent_info: 候选资源信息
+    :param enabled: 当前启用的网盘平台集合
+    :return: 允许参与订阅匹配时返回 True
+    """
+    is_netdisk = (
+        getattr(torrent_info, "download_type", "torrent") == "netdisk"
+        or bool(getattr(torrent_info, "netdisk_platform", None))
+    )
+    if not is_netdisk:
+        return True
+    platform = normalize_platform(getattr(torrent_info, "netdisk_platform", None))
+    return platform is None or platform in enabled
 
 
 def _build_subscription_candidate_filter(
@@ -1119,10 +1144,11 @@ class SubscribeSearchOwner(_SubscribeSearchQueueOwner):
         apply_best_version: bool = True,
     ) -> list[Any]:
         """
-        过滤不满足订阅范围或洗版优先级的候选，并释放原结果列表。
+        过滤已停用网盘平台、不满足订阅范围或洗版优先级的候选，并释放原结果列表。
         """
         matched = []
         activity = current_activity_run()
+        enabled = enabled_platforms()
         try:
             for context in contexts:
                 if activity:
@@ -1133,6 +1159,9 @@ class SubscribeSearchOwner(_SubscribeSearchQueueOwner):
                 torrent_info = context.torrent_info
                 media = context.media_info
                 if getattr(context, "match_status", None) == "candidate" or media is None:
+                    continue
+                if not _netdisk_platform_allowed(torrent_info, enabled):
+                    logger.debug(f"{subscribe.name} 已停用该网盘平台，{torrent_info.title} 不参与订阅匹配")
                     continue
                 if isinstance(media, MusicInfo) and subscribe.best_version:
                     torrent_info.pri_order = torrent_info.pri_order or torrent_meta.audio_quality_score

@@ -27,6 +27,7 @@ from app.application.netdisk.batch_judge import BatchDecision, judge_batch
 from app.application.netdisk.files import NetdiskFilesService
 from app.application.netdisk.registry import find_adapter
 from app.application.netdisk.resolve import NetdiskResolveService
+from app.application.netdisk.settings import enabled_platforms
 from app.application.netdisk.share_blacklist import get_share_blacklist
 from app.domain.episode import episode_numbers, is_special_name
 from app.domain.netdisk import (
@@ -160,6 +161,30 @@ def _utc_now_iso() -> str:
     :return: ISO8601 时间字符串
     """
     return datetime.now(timezone.utc).isoformat()
+
+
+def _platform_enabled(platform: NetdiskPlatform) -> bool:
+    """
+    判断平台是否仍在系统设置的启用范围内。
+
+    :param platform: 网盘平台
+    :return: 平台已启用返回 True
+    """
+    return platform in enabled_platforms()
+
+
+def _pause_for_disabled_platform(task_hash: str, platform: NetdiskPlatform) -> None:
+    """
+    把禁用平台的残留任务标记为暂停，并写入可识别的原因。
+
+    :param task_hash: 任务标识
+    :param platform: 已被禁用的网盘平台
+    """
+    store.upsert_task(task_hash, {
+        "state": "paused", "error": f"网盘平台已禁用：{platform.value}",
+        "paused_reason": "platform_disabled", "paused_at": _utc_now_iso(),
+        "dlspeed": None, "dlspeed_bytes": 0,
+    })
 
 
 def _is_completed_file(target: Path, expected: int) -> bool:
@@ -487,6 +512,12 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             task_hash = _as_text(record.get("hash"))
             if not task_hash or task_hash in self._tasks:
                 continue
+            platform = normalize_platform(record.get("netdisk_platform"))
+            if platform is not None and not _platform_enabled(platform):
+                # 平台已被禁用：启动时不恢复，改为带原因的暂停，等待用户重新启用后再手动重试。
+                _pause_for_disabled_platform(task_hash, platform)
+                logger.info(f"网盘平台已禁用，启动时不恢复任务：{task_hash}")
+                continue
             if self._resume_task(task_hash, record):
                 continue
             store.upsert_task(task_hash, {
@@ -696,6 +727,9 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             platform = ref.platform
         if platform != ref.platform:
             return None, None, None, "分享链接与候选平台不一致"
+        if not _platform_enabled(platform):
+            # 禁用平台在入口直接拒绝，不登记任务也不建目录，避免任何重试路径再拉起。
+            return None, None, None, f"网盘平台已禁用：{platform.value}"
         if selection.is_platform_cooled(platform):
             remaining = selection.platform_cooldown_remaining(platform)
             return None, None, None, f"{platform.value} 平台容量冷却中，约 {int(remaining)} 秒后重试"
@@ -844,6 +878,8 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         platform = normalize_platform(getattr(record, "platform", None))
         if platform is None:
             return None, None, None, "未知的网盘平台"
+        if not _platform_enabled(platform):
+            return None, None, None, f"网盘平台已禁用：{platform.value}"
         config = self._select_config(downloader)
         if config is None:
             return None, None, None, "未配置网盘下载器实例"
@@ -2504,6 +2540,11 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             platform = normalize_platform(record.get("netdisk_platform"))
             download_dir = _as_text(record.get("path"))
             if not share_code or not share_url or platform is None or not download_dir:
+                continue
+            if not _platform_enabled(platform):
+                # 禁用平台不再恢复：任务保持暂停并写明原因，避免手动重试再次拉起。
+                _pause_for_disabled_platform(task_hash, platform)
+                logger.info(f"网盘平台已禁用，跳过恢复任务：{task_hash}")
                 continue
             with self._lock:
                 if task_hash in self._tasks:
