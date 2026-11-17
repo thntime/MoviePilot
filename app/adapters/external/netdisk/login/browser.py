@@ -19,8 +19,7 @@ from urllib.parse import urlsplit
 
 from app.adapters.external.netdisk.login.vnc import vnc_bridge
 from app.adapters.network.browser import BrowserSessionHelper, _BrowserSessionState
-from app.domain.netdisk import LoginResult, LoginSession
-from app.domain.netdisk import NetdiskError, NetdiskErrorCode, NetdiskPlatform
+from app.domain.netdisk import LoginResult, LoginSession, NetdiskError, NetdiskErrorCode, NetdiskPlatform
 from app.runtime.log import logger
 
 # 平台 Cookie 域名后缀，用于从浏览器上下文筛出登录态。
@@ -675,7 +674,6 @@ class BrowserQrLoginAdapter:
         session_id = uuid.uuid4().hex
         session_key = f"netdisk-qr-{session_id}"
         # 所有网页登录都使用真实有头浏览器 + noVNC，让用户用真实鼠标操作验证码。
-        use_vnc = True
         helper = self._vnc_helper
         vnc_bridge().acquire(session_id)
         try:

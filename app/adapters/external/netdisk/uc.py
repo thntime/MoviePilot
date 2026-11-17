@@ -12,8 +12,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
 
-from app.adapters.network.http import RequestUtils
-from app.runtime.log import logger
 from app.adapters.external.netdisk.base import (
     BaseNetdiskAdapter,
     NetdiskHttp,
@@ -21,7 +19,7 @@ from app.adapters.external.netdisk.base import (
     as_text,
     cookie_header,
 )
-from app.domain.netdisk import NetdiskAccountRecord
+from app.adapters.network.http import RequestUtils
 from app.domain.netdisk import (
     AccountProbe,
     DirectLink,
@@ -30,6 +28,7 @@ from app.domain.netdisk import (
     DriveQuota,
     DriveShare,
     LinkPolicy,
+    NetdiskAccountRecord,
     NetdiskError,
     NetdiskErrorCode,
     NetdiskPlatform,
@@ -38,6 +37,7 @@ from app.domain.netdisk import (
     ShareRef,
     TransferHandle,
 )
+from app.runtime.log import logger
 
 UC_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

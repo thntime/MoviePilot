@@ -7,8 +7,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from app.application.netdisk import registry
 from app.domain.netdisk import (
     DirectLink,

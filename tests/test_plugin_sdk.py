@@ -21,12 +21,12 @@ from app.sdk.media import (
     set_custom_separator,
 )
 from app.sdk.network import RequestUtils, RssHelper, SitesHelper
+
 # 惰性导出，静态分析不可见。
 from app.sdk.plugin import ModuleManager, PluginChain, PluginManager, _PluginBase  # pylint: disable=no-name-in-module
 from app.sdk.services import NotificationHelper
 from app.sdk.utilities import StringUtils as UtilityStringUtils
 from app.sdk.utilities import convert, decrypt, encrypt
-
 
 PROJECT_ROOT = Path(__file__).parents[1]
 
@@ -46,21 +46,24 @@ def test_sdk_exports_canonical_plugin_interfaces():
     LegacyDomainStringUtils = importlib.import_module(
         "app.domain.string"
     ).StringUtils
+    from app.adapters.network.http import RequestUtils as CanonicalRequestUtils
+    from app.application.notification import NotificationHelper as CanonicalNotificationHelper
+    from app.application.rss import RssHelper as CanonicalRssHelper
+
+    # 此用例覆盖运行时惰性导出，静态检查无法解析该公开入口。
+    from app.application.site.sites import (
+        SitesHelper as CanonicalSitesHelper,  # pylint: disable=import-error,no-name-in-module
+    )
     from app.foundation.crypto import CryptoJsUtils
     from app.foundation.text import convert as canonical_convert
-    from app.runtime.extensions.module.manager import ModuleManager as CanonicalModuleManager
-    from app.runtime.extensions.plugin.manager import PluginManager as CanonicalPluginManager
-    from app.adapters.network.http import RequestUtils as CanonicalRequestUtils
-    from app.application.rss import RssHelper as CanonicalRssHelper
-    # 此用例覆盖运行时惰性导出，静态检查无法解析该公开入口。
-    from app.application.site.sites import SitesHelper as CanonicalSitesHelper  # pylint: disable=import-error,no-name-in-module
     from app.runtime.cache import Cache as CanonicalCache
     from app.runtime.cache import cached as canonical_cached
     from app.runtime.config import settings as canonical_settings
     from app.runtime.events import Event as CanonicalEvent
     from app.runtime.events import eventmanager as canonical_eventmanager
+    from app.runtime.extensions.module.manager import ModuleManager as CanonicalModuleManager
+    from app.runtime.extensions.plugin.manager import PluginManager as CanonicalPluginManager
     from app.runtime.log import logger as canonical_logger
-    from app.application.notification import NotificationHelper as CanonicalNotificationHelper
 
     assert Cache is CanonicalCache
     assert cached is canonical_cached
@@ -192,8 +195,8 @@ def test_browser_sdk_delegates_sync_and_async_launch(monkeypatch):
     """
     SDK 只转发浏览器参数，不复制宿主生命周期实现。
     """
-    from app.sdk import browser as browser_sdk
     from app.adapters.network import browser as browser_adapter
+    from app.sdk import browser as browser_sdk
 
     sync_context = object()
     async_context = object()

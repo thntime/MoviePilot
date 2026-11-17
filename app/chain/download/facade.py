@@ -8,9 +8,9 @@ from typing import Any, TypeVar
 from app.chain.download.batch import DownloadBatchOwner
 from app.chain.download.existence import DownloadExistenceOwner
 from app.chain.download.failure import DownloadFailureOwner
-from app.chain.download.reconcile import DownloadFailureReconcileOwner
 from app.chain.download.history import DownloadHistoryOwner
 from app.chain.download.processing import DownloadProcessingOwner
+from app.chain.download.reconcile import DownloadFailureReconcileOwner
 from app.chain.download.selection import DownloadSelectionOwner
 from app.chain.download.submission import DownloadSubmissionOwner
 from app.chain.download.subtitle import DownloadSubtitleOwner

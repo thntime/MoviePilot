@@ -10,9 +10,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import app.chain.download.local_existing as local_existing
 from app.application.netdisk import selection
 from app.application.netdisk.existing import ExistingHit
-import app.chain.download.local_existing as local_existing
 from app.chain.download.local_existing import LocalExistingHit
 from app.chain.download.reconcile import DownloadFailureReconcileOwner
 from app.chain.subscribe.completion import SubscribeCompletionOwner
@@ -81,7 +81,6 @@ def test_is_download_file_transferred_requires_deleted_state() -> None:
     """
     只有下载文件记录被标记删除后才视为已整理。
     """
-    torrent = SimpleNamespace(netdisk_platform=None)
     chain = _ReconcileChain([], None)
     chain.download_history_repository = SimpleNamespace(
         get_file_by_fullpath=lambda path: SimpleNamespace(state=0 if path == "done" else 1)

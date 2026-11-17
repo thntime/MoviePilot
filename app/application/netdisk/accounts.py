@@ -25,7 +25,6 @@ from app.domain.netdisk import (
     NetdiskError,
     NetdiskErrorCode,
     NetdiskPlatform,
-    mask_credential,
     normalize_platform,
 )
 from app.runtime.log import logger

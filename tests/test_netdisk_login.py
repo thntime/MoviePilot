@@ -377,6 +377,7 @@ def test_qr_capture_crops_to_qr_element() -> None:
     二维码元素足够大时应截取元素本身，而不是整页。
     """
     from types import SimpleNamespace
+
     from app.adapters.external.netdisk.login.browser import BrowserQrLoginAdapter
 
     page = _FakeQrPage({"width": 220, "height": 220})
@@ -396,6 +397,7 @@ def test_qr_capture_falls_back_to_full_page() -> None:
     找不到足够大的二维码元素时回退整页截图。
     """
     from types import SimpleNamespace
+
     from app.adapters.external.netdisk.login.browser import BrowserQrLoginAdapter
 
     page = _FakeQrPage({"width": 20, "height": 20})
@@ -492,6 +494,7 @@ def test_quark_qr_login_navigates_to_drive_for_puus() -> None:
     夸克扫码后停留在登录页时，读取 Cookie 应进入网盘页触发 __puus 下发。
     """
     from types import SimpleNamespace
+
     from app.adapters.external.netdisk.login.browser import BrowserQrLoginAdapter
     from app.domain.netdisk import NetdiskPlatform
 
@@ -577,6 +580,7 @@ def test_baidu_cookie_header_keeps_duplicate_names_like_yunx() -> None:
     百度原样拼接全部 .baidu.com Cookie（含同名），与 yunx 的采集方式一致。
     """
     from types import SimpleNamespace
+
     from app.adapters.external.netdisk.login.browser import BrowserQrLoginAdapter
     from app.domain.netdisk import NetdiskPlatform
 

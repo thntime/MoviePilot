@@ -4,9 +4,9 @@
 
 from unittest.mock import Mock
 
+from app.application.security.url import SecurityUtils
 from app.chain.mediaserver import MediaServerChain
 from app.schemas.mediaserver import MediaServerLibrary, MediaServerPlayItem
-from app.application.security.url import SecurityUtils
 
 
 def _build_chain(result):

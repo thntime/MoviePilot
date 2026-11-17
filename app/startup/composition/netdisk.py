@@ -21,6 +21,8 @@ def configure_netdisk_composition() -> None:
     """
     装配网盘适配器、账号仓储、参数、Cookie 导入与扫码登录端口。
     """
+    from typing import Mapping, Optional, cast
+
     from app.adapters.external.netdisk.baidu import BaiduAdapter
     from app.adapters.external.netdisk.c139 import C139Adapter
     from app.adapters.external.netdisk.guangya import GuangYaAdapter
@@ -34,12 +36,9 @@ def configure_netdisk_composition() -> None:
     from app.adapters.external.netdisk.xunlei import XunleiAdapter
     from app.adapters.system.netdisk_speed import JsonNetdiskSpeedStore
     from app.application.configuration import get_token_runtime_config
+    from app.application.netdisk.contract import NetdiskAdapter
     from app.db.adapters.netdiskaccount import TransactionalNetdiskAccountRepository
     from app.db.session import SessionFactory
-
-    from typing import Mapping, Optional, cast
-
-    from app.application.netdisk.contract import NetdiskAdapter
     from app.domain.netdisk import NetdiskAccountRecord, NetdiskPlatform
 
     adapters = {

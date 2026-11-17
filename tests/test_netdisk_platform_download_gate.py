@@ -12,9 +12,9 @@ import app.chain.download.submission as download_submission
 import app.modules.netdisk as netdisk_module
 from app.chain.download import DownloadChain
 from app.domain.context import Context, MediaInfo, TorrentInfo
-from app.schemas.context import MetaInfo
 from app.domain.netdisk import DriveFile, NetdiskPlatform
 from app.modules.netdisk import NetdiskModule, store
+from app.schemas.context import MetaInfo
 from app.schemas.types import MediaType
 
 

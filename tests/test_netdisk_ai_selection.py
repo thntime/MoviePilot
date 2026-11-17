@@ -8,12 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.domain.netdisk import ShareFile
-
 from app.application.netdisk.ai_selection import (
     ShareSelectionResult,
     select_share_files,
 )
+from app.domain.netdisk import ShareFile
 
 
 class _FakePromptManager:

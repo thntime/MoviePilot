@@ -23,7 +23,6 @@ from app.adapters.external.netdisk.base import (
     as_text,
     cookie_header,
 )
-from app.domain.netdisk import NetdiskAccountRecord
 from app.domain.netdisk import (
     AccountProbe,
     DirectLink,
@@ -32,6 +31,7 @@ from app.domain.netdisk import (
     DriveQuota,
     DriveShare,
     LinkPolicy,
+    NetdiskAccountRecord,
     NetdiskError,
     NetdiskErrorCode,
     NetdiskPlatform,
@@ -892,7 +892,7 @@ class BaiduAdapter(BaseNetdiskAdapter):
                 "百度网盘必须转存后才能取链",
                 platform=self.platform,
             )
-        cookie = self._require_cookie(account)
+        self._require_cookie(account)
         assert account is not None
         self._ensure_space(file, account)
         sekey = self._secret(ref, account)

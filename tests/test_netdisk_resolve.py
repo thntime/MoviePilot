@@ -25,7 +25,6 @@ from app.domain.netdisk import (
     NetdiskPlatform,
     ShareDetail,
     ShareFile,
-    ShareRef,
     TransferHandle,
 )
 

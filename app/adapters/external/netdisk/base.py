@@ -14,11 +14,6 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from app.adapters.network.http import RequestUtils
-
-# 网盘业务 API 均为国内直连域名；宿主代理常按域名分流，某些域名（如 yun.123pan.cn）
-# 经代理会直接失败。这里显式关闭代理，避免环境变量 HTTPS_PROXY 干扰取链与登录校验。
-_DIRECT_PROXIES = {"http": "", "https": ""}
-from app.domain.netdisk import NetdiskAccountRecord
 from app.domain.netdisk import (
     AccountProbe,
     DirectLink,
@@ -27,6 +22,7 @@ from app.domain.netdisk import (
     DriveQuota,
     DriveShare,
     LinkPolicy,
+    NetdiskAccountRecord,
     NetdiskError,
     NetdiskErrorCode,
     NetdiskPlatform,
@@ -37,6 +33,10 @@ from app.domain.netdisk import (
     parse_share_link,
 )
 from app.runtime.log import logger
+
+# 网盘业务 API 均为国内直连域名；宿主代理常按域名分流，某些域名（如 yun.123pan.cn）
+# 经代理会直接失败。这里显式关闭代理，避免环境变量 HTTPS_PROXY 干扰取链与登录校验。
+_DIRECT_PROXIES = {"http": "", "https": ""}
 
 
 def as_text(value: Any) -> str:

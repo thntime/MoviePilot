@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Callable, Collection, Optional, Sequence, TypeVar
+from typing import Callable, Collection, Optional, TypeVar
 
 from app.application.netdisk import registry, selection
 from app.application.netdisk.accounts import NetdiskAccountService

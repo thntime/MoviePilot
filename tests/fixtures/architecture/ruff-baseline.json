@@ -56,9 +56,6 @@
   "scripts/perf/task_registry_ab.py": {
     "E402": 1
   },
-  "tests/test_agent_session_status.py": {
-    "I001": 1
-  },
   "tests/test_database_migration_startup.py": {
     "F841": 1
   },
@@ -68,12 +65,6 @@
   "tests/test_episode_format_helper.py": {
     "F841": 1
   },
-  "tests/test_feedback_issue_repository_routing.py": {
-    "I001": 1
-  },
-  "tests/test_feedback_issue_scripts.py": {
-    "I001": 1
-  },
   "tests/test_interaction_router.py": {
     "E402": 5
   },
@@ -82,18 +73,6 @@
   },
   "tests/test_media_interaction.py": {
     "F841": 1
-  },
-  "tests/test_media_source_signature_compatibility.py": {
-    "I001": 1
-  },
-  "tests/test_mediaserver_image_signing.py": {
-    "I001": 1
-  },
-  "tests/test_message_channel_permissions.py": {
-    "I001": 1
-  },
-  "tests/test_plugin_sdk.py": {
-    "I001": 3
   },
   "tests/test_plugin_virtual_instances.py": {
     "E731": 1

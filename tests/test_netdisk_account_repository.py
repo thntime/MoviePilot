@@ -7,8 +7,8 @@ import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.application.netdisk.credentials import FernetCredentialCipher
 from app.application.netdisk.contract import NetdiskAccountWrite
+from app.application.netdisk.credentials import FernetCredentialCipher
 from app.db.adapters.netdiskaccount import TransactionalNetdiskAccountRepository
 from app.db.base import Base
 from app.db.models.netdiskaccount import NetdiskAccount

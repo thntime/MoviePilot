@@ -9,7 +9,6 @@ from app.chain.search import SearchChain
 from app.chain.subscribe.facade import SubscribeChain
 from app.chain.transfer.facade import TransferChain
 
-
 LEGACY_MEDIA_ID_PARAMETERS = {
     "tmdbid",
     "doubanid",

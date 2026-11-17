@@ -6,8 +6,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from app.modules.feishu.feishu import Feishu
 from app.modules.discord import DiscordModule
+from app.modules.feishu.feishu import Feishu
 from app.modules.qqbot.module import QQBotModule
 from app.modules.slack import SlackModule
 from app.modules.synologychat import SynologyChatModule

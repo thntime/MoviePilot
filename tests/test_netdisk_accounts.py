@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from app.adapters.external.netdisk.base import BaseNetdiskAdapter
 from app.application.netdisk import registry
 from app.application.netdisk.accounts import NetdiskAccountService, mask_credential, parse_cookie_header
 from app.application.netdisk.contract import (
@@ -15,7 +16,6 @@ from app.application.netdisk.contract import (
     NetdiskAccountWrite,
     NetdiskTuning,
 )
-from app.adapters.external.netdisk.base import BaseNetdiskAdapter
 from app.domain.netdisk import (
     AccountProbe,
     DriveCapabilities,

@@ -14,7 +14,6 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Mapping, Optional
 
-
 # 可入库的视频文件后缀；网盘与本地已有文件检查共用同一判定。
 _VIDEO_SUFFIXES = frozenset({
     "mp4", "mkv", "avi", "ts", "m2ts", "mov", "flv", "wmv", "webm",

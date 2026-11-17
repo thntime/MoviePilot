@@ -29,7 +29,6 @@ from app.domain.netdisk import (
     mask_credential,
 )
 
-
 T = TypeVar("T")
 
 

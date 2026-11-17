@@ -68,6 +68,7 @@ def test_start_qr_returns_vnc_path_for_139(monkeypatch) -> None:
     139 启动扫码会话时返回 noVNC 路径。
     """
     import asyncio
+
     from app.api.endpoints import netdisk as netdisk_module
     from app.domain.netdisk import LoginSession, NetdiskPlatform
     from app.schemas.netdisk import NetdiskQrStartRequest
@@ -105,6 +106,7 @@ def test_start_qr_returns_vnc_path_for_other_platforms(monkeypatch) -> None:
     所有网页登录平台都返回 noVNC 路径。
     """
     import asyncio
+
     from app.api.endpoints import netdisk as netdisk_module
     from app.domain.netdisk import LoginSession, NetdiskPlatform
     from app.schemas.netdisk import NetdiskQrStartRequest

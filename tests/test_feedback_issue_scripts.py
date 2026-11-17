@@ -18,7 +18,6 @@ from app.agent.tools.factory import MoviePilotToolFactory
 from app.agent.tools.impl.ask_user_choice import AskUserChoiceInput
 from app.runtime.config import settings
 
-
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "skills" / "feedback-issue" / "scripts"
 # 只在导入脚本时添加搜索路径，避免改变后续测试的模块解析顺序。
 with patch.object(sys, "path", [str(SCRIPT_DIR), *sys.path]):

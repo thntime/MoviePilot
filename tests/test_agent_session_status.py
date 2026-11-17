@@ -8,12 +8,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage
 
-from app.agent.middleware.usage import UsageMiddleware
 from app.agent.manager import AgentManager
+from app.agent.middleware.usage import UsageMiddleware
 from app.chain.message import MessageChain
 from app.schemas.types import NotificationChannel
 

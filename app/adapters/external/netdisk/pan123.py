@@ -21,7 +21,6 @@ from app.adapters.external.netdisk.base import (
     as_int,
     as_text,
 )
-from app.domain.netdisk import NetdiskAccountRecord
 from app.domain.netdisk import (
     AccountProbe,
     DirectLink,
@@ -30,6 +29,7 @@ from app.domain.netdisk import (
     DriveQuota,
     DriveShare,
     LinkPolicy,
+    NetdiskAccountRecord,
     NetdiskError,
     NetdiskErrorCode,
     NetdiskPlatform,

@@ -2,10 +2,7 @@
 订阅候选按网盘平台启用集合排除的回归测试。
 """
 
-from types import SimpleNamespace
 from typing import Any, Optional
-
-import pytest
 
 import app.chain.subscribe.search as subscribe_search
 from app.application.subscription.contract import SubscriptionSnapshot

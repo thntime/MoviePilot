@@ -86,6 +86,7 @@ def test_instance_tuning_clamps_threads_to_platform_cap():
     实例线程数不能突破平台硬上限（迅雷 8），非法限速回落为 0。
     """
     from types import SimpleNamespace
+
     from app.domain.netdisk import NetdiskPlatform
 
     config = SimpleNamespace(config={"threads": 9999, "rate_limit": 1024, "preempt": False, "multi_source": True})
@@ -101,6 +102,7 @@ def test_instance_tuning_keeps_defaults_without_overrides():
     实例没有覆盖项时沿用系统默认值。
     """
     from types import SimpleNamespace
+
     from app.application.netdisk.resolve import NetdiskResolveService
     from app.domain.netdisk import NetdiskPlatform
 

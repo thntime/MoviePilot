@@ -669,7 +669,7 @@ def test_uc_http_404_is_share_invalid() -> None:
     assert uc_module.UC_ERROR_CODES[404][0] is uc_module.NetdiskErrorCode.SHARE_INVALID
 
 
-def test_uc_http_404_is_share_invalid() -> None:
+def test_uc_http_404_maps_to_share_invalid_error() -> None:
     """
     UC 分享被删除时 HTTP 404 应按分享失效处理。
     """

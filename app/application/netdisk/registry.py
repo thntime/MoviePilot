@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import Mapping, Optional
 
-from app.domain.netdisk import NetdiskError, NetdiskErrorCode, NetdiskPlatform
 from app.application.netdisk.contract import (
     CookieImportPort,
     NetdiskAccountStore,
@@ -17,6 +16,7 @@ from app.application.netdisk.contract import (
     NetdiskSettingsPort,
     NetdiskTuning,
 )
+from app.domain.netdisk import NetdiskError, NetdiskErrorCode, NetdiskPlatform
 
 _adapters: dict[NetdiskPlatform, NetdiskAdapter] = {}
 _account_store: Optional[NetdiskAccountStore] = None

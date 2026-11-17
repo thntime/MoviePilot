@@ -14,7 +14,6 @@ import pytest
 
 from app.runtime.config import settings
 
-
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "skills" / "feedback-issue" / "scripts"
 # 只在导入独立 Skill 脚本时扩展搜索路径，避免影响后续测试的模块解析。
 with patch.object(sys, "path", [str(SCRIPT_DIR), *sys.path]):
