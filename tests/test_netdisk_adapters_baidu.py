@@ -498,6 +498,52 @@ def test_baidu_share_surl_strips_leading_one() -> None:
     assert baidu_module._share_surl("") == ""
 
 
+def test_share_detail_overrides_stale_bdclnd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    账号 Cookie 已带其它分享的 BDCLND 时，列目录必须改用当前分享的 randsk。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    responses[("POST", baidu._VERIFY_URL)] = [{"errno": 0, "randsk": "abc%2Bdef%3D"}]
+    responses[("GET", baidu._SHARE_LIST_URL)] = [_list_payload()]
+    account = NetdiskAccountRecord(
+        id=12,
+        platform=NetdiskPlatform.BAIDU,
+        name="百度主号",
+        credential={"cookie": "BDUSS=fake; BDCLND=stale-token"},
+    )
+
+    adapter.share_detail(_ref(), account)
+
+    cookie = calls[1]["headers"]["Cookie"]
+    assert "BDCLND=abc%2Bdef%3D" in cookie
+    assert "BDCLND=stale-token" not in cookie
+
+
+def test_transfer_sends_decoded_sekey(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    转存请求的 sekey 参数使用解码值，Cookie 中的 BDCLND 保留编码值。
+    """
+    adapter, calls, responses = _install(monkeypatch)
+    responses[("GET", baidu._QUOTA_URL)] = [{"errno": 0, "total": 10_000_000, "used": 0}]
+    responses[("POST", baidu._VERIFY_URL)] = [{"errno": 0, "randsk": "abc%2Bdef%3D"}]
+    responses[("GET", baidu._SHARE_LIST_URL)] = [_list_payload()]
+    responses[("GET", baidu._TEMPLATE_URL)] = [{"errno": 0, "result": {"bdstoken": "tok-1"}}]
+    responses[("POST", baidu._CREATE_URL)] = [{"errno": 0}]
+    responses[("POST", baidu._TRANSFER_URL)] = [
+        {"errno": 0, "extra": {"list": [{"to_fs_id": 777, "to": "/tmp/a.mkv"}]}}
+    ]
+    responses[("POST", baidu._LOCATE_URL)] = [
+        {"errno": 0, "urls": [{"url": "https://appall01.baidupcs.com/plain", "encrypt": 0}]}
+    ]
+    responses[("POST", baidu._DELETE_URL)] = [{"errno": 0}]
+
+    adapter.resolve(_ref(), _file(), _account())
+
+    transfer = next(call for call in calls if call["url"] == baidu._TRANSFER_URL)
+    assert transfer["params"]["sekey"] == "abc+def="
+    assert "BDCLND=abc%2Bdef%3D" in transfer["headers"]["Cookie"]
+
+
 def test_baidu_share_errors_are_share_invalid() -> None:
     """
     分享取消与提取码错误在搜索阶段按分享失效处理，避免保留为未验证。

@@ -15,6 +15,7 @@ import json
 import time
 import uuid
 from typing import Any, Mapping, Optional, Sequence
+from urllib.parse import unquote
 
 from app.adapters.external.netdisk.base import (
     BaseNetdiskAdapter,
@@ -69,6 +70,8 @@ def _share_surl(share_id: str) -> str:
     """
     text = str(share_id or "")
     return text[1:] if text.startswith("1") else text
+
+
 # 账号信息（登录态与昵称）：xpan 接口只认 BDUSS，网页模板接口在部分会话下会返回 -6。
 _UINFO_URL = "https://pan.baidu.com/rest/2.0/xpan/nas"
 # 新建目录。
@@ -95,6 +98,28 @@ _LOCATE_PSIGN = "860a071f77c860e8cea06e4e54c518f3"
 # 分享列表单页条数与最大翻页次数。
 _PAGE_LIMIT = 100
 _MAX_PAGES = 100
+
+
+def _cookie_with_bdclnd(cookie: str, sekey: str) -> str:
+    """
+    用当前分享的 randsk 覆盖 Cookie 中的 BDCLND。
+
+    账号 Cookie 可能残留此前访问其它分享写入的 BDCLND，百度会按该值校验提取码，
+    导致列目录返回 -9、转存返回 200025；因此先剔除旧段再追加当前值。
+
+    :param cookie: 账号 Cookie 头
+    :param sekey: 当前分享的 randsk（URL 编码形态，与百度下发的 BDCLND 一致）
+    :return: 覆盖 BDCLND 后的 Cookie 头；sekey 为空时原样返回
+    """
+    if not sekey:
+        return cookie
+    segments = [
+        segment.strip()
+        for segment in str(cookie or "").split(";")
+        if segment.strip() and segment.split("=", 1)[0].strip().lower() != "bdclnd"
+    ]
+    segments.append(f"BDCLND={sekey}")
+    return "; ".join(segments)
 
 
 def _errno(payload: Mapping[str, Any]) -> int:
@@ -421,9 +446,7 @@ class BaiduAdapter(BaseNetdiskAdapter):
         }
         if sekey:
             params["sekey"] = sekey
-        cookie = cookie_header(account)
-        if sekey and "BDCLND=" not in cookie:
-            cookie = f"{cookie}; BDCLND={sekey}" if cookie else f"BDCLND={sekey}"
+        cookie = _cookie_with_bdclnd(cookie_header(account), sekey)
         headers: dict[str, str] = {
             "Referer": f"https://pan.baidu.com/s/{share_id}",
         }
@@ -672,9 +695,7 @@ class BaiduAdapter(BaseNetdiskAdapter):
         """
         bdstoken = self._bdstoken(account)
         share_id, uk = self._share_info(ref, sekey, account)
-        cookie = cookie_header(account)
-        if sekey and "BDCLND=" not in cookie:
-            cookie = f"{cookie}; BDCLND={sekey}" if cookie else f"BDCLND={sekey}"
+        cookie = _cookie_with_bdclnd(cookie_header(account), sekey)
         payload = self._post_json(
             _TRANSFER_URL,
             account=account,
@@ -682,7 +703,8 @@ class BaiduAdapter(BaseNetdiskAdapter):
                 "shareid": share_id,
                 "from": uk,
                 "channel": "chunlei",
-                "sekey": sekey,
+                # 百度转存校验要求 sekey 为解码后的 randsk；randsk 原值是 URL 编码串。
+                "sekey": unquote(sekey),
                 "ondup": "newcopy",
                 "web": 1,
                 "app_id": _APP_ID,
