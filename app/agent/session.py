@@ -732,101 +732,137 @@ class AgentSessionOwner:
         await _async_finish_processing_status(task.processing_status, task.user_id)
         task.processing_status = None
 
-    async def _process_message_internal(self, task: _MessageTask) -> str:
+    @staticmethod
+    def _needs_new_agent(existing_agent: Any, task: _MessageTask) -> bool:
         """
-        实际处理单条消息
+        判断复用的会话 Agent 是否与当前任务的用户或工厂不兼容。
+
+        :param existing_agent: 会话已存在的 Agent
+        :param task: 待处理的消息任务
+        :return: 需要销毁旧 Agent 并重建时返回 True
+        """
+        if existing_agent.user_id != task.user_id:
+            return True
+        return bool(
+            task.agent_factory
+            and isinstance(task.agent_factory, type)
+            and not isinstance(existing_agent, task.agent_factory)
+        )
+
+    def _create_session_agent(self, task: _MessageTask) -> Any:
+        """
+        按任务工厂创建会话 Agent；未指定工厂时使用默认智能体。
+
+        :param task: 待处理的消息任务
+        :return: 新建的 Agent 实例
+        """
+        if task.agent_factory is None:
+            return MoviePilotAgent(
+                session_id=task.session_id,
+                user_id=task.user_id,
+                channel=task.channel,
+                source=task.source,
+                username=task.username,
+                is_channel_admin=task.is_channel_admin,
+                original_message_id=task.original_message_id,
+                original_chat_id=task.original_chat_id,
+                replay_mode=task.reply_mode,
+                allow_message_tools=task.allow_message_tools,
+                allow_tools=task.allow_tools,
+                output_callback=task.output_callback,
+                protected_output_callback=task.protected_output_callback,
+                data=self._data,
+                memory=self._memory,
+            )
+        # Web 与兼容协议工厂同样属于当前宿主，必须继承其数据和记忆依赖。
+        agent_kwargs: dict[str, Any] = {
+            "session_id": task.session_id,
+            "user_id": task.user_id,
+            "channel": task.channel,
+            "source": task.source,
+            "username": task.username,
+            "is_channel_admin": task.is_channel_admin,
+            "original_message_id": task.original_message_id,
+            "original_chat_id": task.original_chat_id,
+            "replay_mode": task.reply_mode,
+            "allow_message_tools": task.allow_message_tools,
+            "output_callback": task.output_callback,
+            "protected_output_callback": task.protected_output_callback,
+            "data": self._data,
+            "memory": self._memory,
+        }
+        if task.tool_event_callback is not None:
+            agent_kwargs["tool_event_callback"] = task.tool_event_callback
+        if task.message_callback is not None:
+            agent_kwargs["message_callback"] = task.message_callback
+        agent = task.agent_factory(**agent_kwargs)
+        if hasattr(agent, "allow_tools"):
+            agent.allow_tools = task.allow_tools
+        return agent
+
+    @staticmethod
+    def _apply_agent_task_context(agent: Any, task: _MessageTask) -> None:
+        """
+        把本条任务的渠道上下文覆盖到复用的会话 Agent。
+
+        :param agent: 会话已存在的 Agent
+        :param task: 待处理的消息任务
+        """
+        # 每条队列任务都携带完整消息上下文，None 也必须覆盖，避免后台任务
+        # 复用会话 Agent 时继续沿用上一条入站消息的渠道。
+        agent.channel = task.channel
+        agent.source = task.source
+        agent.username = task.username
+        agent.is_channel_admin = task.is_channel_admin
+        agent.original_message_id = task.original_message_id
+        agent.original_chat_id = task.original_chat_id
+        agent.reply_mode = task.reply_mode
+        agent.allow_message_tools = task.allow_message_tools
+        if hasattr(agent, "allow_tools"):
+            agent.allow_tools = task.allow_tools
+        if hasattr(agent, "set_output_callback"):
+            agent.set_output_callback(task.output_callback)
+        else:
+            agent.output_callback = task.output_callback
+        if hasattr(agent, "set_tool_event_callback"):
+            agent.set_tool_event_callback(task.tool_event_callback)
+        agent.set_protected_output_callback(task.protected_output_callback)
+        if task.message_callback is not None and hasattr(agent, "set_message_callback"):
+            agent.set_message_callback(task.message_callback)
+
+    async def _resolve_session_agent(self, task: _MessageTask) -> Any:
+        """
+        复用或新建会话 Agent，并同步本条任务的渠道上下文。
+
+        :param task: 待处理的消息任务
+        :return: 已就绪的会话 Agent 实例
         """
         session_id = task.session_id
         existing_agent = self.active_agents.get(session_id)
-        if (
-                existing_agent
-                and (
-                    existing_agent.user_id != task.user_id
-                    or (
-                        task.agent_factory
-                        and isinstance(task.agent_factory, type)
-                        and not isinstance(existing_agent, task.agent_factory)
-                    )
-                )
-        ):
+        if existing_agent is not None and self._needs_new_agent(existing_agent, task):
             if await existing_agent.cleanup() is False:
                 raise AgentManagerUnavailableError(
                     f"Agent 会话 {session_id} 仍有子代理或终端在停止"
                 )
             self.active_agents.pop(session_id, None)
             self._session_steering_inboxes.pop(session_id, None)
-
         if session_id not in self.active_agents:
             logger.info(
                 f"创建新的AI智能体实例，session_id: {session_id}, user_id: {task.user_id}"
             )
-            if task.agent_factory is None:
-                agent = MoviePilotAgent(
-                    session_id=session_id,
-                    user_id=task.user_id,
-                    channel=task.channel,
-                    source=task.source,
-                    username=task.username,
-                    is_channel_admin=task.is_channel_admin,
-                    original_message_id=task.original_message_id,
-                    original_chat_id=task.original_chat_id,
-                    replay_mode=task.reply_mode,
-                    allow_message_tools=task.allow_message_tools,
-                    allow_tools=task.allow_tools,
-                    output_callback=task.output_callback,
-                    protected_output_callback=task.protected_output_callback,
-                    data=self._data,
-                    memory=self._memory,
-                )
-            else:
-                # Web 与兼容协议工厂同样属于当前宿主，必须继承其数据和记忆依赖。
-                agent_kwargs: dict[str, Any] = {
-                    "session_id": session_id,
-                    "user_id": task.user_id,
-                    "channel": task.channel,
-                    "source": task.source,
-                    "username": task.username,
-                    "is_channel_admin": task.is_channel_admin,
-                    "original_message_id": task.original_message_id,
-                    "original_chat_id": task.original_chat_id,
-                    "replay_mode": task.reply_mode,
-                    "allow_message_tools": task.allow_message_tools,
-                    "output_callback": task.output_callback,
-                    "protected_output_callback": task.protected_output_callback,
-                    "data": self._data,
-                    "memory": self._memory,
-                }
-                if task.tool_event_callback is not None:
-                    agent_kwargs["tool_event_callback"] = task.tool_event_callback
-                if task.message_callback is not None:
-                    agent_kwargs["message_callback"] = task.message_callback
-                agent = task.agent_factory(**agent_kwargs)
-                if hasattr(agent, "allow_tools"):
-                    agent.allow_tools = task.allow_tools
+            agent = self._create_session_agent(task)
             self.active_agents[session_id] = agent
-        else:
-            agent = self.active_agents[session_id]
-            # 每条队列任务都携带完整消息上下文，None 也必须覆盖，避免后台任务
-            # 复用会话 Agent 时继续沿用上一条入站消息的渠道。
-            agent.channel = task.channel
-            agent.source = task.source
-            agent.username = task.username
-            agent.is_channel_admin = task.is_channel_admin
-            agent.original_message_id = task.original_message_id
-            agent.original_chat_id = task.original_chat_id
-            agent.reply_mode = task.reply_mode
-            agent.allow_message_tools = task.allow_message_tools
-            if hasattr(agent, "allow_tools"):
-                agent.allow_tools = task.allow_tools
-            if hasattr(agent, "set_output_callback"):
-                agent.set_output_callback(task.output_callback)
-            else:
-                agent.output_callback = task.output_callback
-            if hasattr(agent, "set_tool_event_callback"):
-                agent.set_tool_event_callback(task.tool_event_callback)
-            agent.set_protected_output_callback(task.protected_output_callback)
-            if task.message_callback is not None and hasattr(agent, "set_message_callback"):
-                agent.set_message_callback(task.message_callback)
+            return agent
+        agent = self.active_agents[session_id]
+        self._apply_agent_task_context(agent, task)
+        return agent
+
+    async def _process_message_internal(self, task: _MessageTask) -> str:
+        """
+        实际处理单条消息
+        """
+        session_id = task.session_id
+        agent = await self._resolve_session_agent(task)
 
         # 每轮都覆盖执行主体，防止计划任务与交互消息复用会话时串用权限。
         agent.execution_user_id = task.execution_user_id
@@ -896,7 +932,7 @@ class AgentSessionOwner:
                         ),
                         terminal_scope=task.terminal_scope,
                     )
-            return result
+            return cast(str, result)
         except BaseException:
             await inbox.finish_run()
             raise

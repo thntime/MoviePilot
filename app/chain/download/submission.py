@@ -728,6 +728,23 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             delivered[key] = delivered.get(key, False) or Path(item.dest).is_file()
         return delivered
 
+    @staticmethod
+    def _netdisk_platform_rejection(torrent: Any) -> Optional[str]:
+        """
+        校验网盘候选的平台是否仍启用。
+
+        禁用平台在准备阶段直接拒绝：不写失败冷却，后续不会因冷却到期而重试或换源重投。
+
+        :param torrent: 下载器资源对象
+        :return: 拒绝原因；非网盘候选或平台可用时返回 None
+        """
+        if str(getattr(torrent, "download_type", "torrent") or "torrent") != "netdisk":
+            return None
+        platform = normalize_platform(getattr(torrent, "netdisk_platform", None))
+        if platform is not None and platform not in enabled_platforms():
+            return f"网盘平台已禁用：{platform.value}"
+        return None
+
     def _prepare_download_single(
         self,
         *,
@@ -749,11 +766,9 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
         if torrent is None or media is None or meta is None:
             return None, "下载上下文缺少媒体、元数据或种子信息"
         is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
-        if is_netdisk:
-            # 禁用平台在准备阶段直接拒绝：不写失败冷却，后续不会因冷却到期而重试或换源重投。
-            platform = normalize_platform(getattr(torrent, "netdisk_platform", None))
-            if platform is not None and platform not in enabled_platforms():
-                return None, f"网盘平台已禁用：{platform.value}"
+        rejection = self._netdisk_platform_rejection(torrent)
+        if rejection:
+            return None, rejection
         site_downloader = torrent.site_downloader
         supplemented_media = MediaChain().supplement_tmdb_info(media, meta)
         if not isinstance(supplemented_media, (MediaInfo, MusicInfo)):

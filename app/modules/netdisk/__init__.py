@@ -469,6 +469,137 @@ def _remove_empty_dir(path: Path) -> bool:
         return False
 
 
+def _no_target_files_error(
+    episodes: Optional[Set[int]],
+    episode_targets: Optional[Dict[int, Set[int]]],
+) -> NetdiskError:
+    """
+    构造「分享内没有目标文件」的错误，优先给出用户实际请求的集数。
+
+    :param episodes: 目标集数集合
+    :param episode_targets: 按季划分的目标集数
+    :return: 带明确说明的解析失败异常
+    """
+    if episode_targets:
+        wanted = sorted({
+            number for numbers in episode_targets.values() for number in numbers
+        })
+        return NetdiskError(
+            NetdiskErrorCode.UNSUPPORTED,
+            f"分享内没有目标集数（{wanted}）对应的文件",
+        )
+    if episodes:
+        return NetdiskError(
+            NetdiskErrorCode.UNSUPPORTED,
+            f"分享内没有目标集数（{sorted(episodes)}）对应的文件",
+        )
+    return NetdiskError(
+        NetdiskErrorCode.UNSUPPORTED, "分享内没有可下载的视频文件"
+    )
+
+
+def _build_runtimes(
+    episode_runtimes: Optional[Dict[str, int]],
+    media_runtime: Optional[int],
+    files: Sequence[ShareFile],
+) -> Dict[str, int]:
+    """
+    构造文件名到期望时长的映射。
+
+    期望时长只服务时长校验：显式单集时长优先，其余文件回落到整批单集时长。
+
+    :param episode_runtimes: 显式单集时长，单位为秒
+    :param media_runtime: 整批单集时长，单位为分钟
+    :param files: 本次任务的文件
+    :return: 文件名到期望秒数的映射
+    """
+    runtimes: Dict[str, int] = dict(episode_runtimes or {})
+    if media_runtime and int(media_runtime) > 0:
+        runtime_seconds = int(media_runtime) * 60
+        for item in files:
+            runtimes.setdefault(item.name, runtime_seconds)
+    return runtimes
+
+
+class _FileProgressWriter:
+    """
+    汇总并发文件的完成字节，按时间/百分比节流写入任务进度。
+
+    :param task_key: 任务标识
+    :param total_size: 任务总字节数
+    :param state: 任务级进度状态，跨回调共享
+    :param lock: 保护 ``state`` 的互斥锁
+    """
+
+    def __init__(
+        self,
+        task_key: str,
+        total_size: int,
+        state: Dict[str, Any],
+        lock: threading.Lock,
+    ) -> None:
+        """
+        保存任务级进度状态与写入参数。
+        """
+        self.task_key = task_key
+        self.total_size = total_size
+        self.state = state
+        self.lock = lock
+
+    def __call__(self, name: str, percent: float, file_size: int) -> None:
+        """
+        记录单文件进度并按节流阈值写入任务进度。
+
+        :param name: 文件名
+        :param percent: 单文件完成百分比
+        :param file_size: 单文件总字节数
+        """
+        with self.lock:
+            self.state["active"][name] = (
+                file_size * max(min(float(percent), 100.0), 0.0) / 100.0
+            )
+            done = self.state["completed"] + sum(self.state["active"].values())
+            now = time.monotonic()
+            speed: Optional[float] = None
+            elapsed = now - float(self.state["at"])
+            if elapsed >= 1.0:
+                instant = max(done - float(self.state["done"]), 0.0) / elapsed
+                # 分片并发会把字节成批送达，瞬时值会在 10MB/s 与几百 KB/s 间跳变；
+                # 用 EWMA 平滑展示速度，避免卡片像网络断开一样闪。
+                previous = float(self.state["speed"])
+                speed = instant if previous <= 0 else previous * 0.7 + instant * 0.3
+                self.state["speed"] = speed
+                self.state["at"], self.state["done"] = now, done
+            overall = (done / self.total_size * 100.0) if self.total_size > 0 else 0.0
+            if (
+                now - float(self.state["write_at"]) < _PROGRESS_INTERVAL_SECONDS
+                and abs(overall - float(self.state["percent"])) < _PROGRESS_DELTA_PERCENT
+            ):
+                return
+            self.state["write_at"], self.state["percent"] = now, overall
+            store.update_progress(self.task_key, overall, dlspeed=speed)
+
+    def discard(self, name: str) -> None:
+        """
+        移除已失败文件的在飞进度。
+
+        :param name: 文件名
+        """
+        with self.lock:
+            self.state["active"].pop(name, None)
+
+    def complete(self, name: str, size: int) -> None:
+        """
+        记录文件完成：累加完成字节并移除在飞进度。
+
+        :param name: 文件名
+        :param size: 文件总字节数
+        """
+        with self.lock:
+            self.state["completed"] += float(size)
+            self.state["active"].pop(name, None)
+
+
 class NetdiskModule(_DownloaderModuleBase[Any]):
     """
     通用网盘下载器：多平台取链、并发分片或 HLS 下载，并接入整理流程。
@@ -676,6 +807,58 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
 
     # ---- 下载 ----
 
+    def _duplicate_task_response(
+        self,
+        task_key: str,
+        code: str,
+        name: str,
+        target_episodes: Set[int],
+        targets: Optional[Dict[int, Set[int]]],
+    ) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], str]]:
+        """
+        判定当前分享是否已有覆盖同一集数的活跃任务。
+
+        同一分享的不同链接形式（带 ?pwd= / # / 长短链）不应变成第二个任务：复用活跃
+        任务的 hash，链路的下载记录才能继续关联；互补集数也必须串行，task_dir 只按
+        share_code 命名，并发写会互相截断。
+
+        :param task_key: 由分享码与链接计算的任务标识
+        :param code: 分享码
+        :param name: 下载器实例展示名
+        :param target_episodes: 目标集数集合；空集合表示整包
+        :param targets: 按季划分的目标集数
+        :return: 需要直接返回给调用方的结果；可以继续创建任务时返回 None
+        """
+        if task_key in self._tasks:
+            current = store.get_task(task_key) or {}
+            if _task_covers_request(current, target_episodes, targets):
+                return name, task_key, None, DOWNLOAD_TASK_ALREADY_EXISTS
+            # 活跃任务只覆盖部分集数时，不能让订阅误以为目标集数已下载。
+            return (
+                name,
+                None,
+                None,
+                "同一分享的任务正在下载其他集数，请等待其完成后再试",
+            )
+        existing = store.find_by_share_code(code)
+        if existing and _as_text(existing.get("state")) in {"downloading", "paused"}:
+            # 空 episodes 表示整包：它已经覆盖所有单集请求，必须复用同一任务，
+            # 否则两个任务会写同一个分享目录并互相截断。
+            if _task_covers_request(existing, target_episodes, targets):
+                return (
+                    name,
+                    _as_text(existing.get("hash")),
+                    None,
+                    DOWNLOAD_TASK_ALREADY_EXISTS,
+                )
+            return (
+                name,
+                None,
+                None,
+                "同一分享已有任务在下载其他集数，请等待其完成后再试",
+            )
+        return None
+
     def download(self, content: Union[Path, str, bytes], download_dir: Path, cookie: str,
                  episodes: Optional[Set[int]] = None, category: Optional[str] = None,
                  label: Optional[str] = None, downloader: Optional[str] = None,
@@ -754,37 +937,11 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             target_episodes = set().union(*targets.values())
         task_key = _task_hash(code, url)
         with self._lock:
-            if task_key in self._tasks:
-                current = store.get_task(task_key) or {}
-                if _task_covers_request(current, target_episodes, targets):
-                    return name, task_key, None, DOWNLOAD_TASK_ALREADY_EXISTS
-                # 活跃任务只覆盖部分集数时，不能让订阅误以为目标集数已下载。
-                return (
-                    name,
-                    None,
-                    None,
-                    "同一分享的任务正在下载其他集数，请等待其完成后再试",
-                )
-            # 同一分享的不同链接形式（带 ?pwd= / # / 长短链）不应变成第二个任务：
-            # 复用活跃任务的 hash，链路的下载记录才能继续关联。
-            existing = store.find_by_share_code(code)
-            if existing and _as_text(existing.get("state")) in {"downloading", "paused"}:
-                # 空 episodes 表示整包：它已经覆盖所有单集请求，必须复用同一任务，
-                # 否则两个任务会写同一个分享目录并互相截断。
-                if _task_covers_request(existing, target_episodes, targets):
-                    return (
-                        name,
-                        _as_text(existing.get("hash")),
-                        None,
-                        DOWNLOAD_TASK_ALREADY_EXISTS,
-                    )
-                # 互补集数也必须串行：task_dir 只按 share_code 命名，并发写会互相截断。
-                return (
-                    name,
-                    None,
-                    None,
-                    "同一分享已有任务在下载其他集数，请等待其完成后再试",
-                )
+            duplicate = self._duplicate_task_response(
+                task_key, code, name, target_episodes, targets,
+            )
+            if duplicate is not None:
+                return duplicate
             stop_event = threading.Event()
             self._stops[task_key] = stop_event
             self._tasks[task_key] = {"stop": stop_event}
@@ -1082,58 +1239,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                         f"网盘已有文件下载失败，继续其他文件：{item.name} - "
                         f"{errors[item.name]}"
                     )
-            missing = [
-                item for item in entries
-                if item.name in errors
-                or not _is_completed_file(task_dir / item.name, int(item.size or 0))
-            ]
-            if not missing:
-                if task_key not in self._discarded:
-                    store.upsert_task(task_key, {
-                        "state": "completed", "progress": 100.0,
-                        "error": None, "dlspeed": None, "dlspeed_bytes": 0,
-                    })
-            elif len(missing) == len(entries):
-                reasons = "; ".join(
-                    f"{item.name}（{errors.get(item.name, '未完成')}）"
-                    for item in missing[:3]
-                )
-                if task_key not in self._discarded:
-                    store.upsert_task(task_key, {
-                        "state": "error",
-                        "error": _friendly_download_error(DownloadError(
-                            f"下载未完成：{reasons}"
-                        )),
-                        "dlspeed": None, "dlspeed_bytes": 0,
-                    })
-            else:
-                missing_episodes = sorted({
-                    number for item in missing
-                    for number in episode_numbers(item.name)
-                })
-                is_subscription = bool(
-                    source and str(source).startswith("Subscribe|")
-                )
-                decision = BatchDecision(
-                    "retry_missing" if is_subscription else "explain_only",
-                    "个人盘已有文件部分失败，按缺失集补下" if is_subscription
-                    else "手动下载没有下一次订阅搜索，仅做说明",
-                    missing_episodes,
-                )
-                if task_key not in self._discarded:
-                    store.upsert_task(task_key, {
-                        "state": "completed", "progress": 100.0,
-                        "error": None, "dlspeed": None, "dlspeed_bytes": 0,
-                        "partial": True,
-                        "missing_episodes": missing_episodes,
-                        "ai_decision": {
-                            "decision": decision.decision,
-                            "reason": decision.reason,
-                            "missing_episodes": list(decision.missing_episodes),
-                        },
-                        "warning": f"部分完成：{len(entries) - len(missing)} 个有效，"
-                                   f"{len(missing)} 个失败",
-                    })
+            self._record_existing_outcome(task_key, entries, errors, task_dir, source)
             logger.info(f"网盘已有文件下载完成：{platform.value}:{account_id}")
         except DownloadCancelled:
             self._mark_task_paused(task_key)
@@ -1151,6 +1257,77 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 self._pause_reasons.pop(task_key, None)
                 self._stops.pop(task_key, None)
                 self._tasks.pop(task_key, None)
+
+    def _record_existing_outcome(
+        self,
+        task_key: str,
+        entries: Sequence[DriveFile],
+        errors: Dict[str, str],
+        task_dir: Path,
+        source: Optional[str],
+    ) -> None:
+        """
+        按下载结果写入个人盘任务终态：全部完成、全部失败或部分完成。
+
+        :param task_key: 任务标识
+        :param entries: 待下载文件条目
+        :param errors: 文件名到失败原因的映射
+        :param task_dir: 任务落盘目录
+        :param source: 下载来源标识
+        """
+        missing = [
+            item for item in entries
+            if item.name in errors
+            or not _is_completed_file(task_dir / item.name, int(item.size or 0))
+        ]
+        if not missing:
+            if task_key not in self._discarded:
+                store.upsert_task(task_key, {
+                    "state": "completed", "progress": 100.0,
+                    "error": None, "dlspeed": None, "dlspeed_bytes": 0,
+                })
+            return
+        if len(missing) == len(entries):
+            reasons = "; ".join(
+                f"{item.name}（{errors.get(item.name, '未完成')}）"
+                for item in missing[:3]
+            )
+            if task_key not in self._discarded:
+                store.upsert_task(task_key, {
+                    "state": "error",
+                    "error": _friendly_download_error(DownloadError(
+                        f"下载未完成：{reasons}"
+                    )),
+                    "dlspeed": None, "dlspeed_bytes": 0,
+                })
+            return
+        missing_episodes = sorted({
+            number for item in missing
+            for number in episode_numbers(item.name)
+        })
+        is_subscription = bool(
+            source and str(source).startswith("Subscribe|")
+        )
+        decision = BatchDecision(
+            "retry_missing" if is_subscription else "explain_only",
+            "个人盘已有文件部分失败，按缺失集补下" if is_subscription
+            else "手动下载没有下一次订阅搜索，仅做说明",
+            missing_episodes,
+        )
+        if task_key not in self._discarded:
+            store.upsert_task(task_key, {
+                "state": "completed", "progress": 100.0,
+                "error": None, "dlspeed": None, "dlspeed_bytes": 0,
+                "partial": True,
+                "missing_episodes": missing_episodes,
+                "ai_decision": {
+                    "decision": decision.decision,
+                    "reason": decision.reason,
+                    "missing_episodes": list(decision.missing_episodes),
+                },
+                "warning": f"部分完成：{len(entries) - len(missing)} 个有效，"
+                           f"{len(missing)} 个失败",
+            })
 
     def _download_existing_one(
         self,
@@ -1380,22 +1557,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 if resolved.detail.title:
                     store.upsert_task(task_key, {"title": resolved.detail.title})
                 if not files:
-                    if episode_targets:
-                        wanted = sorted({
-                            number for numbers in episode_targets.values() for number in numbers
-                        })
-                        raise NetdiskError(
-                            NetdiskErrorCode.UNSUPPORTED,
-                            f"分享内没有目标集数（{wanted}）对应的文件",
-                        )
-                    if episodes:
-                        raise NetdiskError(
-                            NetdiskErrorCode.UNSUPPORTED,
-                            f"分享内没有目标集数（{sorted(episodes)}）对应的文件",
-                        )
-                    raise NetdiskError(
-                        NetdiskErrorCode.UNSUPPORTED, "分享内没有可下载的视频文件"
-                    )
+                    raise _no_target_files_error(episodes, episode_targets)
                 total_size = sum(int(item.size or 0) for item in files)
                 self._ensure_local_space(task_dir, total_size)
                 store.upsert_task(task_key, {
@@ -1406,7 +1568,6 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                     ],
                 })
                 task_tuning = tuning or resolver.tuning
-                progress_lock = threading.Lock()
                 progress_state: Dict[str, Any] = {
                     "completed": 0.0,
                     "active": {},
@@ -1416,44 +1577,11 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                     "write_at": 0.0,
                     "percent": -100.0,
                 }
+                progress_writer = _FileProgressWriter(
+                    task_key, total_size, progress_state, threading.Lock(),
+                )
 
-                def on_file_progress(name: str, percent: float, file_size: int) -> None:
-                    """汇总并发文件的完成字节，按时间/百分比节流写入任务进度。"""
-                    with progress_lock:
-                        progress_state["active"][name] = (
-                            file_size * max(min(float(percent), 100.0), 0.0) / 100.0
-                        )
-                        done = progress_state["completed"] + sum(progress_state["active"].values())
-                        now = time.monotonic()
-                        speed: Optional[float] = None
-                        elapsed = now - float(progress_state["at"])
-                        if elapsed >= 1.0:
-                            instant = max(done - float(progress_state["done"]), 0.0) / elapsed
-                            # 分片并发会把字节成批送达，瞬时值会在 10MB/s 与几百 KB/s 间跳变；
-                            # 用 EWMA 平滑展示速度，避免卡片像网络断开一样闪。
-                            previous = float(progress_state["speed"])
-                            speed = instant if previous <= 0 else previous * 0.7 + instant * 0.3
-                            progress_state["speed"] = speed
-                            progress_state["at"], progress_state["done"] = now, done
-                        overall = (done / total_size * 100.0) if total_size > 0 else 0.0
-                        if (
-                            now - float(progress_state["write_at"]) < _PROGRESS_INTERVAL_SECONDS
-                            and abs(overall - float(progress_state["percent"])) < _PROGRESS_DELTA_PERCENT
-                        ):
-                            return
-                        progress_state["write_at"], progress_state["percent"] = now, overall
-                        store.update_progress(task_key, overall, dlspeed=speed)
-
-                pending: List[ShareFile] = []
-                for item in files:
-                    target = task_dir / item.name
-                    expected = int(item.size or 0)
-                    if _is_completed_file(target, expected):
-                        # 上次已完成但记录未收尾：保留文件，不重复下载与转存。
-                        logger.info(f"网盘文件已存在且确认完成，跳过：{target}")
-                        progress_state["completed"] += float(expected)
-                        continue
-                    pending.append(item)
+                pending = self._pending_files(files, task_dir, progress_state)
 
                 if total_size > 0 and progress_state["completed"] > 0:
                     # 重试时先按已存在文件回写进度，避免任务失败前一直显示 0%。
@@ -1462,183 +1590,47 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                         cast(float, progress_state["completed"]) / total_size * 100.0,
                     )
 
-                workers = max(1, min(int(task_tuning.max_tasks), len(pending))) if pending else 1
-                workers = self._limit_workers_for_task(workers, pending, platform, task_tuning)
-                account_map = self._assign_accounts(platform, pending)
-                per_file_threads = max(1, int(task_tuning.threads))
-                workers = _cap_platform_workers(platform, workers, per_file_threads)
-                # 期望时长只服务时长校验：显式单集时长优先，其余文件回落到整批单集时长。
-                runtimes: Dict[str, int] = dict(episode_runtimes or {})
-                if media_runtime and int(media_runtime) > 0:
-                    runtime_seconds = int(media_runtime) * 60
-                    for item in files:
-                        runtimes.setdefault(item.name, runtime_seconds)
-                with ThreadPoolExecutor(
-                    max_workers=workers, thread_name_prefix=f"netdisk-file-{task_key}"
-                ) as pool:
-                    futures = {
-                        pool.submit(
-                            self._download_one,
-                            resolver, platform, share_url, passcode, item, task_dir,
-                            task_key, stop_event, share_token, task_tuning,
-                            on_file_progress, threads=per_file_threads,
-                            concurrency=workers,
-                            account_id=account_map.get(item.name),
-                            episode_runtimes=runtimes,
-                        ): item
-                        for item in pending
-                    }
-                    file_errors: Dict[str, str] = {}
-                    # 保留原始异常，全批失败时用 `raise ... from` 保住分享级错误的判定链。
-                    file_exceptions: Dict[str, Exception] = {}
-                    for future in as_completed(futures):
-                        item = futures[future]
-                        try:
-                            future.result()
-                        except DownloadCancelled:
-                            # 用户暂停：保持 paused，不能被后续的「内部异常」分支记成失败。
-                            for pending_future in futures:
-                                pending_future.cancel()
-                            raise
-                        except Exception as err:  # noqa: BLE001
-                            # 单文件失败只记账，不打断其他文件，也不让整个任务失败。
-                            file_errors[item.name] = _friendly_download_error(err)
-                            file_exceptions[item.name] = err
-                            logger.warning(
-                                f"网盘文件失败，继续其他文件：{item.name} - "
-                                f"{file_errors[item.name]}"
-                            )
-                            with progress_lock:
-                                progress_state["active"].pop(item.name, None)
-                            continue
-                        with progress_lock:
-                            progress_state["completed"] += float(item.size or 0)
-                            progress_state["active"].pop(item.name, None)
+                file_errors, file_exceptions = self._download_pending_files(
+                    pending,
+                    files=files,
+                    resolver=resolver,
+                    platform=platform,
+                    share_url=share_url,
+                    passcode=passcode,
+                    task_dir=task_dir,
+                    task_key=task_key,
+                    stop_event=stop_event,
+                    share_token=share_token,
+                    task_tuning=task_tuning,
+                    progress_writer=progress_writer,
+                    episode_runtimes=episode_runtimes,
+                    media_runtime=media_runtime,
+                )
                 # 只有每个文件都写了 .done 才算完成，防止预分配的空壳文件被整理入库。
                 missing = [
                     item for item in pending
                     if not _is_completed_file(task_dir / item.name, int(item.size or 0))
                 ]
-                # 失败文件的残片（目标、完成标记、分片计划）必须清掉，
-                # 否则下次重试会把残缺文件当成可续传的基础。
-                for item in missing:
-                    target = task_dir / item.name
-                    for path in (target, target.with_name(target.name + ".done"),
-                                 target.with_suffix(target.suffix + ".plan.json")):
-                        try:
-                            path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                if not missing:
-                    if task_key not in self._discarded:
-                        store.upsert_task(task_key, {
-                            "state": "completed", "progress": 100.0,
-                            "error": None, "dlspeed": None, "dlspeed_bytes": 0,
-                        })
-                elif any(
-                    _is_completed_file(task_dir / item.name, int(item.size or 0))
-                    for item in pending
-                ):
-                    # 至少有一个有效文件：按部分完成入库，交给上层决定是否补齐。
-                    # 分享级文件失败（如仅预览流）仍要拉黑分享，
-                    # 否则补集搜索会反复选中同一个坏分享；有效文件已有 .done，不受影响。
-                    for name, exc in file_exceptions.items():
-                        if is_share_level_error(exc):
-                            reason = _friendly_download_error(exc)
-                            logger.warning(
-                                f"网盘文件分享级失败，拉黑分享："
-                                f"{platform.value}:{share_code} - {name} - {reason}"
-                            )
-                            get_share_blacklist().add(platform.value, share_code, reason)
-                    if task_key not in self._discarded:
-                        valid_files = [
-                            item for item in pending
-                            if _is_completed_file(task_dir / item.name, int(item.size or 0))
-                        ]
-                        missing_episodes = sorted({
-                            number for item in missing
-                            for number in episode_numbers(item.name)
-                        })
-                        target_episodes = set(episodes or ())
-                        if not target_episodes:
-                            target_episodes = set().union(
-                                *(_normalize_episode_targets(episode_targets) or {}).values()
-                            )
-                        summary = {
-                            "media": {
-                                "title": resolved.detail.title or label or share_code,
-                                "season": season,
-                            },
-                            "target_episodes": sorted(target_episodes),
-                            "valid_files": [
-                                {"name": item.name, "size": int(item.size or 0)}
-                                for item in valid_files
-                            ],
-                            "failed_files": [
-                                {"name": item.name, "reason": file_errors.get(item.name, "未完成")}
-                                for item in missing
-                            ],
-                            "missing_episodes": missing_episodes,
-                            "source": source or "",
-                        }
-                        decision = judge_batch(summary)
-                        is_subscription = bool(
-                            source and str(source).startswith("Subscribe|")
-                        )
-                        if decision.decision == "retry_missing" and not is_subscription:
-                            # 手动下载没有下一次订阅搜索，补下建议只会造成误导。
-                            decision = BatchDecision("explain_only", decision.reason, [])
-                        store.upsert_task(task_key, {
-                            "state": "completed", "progress": 100.0,
-                            "error": None, "dlspeed": None, "dlspeed_bytes": 0,
-                            "partial": True,
-                            "failed_files": summary["failed_files"],
-                            # 补集只信本地确定性解析；AI 给出的集数仅保留在 ai_decision 展示。
-                            "missing_episodes": missing_episodes,
-                            "ai_decision": {
-                                "decision": decision.decision,
-                                "reason": decision.reason,
-                                "missing_episodes": list(decision.missing_episodes),
-                            },
-                            "warning": f"部分完成：{len(valid_files)} 个有效，{len(missing)} 个失败",
-                        })
-                else:
-                    # 全批失败时把原因一起带出来，否则用户只看到文件名，
-                    # 无法区分是时长异常、直链失效还是磁盘写入失败。
-                    reasons = "; ".join(
-                        f"{item.name}（{file_errors.get(item.name, '未完成')}）"
-                        for item in missing[:3]
-                    )
-                    error = DownloadError(f"下载未完成：{reasons}")
-                    first_exception = next(iter(file_exceptions.values()), None)
-                    if first_exception is not None:
-                        # 保留原因链，外层才能识别「每个文件都因分享级错误失败」的分享。
-                        raise error from first_exception
-                    raise error
+                self._discard_partial_outputs(task_dir, missing)
+                self._record_task_outcome(
+                    task_key=task_key,
+                    platform=platform,
+                    share_code=share_code,
+                    label=label,
+                    season=season,
+                    episodes=episodes,
+                    episode_targets=episode_targets,
+                    source=source,
+                    title=resolved.detail.title,
+                    pending=pending,
+                    missing=missing,
+                    file_errors=file_errors,
+                    file_exceptions=file_exceptions,
+                    task_dir=task_dir,
+                )
                 logger.info(f"网盘下载完成：{platform.value}:{share_code}")
             except Exception as err:  # noqa: BLE001
-                # 只有外部停止信号置位才算用户暂停；内部异常中止一律按失败记录，
-                # 否则引擎的「下载已取消」会掩盖真实错误，前端表现为任务自动暂停。
-                if stop_event.is_set():
-                    logger.info(f"网盘下载已暂停：{share_code}")
-                    self._mark_task_paused(task_key)
-                else:
-                    error_text = _friendly_download_error(err)
-                    if is_share_level_error(err):
-                        # 分享本身不可用（失效、仅预览流等）时拉黑，
-                        # 避免订阅反复重试同一个坏分享。
-                        get_share_blacklist().add(platform.value, share_code, error_text)
-                    capacity_error = error_text if (
-                        isinstance(err, NetdiskError)
-                        and err.code is NetdiskErrorCode.SPACE_INSUFFICIENT
-                    ) or "空间不足" in error_text or "容量不足" in error_text else None
-                    logger.warn(f"网盘下载失败：{share_code} - {error_text}")
-                    if task_key not in self._discarded:
-                        store.upsert_task(task_key, {
-                            "state": "error", "error": error_text,
-                            "capacity_error": capacity_error,
-                            "dlspeed": None, "dlspeed_bytes": 0,
-                        })
+                self._handle_task_failure(task_key, platform, share_code, stop_event, err)
             finally:
                 # 失败、取消或没有可下载文件时，任务目录可能为空；只回收空目录，
                 # 部分完成的文件保留给续传。
@@ -1647,6 +1639,350 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                     self._pause_reasons.pop(task_key, None)
                     self._stops.pop(task_key, None)
                     self._tasks.pop(task_key, None)
+
+    @staticmethod
+    def _pending_files(
+        files: Sequence[ShareFile],
+        task_dir: Path,
+        progress_state: Dict[str, Any],
+    ) -> List[ShareFile]:
+        """
+        过滤出仍需下载的文件，并把已完成的文件计入初始进度。
+
+        :param files: 分享内的目标文件
+        :param task_dir: 任务落盘目录
+        :param progress_state: 任务级进度状态
+        :return: 仍需下载的文件列表
+        """
+        pending: List[ShareFile] = []
+        for item in files:
+            target = task_dir / item.name
+            expected = int(item.size or 0)
+            if _is_completed_file(target, expected):
+                # 上次已完成但记录未收尾：保留文件，不重复下载与转存。
+                logger.info(f"网盘文件已存在且确认完成，跳过：{target}")
+                progress_state["completed"] += float(expected)
+                continue
+            pending.append(item)
+        return pending
+
+    def _download_pending_files(
+        self,
+        pending: Sequence[ShareFile],
+        *,
+        files: Sequence[ShareFile],
+        resolver: NetdiskResolveService,
+        platform: NetdiskPlatform,
+        share_url: str,
+        passcode: str,
+        task_dir: Path,
+        task_key: str,
+        stop_event: threading.Event,
+        share_token: str,
+        task_tuning: NetdiskTuning,
+        progress_writer: _FileProgressWriter,
+        episode_runtimes: Optional[Dict[str, int]],
+        media_runtime: Optional[int],
+    ) -> Tuple[Dict[str, str], Dict[str, Exception]]:
+        """
+        并发下载待处理文件，并把单文件失败收敛为任务级记账。
+
+        :param pending: 待下载文件
+        :param files: 分享内的目标文件，用于生成整批单集时长
+        :param resolver: 取链服务
+        :param platform: 网盘平台
+        :param share_url: 分享链接
+        :param passcode: 提取码
+        :param task_dir: 任务落盘目录
+        :param task_key: 任务标识
+        :param stop_event: 停止信号
+        :param share_token: 候选透传的分享令牌
+        :param task_tuning: 下载器实例参数快照
+        :param progress_writer: 任务级进度写入器
+        :param episode_runtimes: 文件名到期望时长的映射，单位为秒
+        :param media_runtime: 单集时长（分钟）
+        :return: 文件名到失败原因的映射，以及文件名到原始异常的映射
+        """
+        workers = max(1, min(int(task_tuning.max_tasks), len(pending))) if pending else 1
+        workers = self._limit_workers_for_task(workers, pending, platform, task_tuning)
+        account_map = self._assign_accounts(platform, pending)
+        per_file_threads = max(1, int(task_tuning.threads))
+        workers = _cap_platform_workers(platform, workers, per_file_threads)
+        runtimes = _build_runtimes(episode_runtimes, media_runtime, files)
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix=f"netdisk-file-{task_key}"
+        ) as pool:
+            futures = {
+                pool.submit(
+                    self._download_one,
+                    resolver, platform, share_url, passcode, item, task_dir,
+                    task_key, stop_event, share_token, task_tuning,
+                    progress_writer, threads=per_file_threads,
+                    concurrency=workers,
+                    account_id=account_map.get(item.name),
+                    episode_runtimes=runtimes,
+                ): item
+                for item in pending
+            }
+            file_errors: Dict[str, str] = {}
+            # 保留原始异常，全批失败时用 `raise ... from` 保住分享级错误的判定链。
+            file_exceptions: Dict[str, Exception] = {}
+            for future in as_completed(futures):
+                item = futures[future]
+                try:
+                    future.result()
+                except DownloadCancelled:
+                    # 用户暂停：保持 paused，不能被后续的「内部异常」分支记成失败。
+                    for pending_future in futures:
+                        pending_future.cancel()
+                    raise
+                except Exception as err:  # noqa: BLE001
+                    # 单文件失败只记账，不打断其他文件，也不让整个任务失败。
+                    file_errors[item.name] = _friendly_download_error(err)
+                    file_exceptions[item.name] = err
+                    logger.warning(
+                        f"网盘文件失败，继续其他文件：{item.name} - "
+                        f"{file_errors[item.name]}"
+                    )
+                    progress_writer.discard(item.name)
+                    continue
+                progress_writer.complete(item.name, int(item.size or 0))
+        return file_errors, file_exceptions
+
+    @staticmethod
+    def _discard_partial_outputs(task_dir: Path, missing: Sequence[ShareFile]) -> None:
+        """
+        清理失败文件的残片，避免下次重试把残缺文件当成可续传的基础。
+
+        :param task_dir: 任务落盘目录
+        :param missing: 未完成的文件
+        """
+        for item in missing:
+            target = task_dir / item.name
+            for path in (target, target.with_name(target.name + ".done"),
+                         target.with_suffix(target.suffix + ".plan.json")):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _record_task_outcome(
+        self,
+        *,
+        task_key: str,
+        platform: NetdiskPlatform,
+        share_code: str,
+        label: Optional[str],
+        season: Optional[Union[int, str, Sequence[int]]],
+        episodes: Optional[Set[int]],
+        episode_targets: Optional[Dict[int, Set[int]]],
+        source: Optional[str],
+        title: str,
+        pending: Sequence[ShareFile],
+        missing: Sequence[ShareFile],
+        file_errors: Dict[str, str],
+        file_exceptions: Dict[str, Exception],
+        task_dir: Path,
+    ) -> None:
+        """
+        按下载结果写入任务终态：全部完成、部分完成或抛出全批失败。
+
+        :param task_key: 任务标识
+        :param platform: 网盘平台
+        :param share_code: 分享码
+        :param label: 任务标签
+        :param season: 订阅目标季
+        :param episodes: 目标集数集合
+        :param episode_targets: 按季划分的目标集数
+        :param source: 下载来源标识
+        :param title: 分享标题
+        :param pending: 本次提交下载的文件
+        :param missing: 未完成的文件
+        :param file_errors: 文件名到失败原因的映射
+        :param file_exceptions: 文件名到原始异常的映射
+        :param task_dir: 任务落盘目录
+        :raises DownloadError: 全部文件失败时抛出，并保留首个异常的原因链
+        """
+        if not missing:
+            if task_key not in self._discarded:
+                store.upsert_task(task_key, {
+                    "state": "completed", "progress": 100.0,
+                    "error": None, "dlspeed": None, "dlspeed_bytes": 0,
+                })
+            return
+        if any(
+            _is_completed_file(task_dir / item.name, int(item.size or 0))
+            for item in pending
+        ):
+            self._record_partial_outcome(
+                task_key=task_key,
+                platform=platform,
+                share_code=share_code,
+                label=label,
+                season=season,
+                episodes=episodes,
+                episode_targets=episode_targets,
+                source=source,
+                title=title,
+                pending=pending,
+                missing=missing,
+                file_errors=file_errors,
+                file_exceptions=file_exceptions,
+                task_dir=task_dir,
+            )
+            return
+        # 全批失败时把原因一起带出来，否则用户只看到文件名，
+        # 无法区分是时长异常、直链失效还是磁盘写入失败。
+        reasons = "; ".join(
+            f"{item.name}（{file_errors.get(item.name, '未完成')}）"
+            for item in missing[:3]
+        )
+        error = DownloadError(f"下载未完成：{reasons}")
+        first_exception = next(iter(file_exceptions.values()), None)
+        if first_exception is not None:
+            # 保留原因链，外层才能识别「每个文件都因分享级错误失败」的分享。
+            raise error from first_exception
+        raise error
+
+    def _record_partial_outcome(
+        self,
+        *,
+        task_key: str,
+        platform: NetdiskPlatform,
+        share_code: str,
+        label: Optional[str],
+        season: Optional[Union[int, str, Sequence[int]]],
+        episodes: Optional[Set[int]],
+        episode_targets: Optional[Dict[int, Set[int]]],
+        source: Optional[str],
+        title: str,
+        pending: Sequence[ShareFile],
+        missing: Sequence[ShareFile],
+        file_errors: Dict[str, str],
+        file_exceptions: Dict[str, Exception],
+        task_dir: Path,
+    ) -> None:
+        """
+        至少有一个有效文件时按部分完成入库，并拉黑分享级失败。
+
+        :param task_key: 任务标识
+        :param platform: 网盘平台
+        :param share_code: 分享码
+        :param label: 任务标签
+        :param season: 订阅目标季
+        :param episodes: 目标集数集合
+        :param episode_targets: 按季划分的目标集数
+        :param source: 下载来源标识
+        :param title: 分享标题
+        :param pending: 本次提交下载的文件
+        :param missing: 未完成的文件
+        :param file_errors: 文件名到失败原因的映射
+        :param file_exceptions: 文件名到原始异常的映射
+        :param task_dir: 任务落盘目录
+        """
+        # 分享级文件失败（如仅预览流）仍要拉黑分享，否则补集搜索会反复选中同一个
+        # 坏分享；有效文件已有 .done，不受影响。
+        for name, exc in file_exceptions.items():
+            if is_share_level_error(exc):
+                reason = _friendly_download_error(exc)
+                logger.warning(
+                    f"网盘文件分享级失败，拉黑分享："
+                    f"{platform.value}:{share_code} - {name} - {reason}"
+                )
+                get_share_blacklist().add(platform.value, share_code, reason)
+        if task_key in self._discarded:
+            return
+        valid_files = [
+            item for item in pending
+            if _is_completed_file(task_dir / item.name, int(item.size or 0))
+        ]
+        missing_episodes = sorted({
+            number for item in missing
+            for number in episode_numbers(item.name)
+        })
+        target_episodes = set(episodes or ())
+        if not target_episodes:
+            target_episodes = set().union(
+                *(_normalize_episode_targets(episode_targets) or {}).values()
+            )
+        summary = {
+            "media": {
+                "title": title or label or share_code,
+                "season": season,
+            },
+            "target_episodes": sorted(target_episodes),
+            "valid_files": [
+                {"name": item.name, "size": int(item.size or 0)}
+                for item in valid_files
+            ],
+            "failed_files": [
+                {"name": item.name, "reason": file_errors.get(item.name, "未完成")}
+                for item in missing
+            ],
+            "missing_episodes": missing_episodes,
+            "source": source or "",
+        }
+        decision = judge_batch(summary)
+        is_subscription = bool(
+            source and str(source).startswith("Subscribe|")
+        )
+        if decision.decision == "retry_missing" and not is_subscription:
+            # 手动下载没有下一次订阅搜索，补下建议只会造成误导。
+            decision = BatchDecision("explain_only", decision.reason, [])
+        store.upsert_task(task_key, {
+            "state": "completed", "progress": 100.0,
+            "error": None, "dlspeed": None, "dlspeed_bytes": 0,
+            "partial": True,
+            "failed_files": summary["failed_files"],
+            # 补集只信本地确定性解析；AI 给出的集数仅保留在 ai_decision 展示。
+            "missing_episodes": missing_episodes,
+            "ai_decision": {
+                "decision": decision.decision,
+                "reason": decision.reason,
+                "missing_episodes": list(decision.missing_episodes),
+            },
+            "warning": f"部分完成：{len(valid_files)} 个有效，{len(missing)} 个失败",
+        })
+
+    def _handle_task_failure(
+        self,
+        task_key: str,
+        platform: NetdiskPlatform,
+        share_code: str,
+        stop_event: threading.Event,
+        err: Exception,
+    ) -> None:
+        """
+        按停止信号或真实异常写入任务暂停/失败状态，并拉黑分享级错误。
+
+        :param task_key: 任务标识
+        :param platform: 网盘平台
+        :param share_code: 分享码
+        :param stop_event: 停止信号
+        :param err: 后台任务抛出的异常
+        """
+        # 只有外部停止信号置位才算用户暂停；内部异常中止一律按失败记录，
+        # 否则引擎的「下载已取消」会掩盖真实错误，前端表现为任务自动暂停。
+        if stop_event.is_set():
+            logger.info(f"网盘下载已暂停：{share_code}")
+            self._mark_task_paused(task_key)
+            return
+        error_text = _friendly_download_error(err)
+        if is_share_level_error(err):
+            # 分享本身不可用（失效、仅预览流等）时拉黑，
+            # 避免订阅反复重试同一个坏分享。
+            get_share_blacklist().add(platform.value, share_code, error_text)
+        capacity_error = error_text if (
+            isinstance(err, NetdiskError)
+            and err.code is NetdiskErrorCode.SPACE_INSUFFICIENT
+        ) or "空间不足" in error_text or "容量不足" in error_text else None
+        logger.warn(f"网盘下载失败：{share_code} - {error_text}")
+        if task_key not in self._discarded:
+            store.upsert_task(task_key, {
+                "state": "error", "error": error_text,
+                "capacity_error": capacity_error,
+                "dlspeed": None, "dlspeed_bytes": 0,
+            })
 
     @staticmethod
     def _ensure_local_space(directory: Path, total_size: int) -> None:
@@ -2468,16 +2804,26 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                     stats["transferred_removed"] += 1
                 except OSError as error:
                     logger.warning(f"删除已整理网盘目录失败：{child} - {error}")
+        stats["handles_cleaned"] = self._cleanup_terminal_handles()
+        stats["records_removed"] = store.prune_terminal_tasks(record_ttl_seconds)
+        return stats
+
+    def _cleanup_terminal_handles(self) -> int:
+        """
+        清理终态任务记录里残留的转存句柄。
+
+        :return: 已清理的句柄数量
+        """
         terminal_states = {"completed", "transferred", "error", "paused"}
+        cleaned = 0
         for record in store.all_tasks():
             task_hash = _as_text(record.get("hash"))
             if not task_hash or str(record.get("state") or "") not in terminal_states:
                 continue
             if record.get("cleanup_handles"):
                 self._cleanup_persisted_handles(task_hash, record)
-                stats["handles_cleaned"] += 1
-        stats["records_removed"] = store.prune_terminal_tasks(record_ttl_seconds)
-        return stats
+                cleaned += 1
+        return cleaned
 
     def mark_reconciled(self, hashs: Union[str, list[str]],
                         downloader: Optional[str] = None) -> None:

@@ -406,16 +406,7 @@ class SubscribeRefreshOwner(SubscribeMetadataOwner):
         downloaded: List[int] = self._SubscribeChain__get_downloaded(subscribe)
         if self._SubscribeChain__is_full_best_version_enabled(subscribe):
             downloaded = []
-        if meta.type == MediaType.TV and downloaded:
-            # 后台失败但尚未被对账任务回滚的网盘任务不能计入已下载，否则订阅会被误判完成。
-            download_chain = DownloadChain()
-            failed_lookup = getattr(download_chain, "failed_netdisk_episodes", None)
-            failed_episodes = (
-                failed_lookup(subscribe.media_source, subscribe.media_id, subscribe.season)
-                if callable(failed_lookup) else set()
-            )
-            if failed_episodes:
-                downloaded = [episode for episode in downloaded if episode not in failed_episodes]
+        downloaded = self._exclude_failed_netdisk_episodes(subscribe, meta, downloaded)
         if meta.type == MediaType.TV:
             return cast(
                 Tuple[bool, Dict[Union[int, str], Dict[int, _SchemaNotExistMediaInfo]]],
@@ -438,6 +429,34 @@ class SubscribeRefreshOwner(SubscribeMetadataOwner):
         if meta.type in (MediaType.MOVIE, MediaType.MUSIC):
             return bool(downloaded), no_exists
         return False, no_exists
+
+    def _exclude_failed_netdisk_episodes(
+        self,
+        subscribe: SubscriptionSnapshot,
+        meta: MetaBase,
+        downloaded: List[int],
+    ) -> List[int]:
+        """
+        剔除后台失败但尚未被对账任务回滚的网盘集数。
+
+        这些任务不能计入已下载，否则订阅会被误判完成。
+
+        :param subscribe: 订阅快照
+        :param meta: 识别后的元数据
+        :param downloaded: 已下载集数
+        :return: 过滤后的已下载集数；非电视剧或没有已下载集数时原样返回
+        """
+        if meta.type != MediaType.TV or not downloaded:
+            return downloaded
+        download_chain = DownloadChain()
+        failed_lookup = getattr(download_chain, "failed_netdisk_episodes", None)
+        failed_episodes = (
+            failed_lookup(subscribe.media_source, subscribe.media_id, subscribe.season)
+            if callable(failed_lookup) else set()
+        )
+        if not failed_episodes:
+            return downloaded
+        return [episode for episode in downloaded if episode not in failed_episodes]
 
     def _SubscribeChain__resolve_total_episode_decrease(
         self,

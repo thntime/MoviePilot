@@ -15,7 +15,6 @@
       "app/agent/orchestrator.py:MoviePilotAgent._execute_agent": 18,
       "app/agent/policy/mcp.py:build_api_mcp_input_schema": 17,
       "app/agent/policy/sanitizer.py:sanitize_for_host": 45,
-      "app/agent/session.py:AgentSessionOwner._process_message_internal": 23,
       "app/agent/session.py:AgentSessionOwner._session_worker": 22,
       "app/agent/tools/base.py:MoviePilotTool._arun": 23,
       "app/agent/tools/impl/agent_task.py:AgentTaskTool._update_task": 16,
