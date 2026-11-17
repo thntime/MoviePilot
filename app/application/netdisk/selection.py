@@ -201,8 +201,9 @@ def should_alert(account_id: object, window_seconds: float = 6 * 60 * 60) -> boo
     """
     now = time.monotonic()
     with _LOCK:
-        last = _LAST_ALERT.get(account_id, 0.0)
-        if now - last < max(float(window_seconds), 0.0):
+        # monotonic 起点不固定，不能用 0.0 当哨兵：进程启动不足一个窗口时会被误判为刚告警。
+        last = _LAST_ALERT.get(account_id)
+        if last is not None and now - last < max(float(window_seconds), 0.0):
             return False
         _LAST_ALERT[account_id] = now
         return True

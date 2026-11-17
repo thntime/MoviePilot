@@ -1,4 +1,10 @@
 {
+  "app/adapters/cache/redis.py:asyncio.AbstractEventLoop.create_task": {
+    "owners": {
+      "AsyncRedisHelper._get_async_read_task": 1
+    },
+    "target": "asyncio.AbstractEventLoop.create_task"
+  },
   "app/adapters/external/plugin/client.py:asyncio.to_thread": {
     "owners": {
       "PluginMarketTransport.async_get_plugin_system_version_check_message": 1
@@ -222,6 +228,12 @@
     },
     "target": "asyncio.create_task"
   },
+  "app/api/dependencies/auth.py:app.runtime.execution.run_in_threadpool": {
+    "owners": {
+      "get_current_user_async": 1
+    },
+    "target": "app.runtime.execution.run_in_threadpool"
+  },
   "app/api/endpoints/anthropic.py:app.runtime.execution.run_in_threadpool": {
     "owners": {
       "_check_auth": 1
@@ -235,12 +247,75 @@
     },
     "target": "app.runtime.execution.run_in_threadpool"
   },
+  "app/api/endpoints/history.py:app.runtime.execution.run_in_threadpool": {
+    "owners": {
+      "download_history": 1
+    },
+    "target": "app.runtime.execution.run_in_threadpool"
+  },
   "app/api/endpoints/history.py:asyncio.to_thread": {
     "owners": {
+      "_grant_manual_identity_authorization": 1,
       "ai_redo_transfer_history": 1,
       "batch_ai_redo_transfer_history": 1
     },
     "target": "asyncio.to_thread"
+  },
+  "app/api/endpoints/netdisk.py:app.runtime.execution.run_in_threadpool": {
+    "owners": {
+      "cancel_qr_login": 1,
+      "check_all_accounts": 2,
+      "clear_recycle_bin": 1,
+      "confirm_qr_login": 1,
+      "create_cookie_account": 1,
+      "create_cookiecloud_account": 1,
+      "create_password_account": 1,
+      "delete_account": 1,
+      "delete_share_blacklist": 1,
+      "get_account_detail": 1,
+      "list_accounts": 1,
+      "list_share_blacklist": 1,
+      "login_with_sms": 1,
+      "poll_qr_login": 1,
+      "preview_share": 1,
+      "probe_account": 1,
+      "qr_login_frame": 1,
+      "qr_login_input": 1,
+      "qr_login_stream": 2,
+      "qr_login_stream.receiver": 1,
+      "qr_login_stream.sender": 1,
+      "refresh_account": 1,
+      "send_sms_code": 1,
+      "start_qr_login": 1,
+      "update_account": 3
+    },
+    "target": "app.runtime.execution.run_in_threadpool"
+  },
+  "app/api/endpoints/netdisk.py:asyncio.create_task": {
+    "owners": {
+      "qr_login_stream": 2,
+      "qr_login_vnc": 2
+    },
+    "target": "asyncio.create_task"
+  },
+  "app/api/endpoints/netdisk.py:asyncio.to_thread": {
+    "owners": {
+      "qr_login_stream.sender": 1
+    },
+    "target": "asyncio.to_thread"
+  },
+  "app/api/endpoints/netdisk_files.py:app.runtime.execution.run_in_threadpool": {
+    "owners": {
+      "drive_capabilities": 1,
+      "drive_delete": 1,
+      "drive_list": 1,
+      "drive_move": 1,
+      "drive_quota": 1,
+      "drive_rename": 1,
+      "drive_share": 1,
+      "drive_stream": 2
+    },
+    "target": "app.runtime.execution.run_in_threadpool"
   },
   "app/api/endpoints/openai.py:app.runtime.execution.run_in_threadpool": {
     "owners": {
@@ -370,6 +445,12 @@
     },
     "target": "app.runtime.execution.run_in_threadpool"
   },
+  "app/chain/download/reconcile.py:threading.Thread": {
+    "owners": {
+      "DownloadFailureReconcileOwner.reconcile_netdisk_failures": 1
+    },
+    "target": "threading.Thread"
+  },
   "app/chain/media/album.py:app.runtime.execution.run_in_threadpool": {
     "owners": {
       "MediaAlbumOwner._async_match_music_album_directory": 1,
@@ -416,6 +497,12 @@
       "TransferQueueOwner._TransferChain__init": 1,
       "TransferQueueOwner._TransferChain__start_lease_heartbeat_owner_locked": 1,
       "TransferQueueOwner._TransferChain__start_lease_release_owner_locked": 1
+    },
+    "target": "threading.Thread"
+  },
+  "app/chain/transfer/settlement.py:threading.Thread": {
+    "owners": {
+      "TransferSettlementOwner._rollback_subscribe_on_transfer_failure": 1
     },
     "target": "threading.Thread"
   },
@@ -497,6 +584,36 @@
     },
     "target": "app.runtime.execution.run_in_threadpool"
   },
+  "app/modules/netdisk/__init__.py:concurrent.futures.Executor.submit": {
+    "owners": {
+      "NetdiskModule._download_pending_files": 1
+    },
+    "target": "concurrent.futures.Executor.submit"
+  },
+  "app/modules/netdisk/__init__.py:concurrent.futures.ThreadPoolExecutor": {
+    "owners": {
+      "NetdiskModule._download_pending_files": 1
+    },
+    "target": "concurrent.futures.ThreadPoolExecutor"
+  },
+  "app/modules/netdisk/__init__.py:threading.Thread": {
+    "owners": {
+      "NetdiskModule._resume_task": 2,
+      "NetdiskModule.download": 1,
+      "NetdiskModule.download_existing": 1,
+      "NetdiskModule.start_torrents": 1
+    },
+    "target": "threading.Thread"
+  },
+  "app/modules/netdisk/engine.py:threading.Thread": {
+    "owners": {
+      "ChunkedDownloader._refill_missing": 1,
+      "ChunkedDownloader._run_elastic": 1,
+      "ChunkedDownloader._run_main": 1,
+      "ChunkedDownloader.run": 1
+    },
+    "target": "threading.Thread"
+  },
   "app/modules/qqbot/gateway.py:threading.Thread": {
     "owners": {
       "run_gateway.start_heartbeat": 1
@@ -506,21 +623,6 @@
   "app/modules/qqbot/qqbot.py:threading.Thread": {
     "owners": {
       "QQBot._start_gateway": 1
-    },
-    "target": "threading.Thread"
-  },
-  "app/modules/quark/__init__.py:threading.Thread": {
-    "owners": {
-      "QuarkModule.download": 1,
-      "QuarkModule.start_torrents": 1
-    },
-    "target": "threading.Thread"
-  },
-  "app/modules/quark/engine.py:threading.Thread": {
-    "owners": {
-      "ChunkedDownloader._run_elastic": 1,
-      "ChunkedDownloader._run_main": 1,
-      "ChunkedDownloader.run": 1
     },
     "target": "threading.Thread"
   },
