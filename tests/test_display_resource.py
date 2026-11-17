@@ -87,7 +87,7 @@ def test_virtual_display_starts_and_stops_owned_process(monkeypatch) -> None:
             "create",
             {
                 "visible": False,
-                "size": (1024, 768),
+                "size": (1440, 900),
             },
         ),
         "start",

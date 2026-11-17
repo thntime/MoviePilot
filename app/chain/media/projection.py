@@ -7,13 +7,18 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Final, Optional, cast
+from typing import Any, Final, Literal, Optional, cast
 
+from pydantic import ValidationError
+
+from app.application.server.mapping import get_media_mapping_port
 from app.chain.media.contract import _MediaOwnerBase
+from app.domain.context import MediaInfo
 from app.domain.metainfo import MetaInfo
 from app.schemas.event import (
     MediaRecognizeConvertEventData as _SchemaMediaRecognizeConvertEventData,
 )
+from app.schemas.mapping import MediaMapping, MediaMappingQuery
 from app.schemas.media import normalize_media_source, resolve_media_identity
 from app.schemas.types import ChainEventType, MediaSource, MediaType
 
@@ -30,6 +35,8 @@ class _ProjectionRule(Enum):
     DOUBAN_TO_TMDB = auto()
     # 根据 Bangumi 详情匹配 TMDB 身份。
     BANGUMI_TO_TMDB = auto()
+    # 根据 AniList 的多语言标题、年份和季信息匹配 TMDB 身份。
+    ANILIST_TO_TMDB = auto()
     # 根据 TMDB 详情匹配豆瓣身份。
     TMDB_TO_DOUBAN = auto()
     # 根据 Bangumi 详情匹配豆瓣身份。
@@ -41,11 +48,13 @@ class _ProjectionRule(Enum):
 _PROJECTION_RULES: Final = {
     (MediaSource.Douban, MediaSource.TMDB): _ProjectionRule.DOUBAN_TO_TMDB,
     (MediaSource.Bangumi, MediaSource.TMDB): _ProjectionRule.BANGUMI_TO_TMDB,
+    (MediaSource.AniList, MediaSource.TMDB): _ProjectionRule.ANILIST_TO_TMDB,
     (MediaSource.TMDB, MediaSource.Douban): _ProjectionRule.TMDB_TO_DOUBAN,
     (MediaSource.Bangumi, MediaSource.Douban): _ProjectionRule.BANGUMI_TO_DOUBAN,
 }
 _NUMERIC_SOURCE_RULES: Final = {
     _ProjectionRule.BANGUMI_TO_TMDB,
+    _ProjectionRule.ANILIST_TO_TMDB,
     _ProjectionRule.TMDB_TO_DOUBAN,
     _ProjectionRule.BANGUMI_TO_DOUBAN,
 }
@@ -220,6 +229,28 @@ def _build_bangumi_tmdb_match(
         year=MediaProjectionOwner._extract_year_from_bangumi(source_info),
         media_type=plan.media_type or resolve_media_type(source_info),
         season=selected_season,
+        include_season=(plan.media_type or resolve_media_type(source_info)) == MediaType.TV,
+    )
+
+
+def _build_anilist_tmdb_match(
+    plan: _ProjectionPlan,
+    source_info: _ProjectionSource,
+) -> Optional[_TmdbMatch]:
+    """
+    复用 AniList 详情投影的多语言别名及续季解析，避免用季标题建立独立剧集身份。
+    """
+    media = MediaInfo(anilist_info=dict(source_info))
+    raw_names = _unique_names(tuple(media.names or []) + (media.title, media.original_title))
+    names = _unique_names(tuple(MetaInfo(name).name for name in raw_names) + raw_names)
+    if not names:
+        return None
+    return _TmdbMatch(
+        names=names,
+        year=_optional_text(media.year),
+        media_type=plan.media_type or media.type or MediaType.TV,
+        season=plan.season if plan.season is not None else media.season,
+        include_season=True,
     )
 
 
@@ -279,6 +310,7 @@ def _build_projection_match(
     builders = {
         _ProjectionRule.DOUBAN_TO_TMDB: _build_douban_tmdb_match,
         _ProjectionRule.BANGUMI_TO_TMDB: _build_bangumi_tmdb_match,
+        _ProjectionRule.ANILIST_TO_TMDB: _build_anilist_tmdb_match,
         _ProjectionRule.TMDB_TO_DOUBAN: _build_tmdb_douban_match,
         _ProjectionRule.BANGUMI_TO_DOUBAN: _build_bangumi_douban_match,
     }
@@ -295,6 +327,8 @@ def _load_projection_source(
     """
     if plan.rule == _ProjectionRule.DOUBAN_TO_TMDB:
         return owner.douban_info(doubanid=plan.media_id, mtype=plan.media_type)
+    if plan.rule == _ProjectionRule.ANILIST_TO_TMDB:
+        return cast(Optional[_ProjectionPayload], owner.run_module("anilist_info", anilist_id=int(plan.media_id)))
     if plan.rule in {
         _ProjectionRule.BANGUMI_TO_TMDB,
         _ProjectionRule.BANGUMI_TO_DOUBAN,
@@ -319,6 +353,8 @@ async def _async_load_projection_source(
             doubanid=plan.media_id,
             mtype=plan.media_type,
         )
+    elif plan.rule == _ProjectionRule.ANILIST_TO_TMDB:
+        source_info = await owner.async_run_module("async_anilist_info", anilist_id=int(plan.media_id))
     elif plan.rule in {
         _ProjectionRule.BANGUMI_TO_TMDB,
         _ProjectionRule.BANGUMI_TO_DOUBAN,
@@ -408,6 +444,53 @@ async def _async_convert_builtin_projection(
     return await _async_apply_projection_match(owner, match) if match else None
 
 
+def _mapping_query(plan: _ProjectionPlan) -> MediaMappingQuery | None:
+    """
+    仅为非 TMDB 到 TMDB 的影视转换构造共享查询。
+
+    :param plan: 已标准化的转换输入
+    :return: 单向关系查询，其他转换返回 None
+    """
+    if plan.target != MediaSource.TMDB or plan.source == MediaSource.TMDB or plan.media_type == MediaType.MUSIC:
+        return None
+    try:
+        return MediaMappingQuery(
+            media_source=plan.source, media_id=plan.media_id,
+            type="movie" if plan.media_type == MediaType.MOVIE else "tv" if plan.media_type == MediaType.TV else None,
+            season=plan.season if plan.media_type != MediaType.MOVIE else None,
+        )
+    except ValidationError:
+        return None
+
+
+def _share_mapping(plan: _ProjectionPlan, result: _ProjectionPayload | None) -> None:
+    """
+    从成功的 TMDB 原始详情提取关系；不影响原转换结果与插件兼容合同。
+
+    :param plan: 原来源身份及转换上下文
+    :param result: 成功转换的完整 TMDB 详情，失败为 None
+    """
+    port = get_media_mapping_port()
+    query = _mapping_query(plan)
+    if port is None or query is None or not result:
+        return
+    try:
+        raw_type = result.get("media_type")
+        media_type = raw_type if isinstance(raw_type, MediaType) else MediaType.from_agent(str(raw_type or ""))
+        media_type = media_type or plan.media_type
+        if media_type not in (MediaType.MOVIE, MediaType.TV):
+            return
+        target_type: Literal["movie", "tv"] = "movie" if media_type == MediaType.MOVIE else "tv"
+        port.share(MediaMapping.model_validate({
+            **query.model_dump(), "type": query.type or target_type,
+            "tmdb_id": result.get("id"), "tmdb_type": target_type,
+            "tmdb_season": result.get("season") if target_type == "tv" else None,
+        }))
+    except (ValidationError, TypeError, ValueError):
+        # 未提供有效 TMDB 身份的旧插件结果继续返回业务调用方，但不能污染公共关系表。
+        return
+
+
 class MediaProjectionOwner(_MediaOwnerBase):
     """
     不同媒体来源之间的身份匹配与转换。
@@ -473,9 +556,19 @@ class MediaProjectionOwner(_MediaOwnerBase):
         )
         if not plan:
             return None
+        query = _mapping_query(plan)
+        port = get_media_mapping_port()
+        shared = port.query(query) if port is not None and query is not None else None
+        if shared:
+            result = self.tmdb_info(tmdbid=shared.tmdb_id, mtype=MediaType.MOVIE if shared.tmdb_type == "movie" else MediaType.TV)
+            if result:
+                return {**result, "season": shared.tmdb_season} if shared.tmdb_season is not None else result
         if plan.rule == _ProjectionRule.EVENT:
-            return MediaProjectionOwner._dispatch_projection_event(self, plan)
-        return _convert_builtin_projection(self, plan)
+            result = MediaProjectionOwner._dispatch_projection_event(self, plan)
+        else:
+            result = _convert_builtin_projection(self, plan)
+        _share_mapping(plan, result)
+        return result
 
     @staticmethod
     def _extract_year_from_bangumi(
@@ -569,8 +662,18 @@ class MediaProjectionOwner(_MediaOwnerBase):
         )
         if not plan:
             return None
+        query = _mapping_query(plan)
+        port = get_media_mapping_port()
+        shared = await port.async_query(query) if port is not None and query is not None else None
+        if shared:
+            result = await self.async_tmdb_info(tmdbid=shared.tmdb_id, mtype=MediaType.MOVIE if shared.tmdb_type == "movie" else MediaType.TV)
+            if result:
+                return {**result, "season": shared.tmdb_season} if shared.tmdb_season is not None else result
         if plan.rule == _ProjectionRule.EVENT:
-            return await MediaProjectionOwner._async_dispatch_projection_event(
+            result = await MediaProjectionOwner._async_dispatch_projection_event(
                 self, plan
             )
-        return await _async_convert_builtin_projection(self, plan)
+        else:
+            result = await _async_convert_builtin_projection(self, plan)
+        _share_mapping(plan, result)
+        return result

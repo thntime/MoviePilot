@@ -13,7 +13,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from app.application.netdisk.integrity import is_complete_file
 from app.domain.episode import episode_numbers
@@ -24,8 +24,12 @@ from app.runtime.log import logger
 _CACHE_TTL_SECONDS = 60.0
 # 缓存条目上限，超出时优先清理已过期项。
 _CACHE_MAX_ENTRIES = 512
-# 未命中缓存的哨兵，区分「没有缓存」与「缓存了负结果」。
-_MISS = object()
+# 未命中缓存的哨兵类型，区分「没有缓存」与「缓存了负结果」。
+class _CacheMiss:
+    """缓存未命中的哨兵；只用于身份判定，不承载数据。"""
+
+
+_MISS = _CacheMiss()
 # (title, season, episodes, dirs) -> (expires_at, result)
 _CACHE: dict[
     Tuple[str, Optional[int], Tuple[int, ...], Tuple[str, ...]],
@@ -110,7 +114,9 @@ def _cache_key(
     return (title, season, tuple(sorted(episodes)), tuple(download_dirs))
 
 
-def _cached(key) -> object:
+def _cached(
+    key: Tuple[str, Optional[int], Tuple[int, ...], Tuple[str, ...]],
+) -> Union[LocalExistingHit, None, _CacheMiss]:
     """读取未过期的缓存；没有缓存时返回 `_MISS`，负结果返回 None。"""
     entry = _CACHE.get(key)
     if entry is None:
@@ -232,7 +238,7 @@ def find_local_complete(
             logger.debug(f"媒体库存在性查询失败：{type(error).__name__}")
     key = _cache_key(str(title or ""), season, episodes, download_dirs)
     cached = _cached(key)
-    if cached is not _MISS:
+    if not isinstance(cached, _CacheMiss):
         return cached
     found: Dict[int, Path] = {}
     budget = _Budget(max_dirs, max_files, timeout_seconds)

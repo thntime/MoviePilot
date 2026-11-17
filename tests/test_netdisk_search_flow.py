@@ -98,7 +98,7 @@ def test_netdisk_indexers_respect_selected_sites() -> None:
     assert [site["id"] for site in projected] == [3]
 
 
-def test_search_site_page_routes_netdisk_site_to_netdisk_search(monkeypatch) -> None:
+def test_search_site_page_routes_netdisk_site_to_netdisk_search() -> None:
     """
     CD 站点的一页搜索必须走网盘搜索入口，而不是 PT 索引器搜索。
     """
@@ -129,8 +129,6 @@ def test_search_site_page_routes_netdisk_site_to_netdisk_search(monkeypatch) -> 
             calls.append(("torrent", kwargs))
             return [TorrentInfo(title="种子候选")]
 
-    monkeypatch.setattr(provider_module, "_wait_for_site_request", lambda site: None)
-
     result = provider_module._search_site_page(
         _Owner(),
         site={"id": 2, "name": "网盘站点", "kind": "cd"},
@@ -143,7 +141,7 @@ def test_search_site_page_routes_netdisk_site_to_netdisk_search(monkeypatch) -> 
     assert result and result[0].download_type == "netdisk"
 
 
-def test_search_site_page_keeps_pt_site_on_torrent_search(monkeypatch) -> None:
+def test_search_site_page_keeps_pt_site_on_torrent_search() -> None:
     """
     PT 站点的一页搜索保持原有索引器搜索入口。
     """
@@ -173,8 +171,6 @@ def test_search_site_page_keeps_pt_site_on_torrent_search(monkeypatch) -> None:
             """
             calls.append("torrent")
             return [TorrentInfo(title="种子候选")]
-
-    monkeypatch.setattr(provider_module, "_wait_for_site_request", lambda site: None)
 
     provider_module._search_site_page(
         _Owner(),
@@ -459,19 +455,6 @@ def test_async_search_routes_cd_site_to_netdisk_search(monkeypatch) -> None:
     assert calls == ["netdisk"]
     assert [item.title for item in results] == ["网盘候选"]
 
-    async def blocked(site):  # noqa: ARG001
-        """
-        模拟站点仍在请求冷却中。
-
-        :return: 始终表示需要等待
-        """
-        return True
-
-    monkeypatch.setattr(provider_module, "_async_wait_for_site_request", blocked)
-    blocked_results = asyncio.run(owner._async_search_all_sites(keyword="测试"))
-
-    assert blocked_results == []
-    assert calls == ["netdisk"]
 
 
 def test_manual_page_groups_netdisk_keywords_per_round() -> None:

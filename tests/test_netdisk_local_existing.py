@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app.chain.download import local_existing
+import app.chain.download.local_existing as local_existing
 from app.chain.download.local_existing import find_local_complete
 
 

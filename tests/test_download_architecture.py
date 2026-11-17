@@ -54,6 +54,7 @@ def test_download_monolith_is_retired_and_package_owners_are_complete() -> None:
         "failure.py",
         "reconcile.py",
         "history.py",
+        "local_existing.py",
         "ports.py",
         "processing.py",
         "selection.py",

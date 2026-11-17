@@ -379,8 +379,13 @@ class TransferWorkflowOwner(_TransferOwnerBase):
                     return False
                 if not self._is_allow_filesize(item, min_filesize):
                     return False
-            elif (not is_bluray_dir and not self._is_subtitle_file(item) and not self._is_audio_file(item)
-                  and not (batch_mtype is None and self._is_music_cover_file(item))):
+            elif (
+                    not is_bluray_dir
+                    and not self._is_subtitle_file(item)
+                    and not self._is_audio_file(item)
+                    and not self._is_media_cover_file(item)
+                    and not (batch_mtype is None and self._is_music_cover_file(item))
+            ):
                 if not self._is_media_file(item, batch_mtype):
                     return False
                 if not self._is_allow_filesize(item, min_filesize):
@@ -512,6 +517,8 @@ class TransferWorkflowOwner(_TransferOwnerBase):
         selected_fileitems: Optional[list[FileItem]] = None,
         report_results: bool = False,
         skip_success: bool = False,
+        music_track_match: Literal["strict", "ignore_duration", "sequential"] = "strict",
+        music_target_path: Optional[Path] = None,
     ) -> Tuple[bool, Union[str, dict[str, Any]]]:
         """
         执行一个复杂目录的整理操作
@@ -548,6 +555,8 @@ class TransferWorkflowOwner(_TransferOwnerBase):
         :param selected_fileitems: 前端显式选中的文件，按同一批次规划
         :param report_results: 返回实际阶段回执，后台接收不表示入库完成
         :param skip_success: 在预览、历史清理及任务准入前跳过成功记录
+        :param music_track_match: 手选专辑的曲目对齐方式，默认严格校验
+        :param music_target_path: 本次音乐最终目录，冻结后用于预览及恢复执行
         返回：成功标识，错误信息
         """
         selected_music_album: Optional[MusicAlbumInfo]
@@ -636,7 +645,8 @@ class TransferWorkflowOwner(_TransferOwnerBase):
         file_items, inherited_meta_map = candidate_planner._plan_file_items(file_items)
 
         selected_music_track_map, selected_music_error = self._selected_music_track_map(
-            file_items, selected_music_album
+            file_items, selected_music_album,
+            **({"track_match": music_track_match} if music_track_match != "strict" else {}),
         )
         if selected_music_error:
             return False, selected_music_error
@@ -687,6 +697,7 @@ class TransferWorkflowOwner(_TransferOwnerBase):
                 music_release_scripts=music_release_scripts,
                 selected_music_track_map=selected_music_track_map,
                 submission=submission,
+                music_target_path=music_target_path,
             )
         except OperationInterrupted:
             return submission.result(False, [f"{fileitem.name} 已取消"], preview=False, preview_items=[])
@@ -786,6 +797,7 @@ class TransferWorkflowOwner(_TransferOwnerBase):
         music_release_scripts: Optional[list[str]],
         selected_music_track_map: dict[str, MusicInfo],
         submission: _TransferSubmissionCollector,
+        music_target_path: Optional[Path] = None,
     ) -> Tuple[List[TransferTask], bool, List[str], int, set[Tuple[str, str]]]:
         """
         从冻结候选构建任务，并集中执行历史去重与 持久化 绑定。
@@ -808,7 +820,9 @@ class TransferWorkflowOwner(_TransferOwnerBase):
                 "notification_debounce": notification_debounce,
             }
         try:
-            for file_item, bluray_dir in self._music_transfer_items(file_items, music_batch_context):
+            for file_item, bluray_dir in self._music_transfer_items(
+                    file_items, music_batch_context, batch_mtype
+            ):
                 if runtime_stop_state.is_system_stopped:
                     raise OperationInterrupted()
                 if continue_callback and not continue_callback():
@@ -976,7 +990,8 @@ class TransferWorkflowOwner(_TransferOwnerBase):
                 cleanup_intent = cleanup_dest_fileitem if not preview and not cleanup_intent_assigned else None
                 transfer_task.bind_planning_input(
                     self._build_music_planning_input(transfer_task, music_batch_context, cleanup_intent,
-                                                    music_release_regions, music_release_scripts)
+                                                    music_release_regions, music_release_scripts,
+                                                    music_target_path=music_target_path)
                 )
                 if (
                     recovery_admission
@@ -1034,13 +1049,25 @@ class TransferWorkflowOwner(_TransferOwnerBase):
         )
 
     def _music_transfer_items(
-            self, items: List[Tuple[FileItem, bool]], context: Any,
+            self,
+            items: List[Tuple[FileItem, bool]],
+            context: Any,
+            batch_mtype: Optional[MediaType],
     ) -> Generator[Tuple[FileItem, bool], None, None]:
         """
-        随主音轨逐项解析再放行封面，无法证明唯一音乐归属时不生成图片任务。
+        音乐批次随主音轨逐项解析再放行封面，影视批次直接保留标准媒体封面。
+
+        :param batch_mtype: 当前批次媒体类型，用于隔离音乐封面归属校验。
         """
+        has_video_batch = any(
+            item.type == "file" and self._is_media_file(item, None)
+            for item, _ in items
+        )
+        is_music_batch = batch_mtype == MediaType.MUSIC or (
+            batch_mtype is None and not has_video_batch
+        )
         for item, bluray in items:
-            if self._is_music_cover_file(item):
+            if is_music_batch and self._is_music_cover_file(item):
                 related = context.related_main_keys.get(self._get_file_key(item))
                 if related not in context.resolved_contexts:
                     logger.info(f"{item.name} 没有唯一且已识别的同目录音乐归属，跳过封面整理")

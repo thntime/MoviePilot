@@ -5,7 +5,7 @@ Transmission 下载模块，负责实例路由、任务投影与下载文件选�
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Literal, Optional, Set, Tuple, Union, overload
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Literal, Optional, Set, Tuple, Union, overload
 
 from app.domain import torrent as torrent_rules
 from app.domain.metainfo import MetaInfo
@@ -44,6 +44,10 @@ _TRANSMISSION_DOWNLOADING_STATES = {
 _TRANSMISSION_PAUSED_STATES = {
     "stopped",
 }
+# 暂停磁力取元数据时最多等待 10 秒（每秒查询一次），仍无文件列表则恢复暂停并报错。
+_TORRENT_METADATA_RETRY_TIMES = 10
+# 取元数据时文件索引查询之间的等待秒数。
+_TORRENT_METADATA_RETRY_INTERVAL = 1
 
 
 @overload
@@ -148,9 +152,13 @@ class TransmissionModule(_DownloaderModuleBase[Transmission]):
     def download(self, content: Union[Path, str, bytes], download_dir: Path, cookie: str,
                  episodes: Optional[Set[int]] = None, category: Optional[str] = None, label: Optional[str] = None,
                  downloader: Optional[str] = None,
-                 custom_words: Optional[str] = None) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], str]]:
+                 custom_words: Optional[str] = None,
+                 episode_selection: Optional[torrent_rules.EpisodeSelection] = None,
+                 ) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], str]]:
         """
         读取种子内容并添加下载任务，按需选择剧集文件。
+
+        已有任务直接返回存在标志，不暂停或重选文件，包括 RPC 返回的重复添加结果。
 
         :param content: 本地种子路径、磁力链接或种子文件字节内容；普通 URL 不会由本方法下载
         :param download_dir: MoviePilot 侧的下载目录，会映射为下载器路径
@@ -160,6 +168,7 @@ class TransmissionModule(_DownloaderModuleBase[Transmission]):
         :param label: 逗号分隔的任务标签；省略时使用系统种子标签
         :param downloader: 下载器配置名称，省略时使用默认实例
         :param custom_words: 来源识别词，按行参与文件名识别，使选集结果与订阅一致
+        :param episode_selection: 目标季与已确认的季集对应关系；选集失败清理本次新增任务并保留文件
         :return: 下载器名称、任务哈希、内容布局和结果说明；无适用实例时返回 None，
             添加失败时前三项为空，说明包含失败原因
         """
@@ -191,7 +200,7 @@ class TransmissionModule(_DownloaderModuleBase[Transmission]):
             labels = get_runtime_setting('TORRENT_TAG').split(',')
         else:
             labels = None
-        added_torrent = server.add_torrent(
+        added_torrent, already_exists = server.add_torrent_with_status(
             content=torrent_content,
             download_dir=self.normalize_path(download_dir, downloader),
             is_paused=is_paused,
@@ -200,6 +209,9 @@ class TransmissionModule(_DownloaderModuleBase[Transmission]):
         )
         # TR 始终使用原始种子布局, 返回"Original"
         torrent_layout = "Original"
+
+        if added_torrent and already_exists:
+            return downloader or self.get_default_config_name(), added_torrent.hashString, torrent_layout, DOWNLOAD_TASK_ALREADY_EXISTS
 
         if not added_torrent:
             # 查询所有下载器的种子
@@ -226,12 +238,6 @@ class TransmissionModule(_DownloaderModuleBase[Transmission]):
                                 if get_runtime_setting('TORRENT_TAG') and get_runtime_setting('TORRENT_TAG') not in labels:
                                     labels.append(get_runtime_setting('TORRENT_TAG'))
                                     server.set_torrent_tag(ids=torrent_hash, tags=labels)
-                            if is_paused:
-                                selected, message = self._select_download_files(
-                                    server, torrent_hash, episodes or set(), custom_words,
-                                )
-                                if not selected:
-                                    return None, None, None, message
                             return downloader or self.get_default_config_name(), torrent_hash, torrent_layout, DOWNLOAD_TASK_ALREADY_EXISTS
                 finally:
                     torrents.clear()
@@ -242,72 +248,93 @@ class TransmissionModule(_DownloaderModuleBase[Transmission]):
             if is_paused:
                 selected, message = self._select_download_files(
                     server, torrent_hash, episodes or set(), custom_words,
+                    episode_selection,
                 )
                 if not selected:
-                    return None, None, None, message
+                    return None, None, None, self._discard_failed_selection(server, torrent_hash, message)
                 return downloader or self.get_default_config_name(), torrent_hash, torrent_layout, "添加下载任务成功"
             else:
                 return downloader or self.get_default_config_name(), torrent_hash, torrent_layout, "添加下载任务成功"
 
     @staticmethod
+    def _fetch_files_with_metadata(
+            server: Transmission, torrent_hash: str, failure: str,
+    ) -> Tuple[List[Any], bool, Optional[str]]:
+        """
+        暂停磁力取元数据：先启动任务再轮询文件列表，拿到后重新暂停。
+
+        暂停的磁力不建立 peer/DHT 连接，文件列表恒为空；先启动取元数据，
+        拿到后再重新暂停选集，超时仍恢复暂停，避免任务永久留在暂停状态。
+
+        :param server: 已配置的 Transmission 客户端
+        :param torrent_hash: 需要取元数据的任务哈希
+        :param failure: 任务保持暂停时的失败前缀
+        :return: 文件列表、取元数据后是否确认暂停、失败说明；失败说明非空时
+            文件列表为空列表，暂停状态无效
+        """
+        if not server.ensure_torrent_state(torrent_hash, paused=False):
+            return [], True, f"选集失败，任务 {torrent_hash} 启动任务未确认，请在下载器核实，未记录成功"
+        torrent_files = server.get_files(
+            torrent_hash,
+            retry=_TORRENT_METADATA_RETRY_TIMES,
+            interval=_TORRENT_METADATA_RETRY_INTERVAL,
+        )
+        if not torrent_files:
+            if not server.ensure_torrent_state(torrent_hash, paused=True):
+                return [], False, f"选集失败，任务 {torrent_hash} 启动任务未确认，请在下载器核实，未记录成功"
+            return [], True, f"{failure}：获取种子文件失败"
+        paused = server.ensure_torrent_state(torrent_hash, paused=True)
+        if not paused:
+            logger.warning(f"种子 {torrent_hash} 获取元数据后无法确认暂停，继续选集")
+        return torrent_files, paused, None
+
+    @staticmethod
     def _select_download_files(
             server: Transmission, torrent_hash: str, episodes: Set[int], custom_words: Optional[str],
+            episode_selection: Optional[torrent_rules.EpisodeSelection] = None,
     ) -> Tuple[bool, str]:
         """
         先确认任务暂停再按来源集数映射选集，确认启动状态后才返回成功。
 
-        本次只请求一集且种子只有一个视频文件时，即使文件名保留累计集号，也按
-        唯一视频文件兜底选中，避免识别后的季集与物理文件集号不一致导致误报缺集。
+        视频按目标集交集选择，保留无集号非视频附件；单集请求保留唯一视频兜底。
 
         :param server: 已配置的 Transmission 客户端
         :param torrent_hash: 需要暂停、选集并恢复的任务哈希
         :param episodes: 需要完整匹配的目标集数；空集合不启动任务
         :param custom_words: 来源识别词，按行参与物理文件名识别
+        :param episode_selection: 目标季与已确认的季集对应关系，跨季冲突不参与唯一视频兜底
         :return: 是否确认选集及启动成功，以及失败时的下载器核查说明
         """
         if not server.ensure_torrent_state(torrent_hash, paused=True):
             return False, f"选集失败，任务 {torrent_hash} 无法确认暂停，未执行选集，请在下载器核实"
         failure = f"选集失败，任务 {torrent_hash} 保持暂停，请在下载器检查"
+        paused = True
         torrent_files = server.get_files(torrent_hash)
         if not torrent_files:
-            return False, f"{failure}：获取种子文件失败"
-        wanted: list[int] = []
-        unwanted: list[int] = []
-        matched: set[int] = set()
+            torrent_files, paused, error = TransmissionModule._fetch_files_with_metadata(
+                server, torrent_hash, failure,
+            )
+            if error:
+                return False, error
+        # 取元数据后无法确认暂停时任务仍在运行，后续失败不得再称“保持暂停”。
+        state_failure = failure if paused else (
+            f"选集失败，任务 {torrent_hash} 启动任务未确认，请在下载器核实，未记录成功"
+        )
         media_extensions = {
             str(extension).lower()
             for extension in get_runtime_setting("RMT_MEDIAEXT", [])
         }
-        media_files: list[tuple[int, set[int]]] = []
         try:
-            for item in torrent_files:
-                file_id = item.id
-                file_name = Path(item.name).name
-                file_path = Path(file_name)
-                meta = MetaInfo(file_name, custom_words=custom_words.splitlines() if custom_words else [])
-                file_episodes = set(meta.episode_list)
-                if file_path.suffix.lower() in media_extensions:
-                    media_files.append((file_id, file_episodes))
-                if file_episodes and file_episodes.issubset(episodes):
-                    wanted.append(file_id)
-                    matched.update(file_episodes)
-                else:
-                    unwanted.append(file_id)
+            wanted, unwanted, matched = torrent_rules.select_torrent_files(
+                ((item.id, item.name) for item in torrent_files),
+                episodes, media_extensions, custom_words, episode_selection,
+            )
         finally:
             torrent_files.clear()
-        if not set(episodes).issubset(matched) and len(episodes) == 1 and len(media_files) == 1:
-            file_id, file_episodes = media_files[0]
-            # 多集视频不能当作单集兜底，否则会把合集误选为目标单集。
-            if len(file_episodes) <= 1:
-                if file_id in unwanted:
-                    unwanted.remove(file_id)
-                if file_id not in wanted:
-                    wanted.append(file_id)
-                matched.update(episodes)
-        if not wanted or not set(episodes).issubset(matched):
-            return False, f"{failure}：未找到目标集数 {sorted(set(episodes) - matched)}"
+        if not episodes or not episodes.issubset(matched):
+            return False, f"{state_failure}：未找到目标集数 {sorted(set(episodes) - matched)}，请检查季集映射"
         if not server.set_files(torrent_hash, wanted) or not server.set_unwanted_files(torrent_hash, unwanted):
-            return False, f"{failure}：文件选择设置未确认"
+            return False, f"{state_failure}：文件选择设置未确认"
         if not server.ensure_torrent_state(torrent_hash, paused=False):
             if server.ensure_torrent_state(torrent_hash, paused=True):
                 return False, f"{failure}：启动任务未确认，未记录成功"

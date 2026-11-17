@@ -70,17 +70,23 @@ UV_PROJECT_ENVIRONMENT="${MOVIEPILOT_WORKSPACE}/.venv-test" \
 尚未声明无 GIL 支持，不能直接替换 free-threaded 的源码依赖。
 发布审计脚本会将这个已核实修复提交按 1.2.1 版本匹配漏洞公告，安装仍使用锁文件中的源码地址。
 
+#### Beautiful Soup 的 CSS 选择器
+
+锁文件将 Soup Sieve 更新到 4.0.1，覆盖 `CVE-2026-126192` 与 `CVE-2026-126190` 的修复。[兄弟选择器公告](https://github.com/facelessuser/soupsieve/security/advisories/GHSA-4j63-6c4x-wfg4)、[后代选择器公告](https://github.com/facelessuser/soupsieve/security/advisories/GHSA-mmhr-3c5m-f64f)
+
+更新时按锁文件同步环境，并运行完整解析回归及标准、free-threaded 两套依赖审计。
+4.x 的选择器将 `template` 内容作为独立作用域，查询其内容需在对应节点上执行。
+`iframe` 内容沿用所属文档作用域。来源 HTML 解析升级时需同时核对这些边界。[上游变更说明](https://github.com/facelessuser/soupsieve/releases/tag/4.0)
+
 #### CloakBrowser 内核、授权与排队
 
-项目使用 `cloakbrowser 0.7.1`。最新版浏览器内核需要授权 key，免费 key 可运行一个并发实例。
-请先通过 [官方免费申请页](https://cloakbrowser.dev/free) 或 `python -m cloakbrowser login`
-领取，并通过运行进程的 `CLOAKBROWSER_LICENSE_KEY` 环境变量或 SDK 管理的本地 key 文件提供。
-Docker/CI 应在启动容器前配置该环境变量；key 不应提交到仓库或写入公开日志。
-未配置时，宿主浏览器入口会明确报错，不会在后台自动申请账号或输出临时领取链接。
+项目固定使用 `cloakbrowser==0.6.5`，这是上游从 `0.7.0` 开始要求授权 key 之前的最后一个版本。
+未配置 key 时，SDK 会使用旧版免费内核；配置 `CLOAKBROWSER_LICENSE_KEY` 或显式传入 key
+时，仍可按上游规则选择最新或 Pro 内核。key 不应提交到仓库或写入公开日志。
 
 宿主 Agent、站点浏览器仿真、`app.sdk.browser` 与宿主加载的旧 CloakBrowser 插件共用实例队列：
 
-- `CLOAKBROWSER_MAX_CONCURRENCY` 默认 `1`，表示同时存活的独立浏览器实例数；拥有更高授权额度时可提高。
+- `CLOAKBROWSER_MAX_CONCURRENCY` 默认 `3`，表示同时存活的独立浏览器实例数；多个独立进程仍需自行协调。
 - `CLOAKBROWSER_QUEUE_TIMEOUT` 默认 `60` 秒，超过等待上限会返回明确错误，不会终止其它任务。
 - `CLOAKBROWSER_OPERATION_TIMEOUT` 默认 `120` 秒，限制启动和单次原生浏览器操作；`CLOAKBROWSER_CLOSE_TIMEOUT` 默认 `5` 秒，限制关闭宽限。
 - 同一 Agent 浏览器会话的页面、标签及登录状态继续复用；实例未关闭时，包括等待模型响应期间，仍占用名额。
@@ -330,6 +336,21 @@ uv run --locked --no-sync python scripts/architecture/mypy_policy.py --write
 新增兼容边界必须说明真实运行合同与无法直接使用供应方声明的原因，补充行为验证，
 人工复核登记和配置差异；不能用写入命令自动接收。CI 执行同一门禁，并测试新文件报错、
 例外转移、类型桩遮蔽和写入拒绝行为。发布前以最终提交的全量检查结果为准。
+
+### 6.3 容器原生崩溃诊断
+
+容器后端通过 `-X faulthandler` 启动 Python，在导入应用和原生扩展前启用诊断，
+覆盖默认降权启动和 `START_NOGOSU=true` 两种方式。发生 `SIGSEGV`、`SIGABRT` 等致命信号时，
+Python 会尝试将线程栈写入标准错误，由 supervisor 转发到容器日志。
+Python 3.14 还会在平台支持时输出 C 栈；关闭 GIL 时只转储当前线程，避免数据竞争。
+这项诊断用于收集崩溃现场，不会阻止崩溃或代替根因修复。
+
+仍使用旧启动脚本的镜像可在容器环境中设置 `PYTHONFAULTHANDLER=1`，重建容器后生效；
+只在 MoviePilot 的 `app.env` 中设置会晚于解释器初始化，不会自动启用该功能。
+出现异常后，保留容器日志中从 `Fatal Python error` 开始的线程栈、扩展模块列表及前后日志，
+一并记录镜像 digest、revision、Python 和 `moviepilot-rust` 版本。
+标准 GIL 镜像可单独设置 `RUST_ACCEL=false` 对比观察；这只关闭 Rust 业务快路径，
+不保证卸载已导入的扩展，也不能仅凭一次未复现就排除问题。
 
 ### 7. 参考资源
 

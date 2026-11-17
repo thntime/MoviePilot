@@ -1277,7 +1277,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 return default
             value = mapping.get(platform_key)
             try:
-                return int(value)
+                return default if value is None else int(value)
             except (TypeError, ValueError):
                 return default
 
@@ -1407,7 +1407,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 })
                 task_tuning = tuning or resolver.tuning
                 progress_lock = threading.Lock()
-                progress_state = {
+                progress_state: Dict[str, Any] = {
                     "completed": 0.0,
                     "active": {},
                     "at": time.monotonic(),
@@ -1490,7 +1490,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                     }
                     file_errors: Dict[str, str] = {}
                     # 保留原始异常，全批失败时用 `raise ... from` 保住分享级错误的判定链。
-                    file_exceptions: Dict[str, BaseException] = {}
+                    file_exceptions: Dict[str, Exception] = {}
                     for future in as_completed(futures):
                         item = futures[future]
                         try:
@@ -1542,9 +1542,9 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                     # 至少有一个有效文件：按部分完成入库，交给上层决定是否补齐。
                     # 分享级文件失败（如仅预览流）仍要拉黑分享，
                     # 否则补集搜索会反复选中同一个坏分享；有效文件已有 .done，不受影响。
-                    for name, err in file_exceptions.items():
-                        if is_share_level_error(err):
-                            reason = _friendly_download_error(err)
+                    for name, exc in file_exceptions.items():
+                        if is_share_level_error(exc):
+                            reason = _friendly_download_error(exc)
                             logger.warning(
                                 f"网盘文件分享级失败，拉黑分享："
                                 f"{platform.value}:{share_code} - {name} - {reason}"
@@ -1933,7 +1933,7 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
         判断文件是否需要下载。
 
         :param name: 文件名
-        :return: 视频或归档返回 True
+        :return: 视频文件返回 True
         """
         suffix = name[name.rfind("."):].lower() if "." in name else ""
         return suffix in _DOWNLOAD_SUFFIXES

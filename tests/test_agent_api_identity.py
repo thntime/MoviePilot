@@ -340,7 +340,7 @@ def test_identity_scopes_cover_every_operation_and_match_rest_dependencies():
     endpoints = {}
     for router_spec in API_V1_ROUTER_SPECS:
         for route in router_spec.router.routes:
-            if not hasattr(route, "dependant"):
+            if not hasattr(route, "dependant") or not hasattr(route, "methods"):
                 continue
             path = re.sub(r"\{[^}]+\}", "{}", "/api/v1" + router_spec.prefix + route.path)
             for method in route.methods:

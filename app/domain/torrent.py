@@ -1,21 +1,164 @@
 """
-种子身份与下载链接的纯领域判断规则。
+种子身份、下载链接与剧集文件选择的纯领域判断规则。
 """
 
 import base64
 import binascii
 import hashlib
 import re
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
-from urllib.parse import SplitResult, parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit
+
+from app.domain.metainfo import MetaInfo
 
 if TYPE_CHECKING:
-    from app.domain.context import TorrentInfo
+    from app.domain.context import Context, TorrentInfo
 
-# TTG 详情页为 /t/{id}/，下载链接为 /dl/{id}/{auth}；auth 由每次搜索生成，几分钟后或多次请求后失效
-_TTG_HOST = "totheglory.im"
-_TTG_DETAIL_PATH = re.compile(r"/t/(\d+)/?")
-_TTG_DOWNLOAD_PATH = re.compile(r"/dl/(\d+)/[^/]+/?")
+
+@dataclass(frozen=True)
+class EpisodeSelection:
+    """
+    下载目标季与识别阶段已经确认的季集对应关系，不推算未确认的集数。
+
+    :param season: 目标季号，0 表示特别篇
+    :param source_season: 种子标题识别修正前的季号；None 表示未标季
+    :param episode_map: 标题原集号与目标集号的对应项；空元组表示没有额外换算依据
+    """
+
+    season: int
+    source_season: Optional[int] = None
+    episode_map: tuple[tuple[int, int], ...] = ()
+
+
+def episode_selection_for_context(context: "Context") -> Optional[EpisodeSelection]:
+    """
+    从单季候选冻结季集依据，只有等长的明确集号列表才建立逐集对应关系。
+
+    不根据目标季号或单个差值外推整包偏移。来源识别词由文件解析自行应用，
+    此处保留应用来源临时词之前的标题坐标，避免标题专用词无法命中文件名。
+    """
+    meta, torrent = context.meta_info, context.torrent_info
+    if meta is None or len(meta.season_list) != 1:
+        return None
+    season = meta.season_list[0]
+    original = MetaInfo(torrent.title or "", torrent.description) if torrent else None
+    source_season = original.begin_season if original else None
+    source_episodes = original.episode_list if original else []
+    target_episodes = meta.episode_list
+    mapping: tuple[tuple[int, int], ...] = ()
+    if original and len(original.season_list) == 1 and source_episodes and len(source_episodes) == len(target_episodes) and (
+            source_season != season or source_episodes != target_episodes
+    ):
+        mapping = tuple(zip(source_episodes, target_episodes))
+    return EpisodeSelection(season, source_season, mapping)
+
+
+def _file_episode_coordinates(
+        name: str, custom_words: Optional[list[str]], selection: Optional[EpisodeSelection],
+) -> tuple[Optional[set[int]], bool]:
+    """
+    解析文件并应用明确映射；None 表示季集冲突，布尔值区分无集号附件。
+    """
+    original = MetaInfo(Path(name).name)
+    meta = MetaInfo(Path(name).name, custom_words=custom_words) if custom_words else original
+    episodes = set(meta.episode_list)
+    numbered = bool(episodes)
+    if selection is None:
+        return episodes, numbered
+    corrected = (meta.begin_season, meta.episode_list) != (original.begin_season, original.episode_list)
+    if not corrected and selection.episode_map and original.begin_season in (None, selection.source_season):
+        mapping = dict(selection.episode_map)
+        mapped = {mapping[episode] for episode in episodes if episode in mapping}
+        return mapped or None, numbered
+    if meta.begin_season is not None and meta.season_list != [selection.season]:
+        return None, numbered
+    return episodes, numbered
+
+
+def torrent_file_episodes(
+        name: str, custom_words: Optional[list[str]] = None,
+        episode_selection: Optional[EpisodeSelection] = None,
+) -> set[int]:
+    """
+    返回文件在目标季中的已确认集号，供下载候选检查复用；冲突不贡献集数。
+    """
+    episodes, _numbered = _file_episode_coordinates(name, custom_words, episode_selection)
+    return episodes or set()
+
+
+def select_torrent_files(
+        files: Iterable[tuple[int, str]], episodes: set[int], media_extensions: Iterable[str],
+        custom_words: Optional[str] = None, episode_selection: Optional[EpisodeSelection] = None,
+        *, allow_single_fallback: bool = True,
+) -> tuple[list[int], list[int], set[int]]:
+    """
+    按目标季和已确认映射选择真实文件，下载器与历史结算共用相同规则。
+
+    :param files: 下载器文件索引和路径；仅解析文件名，父目录不作为季集依据
+    :param episodes: 必须由视频完整覆盖的目标集号
+    :param media_extensions: 视频后缀；历史调用方可传入其媒体后缀集合
+    :param custom_words: 来源临时识别词，先于明确映射应用，避免重复换算
+    :param episode_selection: 冻结的目标季与映射；None 保留旧调用方的集号选集行为
+    :param allow_single_fallback: 历史去重后不能用剩余唯一文件冒充原始单文件种子
+    :return: 需要下载的索引、不下载的索引和已选视频覆盖的目标集号
+    """
+    extensions = {extension.lower() for extension in media_extensions}
+    words = custom_words.splitlines() if custom_words else None
+    entries: list[tuple[int, set[int], bool]] = []
+    excluded: set[int] = set()
+    for file_id, name in files:
+        is_video = Path(name).suffix.lower() in extensions
+        mapped, numbered = _file_episode_coordinates(name, words, episode_selection)
+        if mapped is None and (is_video or numbered):
+            excluded.add(file_id)
+        entries.append((file_id, mapped or set(), is_video))
+    return select_episode_files(entries, episodes, excluded=excluded, allow_single_fallback=allow_single_fallback)
+
+
+def select_episode_files(
+    files: Iterable[tuple[int, set[int], bool]], episodes: set[int],
+    *, excluded: Optional[set[int]] = None, allow_single_fallback: bool = True,
+) -> tuple[list[int], list[int], set[int]]:
+    """
+    按视频覆盖集数选择文件，保留无集号的非视频附属文件。
+
+    多集文件与目标集有交集即选中，允许一并下载同文件中的其它集。仅请求一集且
+    只有一个单集或无集号视频时，沿用识别修正后的唯一视频兜底；附属文件不证明视频覆盖。
+
+    :param files: 文件索引、已按来源识别词解析的集数、是否为视频组成的条目
+    :param episodes: 本次需要完整覆盖的目标集数
+    :param excluded: 季集依据冲突的文件，不能参与匹配或唯一视频兜底
+    :param allow_single_fallback: 是否允许唯一视频兜底
+    :return: 需要下载的索引、不下载的索引、已选视频覆盖的集数；输入条目不会被修改
+    """
+    wanted: list[int] = []
+    unwanted: list[int] = []
+    matched: set[int] = set()
+    media_files: list[tuple[int, set[int]]] = []
+    for file_id, file_episodes, is_video in files:
+        if is_video:
+            media_files.append((file_id, file_episodes))
+        if excluded and file_id in excluded:
+            unwanted.append(file_id)
+        elif file_episodes.intersection(episodes):
+            wanted.append(file_id)
+            if is_video:
+                matched.update(file_episodes)
+        elif not file_episodes and not is_video:
+            wanted.append(file_id)
+        else:
+            unwanted.append(file_id)
+    if allow_single_fallback and not episodes.issubset(matched) and len(episodes) == 1 and len(media_files) == 1:
+        file_id, file_episodes = media_files[0]
+        # 无交集的多集视频不能用唯一视频规则冒充目标单集。
+        if len(file_episodes) <= 1 and (not excluded or file_id not in excluded):
+            unwanted.remove(file_id)
+            wanted.append(file_id)
+            matched.update(episodes)
+    return wanted, unwanted, matched
 
 
 def is_magnet_link(content: Union[str, bytes]) -> bool:
@@ -125,7 +268,10 @@ def download_hashes(content: Union[str, bytes]) -> frozenset[str]:
 
 def resource_identity(torrent: "TorrentInfo") -> Optional[tuple[str, str]]:
     """
-    按站点和稳定种子标识匹配资源，不把临时签名或标题当成种子 ID。
+    按显式字段和公开查询参数匹配资源；专站路径由 Module 解释。
+
+    :param torrent: 候选的站点、显式身份和公开定位地址
+    :return: 站点及明确资源标识；标题、票据或含糊的地址不产生身份
     """
     site = str(torrent.site or torrent.site_name or "")
     for name, prefix in (("torrent_id", "id"), ("info_hash", "hash")):
@@ -146,41 +292,17 @@ def resource_identity(torrent: "TorrentInfo") -> Optional[tuple[str, str]]:
             if values and len(values) == 1:
                 prefix = "hash" if name == "hash" else "id"
                 return site or parsed.netloc, f"{prefix}={values[0]}"
-        resource_id = _path_resource_id(parsed)
-        if resource_id:
-            return site or parsed.netloc, f"id={resource_id}"
     return None
-
-
-def _is_ttg_url(parsed: SplitResult) -> bool:
-    """
-    判断地址是否属于 TTG 站点（含子域名）。
-    """
-    host = parsed.hostname or ""
-    return host == _TTG_HOST or host.endswith(f".{_TTG_HOST}")
-
-
-def _path_resource_id(parsed: SplitResult) -> Optional[str]:
-    """
-    从已知站点的详情页或下载链接路径中提取稳定种子 ID。
-
-    馒头详情页为 /detail/{id}，换票请求参数不参与资源身份；
-    TTG 详情页为 /t/{id}/，下载链接为 /dl/{id}/{auth}，末段 auth 是临时签名，不参与资源身份。
-
-    :param parsed: 已拆分的 http(s) 地址
-    :return: 站内种子 ID；不是已知路径形态时返回 None
-    """
-    match = re.fullmatch(r"/detail/(\d+)/?", parsed.path)
-    if match is None and _is_ttg_url(parsed):
-        match = _TTG_DETAIL_PATH.fullmatch(parsed.path) or _TTG_DOWNLOAD_PATH.fullmatch(parsed.path)
-    return match[1] if match else None
 
 
 def is_expiring_download_url(url: Optional[str]) -> bool:
     """
     识别已知的短时签名下载链接；不推断签名的具体有效期。
 
-    支持查询参数中的时间戳加签名（t、sign），以及 TTG 放在下载路径末段的 auth 签名。
+    只识别查询参数中的时间戳加签名（t、sign）；专站路径票据由 Module 解释。
+
+    :param url: 下载地址或间接配方
+    :return: 是否带有完整的通用时间戳和签名参数
     """
     if not url or not url.startswith(("http://", "https://")):
         return False
@@ -189,9 +311,7 @@ def is_expiring_download_url(url: Optional[str]) -> bool:
         params = parse_qs(parsed.query)
     except ValueError:
         return False
-    if params.get("t") and params.get("sign"):
-        return True
-    return _is_ttg_url(parsed) and _TTG_DOWNLOAD_PATH.fullmatch(parsed.path) is not None
+    return bool(params.get("t") and params.get("sign"))
 
 
 def rate_limit_cooldown(message: Optional[str]) -> Optional[int]:

@@ -35,7 +35,6 @@ from app.chain.search.provider import (
     _site_keyword,
     _site_rate_limit_backoff,
     _site_request_interval,
-    _wait_for_site_request,
     log_site_skipped,
 )
 from app.chain.search.result import DisambiguationCache, SearchResultOwner, _resource_targets, stored_meta
@@ -194,9 +193,7 @@ class SearchSources:
         with capture_site_search_observation() as observation:
             deferral_seconds = 0.0
             try:
-                if _wait_for_site_request(site):
-                    items = []
-                elif _is_netdisk_site(site):
+                if _is_netdisk_site(site):
                     items = self.owner.search_netdisk_torrents(site=site, keyword=query["keyword"],
                                                                mtype=media_type, page=page) or []
                 else:

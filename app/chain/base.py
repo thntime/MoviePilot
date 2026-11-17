@@ -39,6 +39,7 @@ from app.schemas.types import (
 
 if TYPE_CHECKING:
     from app.application.transfer.workflow import TransferPlanCheckpoint, TransferPlanningInput
+    from app.domain import torrent as torrent_rules
 
 
 class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, metaclass=ABCMeta):
@@ -163,14 +164,20 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
                 raise
             return
 
-    def save_cache(self, cache: Any, filename: str) -> None:
+    def save_cache(self, cache: Any, filename: str, *, strict: bool = False) -> None:
         """
-        保存缓存
+        保存同步缓存，默认保留旧调用的失败日志合同。
+
+        :param cache: 待序列化的业务快照
+        :param filename: 目标缓存键
+        :param strict: 为 True 时向需要确认保存的用例传播失败
         """
         try:
             self.filecache.set(filename, pickle.dumps(cache))
         except Exception as err:
             logger.error(f"保存缓存 {filename} 出错：{str(err)}")
+            if strict:
+                raise
             return
 
     def remove_cache(self, filename: str) -> None:
@@ -916,6 +923,7 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
         label: Optional[str] = None,
         downloader: Optional[str] = None,
         custom_words: Optional[str] = None,
+        episode_selection: Optional[torrent_rules.EpisodeSelection] = None,
         download_type: Optional[str] = None,
         netdisk_platform: Optional[str] = None,
         share_password: Optional[str] = None,
@@ -936,6 +944,7 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
         :param label:  标签
         :param downloader:  下载器
         :param custom_words: 来源识别词，选集须与订阅解析采用相同规则
+        :param episode_selection: 目标季与已确认的原始集号对应关系，旧模块可不接收
         :param download_type: 资源类型，netdisk 表示网盘分享
         :param netdisk_platform: 网盘平台标识
         :param share_password: 网盘分享提取码
@@ -956,6 +965,7 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
             label=label,
             downloader=downloader,
             custom_words=custom_words,
+            episode_selection=episode_selection,
             download_type=download_type,
             netdisk_platform=netdisk_platform,
             share_password=share_password,

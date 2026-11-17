@@ -21,10 +21,13 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
+from typing import (
+    Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, cast,
+)
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import psutil
+from requests import Response
 
 from app.adapters.network.http import RequestUtils
 from app.domain.netdisk import DirectLink
@@ -361,13 +364,15 @@ def _is_too_many_files(error: BaseException) -> bool:
 
 
 @contextmanager
-def _open_direct_stream(url: str, headers: Dict[str, str]):
+def _open_direct_stream(
+    url: str, headers: Dict[str, str]
+) -> Iterator[Optional[Response]]:
     """
     在全局分片配额内打开直连流式响应。
 
     :param url: 直链地址
     :param headers: 请求头
-    :return: 流式响应上下文
+    :return: 流式响应上下文；请求失败时产出 None
     """
     with _CHUNK_SLOTS:
         try:

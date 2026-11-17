@@ -7,7 +7,7 @@
 > [`docs/rules/04-design-patterns.md`](rules/04-design-patterns.md) 为准，本文与其保持一致；
 > 如出现差异，以规则文档为准。
 >
-> *最后更新：2026-11-03*
+> *最后更新：2026-11-12*
 
 ---
 
@@ -412,13 +412,13 @@ flowchart TB
 
 架构基线中的 consumer 表示宿主源码中可静态证明的注册点，不是运行时 listener 实例数。
 collector 只接受 canonical `eventmanager`、`EventManager()` 及其有限别名，忽略其他对象的同名
-`register`/`add_event_listener`；当前宿主有 17 个静态注册点，另保留 1 个由工作流配置驱动的
+`register`/`add_event_listener`；当前宿主有 18 个静态注册点，另保留 1 个由工作流配置驱动的
 真实动态注册。`app/plugins/**` 插件副本不进入宿主事实。
 
 生产者与消费者共用 `scripts/architecture/event_facts.py` 这一份逐调用事实源。当前宿主有 76 个
 生产调用，其中 74 个静态解析为 76 个事件引用，`Command.send_plugin_event` 的插件事件类型和
 `dispatch_event_handler` 的持久事件恢复类型保持动态；后者只接受 `DURABLE_EVENT_TOPICS`
-登记的事件。18 个消费注册中 17 个静态、1 个动态。生成的
+登记的事件。19 个消费注册中 18 个静态、1 个动态。生成的
 `runtime-contract-baseline.json` 保存 line-free 事实、数量和枚举索引；人工维护的
 `runtime-contract-policy.json` 只批准 consumer 的精确 fingerprint、owner 和理由，任何新增、替换、
 重复或陈旧项都会失败，`--write-host` 不会改写该 policy。
@@ -558,7 +558,9 @@ flowchart TB
     I -->|是| J["标记完成 / 发送完成通知"]
 ```
 
-网盘下载失败对账（`reconcile_netdisk_failures()`）按「订阅失败 → 网盘个人盘 → 本地库 → 回滚换源」的顺序恢复：先按任务账号优先查询同平台个人盘，命中则调用个人盘下载入口重新提交并清理旧任务句柄；未命中再查媒体库与任务下载目录，本地命中时先执行真实整理，成功后才调用 `transfer_completed()` 标记整理完成并写入 `reconciled`，不触发换源；两者都未命中才回滚订阅集数、写失败台账并重新搜索。复用任务会带 `existing` 标记，再次失败时不再重复复用而直接换源。文件大小必须大于 0，且能读出有效时长或存在同名 `.done` 完成标记、且没有未完成的分片计划文件才算完整；空壳文件不得视为命中，也不得整理进媒体库。
+自动订阅刷新使用逐站时间片：Scheduler 每分钟唤醒到期检查，
+`application/subscription/refresh.py` 保存可恢复的排程事实，`chain/subscribe/poll.py` 持有有限在途工作，
+`chain/torrents.py` 在网络与识别完成后以短锁合并缓存。完整规则见[自动订阅刷新排程](subscription-refresh.md)。
 
 ### 6.3 文件整理（Transfer）与监控
 
@@ -619,6 +621,28 @@ flowchart LR
   来源 Port 有界回退，`observation.py` 记录本次来源结果和共享预算。Domain 不持有来源客户端。
   `chain/transfer/music.py` 负责批次准入与目录共识，`chain/subscribe/music.py` 使用下载/整理历史
   对账专辑入库事实；匹配不到唯一身份时保留歧义保护。
+
+### 6.6 站点协议分发
+
+- **连接检测**：`SiteChain` 通过 `run_module("test_site", ...)` 委托索引 Module。域名绑定、
+  协议别名、认证和下载权限由站点适配器解释；公共链不保留专站方法或路由表。
+  `SiteConnectionResult` 只有明确“不支持”时才允许通用网页检测，真实失败与模块缺失不会回退误报成功。
+- **RSS 和下载**：Application 持有 `RssSitePort` / `SiteProtocolPort`，启动组合根通过
+  `ModuleInvocationDispatcher` 注入实现。专站 RSS 页面、表单和过期响应归 `modules/indexer/rss.py`，
+  新旧换票配方、首次下载确认及旧站点加密包装归索引 Module；公共用例保留传输、限流、重试和来源安全策略。
+- **RSS 补全和续期**：`application/rss.py` 的 `ensure_site_rss` 统一服务站点更新事件、
+  CookieCloud、登录更新和订阅抓取。只为启用的私有站点补全空地址；已有手工地址保留，
+  只有完整的明确过期响应才续期，HTTP 错误、登录页和普通网络失败不会触发换票。
+  `domain/site.py` 合并生成地址与原筛选，整体替换认证值及生成页更新的有效期，支持相对链接。
+  候选经过真实 RSS 解析后，仓储以原主键、认证、访问配置和原 RSS 做单条条件更新，
+  在独立短事务中提交，防止覆盖并发修改；验证结果供本轮抓取复用。
+  同站点的生成请求互斥，网络与数据库操作在锁外；失败从五分钟退避至一小时，
+  同配置的过期失败通知每天最多一次。状态仅在进程内保存一天且最多 1024 份配置摘要，
+  修改 Cookie 或链接即获得新预算，重启会重置预算。公开站点、停用站点、缺少 Cookie 或
+  不支持生成的站点保留人工配置入口；这些机制不代表所有专站及账号已经实测。
+- **身份和兼容**：Domain 只解释通用身份字段与查询签名；专站路径和短时票据由 Module 解释，
+  缺少公开资源 ID 的旧检查点继续重取原页。旧站点地址、CookieCloud 和 DB Oper 使用独立的精确 Legacy SDK 门面，
+  不把一种兼容入口的符号混入另一种导出面。
 
 ---
 
@@ -821,19 +845,19 @@ flowchart LR
 
 ### 10.2 当前架构快照
 
-以下是 2026-11-06 核对的 `tests/fixtures/architecture/` 数据；这是源码合同快照，
+以下是 2026-11-17 核对的 `tests/fixtures/architecture/` 数据；这是源码合同快照，
 不代表某个已发布镜像或正在运行的实例已经验证。
 
 | 指标 | 当前值 |
 |---|---:|
-| Python 模块 | 1202 |
-| 内部导入边 | 10,405 |
+| Python 模块 | 1178 |
+| 内部导入边 | 10,774 |
 | 非平凡 SCC | 1（29 个模块的 TMDB vendor 精确 containment） |
 | Application / Chain 具体 Adapter 直连 | 0 / 0 |
 | Direct egress | 51（精确 policy 准入，Application / Chain 均为 0） |
-| Module Contract V2 spec | 224（其中 220 个方法进入 `run_module` 观察面） |
+| Module Contract V2 spec | 237（其中 223 个方法进入 `run_module` 观察面） |
 | Event Contract | 53 |
-| Event producer / consumer | 76（74 静态、2 动态）/ 18（17 静态、1 动态） |
+| Event producer / consumer | 76（74 静态、2 动态）/ 19（18 静态、1 动态） |
 | Model/Oper 自动事务与自建 Session | 0 |
 | 组合根外 `SystemConfigOper()` | 0 |
 

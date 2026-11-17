@@ -14,11 +14,11 @@ class NetdiskDriveFileModel(BaseModel):
 
     file_id: str = Field(..., description="平台文件标识")
     name: str = Field(..., description="文件名")
-    size: int = Field(0, description="字节数；目录为 0")
-    is_dir: bool = Field(False, description="是否目录")
+    size: int = Field(default=0, description="字节数；目录为 0")
+    is_dir: bool = Field(default=False, description="是否目录")
     updated_at: Optional[str] = Field(default=None, description="修改时间")
-    parent_id: str = Field("", description="父目录标识")
-    path: str = Field("", description="分享内相对路径；个人盘条目为空")
+    parent_id: str = Field(default="", description="父目录标识")
+    path: str = Field(default="", description="分享内相对路径；个人盘条目为空")
 
 
 class NetdiskDriveQuotaModel(BaseModel):
@@ -26,8 +26,8 @@ class NetdiskDriveQuotaModel(BaseModel):
     个人盘空间配额。
     """
 
-    used: int = Field(0, description="已用字节")
-    total: int = Field(0, description="总字节")
+    used: int = Field(default=0, description="已用字节")
+    total: int = Field(default=0, description="总字节")
 
 
 class NetdiskDriveShareModel(BaseModel):
@@ -36,7 +36,7 @@ class NetdiskDriveShareModel(BaseModel):
     """
 
     url: str = Field(..., description="分享链接")
-    password: str = Field("", description="提取码")
+    password: str = Field(default="", description="提取码")
     expires_at: Optional[str] = Field(default=None, description="过期时间")
 
 
@@ -63,8 +63,8 @@ class NetdiskShareRequest(BaseModel):
     files: list[NetdiskDriveFileModel] = Field(
         ..., min_length=1, description="要分享的个人盘文件列表；条目来自 netdisk.files.list 的浏览结果。"
     )
-    password: str = Field("", description="提取码，留空由平台决定")
-    expires_in: int = Field(0, description="有效期秒数，0 为平台默认")
+    password: str = Field(default="", description="提取码，留空由平台决定")
+    expires_in: int = Field(default=0, description="有效期秒数，0 为平台默认")
 
 
 class NetdiskMoveRequest(BaseModel):

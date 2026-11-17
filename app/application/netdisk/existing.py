@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import List, Optional, Sequence, Set, Tuple, Union
 
 from app.application.netdisk.files import NetdiskFilesService
 from app.domain.episode import episode_numbers
@@ -23,8 +23,12 @@ _MAX_DEPTH = 4
 _CACHE_TTL_SECONDS = 60.0
 # 缓存条目上限，超出时优先清理已过期项，避免进程内无限增长。
 _CACHE_MAX_ENTRIES = 512
-# 未命中缓存的哨兵，区分「没有缓存」与「缓存了负结果」。
-_MISS = object()
+# 未命中缓存的哨兵类型，区分「没有缓存」与「缓存了负结果」。
+class _CacheMiss:
+    """缓存未命中的哨兵；只用于身份判定，不承载数据。"""
+
+
+_MISS = _CacheMiss()
 # (account_id, title, season, episodes) -> (expires_at, result)
 _CACHE: dict[
     Tuple[int, str, Optional[int], Tuple[int, ...]],
@@ -131,7 +135,7 @@ def _cache_key(
 
 def _cached(
     key: Tuple[int, str, Optional[int], Tuple[int, ...]],
-) -> object:
+) -> Union[ExistingHit, None, _CacheMiss]:
     """读取未过期的缓存；没有缓存时返回 `_MISS`，负结果返回 None。"""
     entry = _CACHE.get(key)
     if entry is None:
@@ -271,7 +275,7 @@ def find_complete_media(
     for account_id, _name in accounts:
         key = _cache_key(account_id, title, season, set(target_episodes))
         cached = _cached(key)
-        if cached is not _MISS:
+        if not isinstance(cached, _CacheMiss):
             if cached is not None:
                 return cached
             continue

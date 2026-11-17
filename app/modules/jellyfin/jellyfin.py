@@ -248,6 +248,19 @@ class Jellyfin:
             elif library.get("CollectionType") in ("music", "musicvideos"):
                 library_type = MediaType.MUSIC.value
                 link = f"{self._playhost or self._host}web/index.html#!/music.html?topParentId={library.get('Id')}"
+            elif library.get("CollectionType") in ("boxsets", "books", "playlists"):
+                library_type = MediaType.UNKNOWN.value
+                collection_type = library.get("CollectionType")
+                link = (
+                    f"{self._playhost or self._host}web/index.html#!/{collection_type}"
+                    f"?topParentId={library.get('Id')}&collectionType={collection_type}"
+                )
+            elif library.get("CollectionType") in ("homevideos", "livetv"):
+                library_type = MediaType.UNKNOWN.value
+                link = (
+                    f"{self._playhost or self._host}web/index.html#!/{library.get('CollectionType')}"
+                    f"?topParentId={library.get('Id')}"
+                )
             elif library.get("CollectionType") is None and library.get("Type") == "CollectionFolder":
                 # 混合内容库：Jellyfin 前端没有 library 路由，自身对该类库使用 mixed 路由。
                 library_type = MediaType.UNKNOWN.value
@@ -636,6 +649,75 @@ class Jellyfin:
             return [item for item in (self.__format_item_info(item) for item in items) if item]
         except Exception as e:
             logger.debug(f"查询Jellyfin音乐出错：{e}")
+            return []
+
+    def search_library(
+        self, keyword: str, types: list[str], limit: int
+    ) -> List[_SchemaMediaServerPlayItem]:
+        """
+        通过 Jellyfin Items 搜索接口查询电视剧和可播放音乐单曲。
+
+        :param keyword: 搜索关键词
+        :param types: 需要搜索的业务类型
+        :param limit: 最多返回的条目数量
+        :return: 带封面、年份或音乐副标题的媒体服务器条目
+        """
+        if not self._host or not self._apikey or not self.user or not keyword.strip():
+            return []
+        server_types = []
+        if MediaType.TV.value in types:
+            server_types.append("Series")
+        if MediaType.MUSIC.value in types:
+            server_types.append("Audio")
+        if not server_types:
+            return []
+        url = f"{self._host}Users/{self.user}/Items"
+        params = {
+            "api_key": self._apikey,
+            "IncludeItemTypes": ",".join(server_types),
+            "Fields": "ProductionYear,Album,Artists,AlbumArtist,ImageTags",
+            "Recursive": "true",
+            "searchTerm": keyword.strip(),
+            "StartIndex": 0,
+            "Limit": max(1, min(limit, 50)),
+        }
+        try:
+            response = self._request().get_res(url, params)
+            if not response or response.status_code != 200:
+                return []
+            results: list[_SchemaMediaServerPlayItem] = []
+            for item in (response.json().get("Items") or []):
+                item_id = _optional_text(item.get("Id"))
+                title = _optional_text(item.get("Name"))
+                item_type = item.get("Type")
+                if not item_id or not title or item_type not in server_types:
+                    continue
+                artists = item.get("Artists") or []
+                artist = next((str(value) for value in artists if value), None)
+                album = _optional_text(item.get("Album"))
+                image_url = f"{self._host}Items/{item_id}/Images/Primary?api_key={self._apikey}"
+                image_tag = (item.get("ImageTags") or {}).get("Primary")
+                if image_tag:
+                    image_url += f"&tag={image_tag}"
+                results.append(
+                    _SchemaMediaServerPlayItem(
+                        id=item_id,
+                        item_id=item_id,
+                        title=title,
+                        subtitle=(str(artist or "") + (f" · {album}" if album else "")) or None
+                        if item_type == "Audio"
+                        else str(item.get("ProductionYear")) if item.get("ProductionYear") else None,
+                        year=item.get("ProductionYear"),
+                        type=MediaType.TV.value if item_type == "Series" else MediaType.MUSIC.value,
+                        image=image_url,
+                        server_type="jellyfin",
+                    )
+                )
+                if len(results) >= limit:
+                    break
+            return results
+        except Exception as e:
+            logger.debug(f"搜索 Jellyfin 媒体库出错：{e}")
             return []
 
     def get_tv_episodes(

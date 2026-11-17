@@ -217,6 +217,23 @@ class Aria2:
             return True
         return bool(self._call("aria2.removeDownloadResult", [gid]))
 
+    def delete_torrents(self, delete_file: bool, ids: str) -> bool:
+        """
+        移除任务，保留下载文件。
+
+        aria2 RPC 不提供删除下载文件的选项，``delete_file`` 仅保留签名兼容：
+        运行中的任务先取消，已停止的任务再清理下载结果，两种情况都不删除文件。
+
+        :param delete_file: 是否同时删除下载文件；aria2 不支持，忽略该参数
+        :param ids: 任务 gid
+        :return: 任一删除步骤成功时返回 True
+        """
+        if not ids:
+            return False
+        if self._call("aria2.remove", [ids]):
+            return True
+        return bool(self._call("aria2.removeDownloadResult", [ids]))
+
     def pause(self, gid: str) -> bool:
         """
         暂停任务。

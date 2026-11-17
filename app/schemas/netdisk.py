@@ -22,7 +22,7 @@ class NetdiskCookieRequest(BaseModel):
     platform: Optional[str] = Field(default=None, description="网盘平台标识；传入 account_id 时可省略")
     cookie: str = Field(..., description="浏览器复制的 Cookie 头或平台令牌")
     name: Optional[str] = Field(default=None, description="账号名称，缺省时使用平台默认名称")
-    is_primary: bool = Field(False, description="是否设为该平台主账号")
+    is_primary: bool = Field(default=False, description="是否设为该平台主账号")
     account_id: Optional[int] = Field(default=None, description="已有账号主键，传入时更新凭据而不新建")
 
 
@@ -33,7 +33,7 @@ class NetdiskCookieCloudRequest(BaseModel):
 
     platform: Optional[str] = Field(default=None, description="网盘平台标识；传入 account_id 时可省略")
     name: Optional[str] = Field(default=None, description="账号名称")
-    is_primary: bool = Field(False, description="是否设为该平台主账号")
+    is_primary: bool = Field(default=False, description="是否设为该平台主账号")
     account_id: Optional[int] = Field(default=None, description="已有账号主键，传入时更新凭据而不新建")
 
 
@@ -46,7 +46,7 @@ class NetdiskPasswordRequest(BaseModel):
     username: str = Field(..., description="登录账号")
     password: str = Field(..., description="登录密码，仅用于换取令牌")
     name: Optional[str] = Field(default=None, description="账号名称")
-    is_primary: bool = Field(False, description="是否设为该平台主账号")
+    is_primary: bool = Field(default=False, description="是否设为该平台主账号")
     account_id: Optional[int] = Field(default=None, description="已有账号主键，传入时更新凭据而不新建")
 
 
@@ -90,7 +90,7 @@ class NetdiskSmsLoginRequest(BaseModel):
     code: str = Field(..., description="短信验证码")
     verification_id: str = Field(..., description="发送验证码接口返回的验证会话")
     name: Optional[str] = Field(default=None, description="账号名称")
-    is_primary: bool = Field(False, description="是否设为该平台主账号")
+    is_primary: bool = Field(default=False, description="是否设为该平台主账号")
     account_id: Optional[int] = Field(default=None, description="已有账号主键，传入时更新凭据而不新建")
 
 
@@ -101,7 +101,7 @@ class NetdiskQrStartRequest(BaseModel):
 
     platform: str = Field(..., description="网盘平台标识")
     name: Optional[str] = Field(default=None, description="登录成功后写入的账号名称")
-    is_primary: bool = Field(False, description="是否设为该平台主账号")
+    is_primary: bool = Field(default=False, description="是否设为该平台主账号")
     account_id: Optional[int] = Field(default=None, description="已有账号主键，用于更新登录态")
 
 
@@ -123,7 +123,7 @@ class NetdiskSharePreviewRequest(BaseModel):
     """
 
     url: str = Field(..., description="分享链接")
-    password: str = Field("", description="分享提取码，留空表示无提取码")
+    password: str = Field(default="", description="分享提取码，留空表示无提取码")
     platform: Optional[str] = Field(default=None, description="网盘平台标识；缺省时按链接识别")
     account_id: Optional[int] = Field(default=None, description="指定取链账号，缺省使用平台主账号")
     season: Optional[Union[int, str, list[int]]] = Field(
@@ -132,7 +132,7 @@ class NetdiskSharePreviewRequest(BaseModel):
     episodes: Optional[Union[int, str, list[int]]] = Field(
         default=None, description="目标集数，支持整数、E01-E03 文本或集数列表"
     )
-    user_intent: str = Field("", description="用户自然语言意图，作为预选补充")
+    user_intent: str = Field(default="", description="用户自然语言意图，作为预选补充")
 
 
 class NetdiskPlatformInfo(BaseModel):
@@ -147,8 +147,8 @@ class NetdiskPlatformInfo(BaseModel):
     max_concurrency: int = Field(..., description="平台并发上限")
     cookie_required_keys: list[str] = Field(default_factory=list, description="凭据必填字段")
     supports_password_login: bool = Field(..., description="是否支持账号密码登录")
-    supports_refresh: bool = Field(False, description="是否支持刷新令牌")
-    recycle_bin: bool = Field(False, description="是否支持读取与清空回收站")
+    supports_refresh: bool = Field(default=False, description="是否支持刷新令牌")
+    recycle_bin: bool = Field(default=False, description="是否支持读取与清空回收站")
     login_url: str = Field(..., description="平台登录页地址")
 
 
@@ -165,9 +165,9 @@ class NetdiskAccountView(BaseModel):
     expires_at: Optional[str] = Field(default=None, description="过期时间")
     last_checked_at: Optional[str] = Field(default=None, description="最近检测时间")
     masked: dict[str, str] = Field(default_factory=dict, description="脱敏后的凭据字段")
-    nickname: str = Field("", description="账号昵称/手机号")
-    quota_used: int = Field(0, description="已用空间")
-    quota_total: int = Field(0, description="总空间")
+    nickname: str = Field(default="", description="账号昵称/手机号")
+    quota_used: int = Field(default=0, description="已用空间")
+    quota_total: int = Field(default=0, description="总空间")
     speed: float = Field(0.0, description="账号平均下载速度，单位字节每秒")
 
 
@@ -204,10 +204,10 @@ class NetdiskData(BaseModel):
         default_factory=list, description="当前有效的分享黑名单"
     )
     account: Optional[NetdiskAccountDetailView] = Field(default=None, description="单个账号；详情接口附带明文凭据")
-    checked: int = Field(0, description="本次检测的账号总数")
-    active: int = Field(0, description="检测为有效的账号数")
-    expired: int = Field(0, description="登录态失效的账号数")
-    failed: int = Field(0, description="检测失败或状态未知的账号数")
+    checked: int = Field(default=0, description="本次检测的账号总数")
+    active: int = Field(default=0, description="检测为有效的账号数")
+    expired: int = Field(default=0, description="登录态失效的账号数")
+    failed: int = Field(default=0, description="检测失败或状态未知的账号数")
     session_id: Optional[str] = Field(default=None, description="扫码会话标识")
     ticket: Optional[str] = Field(default=None, description="WebSocket 一次性票据")
     platform: Optional[str] = Field(default=None, description="相关平台")
@@ -233,7 +233,7 @@ class NetdiskData(BaseModel):
         default_factory=list, description="AI 预选中的文件标识，保持模型返回顺序"
     )
     suggested_episode_selection: str = Field(
-        "", description="由 AI 预选文件压缩出的建议集数，可直接填入集数输入框"
+        default="", description="由 AI 预选文件压缩出的建议集数，可直接填入集数输入框"
     )
     quota: Optional[NetdiskDriveQuotaModel] = Field(default=None, description="空间配额")
     share: Optional[NetdiskDriveShareModel] = Field(default=None, description="分享结果")

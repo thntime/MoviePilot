@@ -12,7 +12,7 @@ import pytest
 
 from app.application.netdisk import selection
 from app.application.netdisk.existing import ExistingHit
-from app.chain.download import local_existing
+import app.chain.download.local_existing as local_existing
 from app.chain.download.local_existing import LocalExistingHit
 from app.chain.download.reconcile import DownloadFailureReconcileOwner
 from app.chain.subscribe.completion import SubscribeCompletionOwner

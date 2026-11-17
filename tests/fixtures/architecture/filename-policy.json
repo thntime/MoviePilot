@@ -153,9 +153,34 @@
   ],
   "reviewed_multiword_files": [
     {
+      "path": "app/adapters/system/netdisk_speed.py",
+      "reason": "网盘账号平均速度的 EWMA 采样与 JSON 持久化端口，被网盘下载器与账号接口共用，尚无同名能力包。",
+      "evidence": "app/adapters/system/netdisk_speed.py 被 app/modules/netdisk 与 app/api/endpoints/netdisk_account.py 直接导入，属于单一技术能力。"
+    },
+    {
+      "path": "app/api/endpoints/netdisk_files.py",
+      "reason": "网盘文件浏览与回收站 REST 端点，路由前缀固定，和 netdisk 模块路由一一对应。",
+      "evidence": "该文件注册 /api/v1/netdisk/files 路由族，由 app/api/endpoints/netdisk.py 挂载。"
+    },
+    {
       "evidence": "GitHub OAuth 授权由 API、启动组合根和现有 Copilot 登录共同调用，单独能力服务需要保持稳定的跨层导入路径。",
       "path": "app/application/github_auth.py",
       "reason": "GitHub Token 授权是宿主级应用能力，不属于单一 API 端点或外部适配器实现。"
+    },
+    {
+      "path": "app/application/netdisk/ai_selection.py",
+      "reason": "网盘候选 AI 精选用例，依赖注入的提示与候选投影端口，不构成独立包。",
+      "evidence": "被 app/chain/search 与 Agent 工具共同调用，作为 application/netdisk 包内单文件用例。"
+    },
+    {
+      "path": "app/application/netdisk/batch_judge.py",
+      "reason": "网盘候选批量判定用例，按批合并 AI 判定结果并回写候选状态。",
+      "evidence": "由网盘搜索与订阅链路共用，作为 application/netdisk 包内单文件用例。"
+    },
+    {
+      "path": "app/application/netdisk/share_blacklist.py",
+      "reason": "网盘分享失效黑名单用例与持久化端口，被搜索、下载与对账共同使用。",
+      "evidence": "app/modules/cloudsaver 与 app/chain/download 通过该模块读写黑名单，尚无同名子包。"
     },
     {
       "evidence": "多条现有 Chain 直接导入该私有协议集合，迁移必须随 chain 同名包治理完成。",
@@ -183,6 +208,11 @@
       "reason": "识别 Chain owner 迁移必须与完整调用边界一起完成。"
     },
     {
+      "path": "app/chain/download/local_existing.py",
+      "reason": "下载提交前核对本地已有文件的 owner，隔离扫描缓存与命中判定。",
+      "evidence": "DownloadChain 组合根通过该 owner 提供本地已有文件对账，属于 chain/download 同名包内的单一职责文件。"
+    },
+    {
       "evidence": "所有 ORM 表约束从该私有模块集中引用，单独改名不能改善归属。",
       "path": "app/db/models/_constraints.py",
       "reason": "数据库模型包内共享约束集合是私有实现。"
@@ -201,6 +231,11 @@
       "evidence": "路径属于内含 tmdbv3api 代码，包根已按 contained_vendor 单独登记。",
       "path": "app/modules/themoviedb/tmdbv3api/as_obj.py",
       "reason": "保留内含上游库的原始模块名以维持其内部导入。"
+    },
+    {
+      "path": "app/schemas/netdisk_files.py",
+      "reason": "网盘文件浏览与回收站 API 的请求/响应 schema。",
+      "evidence": "仅被 app/api/endpoints/netdisk_files.py 与前端契约测试使用，属单一 API 数据契约。"
     }
   ],
   "schema_version": 2,

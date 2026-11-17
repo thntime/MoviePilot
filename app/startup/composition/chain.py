@@ -7,6 +7,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
+from app.adapters.external.mapping import MediaMappingClient
 from app.adapters.external.server import MoviePilotServerHelper
 from app.adapters.system.host import SystemUtils
 from app.application.chain.context import (
@@ -25,6 +26,8 @@ from app.application.image import (
     configure_wallpaper_providers,
     reset_wallpaper_providers,
 )
+from app.application.module import ModuleRuntime, configure_module_runtime
+from app.application.server.mapping import configure_media_mapping_port
 from app.application.subscription.activity import SubscriptionActivityService
 from app.application.system import SystemService
 from app.chain._recognition import (
@@ -192,6 +195,13 @@ def configure_chain_runtime_context(
     )
 
 
+def configure_module_runtime_provider() -> None:
+    """
+    在组合层登记惰性宿主模块运行时，不在此阶段实例化具体模块管理器。
+    """
+    configure_module_runtime(lambda: cast(ModuleRuntime, ModuleManager()))
+
+
 def reset_chain_services() -> None:
     """
     按发布逆序撤销 Chain 无参上下文和壁纸来源。
@@ -333,6 +343,7 @@ def configure_chain_port_composition() -> None:
     """
     reset_chain_port_composition()
     try:
+        configure_media_mapping_port(MediaMappingClient())
         configure_recognition_share_port(
             cast(RecognitionSharePort, _RecognitionShareAdapter())
         )
@@ -351,6 +362,7 @@ def reset_chain_port_composition() -> None:
     """
     释放 Chain 技术端口，支持重复 lifespan 与启动失败回滚。
     """
+    configure_media_mapping_port(None)
     reset_network_filesystem_port()
     reset_subscription_share_port()
     reset_recognition_share_port()

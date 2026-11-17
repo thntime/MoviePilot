@@ -11,6 +11,7 @@ import pytest
 import app.chain.download.batch as download_batch
 import app.chain.download.selection as download_selection
 from app.application.netdisk.resolve import NetdiskResolveService, ResolvedShare
+from app.application.torrent.download import TorrentHelper
 from app.chain.download import DownloadChain
 from app.domain.context import Context, MediaInfo, TorrentInfo
 from app.domain.metainfo import MetaInfo
@@ -26,6 +27,9 @@ def _context(
         season: int = 1,
         media_type: MediaType = MediaType.TV,
 ) -> Context:
+    """
+    构造指定媒体身份、季和集号的批量下载候选。
+    """
     meta = MetaInfo(f"{name} S{season:02d}")
     if episodes:
         meta.set_episodes(begin=min(episodes), end=max(episodes))
@@ -44,6 +48,9 @@ def _missing(
         season: int = 1,
         complete: bool = False,
 ) -> NotExistMediaInfo:
+    """
+    构造单季缺集或完整覆盖要求。
+    """
     return NotExistMediaInfo(
         season=season, episodes=list(episodes), total_episode=total,
         start_episode=1, require_complete_coverage=complete,
@@ -75,6 +82,9 @@ def batch(monkeypatch):
 
 
 def _submitted(chain) -> list[Context]:
+    """
+    按调用顺序提取批量下载提交的候选。
+    """
     return [
         call.args[0] if call.args else call.kwargs["context"]
         for call in chain.download_single.call_args_list
@@ -110,6 +120,25 @@ def _patch_netdisk_paths(monkeypatch, paths):
         )
 
     monkeypatch.setattr(NetdiskResolveService, "walk", fake_walk)
+
+
+def test_partial_pack_maps_file_episodes_before_missing_intersection(batch):
+    """
+    拆包候选检查也须先映射，避免目标 E05 在累计编号包中被提前丢弃。
+    """
+    context = _context("Show", episodes=tuple(range(1, 13)), season=2)
+    context.torrent_info.title = "Show.S01E13-E24"
+    batch.chain.download_torrent.return_value = (
+        b"torrent", None, [f"Show.S01E{episode:02}.mkv" for episode in range(13, 25)],
+    )
+    batch.helper.get_torrent_episodes = TorrentHelper.get_torrent_episodes
+    missing = {"tmdb:1": {2: _missing((5,), total=12, season=2)}}
+
+    downloaded, remaining = batch.chain.batch_download([context], missing)
+
+    assert downloaded == [context]
+    assert remaining == {}
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {5}
 
 
 def test_batch_preserves_phase_order_and_submission_options(batch):
@@ -178,6 +207,21 @@ def test_incomplete_season_becomes_labelled_candidate_after_file_inspection(batc
     batch.chain.download_single.assert_called_once()
     assert "torrent_content" not in batch.chain.download_single.call_args.kwargs
     batch.chain._record_download_failure.assert_not_called()
+
+
+def test_whole_season_download_preserves_other_seasons_with_explicit_missing_episodes(batch):
+    """
+    整季下载成功只清除该季，其他季的缺集仍能在本轮获得提交。
+    """
+    whole = _context("show", season=2)
+    partial = _context("show", season=1, episodes=(1,))
+    missing = {"tmdb:1": {1: _missing((1, 2)), 2: _missing(season=2)}}
+
+    result, remaining = batch.chain.batch_download([whole, partial], missing)
+
+    assert result == [whole, partial]
+    assert set(remaining["tmdb:1"]) == {1}
+    assert remaining["tmdb:1"][1].episodes == [2]
 
 
 def test_failed_season_submission_stays_in_cooldown_after_metadata_changes(batch):
@@ -746,3 +790,65 @@ def test_partial_pack_reports_mismatch(batch):
     assert batch.chain.download_single.call_count == 0
     assert calls and calls[0][0] == "rejected"
     assert "季号" in (calls[0][1] or "")
+
+
+def _target_missing(start: int, total: int) -> NotExistMediaInfo:
+    """
+    构造订阅起止集限定的完整覆盖缺失范围，与首次整包优先和洗版入口一致。
+    """
+    return NotExistMediaInfo(
+        season=1, episodes=[], total_episode=total, start_episode=start,
+        require_complete_coverage=True,
+    )
+
+
+def test_whole_season_pack_only_selects_subscribed_episodes(batch):
+    """
+    只订阅单集时，整季包覆盖目标也只选择目标集，不下载订阅范围外的剧集。
+    """
+    pack = _context("pack")
+    single = _context("single", episodes=(5,))
+    missing = {"tmdb:1": {1: _target_missing(5, 5)}}
+    batch.chain.download_torrent.return_value = (b"torrent", None, list(range(1, 11)))
+
+    result, remaining = batch.chain.batch_download([pack, single], missing)
+
+    assert result == [pack]
+    assert remaining == {}
+    batch.chain.download_single.assert_called_once()
+    call = batch.chain.download_single.call_args
+    assert call.kwargs["context"] is pack
+    assert call.kwargs["torrent_content"] == b"torrent"
+    assert call.kwargs["episodes"] == {5}
+    assert pack.confirmed_full_coverage is True
+
+
+def test_whole_season_pack_matching_target_keeps_whole_submission(batch):
+    """
+    种子集数与目标范围一致时仍整包提交，保留字幕、花絮等无集号文件。
+    """
+    pack = _context("pack")
+    missing = {"tmdb:1": {1: _target_missing(1, 4)}}
+
+    result, remaining = batch.chain.batch_download([pack], missing)
+
+    assert result == [pack]
+    assert remaining == {}
+    assert batch.chain.download_single.call_args.kwargs.get("episodes") is None
+    assert pack.confirmed_full_coverage is True
+
+
+def test_labelled_pack_magnet_only_selects_subscribed_episodes(batch):
+    """
+    无法读取文件的带集数完整包回退分集包阶段时，同样只提交订阅范围内的集。
+    """
+    labelled = _context("labelled", episodes=tuple(range(1, 11)))
+    missing = {"tmdb:1": {1: _target_missing(5, 6)}}
+    batch.chain.download_torrent.return_value = ("magnet:?xt=test", None, [])
+
+    result, remaining = batch.chain.batch_download([labelled], missing)
+
+    assert result == [labelled]
+    assert remaining == {}
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {5, 6}
+    assert labelled.confirmed_full_coverage is True

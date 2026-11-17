@@ -447,6 +447,7 @@ class ConfigModel(BaseModel):
                 ".f4v",
             ], description='支持的视频文件后缀格式')
     RMT_SUBEXT: list[str] = Field(default_factory=lambda: [".srt", ".ass", ".ssa", ".sup"], description='支持的字幕文件后缀格式')
+    RMT_LYRICSEXT: list[str] = Field(default_factory=lambda: [".lrc"], description='支持的歌词文件后缀格式')
     RMT_AUDIOEXT: list[str] = Field(
             default_factory=lambda: [
                 ".aac",
@@ -512,7 +513,7 @@ class ConfigModel(BaseModel):
     CLOAKBROWSER_HUMANIZE: bool = Field(default=True, description='CloakBrowser 是否启用拟人化输入')
     CLOAKBROWSER_HUMAN_PRESET: str = Field(default="default", description='CloakBrowser 拟人化输入预设：default 或 careful')
     CLOAKBROWSER_MAX_CONCURRENCY: int = Field(
-        default=1, ge=1, description="同时存活的 CloakBrowser 实例上限，默认 1；提高前需确认授权并发额度",
+        default=3, ge=1, description="同时存活的 CloakBrowser 实例上限，默认 3；提高前需确认授权并发额度",
     )
     CLOAKBROWSER_QUEUE_TIMEOUT: int = Field(
         default=60, ge=1, description="等待 CloakBrowser 实例名额的最长秒数，默认 60 秒",
@@ -761,7 +762,7 @@ class ConfigModel(BaseModel):
     AI_AGENT_PET: str = Field(default="", description='默认助手形象，格式为 插件ID:形象key，留空使用内置机器人；用户个人选择优先')
     AI_AGENT_OUTPUT_LANGUAGE: str = Field(default="zh-CN", description='内置智能助手输出语言，默认使用简体中文')
     LLM_PROVIDER: str = Field(default="deepseek", description='LLM提供商（支持内置 provider，以及从 models.dev 动态补充的平台）')
-    LLM_MODEL: str = Field(default="deepseek-chat", description='LLM模型名称')
+    LLM_MODEL: str = Field(default="deepseek-v4-flash", description='LLM模型名称')
     LLM_THINKING_LEVEL: Optional[str] = Field(
         default="off",
         description='思考模式/深度配置：off/auto/minimal/low/medium/high/max/xhigh；OpenAI兼容接口保留max/xhigh，仅按已知模型能力降级',

@@ -14,11 +14,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 from urllib.parse import parse_qs, unquote, urljoin, urlsplit
 
-from lxml import html
 from torrentool.api import Torrent
 from torrentool.exceptions import TorrentoolException
 
 from app.application.configuration import get_chain_runtime_config_snapshot, get_configured_system_config
+from app.application.site.protocol import get_site_protocol_port, is_expiring_download_url
 from app.application.site.query import get_configured_site_query_service
 from app.application.site.throttle import defer_site_request, site_request_config, wait_for_site_request
 from app.domain import torrent as torrent_rules
@@ -36,7 +36,6 @@ from app.schemas.media import resolve_media_identity
 from app.schemas.types import MediaSource, MediaType, SystemConfigKey
 
 _SIZE_UNIT = 1024 * 1024
-
 
 def _is_transient_torrent_status(status: int) -> bool:
     """
@@ -231,34 +230,6 @@ def _cache_valid_torrent_content(
     return folder_name, file_list
 
 
-def _first_download_form(text: str, url: str) -> Optional[Tuple[str, dict[str, Any]]]:
-    """
-    解析下载确认表单，仅向当前下载端点提交有效控件，避免泄露站点凭据。
-    """
-    try:
-        forms = html.fromstring(text).forms
-    except (ValueError, html.etree.ParserError):
-        return None
-    for form in forms:
-        action = form.get("action", "").strip()
-        target = url if action in ("", "?") else urljoin(url, action)
-        origin, destination = urlsplit(url), urlsplit(target)
-        if (destination[:2] != origin[:2] or destination.path != origin.path
-                or form.get("method", "post").lower() != "post"):
-            continue
-        data = dict(form.form_values())
-        # form_values 不包含用户点击的提交控件，首次下载确认可能依赖该字段。
-        submits = form.xpath(
-            './/input[@name and not(@disabled) and translate(@type, "SUBMIT", "submit")="submit"]'
-            ' | .//button[@name and not(@disabled) and (not(@type) or @type="submit")]'
-        )
-        if submits:
-            data[submits[0].get("name")] = submits[0].get("value", "")
-        if data:
-            return target, data
-    return None
-
-
 def _text_filter_failure(torrent: TorrentInfo, params: Dict[str, Any], content: str) -> Optional[Tuple[str, str]]:
     """
     按原有顺序检查包含、排除、质量等正则，并返回业务原因和运行诊断。
@@ -415,7 +386,7 @@ class TorrentHelper:
                 )
             else:
                 response = self._request_torrent_get(
-                    http_port, retry and not torrent_rules.is_expiring_download_url(url), site,
+                    http_port, retry and not is_expiring_download_url(url), site,
                     url=url, cookie=cookie, ua=ua, referer=referer,
                     proxies=proxies, allow_redirects=False,
                 )
@@ -457,7 +428,7 @@ class TorrentHelper:
             return False
         if self.get_fileinfo_from_torrent_content(content)[1]:
             return False
-        return "下载种子文件".encode("utf-8") not in content
+        return not get_site_protocol_port().is_torrent_download_confirmation(content)
 
     def _cached_torrent_content(self, cache_backend: Any, cache_path: Path) -> Optional[tuple[
         Union[str, bytes], str, list[str],
@@ -511,7 +482,7 @@ class TorrentHelper:
         config = get_chain_runtime_config_snapshot()
         http_port = _require_torrent_port()
         site = site_request_config(url, site_id)
-        retry = cache_invalid and not torrent_rules.is_expiring_download_url(url)
+        retry = cache_invalid and not is_expiring_download_url(url)
         try:
             req, url, cookie = self._request_torrent_redirects(
                 http_port, url=url, cookie=cookie, ua=ua, referer=referer,
@@ -532,8 +503,9 @@ class TorrentHelper:
             )
             if file_list:
                 return cache_path, req.content, folder_name, file_list, ""
-            if "下载种子文件".encode("utf-8") in req.content:
-                confirmation = _first_download_form(req.text, url)
+            protocol = get_site_protocol_port()
+            if protocol.is_torrent_download_confirmation(req.content):
+                confirmation = protocol.parse_torrent_download_confirmation(req.text, url)
                 if confirmation is None:
                     logger.warning("触发首次种子下载，但未找到可安全提交的确认表单")
                     if cache_invalid:
@@ -773,12 +745,16 @@ class TorrentHelper:
         return result
 
     @staticmethod
-    def get_torrent_episodes(files: list[str], custom_words: Optional[List[str]] = None) -> list[int]:
+    def get_torrent_episodes(
+            files: list[str], custom_words: Optional[List[str]] = None,
+            episode_selection: Optional[torrent_rules.EpisodeSelection] = None,
+    ) -> list[int]:
         """
         从种子的文件清单中获取所有集数
 
         :param files: 种子文件清单
         :param custom_words: 当前下载来源的临时自定义识别词
+        :param episode_selection: 目标季和已经确认的季集对应关系，冲突文件不贡献集数
         :return: 识别到的全部集数
         """
         episodes: list[int] = []
@@ -790,10 +766,9 @@ class TorrentHelper:
             if not file_path.suffix or file_path.suffix.lower() not in config.video_extensions:
                 continue
             # 只使用文件名识别
-            meta = MetaInfo(file_path.name, custom_words=custom_words)
-            if not meta.begin_episode:
-                continue
-            episodes = list(set(episodes).union(set(meta.episode_list)))
+            episodes = list(set(episodes).union(torrent_rules.torrent_file_episodes(
+                file_path.name, custom_words=custom_words, episode_selection=episode_selection,
+            )))
         return episodes
 
     def is_invalid(self, url: Optional[str]) -> bool:

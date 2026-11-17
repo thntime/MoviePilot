@@ -65,10 +65,8 @@ def downloader(request):
     """
     content, hashes = _torrent()
     server = Mock()
-    server.add_torrent.return_value = (
-        (True, [hashes[0]]) if request.param is QbittorrentModule
-        else SimpleNamespace(hashString=hashes[0])
-    )
+    server.add_torrent.return_value = (True, [hashes[0]])
+    server.add_torrent_with_status.return_value = (SimpleNamespace(hashString=hashes[0]), False)
     server.get_content_layout.return_value = "Original"
     server.is_force_resume.return_value = False
     server.get_files.side_effect = lambda *_args, **_kwargs: (
@@ -163,6 +161,220 @@ def test_single_video_file_selection_accepts_episode_label_mismatch(downloader):
         server.set_unwanted_files.assert_called_once_with(torrent_hash, [1])
 
 
+def test_paused_magnet_without_metadata_resumes_to_fetch_then_repauses(downloader):
+    """
+    暂停的磁力无元数据时，先启动取元数据、再暂停选集，而不是直接报获取种子文件失败。
+
+    复现 #7347：暂停任务不建立 peer/DHT 连接，第一次读文件为空；启动后元数据
+    到达，重新暂停后再按优先级选集、启动。
+    """
+    module, server, _content, torrent_hash = downloader
+    server.get_files.side_effect = _files_after_start(server, module, torrent_hash)
+
+    selected, message = module._select_download_files(server, torrent_hash, {170}, _CUSTOM_WORDS)
+
+    assert selected is True
+    assert "已选择集数" in message or message == "添加下载任务成功"
+    # 取元数据启动一次，选集完成后再启动一次；重新暂停发生在两次启动之间、设优先级之前。
+    assert server.start_torrents.call_count == 2
+    if isinstance(module, QbittorrentModule):
+        assert server.stop_torrents.call_count == 1
+        assert server.set_files.call_args_list[0].kwargs == {
+            "torrent_hash": torrent_hash, "file_ids": [1], "priority": 0,
+        }
+        assert server.set_files.call_args_list[1].kwargs == {
+            "torrent_hash": torrent_hash, "file_ids": [0], "priority": 1,
+        }
+    else:
+        assert server.stop_torrents.call_count == 2
+        server.set_files.assert_called_once_with(torrent_hash, [0])
+        server.set_unwanted_files.assert_called_once_with(torrent_hash, [1])
+    calls = [str(call) for call in server.mock_calls]
+    resume = next(index for index, call in enumerate(calls) if "start_torrents" in call)
+    repause = next(index for index, call in enumerate(calls) if index > resume and "stop_torrents" in call)
+    set_files = next(index for index, call in enumerate(calls) if "set_files" in call)
+    final_start = max(index for index, call in enumerate(calls) if "start_torrents" in call)
+    assert resume < repause < set_files < final_start
+
+
+def _files_after_start(server, module, torrent_hash):
+    """
+    模拟暂停磁力在启动前无元数据、启动后才有文件列表。
+
+    :param server: 被替换的外部下载器客户端
+    :param module: 当前参数化的下载器模块
+    :param torrent_hash: 本次选集的任务哈希
+    """
+    if isinstance(module, QbittorrentModule):
+        files = [{"id": index, "name": f"Folder.S09E99/{name}"} for index, name in enumerate(_FILES)]
+    else:
+        files = [SimpleNamespace(id=index, name=f"Folder.S09E99/{name}") for index, name in enumerate(_FILES)]
+
+    def read_files(*_args, **_kwargs):
+        """
+        启动前返回空列表模拟无元数据，启动后返回真实文件列表。
+        """
+        return list(files) if server.start_torrents.called else []
+
+    return read_files
+
+
+def test_metadata_wait_failure_restores_paused_state(downloader):
+    """
+    启动后仍无元数据时，任务应恢复暂停并报获取种子文件失败，不能留在运行状态。
+    """
+    module, server, _content, torrent_hash = downloader
+    server.get_files.side_effect = None
+    server.get_files.return_value = []
+
+    selected, message = module._select_download_files(server, torrent_hash, {170}, _CUSTOM_WORDS)
+
+    assert selected is False
+    assert "获取种子文件失败" in message and "保持暂停" in message
+    server.start_torrents.assert_called_once_with(torrent_hash)
+    if isinstance(module, QbittorrentModule):
+        server.stop_torrents.assert_called_once_with(torrent_hash)
+    else:
+        assert server.stop_torrents.call_count == 2
+    server.set_files.assert_not_called()
+    server.set_unwanted_files.assert_not_called()
+    # 取元数据等待次数有界：第一次 5×1s，取元数据时 10×1s。
+    assert server.get_files.call_count == 2
+    assert server.get_files.call_args_list[1].kwargs == {"retry": 10, "interval": 1}
+    if isinstance(module, QbittorrentModule):
+        assert server.get_files.call_args_list[0].kwargs == {"retry": 5, "interval": 1}
+    else:
+        assert server.get_files.call_args_list[0].kwargs == {}
+
+
+def test_repause_failure_reports_unconfirmed_state(downloader):
+    """
+    取元数据后无法重新暂停时，后续失败不得再称“保持暂停”，必须报状态未确认。
+    """
+    module, server, _content, torrent_hash = downloader
+    server.get_files.side_effect = _files_after_start(server, module, torrent_hash)
+    if isinstance(module, QbittorrentModule):
+        server.stop_torrents.return_value = False
+    else:
+        server.stop_torrents.side_effect = [True, False]
+
+    selected, message = module._select_download_files(server, torrent_hash, {999}, _CUSTOM_WORDS)
+
+    assert selected is False
+    assert "未找到目标集数" in message
+    assert "核实" in message
+    assert "保持暂停" not in message
+
+
+def test_metadata_timeout_repause_failure_reports_unconfirmed_state(downloader):
+    """
+    超时仍无元数据且恢复暂停失败时，不得报“保持暂停”，必须报状态未确认。
+    """
+    module, server, _content, torrent_hash = downloader
+    server.get_files.side_effect = None
+    server.get_files.return_value = []
+    if isinstance(module, QbittorrentModule):
+        server.stop_torrents.return_value = False
+    else:
+        server.stop_torrents.side_effect = [True, False]
+
+    selected, message = module._select_download_files(server, torrent_hash, {170}, _CUSTOM_WORDS)
+
+    assert selected is False
+    assert "核实" in message
+    assert "保持暂停" not in message
+    assert "获取种子文件失败" not in message
+
+
+def test_metadata_resume_uses_plain_start_under_force_resume(downloader):
+    """
+    开启强制恢复时，取元数据仍用普通启动，最终启动才用强制恢复；取元数据不等同于下载。
+    """
+    module, server, _content, torrent_hash = downloader
+    if not isinstance(module, QbittorrentModule):
+        pytest.skip("qBittorrent 强制恢复")
+    server.is_force_resume.return_value = True
+    server.get_files.side_effect = _files_after_start(server, module, torrent_hash)
+
+    selected, _message = module._select_download_files(server, torrent_hash, {170}, _CUSTOM_WORDS)
+
+    assert selected is True
+    server.start_torrents.assert_called_once_with(torrent_hash)
+    server.torrents_set_force_start.assert_called_once_with(torrent_hash)
+
+
+def test_metadata_resume_composes_with_single_video_fallback(downloader):
+    """
+    取元数据成功后，#7345 的单视频兜底仍生效：单集种子只有一个视频文件时选中它。
+    """
+    module, server, _content, torrent_hash = downloader
+    server.get_files.side_effect = _single_video_after_start(server, module, torrent_hash)
+
+    selected, message = module._select_download_files(server, torrent_hash, {6}, None)
+
+    assert selected is True
+    assert "未找到目标集数" not in message
+    if isinstance(module, QbittorrentModule):
+        assert server.set_files.call_args_list[0].kwargs == {
+            "torrent_hash": torrent_hash, "file_ids": [1], "priority": 0,
+        }
+        assert server.set_files.call_args_list[1].kwargs == {
+            "torrent_hash": torrent_hash, "file_ids": [0], "priority": 1,
+        }
+    else:
+        server.set_files.assert_called_once_with(torrent_hash, [0])
+        server.set_unwanted_files.assert_called_once_with(torrent_hash, [1])
+
+
+def _single_video_after_start(server, module, torrent_hash):
+    """
+    模拟单视频种子在启动前无元数据、启动后才有文件列表。
+
+    :param server: 被替换的外部下载器客户端
+    :param module: 当前参数化的下载器模块
+    :param torrent_hash: 本次选集的任务哈希
+    """
+    if isinstance(module, QbittorrentModule):
+        files = [
+            {"id": 0, "name": "Show.S03E54.mp4"},
+            {"id": 1, "name": "Show.S03E54.ass"},
+        ]
+    else:
+        files = [
+            SimpleNamespace(id=0, name="Show.S03E54.mp4"),
+            SimpleNamespace(id=1, name="Show.S03E54.ass"),
+        ]
+
+    def read_files(*_args, **_kwargs):
+        """
+        启动前返回空列表模拟无元数据，启动后返回真实文件列表。
+        """
+        return list(files) if server.start_torrents.called else []
+
+    return read_files
+
+
+def test_existing_paused_magnet_preserves_state_on_retry(downloader):
+    """
+    重试不接管已存在的暂停磁力；返回存在标志并由用户决定如何恢复任务。
+    """
+    module, server, content, torrent_hash = downloader
+    server.get_files.side_effect = _files_after_start(server, module, torrent_hash)
+    _report_existing_task(server, module, torrent_hash)
+
+    result = module.download(
+        content, Path("/downloads"), "", episodes={170},
+        custom_words=_CUSTOM_WORDS, downloader="test-downloader",
+    )
+
+    assert result[1] == torrent_hash
+    assert result[3] == DOWNLOAD_TASK_ALREADY_EXISTS
+    server.get_files.assert_not_called()
+    server.start_torrents.assert_not_called()
+    server.stop_torrents.assert_not_called()
+    server.set_files.assert_not_called()
+
+
 @pytest.mark.parametrize("file_count", [1, 2])
 def test_transmission_all_files_wanted_starts_without_unwanted_rpc(downloader, file_count) -> None:
     """
@@ -204,7 +416,7 @@ def _use_transmission_rpc(module, server) -> Transmission:
     """
     client = Transmission.__new__(Transmission)
     client.trc = Mock()
-    client.add_torrent = server.add_torrent
+    client.add_torrent_with_status = server.add_torrent_with_status
     client.get_files = server.get_files
     module.get_instance.return_value = client
     return client
@@ -242,7 +454,7 @@ def test_transmission_new_paused_task_starts_without_stop_rpc(downloader) -> Non
     result = module.download(content, Path("/downloads"), "", episodes={170}, custom_words=_CUSTOM_WORDS)
 
     assert result[1] == torrent_hash
-    assert client.add_torrent.call_args.kwargs["is_paused"] is True
+    assert client.add_torrent_with_status.call_args.kwargs["is_paused"] is True
     client.trc.stop_torrent.assert_not_called()
     client.trc.start_torrent.assert_called_once_with(ids=torrent_hash)
 
@@ -271,9 +483,9 @@ def test_transmission_stopped_after_accepted_start_never_settles_success(downloa
 
 
 @pytest.mark.parametrize("pause_completes", [True, False])
-def test_transmission_async_pause_guards_file_selection(downloader, transmission_clock, pause_completes) -> None:
+def test_transmission_new_task_async_pause_guards_file_selection(downloader, transmission_clock, pause_completes) -> None:
     """
-    重复任务异步暂停前不得选集；暂停超时也不能启动或记录订阅成功。
+    新任务异步暂停前不得选集；暂停超时也不能启动或记录订阅成功。
     """
     module, server, content, torrent_hash = downloader
     if not isinstance(module, TransmissionModule):
@@ -344,9 +556,12 @@ def test_transmission_empty_episode_selection_never_starts_task() -> None:
 
 
 @pytest.mark.parametrize("failure", ["unmatched", "missing_files", "priority", "start"])
-def test_selection_failure_keeps_paused_task_and_never_settles_success(downloader, failure):
+def test_selection_failure_releases_new_task_and_never_settles_success(downloader, failure):
     """
-    零匹配或下载器未确认选集时，不启动整包或把非空 hash 当成功。
+    零匹配或下载器未确认选集时，清理新增任务并保留文件，不能把非空 hash 当成功。
+
+    文件列表为空时允许一次有界启动取元数据（#7347：暂停磁力无元数据时文件列表恒为空），
+    超时后先请求暂停再清理任务，不记录成功。
     """
     module, server, content, torrent_hash = downloader
     words = None if failure == "unmatched" else _CUSTOM_WORDS
@@ -367,7 +582,11 @@ def test_selection_failure_keeps_paused_task_and_never_settles_success(downloade
     assert result is None
     assert torrent_hash in message
     assert ("启动任务未确认" if failure == "start" else "保持暂停") in message
-    if failure != "start":
+    if failure == "missing_files":
+        # 暂停磁力无元数据时先启动一次取元数据；超时后恢复暂停，仍不记录成功。
+        server.start_torrents.assert_called_once_with(torrent_hash)
+        assert server.stop_torrents.call_count == (2 if isinstance(module, TransmissionModule) else 1)
+    elif failure != "start":
         server.start_torrents.assert_not_called()
     else:
         assert server.stop_torrents.call_count == (2 if isinstance(module, TransmissionModule) else 1)
@@ -375,6 +594,7 @@ def test_selection_failure_keeps_paused_task_and_never_settles_success(downloade
         assert "保持暂停" in message
     chain._settle_accepted_download.assert_not_called()
     chain._record_rejected_download.assert_called_once()
+    server.delete_torrents.assert_called_once_with(delete_file=False, ids=torrent_hash)
 
 
 @pytest.mark.parametrize("version", ["v1", "v2", "hybrid"])
@@ -387,6 +607,7 @@ def test_existing_task_requires_actual_info_hash(downloader, version, matching):
     content, hashes = _torrent(version)
     existing_hash = hashes[-1] if matching else "a" * 40
     server.add_torrent.return_value = (False, []) if isinstance(module, QbittorrentModule) else None
+    server.add_torrent_with_status.return_value = (None, False)
     existing = {"name": "Same.Show.S01", "total_size": 42, "hash": existing_hash, "tags": "已整理"}
     server.get_torrents.return_value = (
         [existing] if isinstance(module, QbittorrentModule) else
@@ -403,12 +624,13 @@ def test_existing_task_requires_actual_info_hash(downloader, version, matching):
         server.set_torrent_tag.assert_not_called()
 
 
-def test_existing_paused_task_cannot_bypass_failed_selection(downloader):
+def test_existing_paused_task_is_returned_without_reselection(downloader):
     """
-    重试遇到相同 hash 时仍须核验选集，不能把此前暂停的失败任务结算为成功。
+    重试遇到相同 hash 时返回存在标志，不读取文件或改变原有暂停任务。
     """
     module, server, content, torrent_hash = downloader
     server.add_torrent.return_value = (False, []) if isinstance(module, QbittorrentModule) else None
+    server.add_torrent_with_status.return_value = (None, False)
     server.get_torrents.return_value = (
         [{"hash": torrent_hash, "name": "Same.Show.S01", "total_size": 42, "tags": ""}]
         if isinstance(module, QbittorrentModule) else
@@ -416,59 +638,45 @@ def test_existing_paused_task_cannot_bypass_failed_selection(downloader):
         None,
     )
     result = module.download(content, Path("/downloads"), "", episodes={170}, downloader="test-downloader")
-    assert result[1] is None
-    assert "保持暂停" in result[3]
+    assert result[1] == torrent_hash
+    assert result[3] == DOWNLOAD_TASK_ALREADY_EXISTS
+    server.get_files.assert_not_called()
+    server.stop_torrents.assert_not_called()
+    server.set_files.assert_not_called()
     server.start_torrents.assert_not_called()
 
 
 @pytest.mark.parametrize("matching", [True, False])
-def test_transmission_duplicate_rpc_task_is_paused_before_selection(downloader, matching):
+def test_transmission_duplicate_rpc_task_preserves_selection(downloader, matching):
     """
-    RPC 把重复任务返回为非空 Torrent 时，先暂停正在运行的旧任务再选集。
+    RPC 返回重复任务的非空 Torrent 时，识别词是否匹配都不暂停或重选原任务。
     """
     module, server, content, torrent_hash = downloader
     if not isinstance(module, TransmissionModule):
         pytest.skip("Transmission RPC 重复添加返回非空 Torrent")
-    task_state = {"running": True}
-    list_files = server.get_files.side_effect
-
-    def stop_task(_torrent_hash):
-        """
-        模拟重复添加不会修改状态、显式暂停才能停止的原任务。
-        """
-        task_state["running"] = False
-        return True
-
-    def get_paused_files(*args, **kwargs):
-        """
-        在真正读取和选择文件前验证旧任务已经暂停。
-        """
-        assert not task_state["running"]
-        return list_files(*args, **kwargs)
-
-    server.stop_torrents.side_effect = stop_task
-    server.get_files.side_effect = get_paused_files
+    server.add_torrent_with_status.return_value = (SimpleNamespace(hashString=torrent_hash), True)
     result = module.download(
         content, Path("/downloads"), "", episodes={170},
         custom_words=_CUSTOM_WORDS if matching else None,
     )
 
-    server.stop_torrents.assert_called_once_with(torrent_hash)
-    assert result[1] == (torrent_hash if matching else None)
-    if not matching:
-        server.start_torrents.assert_not_called()
-        assert not task_state["running"]
-        assert "保持暂停" in result[3]
+    assert result[1] == torrent_hash
+    assert result[3] == DOWNLOAD_TASK_ALREADY_EXISTS
+    server.stop_torrents.assert_not_called()
+    server.start_torrents.assert_not_called()
+    server.get_files.assert_not_called()
+    server.set_files.assert_not_called()
+    server.set_unwanted_files.assert_not_called()
 
 
 @pytest.mark.parametrize("pause_result", [False, None])
-def test_transmission_duplicate_rpc_task_requires_confirmed_pause(downloader, pause_result):
+def test_transmission_new_task_requires_confirmed_pause(downloader, pause_result):
     """
-    重复任务的暂停失败或状态未知时，不查询、重选或启动任何文件。
+    新任务的暂停失败或状态未知时，不查询、重选或启动任何文件。
     """
     module, server, content, torrent_hash = downloader
     if not isinstance(module, TransmissionModule):
-        pytest.skip("Transmission RPC 重复添加返回非空 Torrent")
+        pytest.skip("Transmission 新任务的暂停确认")
     server.stop_torrents.return_value = pause_result
 
     result = module.download(content, Path("/downloads"), "", episodes={170}, custom_words=_CUSTOM_WORDS)
@@ -526,6 +734,7 @@ def _report_existing_task(server, module, torrent_hash) -> None:
     server.add_torrent.return_value = (
         (False, []) if isinstance(module, QbittorrentModule) else None
     )
+    server.add_torrent_with_status.return_value = (None, False)
     server.get_torrents.return_value = (
         [{"hash": torrent_hash, "name": "Same.Show.S01", "total_size": 42, "tags": ""}]
         if isinstance(module, QbittorrentModule) else

@@ -2,6 +2,8 @@
 Transmission 客户端连接与下载任务操作封装。
 """
 
+import base64
+import json
 import time
 from typing import List, Optional, Sequence, Tuple, Union
 from urllib.parse import urlsplit
@@ -295,6 +297,53 @@ class Transmission:
                 return None
         return None
 
+    def add_torrent_with_status(
+        self, content: Union[str, bytes], is_paused: Optional[bool] = False,
+        download_dir: Optional[str] = None, labels: Optional[list[str]] = None,
+        cookie: Optional[str] = None,
+    ) -> Tuple[Optional[Torrent], bool]:
+        """
+        添加任务并保留 RPC 的重复标志，供宿主决定是否可以选集。
+
+        SDK 的 add_torrent 会合并 torrent-added 与 torrent-duplicate，无法证明任务
+        是本次创建。此处复用 SDK 传输以保留认证、超时和 409 会话重试，只单独解释添加响应。
+        不依靠添加前查询，避免另一个调用方同时添加相同种子的竞争窗口。
+
+        :param content: 种子 URL、磁力链接或文件字节内容
+        :param is_paused: 新任务是否以暂停状态添加
+        :param download_dir: 下载器保存目录，省略时使用默认目录
+        :param labels: 新任务的标签列表
+        :param cookie: 下载种子 URL 使用的站点 Cookie
+        :return: 种子对象与是否已存在；未连接、请求失败或响应无效时返回 (None, False)
+        """
+        arguments = {
+            key: value for key, value in {
+                "download-dir": download_dir, "paused": is_paused, "labels": labels, "cookies": cookie,
+            }.items() if value is not None
+        }
+        if isinstance(content, bytes) and not content.startswith(b"magnet:"):
+            arguments["metainfo"] = base64.b64encode(content).decode("ascii")
+        else:
+            arguments["filename"] = content.decode("utf-8") if isinstance(content, bytes) else content
+        if not self.trc and getattr(self, "_host", None) and getattr(self, "_port", None):
+            self.reconnect()
+        for attempt in range(2):
+            if not self.trc:
+                return None, False
+            try:
+                response = json.loads(self.trc._http_query({"method": "torrent-add", "arguments": arguments}))
+                if response.get("result") != "success":
+                    raise ValueError(f"添加种子失败：{response.get('result')}")
+                for key, already_exists in (("torrent-added", False), ("torrent-duplicate", True)):
+                    if fields := response.get("arguments", {}).get(key):
+                        return Torrent(fields=fields), already_exists
+                raise ValueError("添加种子响应缺少任务信息")
+            except Exception as err:
+                logger.error(f"添加种子出错：{str(err)}")
+                if attempt == 0:
+                    self.reconnect()
+        return None, False
+
     def start_torrents(self, ids: TorrentIds) -> bool:
         """
         启动指定种子任务。
@@ -383,34 +432,48 @@ class Transmission:
             logger.error(f"删除种子出错：{str(err)}")
             return False
 
-    def get_files(self, tid: str) -> Optional[List[File]]:
+    def get_files(self, tid: str, retry: int = 1, interval: float = 0) -> Optional[List[File]]:
         """
         读取种子文件列表，兼容新旧 transmission-rpc 文件接口。
 
+        暂停的磁力在取到元数据前文件列表为空，调用方可多查几次等待元数据到达；
+        默认只查一次，与旧行为一致。
+
         :param tid: 种子哈希
-        :return: 文件列表；哈希为空、任务不存在、未连接或查询失败时返回 None
+        :param retry: 最多查询次数，最少执行 1 次
+        :param interval: 查询间隔，单位秒；0 表示立即重试
+        :return: 文件列表；哈希为空、任务不存在、未连接、查询失败或始终无文件时返回 None
         """
         if not self.trc:
             return None
         if not tid:
             return None
-        try:
-            torrent = self.trc.get_torrent(tid)
-        except Exception as err:
-            logger.error(f"获取种子文件列表出错：{str(err)}")
-            return None
-        if not torrent:
-            return None
-        try:
-            get_files = getattr(torrent, "get_files", None)
-            if callable(get_files):
-                files: List[File] = get_files()
-                return files
-            legacy_files: List[File] = torrent.files()
-            return legacy_files
-        except Exception as err:
-            logger.error(f"获取种子文件列表出错：{str(err)}")
-            return None
+        retry_times = max(retry, 1)
+        last_error: Optional[Exception] = None
+        for index in range(retry_times):
+            try:
+                torrent = self.trc.get_torrent(tid)
+            except Exception as err:
+                last_error = err
+                torrent = None
+            if torrent:
+                try:
+                    get_files = getattr(torrent, "get_files", None)
+                    if callable(get_files):
+                        files: List[File] = get_files()
+                        if files:
+                            return files
+                    else:
+                        legacy_files: List[File] = torrent.files()
+                        if legacy_files:
+                            return legacy_files
+                except Exception as err:
+                    last_error = err
+            if index < retry_times - 1 and interval:
+                time.sleep(interval)
+        if last_error:
+            logger.error(f"获取种子文件列表出错：{str(last_error)}")
+        return None
 
     def set_files(self, tid: str, file_ids: list[int]) -> bool:
         """

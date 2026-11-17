@@ -366,8 +366,8 @@ def test_sync_browser_facade_activates_display_only_for_headed_mode(monkeypatch)
         retry=True,
     )
     assert launch_context.call_args_list == [
-        call(headless=True, locale="zh-CN"),
-        call(headless=False, locale="zh-CN"),
+        call(headless=True, args=None, locale="zh-CN"),
+        call(headless=False, args=None, locale="zh-CN"),
     ]
 
 

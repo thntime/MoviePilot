@@ -152,8 +152,11 @@ class DownloadFailureOwner(_DownloadOwnerBase):
     @staticmethod
     def _download_failure_ttl(error_msg: Optional[str]) -> int:
         """
-        容量失败按账号空间恢复周期冷却；限流按站点窗口冷却；
-        泛化的空内容不能证明资源失效，使用瞬时冷却。
+        容量失败按账号空间恢复周期冷却；限流按站点窗口冷却；分享级失败短暂冷却后换源；
+        换票、临时地址和泛化空内容失败使用瞬时冷却。
+
+        :param error_msg: 准备或下载器提交阶段保留的具体失败原因
+        :return: 冷却秒数；换票诊断中的 404 等关键字不能升级为资源失效
         """
         error_text = str(error_msg or "").lower()
         if any(keyword in error_text for keyword in DOWNLOAD_FAILURE_CAPACITY_KEYWORDS):
@@ -163,6 +166,8 @@ class DownloadFailureOwner(_DownloadOwnerBase):
             return rate_limit_ttl
         if is_share_level_message(error_msg):
             return DOWNLOAD_FAILURE_SHARE_TTL_SECONDS
+        if error_text.startswith(("换票失败：", "临时下载地址失效：")):
+            return DOWNLOAD_FAILURE_TRANSIENT_TTL_SECONDS
         if any(keyword in error_text for keyword in DOWNLOAD_FAILURE_RESOURCE_ERROR_KEYWORDS):
             return DOWNLOAD_FAILURE_RESOURCE_TTL_SECONDS
         return DOWNLOAD_FAILURE_TRANSIENT_TTL_SECONDS

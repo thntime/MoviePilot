@@ -1607,7 +1607,8 @@ class XunleiAdapter(BaseNetdiskAdapter):
             return None
         if as_text(payload.get("error")):
             return None
-        data = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
+        raw_data = payload.get("data")
+        data: Mapping[str, Any] = raw_data if isinstance(raw_data, Mapping) else payload
         response_fields = {str(key): as_text(value) for key, value in data.items()}
         access = _pick(response_fields, "access_token", "accessToken")
         if not access:

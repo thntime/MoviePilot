@@ -2,6 +2,22 @@
 
 本文面向通过 MCP 调用 MoviePilot 的外部 Agent 和工具开发者。接入后，客户端通过工具目录发现能力，按 JSON Schema 构造参数，并根据业务结果判断操作是否完成。
 
+### 已有的跨来源 TMDB 对应关系
+
+登录用户可通过 `GET /api/v1/media/mapping` 查询非 TMDB 影视来源已有的对应关系，
+参数为 `media_source`、`media_id` 和可选的 `type=movie|tv`、`season`。接口返回统一响应，
+`data` 为关系或 `null`；只查本地缓存及 Server，不现场按名称匹配，也不增加 Agent operation。
+关系包含 `tmdb_id`、`tmdb_type` 和 `tmdb_season`，剧集外链使用 TMDB 季号而非原来源季号。
+
+转换流程仅对“非 TMDB → TMDB”接入此查询；未命中时沿用原转换，成功后向 Server 后台共享。
+沿用 `MEDIA_RECOGNIZE_SHARE` 开关，服务地址为 `MP_SERVER_HOST + /recognize/mapping`，
+独立于种子名识别接口 `MEDIA_RECOGNIZE_SHARE_API`。中心查询总时限 800 毫秒，上报 500 毫秒；
+成功关系缓存一小时、未命中十分钟，故障冷却三十秒，并合并并发查询、限制在途请求数。
+详情页独立异步补充 TheMovieDb 外链，查询失败时保留原详情及操作。
+
+Server 使用独立 SQL 表长期保存关系，不属于识别缓存清理范围。公共上报只补缺，
+管理后台可纠正目标或撤销错误关系；撤销保留记录，防止旧实例覆盖。实例正缓存最多一小时后更新。
+
 ### 外部整理历史登记
 
 管理员可通过 `transfer.history.register`（`POST /api/v1/history/transfer`）登记已经完成的
@@ -29,6 +45,16 @@
 **最短调用路径：**配置连接与密钥 → `initialize` → `notifications/initialized` → `tools/list` → `tools/call`。已有 MCP 客户端通常会自动完成初始化和工具发现，只需配置下表中的连接信息。
 
 ### 插件安装前说明入口
+
+`GET /api/v1/plugin/history/{plugin_id}?force=false` 读取单个已安装插件或分身的元数据，
+只查询其可信绑定仓库，不聚合全部插件市场。未安装时返回 404，尚未绑定来源时保留本地快照；
+`force=true` 可跳过索引缓存，该接口的默认强制刷新语义保持不变。
+失败仓库索引和不存在的代际短暂缓存五分钟，成功索引仍缓存三十分钟；连接失败保留失败语义，
+不能作为完整安装库存。插件说明只读取所选配置仓库的兼容代际。
+
+公开 GitHub 静态图片复用 `GITHUB_PROXY` 镜像前缀，镜像目标和重定向仍接受地址安全校验；
+镜像失败或返回非图片内容后回退原始地址，沿用原始 URL 的图片缓存键。
+携带 Cookie 或 URL 凭据的请求不使用镜像；原始出口继续遵循 `PROXY` 配置。
 
 插件目录的可选 `plugin_readme` 提供 HTTP(S) 文档外链，兼容索引中的 `homepage` 和 `project_url`。
 详情界面通过管理员接口 `GET /api/v1/plugin/readme/{plugin_id}?repo_url=...` 查询当前来源，
@@ -59,6 +85,49 @@
 和 Authorization 区分缓存变体；切换身份后重新校验访问。其它业务 API
 继续按 `no-store` 读取。
 
+### iOS 媒体流与电视剧选集
+
+`GET /api/v1/mediaserver/search?keyword=...&type=电视剧&type=音乐&limit=40` 按关键词调用
+已启用媒体服务器的搜索接口，返回支持的电视剧与音乐单曲；未指定 `type` 时默认搜索两类。
+每条结果包含服务器配置名 `server`、可播放条目标识 `item_id` 和签名海报地址 `image`，供 App
+在播放前精确读取同一服务器的电视剧季集或单曲清单。
+
+`POST /api/v1/mediaserver/stream-ticket` 仅供已登录的管理用户使用，接收文件管理器选中的
+`FileItem` 和 `media_type=video|audio`。接口再次核验用户的存储目录范围，只接受本地支持的视频、音频或 `.strm` 文件，并返回绑定当前用户、
+六小时后失效且不包含明文路径的 `file.` 条目标识。文件被替换或当前登录用户不匹配时票据失效。
+整理历史播放成功记录时使用目标文件，失败记录使用源文件；不会把媒体库目录或剧集系列作为播放对象。
+
+`GET /api/v1/mediaserver/stream-info?itemid=...` 按已入库媒体服务器条目返回 `content_url`
+、媒体类型、所属媒体服务器 `server` 和同目录同基础文件名的外挂字幕清单；音频条目还会返回表演者、专辑和可选 LRC 歌词地址。
+响应不包含本机文件路径或 STRM 上游凭据。`POST /api/v1/mediaserver/stream-info/music` 接收
+单曲 recording 的来源、ID、标题、艺人和专辑信息，在已启用媒体服务器中执行精确匹配后返回实际单曲流清单；
+专辑和艺人的元数据 ID 不可用作播放条目。
+使用普通 Bearer 登录请求该清单会签发短期资源 Cookie。App 将该 Cookie 限定到当前实例的
+媒体流路径后交给播放器，不把访问令牌放入网页桥或播放 URL。
+
+`GET /api/v1/mediaserver/stream?itemid=...` 需要资源 Cookie，流式读取本地媒体文件或 STRM
+目标，支持单段 HTTP `Range` 请求供播放器拖动进度；无效或多段范围返回 `416`。
+MoviePilot 进程必须能读取媒体服务器报告的文件路径；容器部署时需要映射对应媒体目录。
+STRM 接受一行本地文件路径或 HTTP(S) 地址，不支持播放列表、嵌套 STRM、需要额外请求头的地址或 DRM。
+HTTP(S) 重定向逐跳校验；私有网络目标必须属于已配置的媒体服务器或存储主机。
+若上游不支持 Range，接口以 `501` 拒绝无法可靠跳转的请求；当前接口不转码。
+`stream-info`、媒体资源及季集查询支持可选 `server` 参数；客户端应沿用搜索或音乐匹配返回的服务器，
+避免不同服务器复用条目 ID 时播放错误内容。
+
+`GET /api/v1/mediaserver/stream-subtitle?itemid=...&subtitle_id=...` 使用当前登录身份，
+且只允许读取视频同目录中名称匹配的常见外挂字幕。符号链接不得越出媒体目录；字幕 ID
+只是文件名，不能提交路径。`stream-info`、`stream` 和 `stream-subtitle` 也接受上述短期文件票据，
+并验证当前用户与签发时的文件身份。视频文件内嵌音轨和字幕由 App 播放引擎读取及切换。
+
+`GET /api/v1/mediaserver/stream-lyrics?itemid=...` 仅返回音频同目录且基础文件名完全相同的 `.lrc` 文件；
+路径穿越和目录外符号链接会被拒绝。App 支持 UTF-8 / UTF-16 的带时间戳 LRC，
+同步滚动和高亮，并允许点按歌词跳转。
+
+电视剧详情页先调用 `GET /api/v1/mediaserver/episodes?itemid=<series-item-id>`，返回
+`data` 中按季号和集号映射的已入库单集媒体服务器 ID。季号 `0` 表示特别篇；缺集不会返回。
+客户端必须让用户选择季和集，再以选中集的 ID 请求播放清单，不能把系列或整季 ID 当作视频条目。
+ID 使用查询参数以兼容 Plex `/library/metadata/...` 条目路径。
+
 ### 插件生命周期忙碌与超时
 
 `plugin.runtime.status`（`GET /api/v1/plugin/runtime`）的可选 `active_operation` 返回当前
@@ -67,6 +136,16 @@
 插件变更竞争共享执行权时在副作用前明确拒绝；安装的逐插件或启动准入最多等待五秒。
 调用方超时、取消或停机超时不会终止第三方同步钩子，执行权、实例及数据库保留到真实结束。
 遇到执行结果未知时先只读检查此摘要及插件实际状态，不能仅凭超时重复提交变更。
+
+### 插件配置替换防护
+
+`plugin.config.update` 和 `PUT /api/v1/plugin/{plugin_id}` 替换整份配置，不是增量修改。
+提交前应读取当前配置模型，保留不打算删除的字段；遗漏字段仍会被删除。
+已有非空配置时，REST 入口拒绝用空对象覆盖；原本没有配置项的插件仍可保存空表单。
+Agent/MCP 网关要求更新对象非空，且拒绝把 `***` 等宿主脱敏占位或被局部遮蔽的凭据写回。
+若当前上下文只剩脱敏值，请通过插件配置界面修改，不要把占位当作原值。
+内置 Agent 回执只保存完整规范参数的单向摘要，不保存参数原文；不同凭据不会因脱敏后
+相同而共用回执。摘要不是加密，仍须保护回执数据库的访问权限。
 
 ### 订阅下载的提交来源
 
@@ -120,9 +199,20 @@ Web 影视精确与标题 SSE 的 `manual_paging=true` 模式在最终 `done` �
   索引器内部未报告的丢弃原因不作推测。
 - `rule_groups` 包含 `name`、`status`、`reason`、`media_type` 和 `categories`。
   `effective` 表示规则适用，`skipped` 不增加拒绝数。标题搜索沿用过滤器的空媒体上下文。
-- `warnings` 使用 `{code,rule_group?}`，代码包括 `rule_group_not_applicable`、
+- `warnings` 使用 `{code,rule_group?,rule_ids?}`，代码包括 `rule_group_not_applicable`、
   `rule_group_missing`、`provider_error`、`provider_cooldown`、`provider_outcome_unknown`。
-  原始异常、下载地址和凭据不进入诊断。
+  所选且适用的规则组还会检查配置：`rule_id_invalid` 表示 ID 不符合解析语法，
+  `rule_id_missing` 表示引用的 ID 不存在，`rule_syntax_invalid` 表示运算符、括号或层级
+  语法无效。前两者通过可选 `rule_ids` 保留完整 ID，包括旧 ID 的外围空白；没有相关
+  ID 时省略该字段。配置告警不增加资源拒绝计数，也不意味着所有优先级层级都已执行。
+  原始解析异常、下载地址和凭据不进入诊断。
+
+升级时数据库迁移会将存量不符合 Python/Rust 语法的自定义 ID 转为英文字母和数字，
+并同步改写规则组中的完整操作数引用。保留规则名称、匹配内容、顺序、媒体范围和其它
+字段；与内置或已有 ID 冲突时追加数字后缀。仅包含数字或清理后为空的 ID 添加 `Rule`
+前缀。去除外围空白后无法唯一定位引用时中止迁移，需先通过自定义规则改名 API 修复，
+不会猜测引用归属或保存半套变更。新 ID 保持两套解析器的“至少包含一个字母”约束。
+升级前备份沿用数据库自动备份开关；数据降级不自动恢复失效 ID。
 
 `GET /api/v1/search/last/context` 按认证用户返回完整的 `params`、`results` 和可选
 `diagnostics`。同一用户并发搜索按完成顺序保存，异常或取消保留上次完整记录。普通
@@ -133,9 +223,16 @@ Web 影视精确与标题 SSE 的 `manual_paging=true` 模式在最终 `done` �
 ### 大集合查询窗口
 
 `POST /api/v1/media/status` 接受 1 至 50 个媒体身份/标题/年份/季号查询，按输入顺序返回
-`item_id`、`subscribed` 与同来源剧集的各季订阅模式 `seasons`。查询仅访问本地媒体库和
-当前用户可见订阅，不调用外部媒体服务器，不返回完整订阅表。普通用户仍受 owner 限制，
-影视保留标题、年份回退，音乐按实体类型隔离。该界面专用批量端点不新增 Agent 操作。
+`item_id`、`subscribed` 与已确认身份的各季订阅模式 `seasons`。查询使用本地媒体库和
+当前用户可见订阅，不调用外部媒体服务器，不返回完整订阅表。影视原生身份未命中时，
+复用媒体身份转换查询共同 TMDB 身份；同一请求内复用订阅快照和转换结果。
+转换可能读取外部元数据，失败后仍保留标题、年份提示回退。普通用户仍受 owner 限制，
+音乐按实体类型隔离。该界面专用批量端点不新增 Agent 操作。
+
+`subscription.find` 也先按原生身份、再按共同 TMDB 身份查找；可通过 `episode_group`
+限定剧集组。创建影视订阅时，同用户、同类型、同季和同剧集组的跨源身份若已确认等价，
+返回已有订阅 ID，不覆盖旧配置、进度或重复发出新增通知。标题、年份相似只用于展示回退，
+不据此合并或删除订阅。TMDB、豆瓣、Bangumi 和 AniList 使用同一确认规则；音乐保持原规则。
 
 `search.recommend` 的 `check_only=true` 只读当前状态，不读取全量搜索结果缓存；
 推荐禁用时也直接返回 `disabled`。`force=true` 保留优先级，确实启动任务时才读取候选。
@@ -176,6 +273,14 @@ Web 影视精确与标题 SSE 的 `manual_paging=true` 模式在最终 `done` �
 详见[授权、权限与快照协议](widgets.md)。主登录凭据不得交给系统扩展。
 
 ### 通知配置与交互身份
+
+渠道用户和管理员统一在用户管理右下角“渠道授权”弹窗管理。`GET /api/v1/authorization/`
+返回成员和脱敏渠道目录；`POST /api/v1/authorization/` 直接添加授权，
+`PUT /api/v1/authorization/{member_id}` 批准、拒绝、调整或停用。仅网页登录系统管理员可管理。
+`POST /api/v1/authorization/binding` 为当前已登录账号生成五分钟一次性关联码，由本人在原渠道私聊提交。
+成员无需网页登录账号，普通成员 API 只开放明确的搜索、订阅、下载能力，定时任务另行授权。
+渠道内部令牌限定 operation、HTTP 方法与路径，并实时校验授权，不可用于其它路由或网页登录。
+旧白名单按通知实例迁移，投递接收人不再隐含授权。详见[通知渠道授权](channel-authorization.md)。
 
 `slash.run` 返回的是命令已触发，不代表后台命令或通知已完成。消息渠道发起的命令使用
 宿主签名的渠道用户身份；请求头不能指定其他用户，渠道身份缺失或不匹配时会拒绝执行。
@@ -233,6 +338,8 @@ Discord 仅指定 `userid` 的定向通知使用私聊；无法私聊时返回�
 `FileItem` 的可选 `modify_time_ns` 和 `change_time_ns` 保存本地纳秒版本证据，
 JSON 使用十进制字符串避免浏览器数字精度丢失，客户端应原样保留查询返回值，不自行生成。
 恢复清理发现本地源或目标版本变化时会保留副本并转人工复核；
+对于确认为 FUSE 的本地挂载，同路径文件的大小、类型、稳定文件 ID 和纳秒修改时间均一致时，
+单独的状态时间变化会记录告警并继续清理。缺少上述凭据或挂载查询失败时仍需复核。
 云盘时间戳变化仍按大小与稳定文件标识核验。OpenList 中断或大小不符的下载不会作为移动成功结果删除源文件。
 `storage.rename` 的 `recursive=true` 会识别并重命名所有子目录内媒体，随后重命名所选目录。
 
@@ -252,6 +359,8 @@ JSON 使用十进制字符串避免浏览器数字精度丢失，客户端应原
 整理失败的 AI 接管应先读取 `transfer.history` 并核实媒体身份；对持久化任务使用
 `transfer.history.replan` 提交 `history_id`、接管时的 `task_id`/`settlement_revision`、`media_source`、`media_id`、`media_type`
 以及可选的 `season`/`episode`。该操作只接受没有文件副作用的识别拒绝，保留原任务、失败证据、结算回执和重试预算；排队受理不代表文件已经整理完成。
+`history_id` 放入 `path_params`，其余修正字段放入 `body`。预览与重新规划必须保留
+同一组已核实的来源、原生标识、媒体类型及季集，重新识别会直接查询该身份。
 
 认证补充：
 
@@ -637,9 +746,24 @@ Telegram、Feishu；其他交互渠道因无法建立私聊而 fail closed，不
 2. **MCP 工具：**检查 `result.isError`，读取 `result.content` 中的文本块。当前工具返回文本，不能假定存在 `structuredContent`。
 3. **业务与执行状态：**文本为 JSON 时检查 `success: false`、`error`、`execution_outcome` 及具体业务状态。即使 `isError` 缺失，文本内仍可能是业务失败。
 
-`execution_outcome: "pending"` 表示已提交但尚未确认最终完成；`"unknown"` 表示效果未知，先用只读操作核验实际状态。没有该字段时，依据具体业务响应判断，不能自动推断异步任务完成。
+`execution_outcome: "pending"` 表示已提交但尚未确认最终完成；`"unknown"` 表示效果未知，先用只读操作核验实际状态。内置 Agent 的 `"replayed"` 表示本次没有执行写入，`previous_status` 是旧回执状态，不能当作本次成功；只读核验收口也不会重复写入。没有该字段时，依据具体业务响应判断，不能自动推断异步任务完成。
 
 `media.scrape` 遇到不支持的媒体文件或 NFO 保存失败时返回 `success: false` 及原因，目录中的媒体保存失败也会向上传递。不要将这种响应报告为刮削完成。
+
+音乐专辑刮削默认保留已有曲名、艺人和曲序，响应 `message` 与日志会说明。需要尝试更新时，可在系统刮削设置中将“音乐标签”设为“覆盖”：只有与专辑曲目双向唯一对位、且录音身份和时长没有冲突的文件才会采用来源提供的曲目字段；未可靠匹配的文件继续保留本地字段。手动刮削可按唯一曲序纠正曲名，自动刮削使用更严格的证据；启用 CUE 读取时，整轨 CUE 不会被当作单曲覆盖。结果中的匹配数量不等同于实际发生变化的标签数量。远端音轨在对位和写入阶段分别下载；启用 CUE 读取时，目录未列出当前音轨或索引下载失败会保留曲目字段。普通远端存储列表不保证返回全部子项，使用此类存储前应核对 CUE 或通过本地挂载操作。
+
+### 音乐手动整理选项
+
+`transfer.manual` 的 `music_track_match` 默认 `strict`。手动选择专辑后可设为
+`ignore_duration`，跳过时长证据并继续要求曲目唯一对位；`sequential` 将源文件按完整路径
+自然排序（2 在 10 前），依次套用发行版曲目。顺序模式要求逻辑曲目数一致，CUE 按逻辑曲目计数。
+这些选项需要本地音频，预览和执行应使用相同参数与源文件范围。
+
+`music_target_path` 接受音乐最终目录的绝对路径。填写后保留文件名模板，把类型、分类、
+专辑与音质目录层级统一落在该目录；留空沿用现有目录规则。歌词同步重命名，封面与整轨 CUE
+保持配套文件命名规则。最终目录与已选曲目身份会冻结到任务输入，任务恢复沿用原选择。
+音乐没有线上条目时，可留空媒体 ID，使用完整的本地标签整理。
+填写最终目录时，自动整理方式继承匹配目录配置，未匹配目录配置时采用复制。
 
 ### 分页与截断
 

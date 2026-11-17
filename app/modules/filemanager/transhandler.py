@@ -11,6 +11,7 @@ from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
 from jinja2 import Template
 
+from app.adapters.system.fsproxy import fsproxy
 from app.adapters.system.host import SystemUtils
 from app.application.audio import AudioMetadataHelper
 from app.application.classification.reference import (
@@ -55,6 +56,8 @@ from app.schemas.system import TransferDirectoryConf
 from app.schemas.tmdb import TmdbEpisode
 from app.schemas.transfer import TransferInfo
 from app.schemas.types import ChainEventType, MediaType
+
+_MEDIA_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 
 
 class TransHandler:
@@ -250,24 +253,53 @@ class TransHandler:
     @staticmethod
     def __is_subtitle_file(fileitem: FileItem) -> bool:
         """
-        按运行配置检查文件是否为字幕附件。
+        按运行配置检查文件是否为字幕或歌词附件。
 
         :param fileitem: 带扩展名的文件项
-        :return: 扩展名属于字幕配置时为 True
+        :return: 扩展名属于字幕或歌词配置时为 True
         """
         return bool(
             fileitem.extension
-            and f".{fileitem.extension.lower()}" in get_runtime_setting("RMT_SUBEXT")
+            and (
+                f".{fileitem.extension.lower()}" in get_runtime_setting("RMT_SUBEXT")
+                or TransHandler.__is_configured_lyrics_file(fileitem)
+            )
         )
 
     @staticmethod
-    def __is_extra_file(fileitem: FileItem, mediainfo: MediaInfo | MusicInfo) -> bool:
+    def __is_configured_lyrics_file(fileitem: FileItem) -> bool:
+        """
+        按运行时歌词后缀配置判断文件是否为歌词附件。
+
+        :param fileitem: 待判断的文件项
+        :return: 文件名以配置的歌词后缀结尾时返回 True
+        """
+        path = str(fileitem.path or fileitem.name or "").casefold()
+        return any(
+            path.endswith(str(extension).casefold())
+            for extension in get_runtime_setting("RMT_LYRICSEXT")
+        )
+
+    @staticmethod
+    def __is_media_image_file(fileitem: FileItem) -> bool:
+        """
+        判断文件是否为整理链支持的媒体图片附件。
+
+        :param fileitem: 待判断的源文件
+        :return: 图片后缀受支持时返回 True
+        """
+        return bool(
+            fileitem.extension
+            and f".{fileitem.extension.lower()}" in _MEDIA_IMAGE_SUFFIXES
+        )
+
+    def __is_extra_file(self, fileitem: FileItem, mediainfo: MediaInfo | MusicInfo) -> bool:
         """
         识别不参与主媒体质量比较的附属文件。
 
         :param fileitem: 待判断的文件项
         :param mediainfo: 决定音频或歌词附件规则的主媒体信息
-        :return: 字幕、音乐歌词或影视外置音轨时为 True
+        :return: 字幕、歌词或影视外置音轨时为 True
         """
         if not fileitem.extension:
             return False
@@ -275,8 +307,9 @@ class TransHandler:
         path = str(fileitem.path or fileitem.name or "").casefold()
         if extension in get_runtime_setting("RMT_SUBEXT"):
             return True
-        if mediainfo.type == MediaType.MUSIC and path.endswith(
-            (".lrc", ".txt", ".lyricsfile.yaml")
+        if TransHandler.__is_configured_lyrics_file(fileitem) or (
+            mediainfo.type == MediaType.MUSIC
+            and path.endswith((".txt", ".lyricsfile.yaml"))
         ):
             return True
         return (
@@ -522,16 +555,11 @@ class TransHandler:
             )
             if self.__is_subtitle_file(fileitem):
                 final_target = self.__rename_subtitles(fileitem, final_target)
-            target_directory_path = DirectoryHelper.get_media_root_path(
-                rename_format,
-                rename_path=final_target,
-                media_type=mediainfo.type,
+            final_target, target_directory_path = self.__resolve_file_target_paths(
+                planning_input, mediainfo, target_path, final_target, rename_format,
             )
-            if not target_directory_path:
-                raise ValueError("重命名格式无效")
-            if (mediainfo.type == MediaType.MUSIC
-                    and Path(str(fileitem.path)).suffix.casefold() in {".jpg", ".jpeg", ".png", ".webp"}):
-                # 封面保持原名并放到专辑根，不套用曲序/曲名模板或进入 Disc 子目录。
+            if self.__is_media_image_file(fileitem):
+                # 封面保持原名并放到媒体根，不套用曲序/曲名模板或进入 Disc 子目录。
                 final_target = target_directory_path / Path(str(fileitem.path)).name
             if getattr(planning_meta, "music_layout", None) == "image_cue":
                 # 整轨与索引只调整专辑目录，保留原名才能让 CUE FILE 引用继续有效。
@@ -568,6 +596,28 @@ class TransHandler:
             overwrite_mode=overwrite_mode,
             preview=preview,
         )
+
+    @staticmethod
+    def __resolve_file_target_paths(
+            planning_input: TransferPlanningInput,
+            mediainfo: MediaInfo | MusicInfo,
+            target_path: Path,
+            rendered_path: Path,
+            rename_format: str,
+    ) -> tuple[Path, Path]:
+        """
+        解析模板文件与媒体根目录，手动音乐最终目录仅保留已渲染的文件名。
+
+        先渲染完整模板可保留跨目录层级的 Jinja 条件语义。
+        """
+        if mediainfo.type == MediaType.MUSIC and planning_input.options.get("music_target_path"):
+            return target_path / rendered_path.name, target_path
+        media_root = DirectoryHelper.get_media_root_path(
+            rename_format, rename_path=rendered_path, media_type=mediainfo.type,
+        )
+        if not media_root:
+            raise ValueError("重命名格式无效")
+        return rendered_path, media_root
 
     @staticmethod
     def __intercept_transfer(
@@ -641,6 +691,7 @@ class TransHandler:
 
         未知目标状态返回失败结果；明确策略拒绝标记为覆盖跳过，以保留已有成功历史。
         字幕及其他附件优先覆盖；普通文件允许插件先作裁决，再按配置和音乐音质或大小判断。
+        本地链接有效性以目标路径的严格查询结果为准，悬空链接由存储适配器在落地时修复。
 
         :param fileitem: 源文件项，提供大小及附件判断信息
         :param meta: 源元数据，提供音乐音质信息
@@ -677,17 +728,8 @@ class TransHandler:
                 ".jpg", ".jpeg", ".png", ".webp"
             }, None
 
-        checked_target = target_file
-        over_flag = False
-        if target_storage == "local" and target_file.is_symlink():
-            checked_target = target_file.readlink()
-            if not checked_target.exists():
-                over_flag = True
-        if over_flag:
-            return True, False, None
-
         logger.info(
-            f"目的文件系统中已经存在同名文件 {checked_target}，"
+            f"目的文件系统中已经存在同名文件 {target_file}，"
             f"当前整理覆盖模式设置为 {overwrite_mode}"
         )
         event_data = TransferOverwriteCheckEventData(
@@ -815,7 +857,8 @@ class TransHandler:
         清理前比对冻结文件的大小、类型及可用身份；证据不足时保留文件。
 
         本地链接的查询沿用 stat 语义，硬链接和软链接均比较实际内容的身份。
-        本地必须核对修改时间，优先纳秒证据；同路径还核对状态时间，防止等长改写后还原 mtime。
+        本地必须核对修改时间，优先纳秒证据；同路径还核对状态时间。
+        FUSE 可在写入收尾后单独更新状态时间，完整身份一致时按挂载类型兼容。
         rename 合法改变状态时间，因此跨路径只比较修改时间。旧本地快照回退到秒级修改时间，
         缺少时间凭据时转人工复核。云盘修改时间可能在上传后变化或缺失，不参与校验。
 
@@ -838,21 +881,44 @@ class TransHandler:
             if expected.fileid != current.fileid:
                 raise TransferExecutionConflictError(f"文件 {expected.path} 已被替换，禁止清理")
         if expected.storage == "local":
-            expected_time: Optional[int | float]
-            current_time: Optional[int | float]
-            if expected.modify_time_ns is not None:
-                expected_time, current_time = expected.modify_time_ns, current.modify_time_ns
-            else:
-                expected_time, current_time = expected.modify_time, current.modify_time
-            if expected_time is None or current_time is None:
-                raise StorageQueryError(f"文件 {expected.path} 缺少修改时间身份凭据，需人工复核")
-            if expected_time != current_time:
-                raise TransferExecutionConflictError(f"文件 {expected.path} 的修改时间已变化，禁止清理")
-            if expected.path == current.path and expected.change_time_ns is not None:
-                if current.change_time_ns is None:
-                    raise StorageQueryError(f"文件 {expected.path} 缺少状态时间身份凭据，需人工复核")
-                if expected.change_time_ns != current.change_time_ns:
-                    raise TransferExecutionConflictError(f"文件 {expected.path} 的状态时间已变化，禁止清理")
+            TransHandler.__assert_local_file_version(expected, current)
+
+    @staticmethod
+    def __assert_local_file_version(expected: FileItem, current: FileItem) -> None:
+        """
+        在大小、类型和稳定 ID 已核对后，检查本地文件的时间版本凭据。
+
+        同路径状态时间可识别等长改写后还原 mtime 的变化。仅在稳定 ID 和纳秒修改时间
+        均一致且当前挂载确认为 FUSE 时，允许单独的 ctime 变化并记录告警。
+        旧快照凭据不足、挂载未知或查询失败时继续保留文件。
+
+        :param expected: 已完成基础身份核验的冻结本地文件
+        :param current: 当前严格查询结果
+        :raises TransferExecutionConflictError: 修改时间或不满足兼容条件的状态时间变化
+        :raises StorageQueryError: 缺少冻结快照要求的时间凭据
+        :raises OSError: FUSE 挂载识别失败
+        """
+        expected_time: Optional[int | float]
+        current_time: Optional[int | float]
+        if expected.modify_time_ns is not None:
+            expected_time, current_time = expected.modify_time_ns, current.modify_time_ns
+        else:
+            expected_time, current_time = expected.modify_time, current.modify_time
+        if expected_time is None or current_time is None:
+            raise StorageQueryError(f"文件 {expected.path} 缺少修改时间身份凭据，需人工复核")
+        if expected_time != current_time:
+            raise TransferExecutionConflictError(f"文件 {expected.path} 的修改时间已变化，禁止清理")
+        if expected.path != current.path or expected.change_time_ns is None:
+            return
+        if current.change_time_ns is None:
+            raise StorageQueryError(f"文件 {expected.path} 缺少状态时间身份凭据，需人工复核")
+        if expected.change_time_ns == current.change_time_ns:
+            return
+        if (expected.fileid and expected.modify_time_ns is not None
+                and fsproxy.is_fuse_path(Path(cast(str, current.path)))):
+            logger.warning(f"文件 {expected.path} 的 FUSE 状态时间已变化，大小、类型、文件 ID 和纳秒修改时间一致，继续清理")
+            return
+        raise TransferExecutionConflictError(f"文件 {expected.path} 的状态时间已变化，禁止清理")
 
     @classmethod
     def __inherit_shared_local_identity(cls, expected: FileItem, receipt: Optional[FileItem]) -> FileItem:

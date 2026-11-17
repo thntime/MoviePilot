@@ -15,10 +15,11 @@ def _file(name: str) -> ShareFile:
 
 def test_episode_name_prefixes_bare_episode():
     """
-    裸集数文件名补 S01Exx 前缀，整理阶段才能识别。
+    有目标季时裸集数文件名补 SxxExx 前缀，整理阶段才能识别；无季信息保持原样。
     """
-    assert NetdiskModule._episode_name("164 4K.mkv") == "S01E164 164 4K.mkv"
-    assert NetdiskModule._episode_name("01~4K.mp4") == "S01E001 01~4K.mp4"
+    assert NetdiskModule._episode_name("164 4K.mkv", season=1) == "S01E164 164 4K.mkv"
+    assert NetdiskModule._episode_name("01~4K.mp4", season=1) == "S01E001 01~4K.mp4"
+    assert NetdiskModule._episode_name("164 4K.mkv") == "164 4K.mkv"
 
 
 def test_episode_name_keeps_existing_marker_and_ambiguous_name():
@@ -30,14 +31,24 @@ def test_episode_name_keeps_existing_marker_and_ambiguous_name():
     assert NetdiskModule._episode_name("花絮.mp4") == "花絮.mp4"
 
 
-def test_filter_episodes_keeps_only_target_and_ambiguous_names():
+def test_filter_episodes_keeps_only_target_names():
     """
-    目标集数命中或无法解析出唯一集数的文件保留，其他集数被过滤。
+    有精确命中时只保留目标集数文件，无法解析集数的文件不再兜底。
     """
     files = [_file("剧名.S01E27.mkv"), _file("剧名.S01E28.mkv"), _file("剧名.S01E01.mkv"), _file("剧名.mkv")]
     kept = NetdiskModule._filter_episodes(files, {27, 28})
     names = {item.name for item in kept}
-    assert names == {"剧名.S01E27.mkv", "剧名.S01E28.mkv", "剧名.mkv"}
+    assert names == {"剧名.S01E27.mkv", "剧名.S01E28.mkv"}
+
+
+def test_filter_episodes_keeps_ambiguous_when_no_exact_hit():
+    """
+    目标季没有任何精确命中时，无法解析集数的文件作为兜底保留，避免漏集。
+    """
+    files = [_file("剧名.S01E01.mkv"), _file("剧名.mkv")]
+    kept = NetdiskModule._filter_episodes(files, {27})
+    names = {item.name for item in kept}
+    assert names == {"剧名.mkv"}
 
 
 def test_filter_episodes_keeps_all_without_target():
@@ -61,12 +72,12 @@ def test_filter_episodes_logs_target_and_selected_count(monkeypatch):
     assert any("目标集数" in message and "选中 1 个" in message for message in messages)
 
 
-def test_wanted_accepts_video_and_archive_only():
+def test_wanted_accepts_video_only():
     """
-    只下载视频与归档文件。
+    只下载视频文件，压缩包与图片都不下载。
     """
     assert NetdiskModule._wanted("a.mkv") is True
-    assert NetdiskModule._wanted("a.zip") is True
+    assert NetdiskModule._wanted("a.zip") is False
     assert NetdiskModule._wanted("a.jpg") is False
 
 
