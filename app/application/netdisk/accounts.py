@@ -27,6 +27,7 @@ from app.domain.netdisk import (
     NetdiskPlatform,
     normalize_platform,
 )
+from app.domain.netdisk import mask_credential as mask_credential
 from app.runtime.log import logger
 
 # 续期节流必须跨用例实例共享：取链与接口每次请求都会新建服务，90 分钟窗口才有效。
