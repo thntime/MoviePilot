@@ -860,6 +860,47 @@ def test_obfuscated_names_drop_candidate(monkeypatch: pytest.MonkeyPatch) -> Non
     assert results == []
 
 
+def test_feature_share_passes_quality_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    单片（电影）分享没有可解析集数时不应被集数清晰度闸门丢弃。
+    """
+    server = FakeCloudSaverServer()
+    server.search_results = [(200, make_share_payload("替补悍警 (2025)"))]
+    install_server(monkeypatch, server)
+    FakeWalk.files_by_code["foldershare"] = [
+        ShareFile(
+            file_id="f1",
+            name="替补悍警.2025.1080p.WEB-DL.H264.mkv",
+            size=5 * 1024 * 1024 * 1024,
+            duration=6000,
+        ),
+    ]
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "替补悍警")
+
+    assert results is not None
+    assert len(results) == 1
+    assert results[0].title == "替补悍警 (2025)"
+    assert results[0].size == 5 * 1024 * 1024 * 1024
+
+
+def test_multi_video_without_episodes_drops_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    多个视频文件但集数不可解析时，仍按质量闸门丢弃，避免混淆命名混入。
+    """
+    server = FakeCloudSaverServer()
+    server.search_results = [(200, make_share_payload("替补悍警 (2025)"))]
+    install_server(monkeypatch, server)
+    FakeWalk.files_by_code["foldershare"] = [
+        ShareFile(file_id="f1", name="正片A.mkv", size=2 * 1024 * 1024 * 1024),
+        ShareFile(file_id="f2", name="正片B.mkv", size=2 * 1024 * 1024 * 1024),
+    ]
+
+    results = CloudSaverModule().search_netdisk_torrents(make_site(), "替补悍警")
+
+    assert results == []
+
+
 def test_each_candidate_uses_its_own_share_tree(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     多个候选并发检查时，每个候选都必须使用自己的分享文件树，不能串号。

@@ -434,6 +434,21 @@ class CloudSaverModule(_ModuleBase):
         return len(parsed) / len(videos) >= _EPISODE_COVERAGE_THRESHOLD
 
     @staticmethod
+    def _is_feature_share(videos: List[Dict[str, Any]]) -> bool:
+        """
+        判断是否为单片（电影）分享：只有一个视频文件且解析不出集数。
+
+        电影分享的文件树就是「一个正片视频 + 字幕/NFO」，没有集数可解析；
+        剧集分享即使单文件也带集数标记，多文件时仍走集数清晰度判定。
+
+        :param videos: 视频文件条目
+        :return: 是单片分享返回 True
+        """
+        if len(videos) != 1:
+            return False
+        return not CloudSaverModule._episode_numbers(str(videos[0].get("name") or ""))
+
+    @staticmethod
     def _quality_limits() -> Tuple[int, int]:
         """
         读取短剧判定的两个阈值，未配置或非法时使用默认值。
@@ -530,8 +545,13 @@ class CloudSaverModule(_ModuleBase):
         videos = self._video_files(files)
         media_files = self._media_files(files)
         clarity_files = videos or media_files
-        if not self._is_episode_clear(clarity_files):
-            # 集数不清晰：丢弃，避免展示错误集数。
+        if not self._is_episode_clear(clarity_files) and not self._is_feature_share(videos):
+            # 集数不清晰：丢弃，避免展示错误集数；单片（电影）分享没有集数，不属于此类。
+            parsed = sum(1 for entry in clarity_files if self._episode_numbers(str(entry.get("name") or "")))
+            logger.info(
+                f"{torrent.title} 集数不清晰，已丢弃"
+                f"（视频 {len(videos)} 个，可解析 {parsed} 个）"
+            )
             return False
         media_episodes: Set[int] = set()
         for entry in media_files:
