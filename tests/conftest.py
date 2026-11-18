@@ -156,6 +156,20 @@ def isolate_channel_authorization_service():
 
 
 @pytest.fixture(autouse=True)
+def isolate_netdisk_registry():
+    """
+    隔离用例之间注册的网盘端口，避免账号选择触发真实适配器续期。
+
+    :yields: 网盘端口为空的测试阶段；退出时再次清空
+    """
+    from app.application.netdisk.registry import reset_netdisk_services
+
+    reset_netdisk_services()
+    yield
+    reset_netdisk_services()
+
+
+@pytest.fixture(autouse=True)
 def install_runtime_settings_test_proxies(monkeypatch):
     """
     向已导入的历史配置替换点注入本用例专用代理。
