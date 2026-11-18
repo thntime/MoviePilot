@@ -783,3 +783,239 @@ def test_parse_m3u8_rejects_encrypted_playlist() -> None:
 
     with pytest.raises(engine.DownloadError):
         engine.parse_m3u8(text, "https://cdn/index.m3u8")
+
+
+def _range_of(header: str) -> "tuple[int, int]":
+    """
+    把 Range 请求头解析成闭区间。
+
+    :param header: ``bytes=start-end`` 形式的请求头
+    :return: (起点, 终点)
+    """
+    start_text, end_text = header.replace("bytes=", "").split("-")
+    return int(start_text), int(end_text)
+
+
+def _elastic_plan(payload: bytes, threads: int, elastic_done: int) -> "tuple[list, int, int]":
+    """
+    构造「主池全部完成 + 弹性区前 N 字节完成」的计划。
+
+    :param payload: 完整文件内容
+    :param threads: 每文件连接数，决定主池分片
+    :param elastic_done: 弹性区已完成字节数
+    :return: (计划 done 条目, 弹性区起点, 弹性区已完成终点)
+    """
+    total = len(payload)
+    main = engine.plan_chunks(total, threads)
+    elastic_start = main[-1][1] + 1
+    done = [
+        [start, end, hashlib.sha256(payload[start:end + 1]).hexdigest()]
+        for start, end in main
+    ]
+    elastic_end = elastic_start + elastic_done - 1
+    if elastic_done > 0:
+        done.append([
+            elastic_start,
+            elastic_end,
+            hashlib.sha256(payload[elastic_start:elastic_end + 1]).hexdigest(),
+        ])
+    return done, elastic_start, elastic_end
+
+
+def test_elastic_resume_skips_completed_ranges(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    续传时弹性区已校验通过的区间不再请求，只补剩余字节。
+    """
+    payload = bytes(range(256)) * (32 * 1024)  # 8MB
+    total = len(payload)
+    threads = 2
+    done, elastic_start, elastic_end = _elastic_plan(payload, threads, 1024 * 1024)
+    target = tmp_path / "video.mp4"
+    target.write_bytes(payload)
+    target.with_suffix(target.suffix + ".plan.json").write_text(
+        json.dumps({"total": total, "chunks": len(done), "done": done}), encoding="utf-8"
+    )
+    http = FakeHttp(payload)
+    install_http(monkeypatch, http)
+
+    engine.ChunkedDownloader(target, total, _links("https://cdn/file"), threads=threads).run(
+        lambda refresh=False: _links("https://cdn/file")
+    )
+
+    assert target.read_bytes() == payload
+    ranges = [_range_of(call["range"]) for call in http.calls]
+    assert ranges
+    # 已完成的主池与弹性区区间都不应再被请求。
+    assert all(start > elastic_end for start, _ in ranges)
+    assert all(start >= elastic_start for start, _ in ranges)
+    requested = sum(end - start + 1 for start, end in ranges)
+    assert requested == total - elastic_end - 1
+    # 区间两两不交，配合字节数守恒即可证明无缝覆盖、没有重复请求。
+    ordered = sorted(ranges)
+    assert all(
+        later[0] > earlier[1] for earlier, later in zip(ordered, ordered[1:])
+    )
+
+
+def test_elastic_resume_rejects_corrupted_range(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    磁盘上的弹性区数据与计划摘要不符时不得跳过，必须重下该区间。
+    """
+    payload = bytes(range(256)) * (32 * 1024)  # 8MB
+    total = len(payload)
+    threads = 2
+    done, elastic_start, _elastic_end = _elastic_plan(payload, threads, 1024 * 1024)
+    corrupted = bytearray(payload)
+    corrupted[elastic_start + 100] ^= 0xFF
+    target = tmp_path / "video.mp4"
+    target.write_bytes(bytes(corrupted))
+    target.with_suffix(target.suffix + ".plan.json").write_text(
+        json.dumps({"total": total, "chunks": len(done), "done": done}), encoding="utf-8"
+    )
+    http = FakeHttp(payload)
+    install_http(monkeypatch, http)
+
+    engine.ChunkedDownloader(target, total, _links("https://cdn/file"), threads=threads).run(
+        lambda refresh=False: _links("https://cdn/file")
+    )
+
+    # 摘要不符的区间被重新请求，损坏字节被覆盖为正确内容。
+    ranges = [_range_of(call["range"]) for call in http.calls]
+    assert any(start <= elastic_start for start, _ in ranges)
+    assert target.read_bytes() == payload
+
+
+def test_restore_merges_adjacent_elastic_entries(tmp_path: Path) -> None:
+    """
+    相邻的弹性区条目在恢复时合并为一个已完成分片。
+    """
+    import os
+
+    payload = b"m" * (8 * 1024 * 1024)
+    total = len(payload)
+    threads = 2
+    main = engine.plan_chunks(total, threads)
+    elastic_start = main[-1][1] + 1
+    first_end = elastic_start + 256 * 1024 - 1
+    second_end = first_end + 256 * 1024
+    done = [
+        [start, end, hashlib.sha256(payload[start:end + 1]).hexdigest()]
+        for start, end in main
+    ]
+    done.append([
+        elastic_start, first_end,
+        hashlib.sha256(payload[elastic_start:first_end + 1]).hexdigest(),
+    ])
+    done.append([
+        first_end + 1, second_end,
+        hashlib.sha256(payload[first_end + 1:second_end + 1]).hexdigest(),
+    ])
+    target = tmp_path / "video.mp4"
+    target.write_bytes(payload)
+    target.with_suffix(target.suffix + ".plan.json").write_text(
+        json.dumps({"total": total, "chunks": len(done), "done": done}), encoding="utf-8"
+    )
+
+    downloader = engine.ChunkedDownloader(
+        target, total, _links("https://cdn/file"), threads=threads,
+    )
+    downloader._chunks = [  # pylint: disable=protected-access
+        engine._Chunk(index, start, end)
+        for index, (start, end) in enumerate(main)
+    ]
+    downloader._fd = os.open(target, os.O_RDWR)  # pylint: disable=protected-access
+    try:
+        downloader._restore()  # pylint: disable=protected-access
+        assert downloader._restored == [(elastic_start, second_end)]  # pylint: disable=protected-access
+        restored = [
+            chunk for chunk in downloader._chunks  # pylint: disable=protected-access
+            if chunk.done and chunk.start >= elastic_start
+        ]
+        assert len(restored) == 1
+        # 合并区间不等于任何单条条目，摘要必须由合并范围重算。
+        assert restored[0].expected_digest == hashlib.sha256(
+            payload[elastic_start:second_end + 1]
+        ).hexdigest()
+    finally:
+        os.close(downloader._fd)  # pylint: disable=protected-access
+
+
+def test_elastic_resume_skips_network_when_tail_complete(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    主池与弹性区都已校验通过时不再发起任何请求，直接收尾。
+    """
+    payload = b"e" * (8 * 1024 * 1024)
+    total = len(payload)
+    threads = 2
+    main = engine.plan_chunks(total, threads)
+    elastic_start = main[-1][1] + 1
+    done = [
+        [start, end, hashlib.sha256(payload[start:end + 1]).hexdigest()]
+        for start, end in main
+    ]
+    done.append([
+        elastic_start,
+        total - 1,
+        hashlib.sha256(payload[elastic_start:total]).hexdigest(),
+    ])
+    target = tmp_path / "video.mp4"
+    target.write_bytes(payload)
+    target.with_suffix(target.suffix + ".plan.json").write_text(
+        json.dumps({"total": total, "chunks": len(done), "done": done}), encoding="utf-8"
+    )
+    http = FakeHttp(payload)
+    install_http(monkeypatch, http)
+
+    engine.ChunkedDownloader(target, total, _links("https://cdn/file"), threads=threads).run(
+        lambda refresh=False: _links("https://cdn/file")
+    )
+
+    assert http.calls == []
+    assert target.read_bytes() == payload
+
+
+def test_plan_roundtrip_keeps_elastic_progress(tmp_path: Path) -> None:
+    """
+    恢复后写回的计划仍包含弹性区进度，再次恢复时已完成字节数不变。
+    """
+    import os
+
+    payload = b"r" * (8 * 1024 * 1024)
+    total = len(payload)
+    threads = 2
+    main = engine.plan_chunks(total, threads)
+    done, _elastic_start, _elastic_end = _elastic_plan(payload, threads, 512 * 1024)
+    target = tmp_path / "video.mp4"
+    target.write_bytes(payload)
+    target.with_suffix(target.suffix + ".plan.json").write_text(
+        json.dumps({"total": total, "chunks": len(done), "done": done}), encoding="utf-8"
+    )
+
+    def restore_once() -> int:
+        """执行一次恢复并返回已完成字节数，成功后写回计划。"""
+        downloader = engine.ChunkedDownloader(
+            target, total, _links("https://cdn/file"), threads=threads,
+        )
+        downloader._chunks = [  # pylint: disable=protected-access
+            engine._Chunk(index, start, end)
+            for index, (start, end) in enumerate(main)
+        ]
+        downloader._fd = os.open(target, os.O_RDWR)  # pylint: disable=protected-access
+        try:
+            downloader._restore()  # pylint: disable=protected-access
+            written = downloader._written  # pylint: disable=protected-access
+            downloader._save_plan()  # pylint: disable=protected-access
+        finally:
+            os.close(downloader._fd)  # pylint: disable=protected-access
+        return written
+
+    first = restore_once()
+    second = restore_once()
+
+    assert second == first

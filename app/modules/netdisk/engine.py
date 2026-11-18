@@ -467,6 +467,8 @@ class ChunkedDownloader:
         self._link_generation = 0
         self._written = 0
         self._chunks: List[_Chunk] = []
+        # 恢复得到的弹性区已完成区间（已排序、已合并），弹性区分配时按它跳过。
+        self._restored: List[Tuple[int, int]] = []
         self._error: Optional[Exception] = None
         self._started_at = time.monotonic()
         self._fd: Optional[int] = None
@@ -591,7 +593,82 @@ class ChunkedDownloader:
                     chunk.digest.update(self._read_range(chunk.start, chunk.position - 1))
         if disk_size != self.total:
             os.ftruncate(fd, self.total)
+        self._restore_elastic(done, disk_size)
         self._written = sum(chunk.position - chunk.start for chunk in self._chunks)
+
+    def _restore_elastic(self, done: Sequence[Any], disk_size: int) -> None:
+        """
+        把计划中落在弹性区的已完成区间恢复为已完成分片。
+
+        只有磁盘数据覆盖该区间、且摘要与计划记录一致时才采用；通过校验的相邻区间
+        合并后生成一个已完成分片，供弹性区分配时跳过，避免重启后重下尾部字节。
+
+        :param done: 计划中的已完成区间条目
+        :param disk_size: 磁盘当前长度
+        """
+        if not self._chunks:
+            return
+        elastic_start = self._chunks[-1].end + 1
+        if elastic_start >= self.total:
+            return
+        ranges: List[Tuple[int, int, str]] = []
+        for entry in done:
+            start, end = int(entry[0]), int(entry[1])
+            expected = str(entry[2]) if len(entry) > 2 else ""
+            if start < elastic_start:
+                # 只处理完全落在弹性区的条目。跨边界条目由 _restore 按裁剪后的区间
+                # 摘要校验（通常不匹配）后重下，这里保守跳过，避免误信半段数据。
+                continue
+            end = min(end, self.total - 1)
+            if start > end or not expected or disk_size < end + 1:
+                continue
+            if self._digest_range(start, end) != expected:
+                continue
+            ranges.append((start, end, expected))
+        if not ranges:
+            return
+        ranges.sort()
+        merged: List[List[int]] = []
+        for start, end, _expected in ranges:
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], end)
+                continue
+            merged.append([start, end])
+        digests = {(start, end): expected for start, end, expected in ranges}
+        for start, end in merged:
+            chunk = _Chunk(len(self._chunks), start, end)
+            chunk.position = end + 1
+            # 合并区间没有现成摘要：只有恰好等于单条条目时才能复用校验结果。
+            chunk.expected_digest = digests.get((start, end)) or self._digest_range(start, end)
+            self._chunks.append(chunk)
+            self._restored.append((start, end))
+
+    def _skip_restored(self, position: int) -> int:
+        """
+        跳过从当前位置开始的已完成弹性区区间。
+
+        :param position: 当前分配位置
+        :return: 不在任何已完成区间内的位置
+        """
+        for start, end in self._restored:
+            if start > position:
+                break
+            if position <= end:
+                return end + 1
+        return position
+
+    def _trim_before_restored(self, start: int, end: int) -> int:
+        """
+        把块尾裁剪到下一个已完成弹性区区间之前。
+
+        :param start: 块起点
+        :param end: 块终点（含）
+        :return: 不与已完成区间重叠的块终点
+        """
+        for restored_start, _ in self._restored:
+            if start < restored_start <= end:
+                return restored_start - 1
+        return end
 
     # ---- 下载 ----
 
@@ -784,21 +861,25 @@ class ChunkedDownloader:
         """
         position = cursor
         while position < self.total and not self._halted:
+            position = self._skip_restored(position)
+            if position >= self.total:
+                break
             remaining = self.total - position
             block = self._elastic_block()
             workers = min(self.threads, max(remaining // max(block, 1), 1))
             threads: List[threading.Thread] = []
             for _ in range(workers):
+                position = self._skip_restored(position)
                 left = self.total - position
                 if left <= 0:
                     break
                 size = min(block, left)
                 if left < block * workers:
                     size = max(left // workers, TAIL_MIN)
-                chunk = _Chunk(
-                    len(self._chunks), position,
-                    min(position + size - 1, self.total - 1),
+                end = self._trim_before_restored(
+                    position, min(position + size - 1, self.total - 1),
                 )
+                chunk = _Chunk(len(self._chunks), position, end)
                 self._chunks.append(chunk)
                 position = chunk.end + 1
                 thread = threading.Thread(
