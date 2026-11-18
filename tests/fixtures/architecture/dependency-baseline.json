@@ -1002,8 +1002,8 @@
       "runtime_only": true
     }
   },
-  "edge_count": 10774,
-  "edge_sha256": "38f2b011f785837b4512ba57c3cd05ad65ebf741403c7da89ebf1f717047b80d",
+  "edge_count": 10776,
+  "edge_sha256": "9b40c814bebec709521d92e925ca01fb9d30ee0d6f149ddf6b423b7298ae3cbf",
   "edges": [
     "app -> app.foundation",
     "app -> app.foundation.environment",
@@ -2964,6 +2964,7 @@
     "app.api.endpoints.mediaserver -> app.chain",
     "app.api.endpoints.mediaserver -> app.chain.download",
     "app.api.endpoints.mediaserver -> app.chain.mediaserver",
+    "app.api.endpoints.mediaserver -> app.chain.tmdb",
     "app.api.endpoints.mediaserver -> app.domain",
     "app.api.endpoints.mediaserver -> app.domain.context",
     "app.api.endpoints.mediaserver -> app.domain.metainfo",
@@ -2973,6 +2974,7 @@
     "app.api.endpoints.mediaserver -> app.schemas.media",
     "app.api.endpoints.mediaserver -> app.schemas.mediaserver",
     "app.api.endpoints.mediaserver -> app.schemas.response",
+    "app.api.endpoints.mediaserver -> app.schemas.tmdb",
     "app.api.endpoints.mediaserver -> app.schemas.token",
     "app.api.endpoints.mediaserver -> app.schemas.types",
     "app.api.endpoints.message -> app.adapters",
