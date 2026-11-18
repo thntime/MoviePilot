@@ -48,7 +48,6 @@ from app.domain.netdisk import (
     NetdiskError,
     NetdiskErrorCode,
     NetdiskPlatform,
-    ShareDetail,
     ShareFile,
     TransferHandle,
 )
