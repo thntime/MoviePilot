@@ -777,9 +777,9 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
         page: Optional[int] = 0,
     ) -> List[TorrentInfo]:
         """
-        搜索一个 CD 站点的网盘分享资源。
+        搜索一个网盘站点（CD 或 PS）的网盘分享资源。
 
-        :param site: CD 站点配置
+        :param site: 网盘站点配置
         :param keyword: 搜索关键词
         :param mtype: 媒体类型
         :param page: 页码
@@ -800,9 +800,9 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
         page: Optional[int] = 0,
     ) -> List[TorrentInfo]:
         """
-        异步搜索一个 CD 站点的网盘分享资源。
+        异步搜索一个网盘站点（CD 或 PS）的网盘分享资源。
 
-        :param site: CD 站点配置
+        :param site: 网盘站点配置
         :param keyword: 搜索关键词
         :param mtype: 媒体类型
         :param page: 页码
@@ -817,9 +817,9 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
 
     def test_netdisk_site(self, site: dict[str, Any]) -> Optional[Tuple[bool, str]]:
         """
-        通过 CloudSaver 模块校验 CD 站点登录是否可用。
+        通过网盘搜索模块校验站点凭据是否可用。
 
-        :param site: CD 站点配置
+        :param site: 网盘站点配置
         :return: 是否可用及失败原因；模块未处理时为空
         """
         return cast(Optional[Tuple[bool, str]], self.run_module("test_netdisk_site", site=site))

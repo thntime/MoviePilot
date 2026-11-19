@@ -74,6 +74,7 @@ BASELINE_ASSESSED_MODULES = frozenset(
         "cloudsaver",
         "discord",
         "netdisk",
+        "pansou",
         "douban",
         "emby",
         "fanart",

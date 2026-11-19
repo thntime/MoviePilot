@@ -40,7 +40,7 @@ class Site(BaseModel):
     limit_seconds: Optional[int] = Field(default=None, description="相邻请求之间的最小间隔，单位为秒；None 表示未配置")
     is_active: Optional[bool] = Field(default=True, description="是否启用")
     downloader: Optional[str] = Field(default=None, description="下载器")
-    kind: Optional[str] = Field(default=None, description="站点类型：pt 表示 PT 站，cd 表示网盘资源站")
+    kind: Optional[str] = Field(default=None, description="站点类型：pt 表示 PT 站，cd 表示 CloudSaver 网盘资源站，ps 表示 PanSou 网盘搜索站")
     auth_type: Optional[str] = Field(default=None, description="认证方式：cookie、api 或 auth")
     username: Optional[str] = Field(default=None, description="AUTH 认证用户名")
     auth_refresh_interval: Optional[int] = Field(

@@ -61,7 +61,7 @@ class Site(Base):
     lst_mod_date: Mapped[Optional[str]] = mapped_column(String, default=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     # 下载器
     downloader: Mapped[Optional[str]] = mapped_column(String)
-    # 站点类型：pt 表示 PT 站，cd 表示 CloudSaver 网盘资源站
+    # 站点类型：pt 表示 PT 站，cd 表示 CloudSaver 网盘资源站，ps 表示 PanSou 网盘搜索站
     kind: Mapped[Optional[str]] = mapped_column(String, default="pt")
     # 认证方式：cookie、api 或 auth，auth 表示用户名密码认证
     auth_type: Mapped[Optional[str]] = mapped_column(String, default="cookie")

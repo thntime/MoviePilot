@@ -280,6 +280,9 @@ def _open_site_response(
 # CD 站点令牌最近一次成功刷新时间，进程内共享，避免每次调度都重新登录。
 _netdisk_token_refreshed_at: Dict[int, float] = {}
 
+# 网盘站点类型：没有网页登录流程，凭据校验走模块的站点连接检测。
+_NETDISK_SITE_KINDS = frozenset({"cd", "ps"})
+
 
 def _netdisk_site_dict(snapshot: SiteSnapshot) -> Dict[str, Any]:
     """
@@ -824,7 +827,7 @@ class SiteChain(InteractionChainMixin, ChainBase):
 
         try:
             start_time = datetime.now()
-            if site_info.kind == "cd":
+            if site_info.kind in _NETDISK_SITE_KINDS:
                 netdisk_result = self.run_module(
                     "test_netdisk_site",
                     site={
@@ -836,12 +839,13 @@ class SiteChain(InteractionChainMixin, ChainBase):
                         "auth_type": site_info.auth_type,
                         "username": site_info.username,
                         "password": site_info.password,
+                        "token": site_info.token,
                         "timeout": site_info.timeout,
                         "auth_refresh_interval": site_info.auth_refresh_interval,
                     },
                 )
                 if netdisk_result is None:
-                    state, message = False, "CloudSaver 模块不可用"
+                    state, message = False, "网盘搜索模块不可用"
                 else:
                     state, message = netdisk_result
             else:
@@ -1007,8 +1011,8 @@ class SiteChain(InteractionChainMixin, ChainBase):
         site_url = site_info.url
         if site_id is None or not site_url:
             return False, "站点配置不完整"
-        # CD 站点没有网页登录与 Cookie，凭据更新本质是测试 CloudSaver 登录。
-        if getattr(site_info, "kind", "pt") == "cd":
+        # 网盘站点没有网页登录与 Cookie，凭据更新本质是测试网盘搜索服务是否可用。
+        if getattr(site_info, "kind", "pt") in _NETDISK_SITE_KINDS:
             result = self.run_module(
                 "test_netdisk_site",
                 site={
@@ -1016,16 +1020,17 @@ class SiteChain(InteractionChainMixin, ChainBase):
                     "name": getattr(site_info, "name", ""),
                     "domain": getattr(site_info, "domain", ""),
                     "url": site_url,
-                    "kind": "cd",
+                    "kind": getattr(site_info, "kind", "cd"),
                     "auth_type": getattr(site_info, "auth_type", "auth"),
                     "username": username,
                     "password": password,
+                    "token": getattr(site_info, "token", None),
                     "timeout": getattr(site_info, "timeout", 60),
                     "auth_refresh_interval": getattr(site_info, "auth_refresh_interval", 300),
                 },
             )
             if result is None:
-                return False, "CloudSaver 模块不可用"
+                return False, "网盘搜索模块不可用"
             state, message = result
             return bool(state), message or ("登录成功" if state else "登录失败")
         result = CookieHelper().get_site_cookie_ua(

@@ -1,0 +1,15 @@
+schema_version = 1
+id = "PansouModule"
+kind = "host_module"
+entrypoint = "app.modules.pansou:PansouModule"
+depends_on = []
+
+[metadata]
+name = "PanSou"
+type = "indexer"
+subtype = "Pansou"
+priority = 2
+
+[activation]
+policy = "bootstrap"
+watch = []

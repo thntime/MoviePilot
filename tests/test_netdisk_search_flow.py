@@ -4,6 +4,7 @@ CD 站点网盘搜索的路由、投影与过滤中性化测试。
 
 import asyncio
 from types import SimpleNamespace
+from typing import Optional
 
 from app.chain import site as site_module
 from app.chain.search import provider as provider_module
@@ -37,13 +38,14 @@ class _RuleHelper:
         return [group for group in self._groups if group.name in group_names]
 
 
-def _snapshot(site_id: int, kind: str, name: str) -> SimpleNamespace:
+def _snapshot(site_id: int, kind: str, name: str, token: Optional[str] = None) -> SimpleNamespace:
     """
     构造站点配置快照替身。
 
     :param site_id: 站点主键
     :param kind: 站点类型
     :param name: 站点名称
+    :param token: 站点认证令牌，PS 站点使用
     :return: 具备搜索链所需字段的快照替身
     """
     return SimpleNamespace(
@@ -53,11 +55,12 @@ def _snapshot(site_id: int, kind: str, name: str) -> SimpleNamespace:
         url=f"http://site{site_id}.example.com/",
         pri=1,
         kind=kind,
-        auth_type="auth" if kind == "cd" else "cookie",
+        auth_type="auth" if kind == "cd" else ("api" if kind == "ps" else "cookie"),
         username="user" if kind == "cd" else None,
         password="secret" if kind == "cd" else None,
+        token=token,
         auth_refresh_interval=300 if kind == "cd" else None,
-        timeout=90 if kind == "cd" else 15,
+        timeout=90 if kind == "cd" else (30 if kind == "ps" else 15),
         downloader=None,
         proxy=0,
         limit_interval=0,
@@ -96,6 +99,65 @@ def test_netdisk_indexers_respect_selected_sites() -> None:
     projected = provider_module._netdisk_indexers(snapshots, [3], set())
 
     assert [site["id"] for site in projected] == [3]
+
+
+def test_netdisk_indexers_include_ps_sites_with_token() -> None:
+    """
+    PS 站点与 CD 站点一样进入网盘站点集合，并把 Bearer token 带进搜索配置。
+    """
+    snapshots = [
+        _snapshot(1, "pt", "PT 站点"),
+        _snapshot(4, "ps", "PanSou 站点", token="secret-token"),
+    ]
+
+    projected = provider_module._netdisk_indexers(snapshots, [], set())
+
+    assert [site["id"] for site in projected] == [4]
+    assert projected[0]["kind"] == "ps"
+    assert projected[0]["token"] == "secret-token"
+
+
+def test_search_site_page_routes_ps_site_to_netdisk_search() -> None:
+    """
+    PS 站点的一页搜索同样走网盘搜索入口。
+    """
+    calls = []
+
+    class _Owner:
+        """
+        记录搜索入口调用的站点所有者替身。
+        """
+
+        def search_netdisk_torrents(self, **kwargs):
+            """
+            记录网盘搜索调用。
+
+            :param kwargs: 搜索参数
+            :return: 固定候选列表
+            """
+            calls.append(("netdisk", kwargs))
+            return [TorrentInfo(title="网盘候选", download_type="netdisk")]
+
+        def search_site_torrents(self, **kwargs):  # noqa: ARG002
+            """
+            记录不应发生的 PT 站点搜索调用。
+
+            :param kwargs: 搜索参数
+            :return: 空列表
+            """
+            calls.append(("torrent", kwargs))
+            return []
+
+    result = provider_module._search_site_page(
+        _Owner(),
+        site={"id": 4, "name": "PanSou 站点", "kind": "ps"},
+        keyword="测试",
+        media_type=None,
+        page=0,
+    )
+
+    assert calls and calls[0][0] == "netdisk"
+    assert result and result[0].download_type == "netdisk"
 
 
 def test_search_site_page_routes_netdisk_site_to_netdisk_search() -> None:

@@ -35,13 +35,19 @@ DomainExtractor = Callable[[str], str]
 UrlNormalizer = Callable[[str], str]
 
 # tg 为前端 TG 频道沿用的历史类型值，行为与 PT 一致，仅用于保留既有创建流程。
-_SITE_KINDS = frozenset({"pt", "cd", "tg"})
+# ps 表示 PanSou 网盘搜索服务，凭据是可选的 Bearer token，因此只允许 api 认证方式。
+_SITE_KINDS = frozenset({"pt", "cd", "tg", "ps"})
 _SITE_AUTH_TYPES = frozenset({"cookie", "api", "auth"})
 _SITE_KIND_AUTH_TYPES = {
     "pt": frozenset({"cookie", "api"}),
     "cd": frozenset({"auth"}),
     "tg": frozenset({"cookie", "api"}),
+    "ps": frozenset({"api"}),
 }
+# 网盘站点类型：不依赖官方站点资源包，也没有用户名密码登录流程。
+_NETDISK_SITE_KINDS = frozenset({"cd", "ps"})
+# 未显式声明认证方式时，各网盘站点类型推导出的唯一可用认证方式。
+_NETDISK_KIND_DEFAULT_AUTH = {"cd": "auth", "ps": "api"}
 
 
 def _resolve_site_kind_auth(
@@ -63,13 +69,13 @@ def _resolve_site_kind_auth(
     raw_auth_type = values.get("auth_type")
     if isinstance(raw_auth_type, str) and raw_auth_type:
         auth_type = raw_auth_type
-    elif kind == "cd":
-        # CD 站点只有 AUTH 一种可用认证方式，未显式提供时直接推导。
-        auth_type = "auth"
+    elif kind in _NETDISK_KIND_DEFAULT_AUTH:
+        # 网盘站点只有一种可用认证方式，未显式提供时直接推导。
+        auth_type = _NETDISK_KIND_DEFAULT_AUTH[kind]
     else:
         auth_type = default_auth_type
     if kind not in _SITE_KINDS:
-        return "", "", f"站点类型不支持：{kind}，仅支持 pt/cd"
+        return "", "", f"站点类型不支持：{kind}，仅支持 pt/cd/ps"
     if auth_type not in _SITE_AUTH_TYPES:
         return "", "", f"认证方式不支持：{auth_type}，仅支持 cookie/api/auth"
     if auth_type not in _SITE_KIND_AUTH_TYPES[kind]:
@@ -208,12 +214,28 @@ class SiteMutationCommand:
         kind, auth_type, error = _resolve_site_kind_auth(values)
         if error:
             return SiteMutationResult(False, error)
-        # CD 站点不依赖官方站点资源包，不需要用户认证；PT 站点保持原有认证门槛。
-        if kind != "cd" and self._auth_level_provider() < 2:
+        # 网盘站点不依赖官方站点资源包，不需要用户认证；PT/TG 站点保持原有认证门槛。
+        if kind not in _NETDISK_SITE_KINDS and self._auth_level_provider() < 2:
             return SiteMutationResult(False, "用户未通过认证，无法使用站点功能！")
 
         domain = self._domain_extractor(raw_url)
-        if kind == "cd":
+        if kind == "ps":
+            # PS 站点只填 PanSou 地址；凭据是可选 Bearer token，不做登录校验。
+            if await self._repository.async_get_by_domain(domain):
+                return SiteMutationResult(False, f"{domain} 站点己存在")
+            raw_name = values.get("name")
+            name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else domain
+            values.update(
+                {
+                    "domain": domain,
+                    "url": self._url_normalizer(raw_url),
+                    "name": name,
+                    "public": 0,
+                }
+            )
+            if values.get("timeout") is None:
+                values["timeout"] = 30
+        elif kind == "cd":
             username = values.get("username")
             password = values.get("password")
             if not isinstance(username, str) or not username.strip():

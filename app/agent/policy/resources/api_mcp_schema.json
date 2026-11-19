@@ -3797,7 +3797,7 @@
               "type": "null"
             }
           ],
-          "description": "站点类型：pt 表示 PT 站，cd 表示网盘资源站",
+          "description": "站点类型：pt 表示 PT 站，cd 表示 CloudSaver 网盘资源站，ps 表示 PanSou 网盘搜索站",
           "title": "Kind"
         },
         "limit_count": {

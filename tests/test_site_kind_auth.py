@@ -303,3 +303,58 @@ async def test_create_pt_site_still_requires_user_auth_level():
     assert result.success is False
     assert "用户未通过认证" in (result.message or "")
     dependencies["repository"].stage_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_ps_site_skips_indexer_loader_and_defaults():
+    """
+    PS 站点跳过资源包校验，认证方式推导为 api，名称取域名、公开状态关闭、超时 30 秒。
+    """
+    command, dependencies = _command()
+
+    result = await command.create(
+        {"url": "http://pansou.example:3303", "kind": "ps", "public": 1}
+    )
+
+    assert result.success is True
+    dependencies["indexer_loader"].assert_not_awaited()
+    mutation = dependencies["repository"].stage_create.await_args.args[0]
+    assert mutation.values["kind"] == "ps"
+    assert mutation.values["auth_type"] == "api"
+    assert mutation.values["name"] == "demo.example"
+    assert mutation.values["public"] == 0
+    assert mutation.values["timeout"] == 30
+
+
+@pytest.mark.asyncio
+async def test_create_ps_site_rejects_cookie_auth():
+    """
+    PS 站点只支持 api 认证方式，Cookie 认证在写库前被拒绝。
+    """
+    command, dependencies = _command()
+
+    result = await command.create(
+        {"url": "http://pansou.example:3303", "kind": "ps", "auth_type": "cookie"}
+    )
+
+    assert result.success is False
+    assert result.message
+    dependencies["indexer_loader"].assert_not_awaited()
+    dependencies["repository"].stage_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_ps_site_skips_user_auth_level_gate():
+    """
+    PS 站点不依赖官方站点资源包，未通过用户认证时仍可新增。
+    """
+    command, dependencies = _command(auth_level_provider=Mock(return_value=1))
+
+    result = await command.create(
+        {"url": "http://pansou.example:3303", "kind": "ps", "name": "PanSou 主站"}
+    )
+
+    assert result.success is True
+    mutation = dependencies["repository"].stage_create.await_args.args[0]
+    assert mutation.values["name"] == "PanSou 主站"
+    assert mutation.values["auth_type"] == "api"

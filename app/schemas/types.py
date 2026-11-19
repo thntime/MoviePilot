@@ -855,6 +855,8 @@ class OtherModulesType(Enum):
     Indexer = "站点索引"
     # CloudSaver 网盘搜索
     CloudSaver = "网盘搜索"
+    # PanSou 网盘聚合搜索
+    Pansou = "PanSou 网盘搜索"
     # PostgreSQL 数据库服务
     PostgreSQL = "PostgreSQL"
     # Redis 缓存服务

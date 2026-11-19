@@ -38,6 +38,9 @@ from app.schemas.types import MediaType, ProgressKey, SystemConfigKey
 SiteIndexer = Dict[str, Any]
 SyncPending = dict[Future[Any], tuple[SiteIndexer, int, int]]
 
+# 网盘站点类型：走模块的网盘搜索入口，不经过站点资源包的索引器。
+_NETDISK_SITE_KINDS = frozenset({"cd", "ps"})
+
 # 站点连续搜索失败达到该次数后，订阅搜索跳过它时在日志里提醒检查站点。
 SITE_FAILING_NOTICE_FAILURES = 3
 # 同一站点提醒的间隔，单位为秒；跳过发生在每个订阅的每一轮，不能每次都写警告。
@@ -70,17 +73,17 @@ def log_site_skipped(site: SiteIndexer, error: SubscriptionSiteBudgetUnavailable
 
 def _is_netdisk_site(site: SiteIndexer) -> bool:
     """
-    判断站点配置是否为 CD 网盘站点。
+    判断站点配置是否为网盘站点（CD 或 PS）。
 
     :param site: 站点索引配置
-    :return: 类型为 cd 时返回 True
+    :return: 类型为 cd 或 ps 时返回 True
     """
-    return str(site.get("kind") or "pt") == "cd"
+    return str(site.get("kind") or "pt") in _NETDISK_SITE_KINDS
 
 
 def _netdisk_site_payload(snapshot: Any) -> SiteIndexer:
     """
-    把 CD 站点快照投影为搜索链使用的站点配置字典。
+    把网盘站点快照投影为搜索链使用的站点配置字典。
 
     :param snapshot: 站点配置快照
     :return: 含类型、凭据与流控字段的站点字典
@@ -91,10 +94,11 @@ def _netdisk_site_payload(snapshot: Any) -> SiteIndexer:
         "domain": snapshot.domain,
         "url": snapshot.url,
         "pri": snapshot.pri,
-        "kind": "cd",
+        "kind": str(getattr(snapshot, "kind", None) or "cd"),
         "auth_type": snapshot.auth_type,
         "username": snapshot.username,
         "password": snapshot.password,
+        "token": getattr(snapshot, "token", None),
         "auth_refresh_interval": snapshot.auth_refresh_interval,
         "timeout": snapshot.timeout,
         "downloader": snapshot.downloader,
@@ -139,7 +143,7 @@ def _netdisk_indexers(
     return [
         _netdisk_site_payload(snapshot)
         for snapshot in snapshots
-        if str(getattr(snapshot, "kind", None) or "pt") == "cd"
+        if str(getattr(snapshot, "kind", None) or "pt") in _NETDISK_SITE_KINDS
         and getattr(snapshot, "id", None) not in existing_ids
         and (not selected_sites or getattr(snapshot, "id", None) in selected_sites)
     ]

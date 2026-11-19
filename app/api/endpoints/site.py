@@ -65,28 +65,31 @@ from app.schemas.types import MediaType, SystemConfigKey
 
 router = ResponseAPIRouter()
 
+# 网盘站点类型：这些站点没有 PT 的用户数据、图标与分类资源。
+_NETDISK_SITE_KINDS = frozenset({"cd", "ps"})
 
-def _is_cd_site(site: Any) -> bool:
+
+def _is_netdisk_site(site: Any) -> bool:
     """
-    判断站点是否为 CD 网盘资源站。
+    判断站点是否为网盘站点（CD 或 PS）。
 
     :param site: 站点快照或 API DTO
-    :return: 站点类型为 cd 时为 True
+    :return: 站点类型为 cd 或 ps 时为 True
     """
-    return getattr(site, "kind", None) == "cd"
+    return getattr(site, "kind", None) in _NETDISK_SITE_KINDS
 
 
 async def _netdisk_domains(query: SiteQueryService) -> set[str]:
     """
-    读取全部 CD 站点域名，用于过滤 PT 专属数据。
+    读取全部网盘站点域名，用于过滤 PT 专属数据。
 
     :param query: 站点查询服务
-    :return: CD 站点域名集合
+    :return: 网盘站点域名集合
     """
     sites = await query.list_ordered()
     domains: set[str] = set()
     for site in sites:
-        if site.domain and _is_cd_site(site):
+        if site.domain and _is_netdisk_site(site):
             domains.add(site.domain)
     return domains
 
@@ -540,8 +543,8 @@ def refresh_userdata(
             status_code=404,
             detail=f"站点 {site_id} 不存在",
         )
-    if _is_cd_site(site):
-        return _SchemaResponse(success=False, message="CD 站点不支持该能力")
+    if _is_netdisk_site(site):
+        return _SchemaResponse(success=False, message="网盘站点不支持该能力")
     if not site.domain:
         return _SchemaResponse(success=False, message="站点域名未配置")
     indexer = SitesHelper().get_indexer(site.domain)
@@ -623,8 +626,8 @@ async def read_userdata(
             status_code=404,
             detail=f"站点 {site_id} 不存在",
         )
-    if _is_cd_site(site):
-        return _SchemaResponse(success=False, message="CD 站点不支持该能力", data=[])
+    if _is_netdisk_site(site):
+        return _SchemaResponse(success=False, message="网盘站点不支持该能力", data=[])
     if not site.domain:
         raise HTTPException(
             status_code=409,
@@ -721,7 +724,7 @@ async def site_category(
             status_code=404,
             detail=f"站点 {site_id} 不存在",
         )
-    if _is_cd_site(site):
+    if _is_netdisk_site(site):
         return []
     if not site.domain:
         raise HTTPException(status_code=400, detail="站点域名未配置")
@@ -769,7 +772,7 @@ async def site_resource(
             status_code=404,
             detail=f"站点 {site_id} 不存在",
         )
-    if _is_cd_site(site):
+    if _is_netdisk_site(site):
         return []
     if not site.domain:
         raise HTTPException(status_code=400, detail="站点域名未配置")
@@ -819,7 +822,7 @@ async def read_statistic_by_domain(
     """
     domain = site_domain(site_url)
     site = await query.get_by_domain(domain)
-    if site and _is_cd_site(site):
+    if site and _is_netdisk_site(site):
         return _SchemaSiteStatistic()
     return await query.statistic(domain)
 
