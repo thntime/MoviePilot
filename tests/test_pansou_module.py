@@ -424,3 +424,97 @@ def test_site_timeout_falls_back_to_thirty_seconds() -> None:
     assert PansouModule._site_timeout({}) == 30
     assert PansouModule._site_timeout({"timeout": 0}) == 30
     assert PansouModule._site_timeout({"timeout": "45"}) == 45
+
+
+def _numbered_files(count: int, start: int = 1) -> List[ShareFile]:
+    """
+    构造「纯编号命名」的分享文件树，例如 01 4K.mkv / 02 4K.mkv。
+    """
+    return [
+        ShareFile(file_id=f"f{number}", name=f"{number:02d} 4K.mkv", size=350 * 1024 * 1024)
+        for number in range(start, start + count)
+    ]
+
+
+def test_mislabeled_share_is_dropped(server: FakeServer, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    标题声明 218 集、分享里只有 01-40 集的错标包必须被丢弃。
+
+    真实案例：频道把《启运丹田》的分享标成《斗破苍穹 年番 4K 更新218集》，
+    文件名只有编号，元数据里没有别的判据。
+    """
+    server.responses["/api/search"] = FakeResponse(_merge_payload({
+        "quark": [{
+            "url": "https://pan.quark.cn/s/33354a7c3298",
+            "note": "斗破苍穹 年番 4K 更新218集",
+        }],
+    }))
+    _install_walk(monkeypatch, files={"33354a7c3298": _numbered_files(40)})
+
+    assert PansouModule().search_netdisk_torrents(_ps_site(), "斗破苍穹") == []
+
+
+def test_recent_episode_pack_is_kept(server: FakeServer, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    只放最近若干集的正常分享（180-219 集）不触发内容一致性检查。
+    """
+    server.responses["/api/search"] = FakeResponse(_merge_payload({
+        "quark": [{
+            "url": "https://pan.quark.cn/s/recent219",
+            "note": "斗破苍穹 年番 4K 更新219集",
+        }],
+    }))
+    _install_walk(monkeypatch, files={"recent219": _numbered_files(40, start=180)})
+
+    results = PansouModule().search_netdisk_torrents(_ps_site(), "斗破苍穹")
+
+    assert results is not None
+    assert len(results) == 1
+
+
+def test_small_claim_does_not_trigger_conflict() -> None:
+    """
+    声明集数低于下限时不判矛盾，避免短片、综艺被误伤。
+    """
+    files = [{"name": f"{number:02d}.mp4"} for number in range(1, 13)]
+
+    assert PansouModule._claim_conflicts("某某短剧 全12集", files) is False
+
+
+def test_claim_conflict_ignores_share_without_episode_numbers() -> None:
+    """
+    文件名解析不出集号时不做判断，交给通用质量门处理。
+    """
+    files = [{"name": "斗破苍穹 正片.mkv"}, {"name": "花絮.mkv"}]
+
+    assert PansouModule._claim_conflicts("斗破苍穹 更新218集", files) is False
+
+
+def test_unrecognized_link_is_dropped(server: FakeServer, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    错域名或伪造域名的链接（pan.qoark.cn）在进入取链前就被丢弃。
+    """
+    server.responses["/api/search"] = FakeResponse(_merge_payload({
+        "quark": [
+            {"url": "https://pan.qoark.cn/s/dpcq", "note": "🎞️ 斗破苍穹"},
+            {"url": "https://pan.quark.cn/s/good123", "note": "斗破苍穹 年番"},
+        ],
+    }))
+    _install_walk(monkeypatch)
+
+    results = PansouModule().search_netdisk_torrents(_ps_site(), "斗破苍穹")
+
+    assert results is not None
+    assert [item.enclosure for item in results] == ["https://pan.quark.cn/s/good123"]
+
+def test_platform_host_match_keeps_real_forms_and_rejects_lookalikes() -> None:
+    """
+    域名一致性只拦「错域名」，不能误伤 123/139/UC 等真实链接写法。
+    """
+    assert PansouModule._platform_matches_host("quark", "https://pan.qoark.cn/s/dpcq") is False
+    assert PansouModule._platform_matches_host("quark", "https://pan.quark.cn/s/abc123") is True
+    assert PansouModule._platform_matches_host("pan123", "https://123pan.cn/123pan/u9izjv-jwlWv") is True
+    assert PansouModule._platform_matches_host("pan139", "https://caiyun.139.com/m/i?105CqFasD8oLm") is True
+    assert PansouModule._platform_matches_host("uc", "https://fast.uc.cn/s/431c8fbe24474") is True
+    assert PansouModule._platform_matches_host("tianyi", "https://cloud.189.cn/t/abcd") is True
+    assert PansouModule._platform_matches_host("magnet", "magnet:?xt=urn:btih:abc") is True

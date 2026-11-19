@@ -5,10 +5,12 @@ PanSou 网盘搜索模块，按 PS 站点地址搜索 PanSou 并把链接展开�
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from app.application.netdisk import candidates
 from app.application.site.observation import report_site_search_outcome, report_site_search_page
@@ -28,6 +30,25 @@ _ALIVE_CACHE_TTL = 1800
 _ALIVE_CACHE_LIMIT = 2000
 _alive_cache: Dict[str, Tuple[float, bool, Optional[Dict[str, Any]]]] = {}
 _alive_lock = threading.Lock()
+
+# 标题里声明的总集数（更新218集 / 全219集 / 共12话）；频道文案经常与实际分享不符。
+_CLAIM_EPISODE_PATTERN = re.compile(r"(?:更新至?|全集?|共)\s*(\d{1,4})\s*[集话]")
+# 声明集数低于该值时不做一致性判断，避免短片、综艺等正常分集被误伤。
+_CLAIM_MIN_EPISODES = 60
+# 实际最大集号低于声明集数的该比例时，判定标题与实际内容不符。
+_CLAIM_TOLERANCE_RATIO = 0.5
+# 各平台允许的分享域名后缀：频道文案经常把链接写成错域名，下载必然失败。
+_PLATFORM_HOST_SUFFIXES = {
+    "quark": ("quark.cn",),
+    "uc": ("uc.cn",),
+    "pan115": ("115.com", "115cdn.com"),
+    "baidu": ("baidu.com",),
+    "xunlei": ("xunlei.com",),
+    "tianyi": ("189.cn",),
+    "pan123": ("123pan.com", "123pan.cn", "123684.com", "123865.com", "123912.com"),
+    "pan139": ("139.com",),
+    "guangya": ("guangyapan.com",),
+}
 
 
 class PansouModule(_ModuleBase):
@@ -195,6 +216,10 @@ class PansouModule(_ModuleBase):
             platform = self._as_text(entry.get("platform"))
             if not candidates.platform_supported(platform) or not candidates.platform_enabled(platform):
                 continue
+            if not self._platform_matches_host(platform, url):
+                # 频道文案里的链接可能是错域名或伪造域名（如 pan.qoark.cn），下载必然失败，直接丢弃。
+                logger.info(f"{self._as_text(entry.get('title')) or url} 链接域名与平台不符，已丢弃：{url}")
+                continue
             # 同一分享可能以不同链接形式重复出现，按分享码去重；无法解析分享码时保留完整链接。
             share_ref = parse_share_link(url, self._as_text(entry.get("password")) or None)
             dedup_key = f"{share_ref.platform.value}:{share_ref.share_id}" if share_ref and share_ref.share_id else url
@@ -222,6 +247,26 @@ class PansouModule(_ModuleBase):
                 labels=[source] if source else [],
             ))
         return torrents
+
+    @staticmethod
+    def _platform_matches_host(platform: str, url: str) -> bool:
+        """
+        判断分享链接的域名是否属于该平台。
+
+        频道文案里的链接常写成错域名（如把 quark 写成 pan.qoark.cn），这类链接
+        永远取不到内容，应在进入取链前丢弃；未知平台不做判断，交给平台过滤。
+
+        :param platform: PanSou 返回的平台标识
+        :param url: 分享链接
+        :return: 域名属于该平台或无法判断时返回 True
+        """
+        suffixes = _PLATFORM_HOST_SUFFIXES.get(str(platform or "").strip())
+        if not suffixes:
+            return True
+        host = (urlsplit(url).hostname or "").lower()
+        if not host:
+            return False
+        return any(host == suffix or host.endswith(f".{suffix}") for suffix in suffixes)
 
     @staticmethod
     def _alive_cache_key(site: Dict[str, Any], identity: str) -> str:
@@ -298,7 +343,7 @@ class PansouModule(_ModuleBase):
         from app.domain.netdisk import NetdiskError, NetdiskErrorCode
 
         if cached_detail and cached_detail.get("_files"):
-            return cached_detail, candidates.passes_quality(torrent, cached_detail)
+            return cached_detail, PansouModule._passes_pansou_quality(torrent, cached_detail)
         try:
             service = NetdiskResolveService()
             walked = service.walk(
@@ -329,7 +374,57 @@ class PansouModule(_ModuleBase):
             "stoken": walked.detail.stoken,
             "_files": files,
         }
-        return detail, candidates.passes_quality(torrent, detail)
+        return detail, PansouModule._passes_pansou_quality(torrent, detail)
+
+    @classmethod
+    def _passes_pansou_quality(cls, torrent: TorrentInfo, detail: Dict[str, Any]) -> bool:
+        """
+        在通用质量门之前先做 PanSou 来源专属的内容一致性检查。
+
+        PanSou 的标题来自频道文案，与实际分享内容可能完全无关：例如标题写
+        「斗破苍穹 年番 4K 更新218集」，分享里却是另一部短剧的 40 个编号文件。
+        这里用标题声明的总集数与分享实际集号做交叉校验，明显对不上的直接丢弃。
+
+        :param torrent: 待检查的网盘候选
+        :param detail: 分享详情，含 `_files` 文件树
+        :return: 通过返回 True
+        """
+        files = detail.get("_files")
+        if isinstance(files, list) and cls._claim_conflicts(torrent.title or "", files):
+            return False
+        return candidates.passes_quality(torrent, detail)
+
+    @staticmethod
+    def _claim_conflicts(title: str, files: List[Dict[str, Any]]) -> bool:
+        """
+        判断标题声明的总集数是否与实际分享的集号明显矛盾。
+
+        只对声明集数不小于 `_CLAIM_MIN_EPISODES` 的标题生效，且要求实际最大集号
+        低于声明集数的一半才判定矛盾，避免把「只放最近若干集」的正常分享误伤。
+
+        :param title: 候选标题（PanSou 的频道文案）
+        :param files: 分享文件树中的文件条目
+        :return: 判定为内容与标题不符时返回 True
+        """
+        claims = [int(value) for value in _CLAIM_EPISODE_PATTERN.findall(str(title or ""))]
+        if not claims:
+            return False
+        claim = max(claims)
+        if claim < _CLAIM_MIN_EPISODES:
+            return False
+        numbers: set[int] = set()
+        for entry in files or []:
+            if not isinstance(entry, dict):
+                continue
+            numbers.update(candidates.episode_numbers(str(entry.get("name") or "")))
+        if not numbers:
+            return False
+        if max(numbers) >= claim * _CLAIM_TOLERANCE_RATIO:
+            return False
+        logger.info(
+            f"{title} 标题声明 {claim} 集，分享实际最大集号 {max(numbers)}，内容与标题不符，已丢弃"
+        )
+        return True
 
     def _inspect_share(
         self,
