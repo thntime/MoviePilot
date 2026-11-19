@@ -710,6 +710,38 @@ Telegram、Feishu；其他交互渠道因无法建立私聊而 fail closed，不
 - 单次最多把 200 个文件送入 AI，超出部分仍可手动选择；只有能解析出集数的选中文件才计入 `suggested_episode_selection`。
 - 响应只使用安全文件字段，不回显提取码、分享 token 或 Cookie；请求与响应都不包含账号凭据。
 
+### 4.7 分享体检
+
+手动下载弹窗的网盘分享区域还提供“体检”按钮，调用管理员端点
+`POST /api/v1/netdisk/share/audit`，只读地回答三件事：这个分享是哪个媒体、里面有多少
+影视文件、媒体库还缺哪几集。该端点使用网页登录的管理员身份，只服务内置手动下载弹窗，
+**不是** Agent 的 `moviepilot_api` 操作，外部 MCP 客户端不能通过网关调用。
+
+请求字段为 `url`、`password`（提取码，留空表示无）、`platform`（缺省按链接识别）与
+`account_id`（缺省用平台主账号）。手动下载弹窗还会带上目标媒体身份：`media_source`、
+`media_id`、`mtype`、`title`、`year` 与 `season`（只比对这一季）。成功响应的 `data.audit`
+包含 `share_title`、`platform`、`file_count`、`total_bytes`、`truncated`、`unrecognized_files`
+与 `media` 列表；每个媒体项给出 `title`、`year`、`type`、`recognized`、`media_source`、
+`media_id`、`files`、`total_bytes`、`seasons`（季号与分享内集号）、`episodes`（逐集状态，含
+`season`、`episode`、`state`）、`missing_episodes`（媒体库缺且分享可补，跨季合并）、
+`existing_episodes`（媒体库已有，跨季合并）、`season_gaps`（按季拆开的 `missing_episodes`
+与 `existing_episodes`，多季分享按季取用）、`library_evidence`、`library_state` 与 `truncated`。
+
+- 带上 `media_source`+`media_id` 时按该身份算缺集，只套到标题归一化后匹配的分组；没有匹配
+  分组时套到体量最大的分组，其余分组仍按分享内路径识别。识别失败时退回路径识别，不报错。
+- 体检只读：不转存、不下载、不写盘；`missing_episodes` 回填到集数输入框后仍由用户确认下载。
+- 单集状态取值：`present` 媒体库已有、`missing` 媒体库缺且分享可补、`share_absent`
+  媒体库缺但分享也没有、`unconfirmed` 媒体库证据不足。
+- 缺集分母只算已播出集：季内单集清单带播出日期时按日期过滤；否则用 TMDB 的
+  `last_episode_to_air` 判断该季播到第几集（更早的季视为整季播完，更晚的季视为未开播）；
+  再否则只有季首播日期晚于今天时整季排除。全都没有时才退回该季集数清单，此时季内
+  未播出的集可能出现在 `missing_episodes` 里。
+- 媒体库证据来自媒体服务器本地缓存与成功整理历史的并集；两者都没有该作品的证据时返回
+  `library_evidence=none`、`library_state=unknown`，全部集标 `unconfirmed`，不得据此判断缺集。
+- 视频文件超过 5000 个时截断处理并返回 `truncated=true`；未扫到的集不计入 `missing_episodes`。
+- 分享内没有视频文件时返回空 `media` 列表；分享失效或提取码错误沿用 `NetdiskErrorCode` 分类。
+- 响应不回显提取码、分享 token 或 Cookie；请求与响应都不包含账号凭据。
+
 ## 5. 组合业务调用
 
 以下是调用顺序指引。具体参数仍按各 operation 的 Schema 构造，不将顺序中的操作全部默认执行。

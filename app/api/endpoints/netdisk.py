@@ -6,6 +6,7 @@
 
 import asyncio
 import base64
+import datetime
 import queue
 import secrets
 import time
@@ -15,15 +16,28 @@ import websockets
 from fastapi import Depends, Query, WebSocket, WebSocketDisconnect
 
 from app.api.dependencies.auth import get_current_active_superuser_async
+from app.api.dependencies.history import (
+    get_history_query_service,
+    get_mediaserver_query_service,
+)
 from app.api.principal import ApiPrincipal
 from app.api.response import ResponseAPIRouter
+from app.application.history import HistoryQueryService
+from app.application.mediaserver import MediaServerQueryService
 from app.application.netdisk import registry, selection
 from app.application.netdisk.accounts import NetdiskAccountService
 from app.application.netdisk.ai_selection import select_share_files
+from app.application.netdisk.audit import (
+    RecognizedMedia,
+    ShareAuditReport,
+    ShareAuditService,
+)
 from app.application.netdisk.contract import NetdiskAccountDetail, NetdiskAccountView
 from app.application.netdisk.login import NetdiskLoginService
 from app.application.netdisk.resolve import NetdiskResolveService
 from app.application.netdisk.share_blacklist import get_share_blacklist
+from app.chain.media import MediaChain
+from app.domain.episode import parse_episode_selection
 from app.domain.netdisk import NetdiskError, NetdiskErrorCode, ShareFile
 from app.runtime.execution import run_in_threadpool
 from app.runtime.log import logger
@@ -37,6 +51,12 @@ from app.schemas.netdisk import (
     NetdiskPlatformInfo,
     NetdiskQrInputRequest,
     NetdiskQrStartRequest,
+    NetdiskShareAuditEpisode,
+    NetdiskShareAuditMedia,
+    NetdiskShareAuditReport,
+    NetdiskShareAuditRequest,
+    NetdiskShareAuditSeason,
+    NetdiskShareAuditSeasonGap,
     NetdiskShareBlacklistEntry,
     NetdiskSharePreviewRequest,
     NetdiskSmsLoginRequest,
@@ -44,6 +64,7 @@ from app.schemas.netdisk import (
 )
 from app.schemas.netdisk_files import NetdiskDriveFileModel
 from app.schemas.response import Response as _SchemaResponse
+from app.schemas.types import MediaSource, MediaType
 
 router = ResponseAPIRouter()
 
@@ -246,6 +267,402 @@ async def preview_share(
             suggested_episode_selection=result.suggested_episode_selection,
         ),
     )
+
+
+def _audit_last_aired_point(info: Any) -> tuple[Optional[int], Optional[int]]:
+    """
+    从 TMDB 原始详情里取「最近播出的那一集」，用来判断连载剧播到哪。
+
+    TMDB 的 `tv/{id}` 详情带 `last_episode_to_air`，但统一媒体字段没有投影它，
+    这里直接读原始字典；其它数据源没有该字段时返回两个 None。
+
+    :param info: 识别出的媒体信息
+    :return: （季号, 集号）；拿不到时两个元素都是 None
+    """
+    tmdb_info = getattr(info, "tmdb_info", None)
+    if not isinstance(tmdb_info, dict):
+        return None, None
+    last = tmdb_info.get("last_episode_to_air")
+    if not isinstance(last, dict):
+        return None, None
+    try:
+        season = int(last.get("season_number"))
+        episode = int(last.get("episode_number"))
+    except (TypeError, ValueError):
+        return None, None
+    return season, episode
+
+
+def _audit_aired_seasons(info: Any) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """
+    从识别结果里取出已播出的季集，作为缺集计算的分母。
+
+    优先级从准到粗：季内单集清单带播出日期时按日期过滤；否则用 TMDB 的
+    `last_episode_to_air` 判断该季播到第几集（更早的季视为整季播完，更晚的季视为未开播）；
+    再否则只有季首播日期晚于今天时整季排除；全都没有才退回该季集数清单。
+
+    :param info: 识别出的媒体信息
+    :return: 季号到已播出集号集合的序列
+    """
+    today = datetime.date.today().isoformat()
+    last_season, last_episode = _audit_last_aired_point(info)
+    aired: dict[int, set[int]] = {}
+    decided: set[int] = set()
+    for season in getattr(info, "season_info", None) or []:
+        if not isinstance(season, dict):
+            continue
+        number = season.get("season_number")
+        if number is None:
+            number = season.get("order")
+        if number is None:
+            continue
+        try:
+            season_number = int(number)
+        except (TypeError, ValueError):
+            continue
+        episodes = [item for item in (season.get("episodes") or []) if isinstance(item, dict)]
+        dated = [item for item in episodes if item.get("air_date")]
+        if dated:
+            picked: set[int] = set()
+            for episode in episodes:
+                value = episode.get("episode_number")
+                if value is None:
+                    continue
+                date = str(episode.get("air_date") or "")
+                if not date or date > today:
+                    continue
+                try:
+                    picked.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            if picked:
+                aired[season_number] = picked
+            decided.add(season_number)
+            continue
+        if last_season is not None and last_episode is not None:
+            if season_number < last_season:
+                count = season.get("episode_count")
+                if isinstance(count, int) and count > 0:
+                    aired[season_number] = set(range(1, count + 1))
+            elif season_number == last_season:
+                aired[season_number] = set(range(1, last_episode + 1))
+            decided.add(season_number)
+            continue
+        season_air_date = str(season.get("air_date") or "")
+        if season_air_date and season_air_date > today:
+            decided.add(season_number)
+    for number, numbers in (getattr(info, "seasons", None) or {}).items():
+        try:
+            season_number = int(number)
+        except (TypeError, ValueError):
+            continue
+        if season_number in decided or season_number in aired:
+            continue
+        try:
+            aired[season_number] = {int(value) for value in numbers or []}
+        except (TypeError, ValueError):
+            continue
+    return tuple(
+        (number, tuple(sorted(numbers))) for number, numbers in sorted(aired.items())
+    )
+
+
+def _recognized_from_context(context: Any) -> Optional[RecognizedMedia]:
+    """
+    把按路径识别出的上下文转成体检使用的媒体身份。
+
+    :param context: MediaChain 识别返回的上下文
+    :return: 媒体身份；未识别、缺少身份或类型不支持时为 None
+    """
+    info = getattr(context, "media_info", None)
+    if info is None:
+        return None
+    media_id = str(getattr(info, "media_id", "") or "")
+    if not media_id:
+        return None
+    mtype = getattr(info, "type", None)
+    if mtype not in (MediaType.MOVIE, MediaType.TV):
+        return None
+    source = getattr(info, "media_source", None)
+    return RecognizedMedia(
+        media_source=str(getattr(source, "value", "") or ""),
+        media_id=media_id,
+        title=str(getattr(info, "title", "") or ""),
+        year=str(getattr(info, "year", "") or ""),
+        mtype=mtype.value,
+        aired_seasons=_audit_aired_seasons(info),
+    )
+
+
+class _MediaServerProbe:
+    """
+    用媒体服务器本地缓存与整理历史回答体检问题的只读探针。
+
+    两个来源取并集：媒体服务器缓存代表「库里现在有什么」，整理历史代表「我们整理过什么」。
+    缓存缺季集快照、整理历史删了文件仍留记录，两者都空时才判「未确认」。
+    """
+
+    # 单次体检最多读取的整理历史条数，避免一次查询拖垮接口。
+    _HISTORY_LIMIT = 50
+
+    def __init__(
+        self,
+        library: MediaServerQueryService,
+        history: Optional[HistoryQueryService] = None,
+    ) -> None:
+        """
+        保存媒体库查询服务与可选的整理历史查询服务。
+
+        :param library: 只访问本地缓存的媒体库查询服务
+        :param history: 整理历史查询服务；为 None 时只用媒体库缓存
+        """
+        self._library = library
+        self._history = history
+
+    @staticmethod
+    def _source(media: RecognizedMedia) -> Optional[MediaSource]:
+        """
+        把识别结果里的来源标识还原为媒体来源枚举。
+
+        :param media: 已识别的媒体身份
+        :return: 可识别的来源枚举；未知来源时为 None
+        """
+        if not media.media_source:
+            return None
+        try:
+            return MediaSource(media.media_source)
+        except ValueError:
+            return None
+
+    async def _history_records(self, media: RecognizedMedia) -> list[Any]:
+        """
+        读取该标题的整理历史记录，查询失败按空列表降级。
+
+        :param media: 已识别的媒体身份
+        :return: 整理历史 DTO 列表
+        """
+        if self._history is None or not media.title:
+            return []
+        try:
+            page = await self._history.list_transfer(
+                title=media.title,
+                count=self._HISTORY_LIMIT,
+                status=True,
+            )
+        except Exception as error:  # noqa: BLE001 - 历史只是补充证据，失败不影响体检
+            logger.warning(f"分享体检读取整理历史失败：{type(error).__name__}")
+            return []
+        return list(getattr(page, "list", None) or [])
+
+    @staticmethod
+    def _same_media(record: Any, media: RecognizedMedia) -> bool:
+        """
+        判断一条整理历史是否属于同一部作品。
+
+        :param record: 整理历史 DTO
+        :param media: 已识别的媒体身份
+        :return: 身份一致或标题一致时返回 True
+        """
+        record_source = str(getattr(record, "media_source", "") or "")
+        record_id = str(getattr(record, "media_id", "") or "")
+        if record_id and media.media_id:
+            return record_id == media.media_id and (
+                not record_source or not media.media_source or record_source == media.media_source
+            )
+        record_title = str(getattr(record, "title", "") or "")
+        return bool(record_title) and record_title == media.title
+
+    @staticmethod
+    def _season_matches(record: Any, season: int) -> bool:
+        """
+        判断一条整理历史是否覆盖目标季。
+
+        :param record: 整理历史 DTO
+        :param season: 目标季号
+        :return: 历史没有季信息或季号匹配时返回 True
+        """
+        numbers = parse_episode_selection(str(getattr(record, "seasons", "") or ""))
+        return not numbers or season in numbers
+
+    async def has_item(self, media: RecognizedMedia) -> bool:
+        """
+        判断媒体库缓存或整理历史里是否存在该作品。
+
+        :param media: 已识别的媒体身份
+        :return: 命中条目时返回 True
+        """
+        item_id = await self._library.find_item_id(
+            title=media.title or None,
+            year=media.year or None,
+            mtype=media.mtype or None,
+            media_source=self._source(media),
+            media_id=media.media_id or None,
+        )
+        if item_id:
+            return True
+        return any(
+            self._same_media(record, media)
+            for record in await self._history_records(media)
+        )
+
+    async def season_episodes(self, media: RecognizedMedia, season: int) -> set[int]:
+        """
+        返回媒体库缓存与整理历史里该作品某季已入库的集号并集。
+
+        :param media: 已识别的媒体身份
+        :param season: 目标季号
+        :return: 集号集合；两个来源都没有证据时为空集合
+        """
+        numbers = await self._library.find_season_episodes(
+            title=media.title or None,
+            year=media.year or None,
+            mtype=media.mtype or None,
+            media_source=self._source(media),
+            media_id=media.media_id or None,
+            season=season,
+        )
+        for record in await self._history_records(media):
+            if not self._same_media(record, media) or not self._season_matches(record, season):
+                continue
+            numbers |= set(parse_episode_selection(str(getattr(record, "episodes", "") or "")))
+        return numbers
+
+
+def _audit_report_model(report: ShareAuditReport) -> NetdiskShareAuditReport:
+    """
+    把体检结果转成接口响应模型。
+
+    :param report: 体检结果
+    :return: 响应模型
+    """
+    return NetdiskShareAuditReport(
+        share_title=report.share_title,
+        platform=report.platform,
+        file_count=report.file_count,
+        total_bytes=report.total_bytes,
+        truncated=report.truncated,
+        unrecognized_files=report.unrecognized_files,
+        media=[
+            NetdiskShareAuditMedia(
+                title=item.title,
+                year=item.year,
+                type=item.mtype,
+                recognized=item.recognized,
+                media_source=item.media_source or None,
+                media_id=item.media_id or None,
+                files=item.files,
+                total_bytes=item.total_bytes,
+                seasons=[
+                    NetdiskShareAuditSeason(season=season, episodes=list(numbers))
+                    for season, numbers in item.seasons
+                ],
+                season_gaps=[
+                    NetdiskShareAuditSeasonGap(
+                        season=season,
+                        missing_episodes=list(dict(item.season_missing).get(season, ())),
+                        existing_episodes=list(dict(item.season_existing).get(season, ())),
+                    )
+                    for season in sorted(
+                        set(dict(item.season_missing)) | set(dict(item.season_existing))
+                    )
+                ],
+                episodes=[
+                    NetdiskShareAuditEpisode(season=season, episode=episode, state=state)
+                    for season, episode, state in item.episode_states
+                ],
+                missing_episodes=list(item.missing_episodes),
+                existing_episodes=list(item.existing_episodes),
+                library_evidence=item.library_evidence,
+                library_state=item.library_state,
+                truncated=item.truncated,
+            )
+            for item in report.media
+        ],
+    )
+
+
+async def _audit_identity(payload: NetdiskShareAuditRequest) -> Optional[RecognizedMedia]:
+    """
+    把请求里的目标媒体身份转成体检身份。
+
+    只有 media_source 与 media_id 成对提供时才按该身份体检；其余情况返回 None，
+    保持按分享内路径识别的旧行为。
+
+    :param payload: 体检请求体
+    :return: 体检用的媒体身份；未提供、来源非法或识别失败时为 None
+    """
+    if not payload.media_source or not payload.media_id:
+        return None
+    try:
+        source = MediaSource(payload.media_source)
+    except ValueError:
+        logger.warning(f"分享体检忽略未知媒体来源：{payload.media_source}")
+        return None
+    mtype: Optional[MediaType] = None
+    if payload.mtype == MediaType.TV.value:
+        mtype = MediaType.TV
+    elif payload.mtype == MediaType.MOVIE.value:
+        mtype = MediaType.MOVIE
+    try:
+        context = await MediaChain().async_recognize_media(
+            mtype=mtype,
+            media_source=source,
+            media_id=payload.media_id,
+        )
+    except Exception as error:  # noqa: BLE001 - 识别失败退回路径识别
+        logger.warning(f"分享体检按指定身份识别失败：{type(error).__name__}")
+        return None
+    recognized = _recognized_from_context(context)
+    if recognized is None:
+        return None
+    return RecognizedMedia(
+        media_source=recognized.media_source,
+        media_id=recognized.media_id,
+        title=recognized.title or (payload.title or ""),
+        year=recognized.year or (payload.year or ""),
+        mtype=recognized.mtype,
+        aired_seasons=recognized.aired_seasons,
+    )
+
+
+@router.post("/share/audit", summary="体检分享内容并与媒体库比对")
+async def audit_share(
+    payload: NetdiskShareAuditRequest,
+    library: MediaServerQueryService = Depends(get_mediaserver_query_service),
+    history: HistoryQueryService = Depends(get_history_query_service),
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> _SchemaResponse[NetdiskData]:
+    """
+    只读体检：展开分享文件树、按媒体分组、与媒体库缓存和整理历史比对缺口。
+
+    不转存、不下载、不写盘；媒体库证据不足的分组标为未确认，缺集可直接填入下载集数。
+    """
+    async def recognize(path: str) -> Optional[RecognizedMedia]:
+        """
+        按分享内相对路径识别媒体身份。
+
+        :param path: 分享内相对路径
+        :return: 识别出的媒体身份；识别失败时为 None
+        """
+        return _recognized_from_context(await MediaChain().async_recognize_by_path(path))
+
+    identity = await _audit_identity(payload)
+    service = ShareAuditService(
+        recognize=recognize,
+        probe=_MediaServerProbe(library, history),
+    )
+    try:
+        report = await service.audit(
+            payload.url,
+            payload.password or None,
+            payload.platform,
+            payload.account_id,
+            identity=identity,
+            season=payload.season,
+        )
+    except NetdiskError as error:
+        return _error_response(error)
+    return _SchemaResponse(success=True, data=NetdiskData(audit=_audit_report_model(report)))
 
 
 @router.get("/accounts", summary="查询网盘账号")

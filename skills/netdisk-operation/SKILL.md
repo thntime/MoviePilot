@@ -99,3 +99,7 @@ retrying with broader scope.
 - Report stable error codes and the explicit unsupported/denied result as
   returned. Do not fall back to partial writes, other accounts, or unregistered
   operations.
+- The manual download dialog's share preview (`POST /api/v1/netdisk/share/preview`)
+  and share audit (`POST /api/v1/netdisk/share/audit`) serve the web UI only and
+  are not authorized operations of this skill. Do not call them through the
+  gateway or by raw HTTP.

@@ -77,6 +77,33 @@ class TransactionalMediaServerRepository:
         )
         return item_id
 
+    def get_season_episodes(
+        self,
+        *,
+        server: Optional[str] = None,
+        title: Optional[str] = None,
+        year: Optional[Union[str, int]] = None,
+        mtype: Optional[str] = None,
+        media_source: Optional[MediaSource] = None,
+        media_id: Optional[str] = None,
+        season: Optional[int] = None,
+    ) -> set[int]:
+        """
+        在短会话中返回媒体库缓存中某部作品某季已入库的集号集合。
+        """
+        episodes: set[int] = self._read(
+            lambda repository: repository.get_season_episodes(
+                server=server,
+                title=title,
+                year=year,
+                mtype=mtype,
+                media_source=media_source,
+                media_id=media_id,
+                season=season,
+            )
+        )
+        return episodes
+
     def upsert(self, item: MediaServerSyncItem) -> bool:
         """
         在单个短事务中新增或更新一个媒体库同步条目。

@@ -1,4 +1,4 @@
-"""
+﻿"""
 媒体服务器条目缓存的数据访问入口，适配调用方会话及兼容事务执行器。
 """
 
@@ -279,3 +279,61 @@ class MediaServerOper(DbOper):
         if not item:
             return None
         return str(item.server or ""), str(item.item_id)
+
+    @staticmethod
+    def _season_episode_numbers(item: MediaServerItem, season: int) -> set[int]:
+        """
+        从缓存的季集快照中取出某一季的已入库集号。
+
+        快照经 JSON 往返后季号键可能变成字符串，两种写法都要认；非字典或
+        集号列表损坏时返回空集合，由调用方按「未确认」处理而不是判为缺失。
+
+        :param item: 媒体服务器缓存条目
+        :param season: 目标季号
+        :return: 该季的集号集合；快照缺失或格式异常时为空集合
+        """
+        seasoninfo = item.seasoninfo
+        if not isinstance(seasoninfo, dict):
+            return set()
+        raw = seasoninfo.get(season)
+        if raw is None:
+            raw = seasoninfo.get(str(season))
+        if not isinstance(raw, (list, tuple, set, frozenset)):
+            return set()
+        episodes: set[int] = set()
+        for value in raw:
+            try:
+                episodes.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return episodes
+
+    def get_season_episodes(self, **kwargs: Any) -> set[int]:
+        """
+        同步获取某季已入库的集号集合。
+
+        :param kwargs: 与 exists 相同的匹配条件，season 必填
+        :return: 集号集合；未命中、该季不存在或快照缺失时为空集合
+        """
+        season = kwargs.get("season")
+        if season is None:
+            return set()
+        item = self.exists(**kwargs)
+        if not item:
+            return set()
+        return self._season_episode_numbers(item, int(season))
+
+    async def async_get_season_episodes(self, **kwargs: Any) -> set[int]:
+        """
+        异步获取某季已入库的集号集合。
+
+        :param kwargs: 与 async_exists 相同的匹配条件，season 必填
+        :return: 集号集合；未命中、该季不存在或快照缺失时为空集合
+        """
+        season = kwargs.get("season")
+        if season is None:
+            return set()
+        item = await self.async_exists(**kwargs)
+        if not item:
+            return set()
+        return self._season_episode_numbers(item, int(season))

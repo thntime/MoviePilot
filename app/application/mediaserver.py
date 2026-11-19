@@ -232,6 +232,31 @@ class AsyncMediaServerQueryRepository(Protocol):
         """
         ...
 
+    async def async_get_season_episodes(
+        self,
+        *,
+        server: Optional[str] = None,
+        title: Optional[str] = None,
+        year: Optional[Union[str, int]] = None,
+        mtype: Optional[str] = None,
+        media_source: Optional[MediaSource] = None,
+        media_id: Optional[str] = None,
+        season: Optional[int] = None,
+    ) -> set[int]:
+        """
+        按与 async_get_item_id 相同的匹配规则，返回命中条目在某季已入库的集号集合。
+
+        :param server: 媒体服务器配置名称，None 表示不限定服务器
+        :param title: 匹配的媒体标题，也用于来源身份未命中时的跨来源回退
+        :param year: 媒体发行年份，None 表示未提供年份条件
+        :param mtype: 媒体条目类型，None 表示不限定类型
+        :param media_source: 统一媒体身份的数据来源，需与 media_id 配合使用
+        :param media_id: 对应来源的原生媒体标识，缺少完整身份时按标题查询
+        :param season: 目标季号；None 时返回空集合
+        :return: 该季已入库的集号集合；未命中、季不存在或季集快照缺失时为空集合
+        """
+        ...
+
 
 class MediaServerQueryService:
     """
@@ -310,6 +335,39 @@ class MediaServerQueryService:
             return None
         server, item_id = found
         return MediaServerItemRef(server=server, item_id=item_id)
+
+    async def find_season_episodes(
+            self,
+            *,
+            title: Optional[str] = None,
+            year: Optional[Union[str, int]] = None,
+            mtype: Optional[str] = None,
+            media_source: Optional[MediaSource] = None,
+            media_id: Optional[str] = None,
+            season: Optional[int] = None,
+    ) -> set[int]:
+        """
+        返回媒体库缓存中某部作品某季已入库的集号集合。
+
+        空集合表示「没有可用证据」，调用方必须把它当作未确认，不能据此断言
+        媒体库缺少这些集；缓存同步未写入季集快照时同样返回空集合。
+
+        :param title: 匹配的媒体标题，也用于来源身份未命中时的跨来源回退
+        :param year: 媒体发行年份，None 表示未提供年份条件
+        :param mtype: 媒体条目类型，None 表示不限定类型
+        :param media_source: 统一媒体身份的数据来源，需与 media_id 配合使用
+        :param media_id: 对应来源的原生媒体标识，缺少完整身份时按标题查询
+        :param season: 目标季号；None 时返回空集合
+        :return: 该季已入库的集号集合；未命中、季不存在或快照缺失时为空集合
+        """
+        return await self._repository.async_get_season_episodes(
+            title=title,
+            year=year,
+            mtype=mtype,
+            media_source=media_source,
+            media_id=media_id,
+            season=season,
+        )
 
 
 class MediaServerIdentityHelper:
