@@ -123,3 +123,73 @@ def test_subscription_search_drops_bang_dream_candidates(target, monkeypatch, ye
 
     assert [context.torrent_info.title for context in contexts] == [torrents[1].title]
     media_chain.recognize_by_meta.assert_not_called()
+
+
+@pytest.fixture
+def xiakexing() -> MediaInfo:
+    """
+    构造带年份前缀与修饰词的真实网盘资源所对应的目标剧集身份。
+    """
+    return MediaInfo(
+        media_source=MediaSource.TMDB,
+        media_id="94070",
+        tmdb_id=94070,
+        title="侠客行",
+        original_title="侠客行",
+        names=["侠客行", "俠客行", "Ode to Gallantry"],
+        type=MediaType.TV,
+        year="2002",
+        season_years={1: "2002"},
+        seasons={1: list(range(1, 41))},
+    )
+
+
+def test_title_with_year_prefix_and_suffix_matches_same_work(xiakexing):
+    """
+    标题把年份写在名称前并带修饰词时，只要年份一致且包含目标名就视为同一作品。
+    """
+    torrent = TorrentInfo(
+        title="《2002侠客行吴健高清版》 S01E01-E40",
+        description="吴健版侠客行，武侠经典重现江湖。剧情紧凑打戏精彩",
+        download_type="netdisk",
+        netdisk_platform="baidu",
+    )
+
+    assert TorrentHelper.match_torrent(xiakexing, MetaInfo(torrent.title, torrent.description), torrent)
+
+
+def test_contains_match_rejects_same_prefix_different_year(xiakexing):
+    """
+    同前缀作品年份不同时不得靠名称包含通过匹配。
+    """
+    torrent = TorrentInfo(
+        title="侠客行不通 (2025) S01E01-E30",
+        description="喜剧 武侠 国产剧",
+    )
+
+    assert not TorrentHelper.match_torrent(xiakexing, MetaInfo(torrent.title, torrent.description), torrent)
+
+
+def test_contains_match_requires_year_in_title(xiakexing):
+    """
+    标题没有年份时不启用包含匹配，避免无年份候选被放宽。
+    """
+    torrent = TorrentInfo(
+        title="侠客行吴健高清版 S01E01-E40",
+        description="吴健版侠客行",
+    )
+
+    assert not TorrentHelper.match_torrent(xiakexing, MetaInfo(torrent.title, torrent.description), torrent)
+
+
+def test_contains_match_skips_english_alias_substring(target):
+    """
+    英文别名不做子串匹配，BanG Dream 不能因包含 Dream 而命中。
+    """
+    torrent = TorrentInfo(
+        title="BanG Dream YUME MITA S01 2026 1080p WEB-DL",
+        description="BanG Dream! YUME∞MITA | 01-13 日语+简繁字幕",
+        category=MediaType.TV.value,
+    )
+
+    assert not TorrentHelper.match_torrent(target, MetaInfo(torrent.title, torrent.description), torrent)

@@ -305,6 +305,13 @@ def _title_fragments(value: str, separators: str) -> set[str]:
     return {fragment for fragment in fragments if not text_tools.is_english_word(fragment)}
 
 
+# 标题里的 4 位年份，用于在包含匹配时区分同名前缀作品。
+_TITLE_YEAR_PATTERN = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
+
+# 中日韩字符：这些语言没有词边界，标题里的修饰词会直接粘在作品名前后。
+_CJK_PATTERN = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+
+
 class TorrentHelper:
     """
     种子帮助类
@@ -876,7 +883,46 @@ class TorrentHelper:
                 logger.info(f'{mediainfo.title} 通过副标题匹配到资源：{torrent.site_name} - {torrent.title}，'
                             f'副标题：{torrent.description}')
                 return True
+        if TorrentHelper._match_title_contains(
+                mediainfo=mediainfo, torrent=torrent, torrent_meta=torrent_meta):
+            logger.info(f'{mediainfo.title} 通过标题包含匹配到资源：{torrent.site_name} - {torrent.title}')
+            return True
         logger.debug(f'{torrent.site_name} - {torrent.title} 标题不匹配，识别名称：{meta_names}')
+        return False
+
+    @staticmethod
+    def _match_title_contains(
+            mediainfo: MediaInfo,
+            torrent: TorrentInfo,
+            torrent_meta: MetaBase,
+    ) -> bool:
+        """
+        标题年份一致且完整包含目标中文名时视为同一作品。
+
+        中文标题没有词边界，年份或修饰词会直接粘在作品名前后，精确比较会漏掉这类资源；
+        英文有词边界且子串误配风险高（Dream 会匹配到 BanG Dream），因此不参与包含匹配。
+
+        :param mediainfo: 目标媒体信息
+        :param torrent: 资源信息
+        :param torrent_meta: 资源识别信息
+        :return: 命中包含匹配时返回 True
+        """
+        target_years = {str(mediainfo.year)} if mediainfo.year else set()
+        target_years.update(
+            str(year) for year in (getattr(mediainfo, "season_years", None) or {}).values() if year
+        )
+        if not target_years:
+            return False
+        raw_title = torrent_meta.org_string or torrent.title or ""
+        if not target_years.intersection(_TITLE_YEAR_PATTERN.findall(raw_title)):
+            return False
+        normalized_title = text_tools.normalize_upper(raw_title)
+        for name in {mediainfo.title, mediainfo.original_title, *(mediainfo.names or [])}:
+            normalized_name = text_tools.normalize_upper(name)
+            if len(normalized_name) < 2 or not _CJK_PATTERN.search(normalized_name):
+                continue
+            if normalized_name in normalized_title:
+                return True
         return False
 
     @staticmethod
