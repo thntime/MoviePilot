@@ -1,11 +1,11 @@
-"""
+﻿"""
 剧集编号的解析与显示规则。
 
 解析入口供搜索结果、网盘下载器与整理兜底共用，避免各模块各写一套正则。
 """
 
 import re
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 # 结构化集数写法：第12集 / S01E12 / E12。
 STRUCTURED_PATTERNS = (
@@ -39,6 +39,14 @@ SPECIAL_NAME_PATTERN = re.compile(
 )
 # 下载记录里的集数文本按这些分隔符切分。
 SELECTION_SPLITTER = re.compile(r"[、,，;；/\s]+")
+# 标题声明的标准季集标记：S01E140 / S01E140-E179。
+DECLARED_WINDOW_PATTERN = re.compile(
+    r"[Ss](\d{1,3})\s*[Ee][Pp]?\s*(\d{1,4})(?:\s*[-~—至到]\s*[Ee]?\s*(\d{1,4}))?"
+)
+# 标题声明窗口的集数上限，异常标题不展开成超大窗口。
+DECLARED_WINDOW_LIMIT = 2000
+# 窗口识别只看独立数字：前后不能紧邻字母，避免把 4K 的 K 前数字算进来。
+WINDOW_NUMBER_PATTERN = re.compile(r"(?<![0-9A-Za-z])(\d{1,4})(?![0-9A-Za-z])")
 
 
 def compact_numbers(numbers: List[int]) -> str:
@@ -136,6 +144,51 @@ def episode_numbers(file_name: str) -> List[int]:
             if episode is not None:
                 numbers.append(episode)
     return [value for value in numbers if is_plausible_episode(value)]
+
+
+def windowed_episode_numbers(file_name: str, window: Iterable[int]) -> List[int]:
+    """
+    在给定集数窗口内提取文件名里的集数。
+
+    站点为规避网盘审核，常把分享内文件写成 `140_179.mp4`、`140@xx.mp4`、
+    `140.4K.mp4` 这类只有集数、没有片名季号的形态。这类名字按通用规则会被
+    版本号、混淆符号或多候选数字否决；窗口模式改用「落在目标范围内的数字」
+    当白名单，范围外的年份、帧率、清晰度自然被排除。
+
+    :param file_name: 文件名或目录名
+    :param window: 目标集数窗口，为空时不识别
+    :return: 落在窗口内的集号，升序去重；特典文件始终为空
+    """
+    allowed = {int(value) for value in window or ()}
+    text = str(file_name or "")
+    if not allowed or is_special_name(text):
+        return []
+    numbers: Set[int] = set()
+    for matched in WINDOW_NUMBER_PATTERN.finditer(text):
+        value = int(matched.group(1))
+        if value in allowed:
+            numbers.add(value)
+    return sorted(numbers)
+
+
+def declared_episode_window(title: str) -> Dict[int, Set[int]]:
+    """
+    从候选标题解析声明的季集窗口。
+
+    `S01E140-E179` 展开成第 1 季 140-179 集；单集写法 `S01E140` 只含 140。
+
+    :param title: 候选标题
+    :return: 季号到集号集合的映射；标题没有标准季集标记时为空字典
+    """
+    windows: Dict[int, Set[int]] = {}
+    for matched in DECLARED_WINDOW_PATTERN.finditer(str(title or "")):
+        season = int(matched.group(1))
+        begin = int(matched.group(2))
+        end = int(matched.group(3) or begin)
+        if begin <= 0 or end < begin or end - begin + 1 > DECLARED_WINDOW_LIMIT:
+            continue
+        windows.setdefault(season, set()).update(range(begin, end + 1))
+    return windows
 
 
 def episode_token(file_names: Iterable[str]) -> Optional[str]:

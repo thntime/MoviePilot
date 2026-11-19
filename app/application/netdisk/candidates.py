@@ -167,16 +167,25 @@ def archive_files(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
-def is_episode_clear(videos: List[Dict[str, Any]]) -> bool:
+def is_episode_clear(videos: List[Dict[str, Any]], window: Optional[Set[int]] = None) -> bool:
     """
     判断文件树的集数是否清晰：能解析出集数的视频占比达到下限。
 
+    给出集数窗口时（来自候选标题声明的季集范围），只标集数的文件名
+    （如 `140.4K.mp4`）也算可解析，避免站点为规避网盘审核的命名被误杀。
+
     :param videos: 视频文件条目
+    :param window: 集数窗口；为空时只按通用规则判定
     :return: 集数清晰返回 True
     """
     if not videos:
         return False
-    parsed = [entry for entry in videos if episode_numbers(entry.get("name") or "")]
+    allowed = set(window or set())
+    parsed = [
+        entry for entry in videos
+        if episode_numbers(entry.get("name") or "")
+        or (allowed and episode_rules.windowed_episode_numbers(entry.get("name") or "", allowed))
+    ]
     return len(parsed) / len(videos) >= _EPISODE_COVERAGE_THRESHOLD
 
 
@@ -294,7 +303,11 @@ def passes_quality(
     videos = video_files(files)
     media_entries = media_files(files)
     clarity_files = videos or media_entries
-    if not is_episode_clear(clarity_files) and not is_feature_share(videos):
+    windows = episode_rules.declared_episode_window(str(torrent.title or ""))
+    window: Set[int] = set()
+    for numbers in windows.values():
+        window.update(numbers)
+    if not is_episode_clear(clarity_files, window) and not is_feature_share(videos):
         # 集数不清晰：丢弃，避免展示错误集数；单片（电影）分享没有集数，不属于此类。
         parsed = sum(1 for entry in clarity_files if episode_numbers(str(entry.get("name") or "")))
         logger.info(

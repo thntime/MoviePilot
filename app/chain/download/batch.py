@@ -240,14 +240,17 @@ class _BatchDownloadRun:
         if callable(report):
             report(context, "rejected", reason)
 
-    def _netdisk_episodes(self, torrent: TorrentInfo) -> Optional[List[int]]:
+    def _netdisk_episodes(
+            self, torrent: TorrentInfo, *, windows: Optional[Dict[int, Set[int]]] = None,
+    ) -> Optional[List[int]]:
         """
         从网盘分享的文件清单解析覆盖集数（兼容接口，返回所有季集号的并集）。
 
         :param torrent: 网盘候选
+        :param windows: 季号到集数窗口的映射，用于识别只标集数的文件名
         :return: 升序集数列表；分享不可读或没有可解析集数时返回 None
         """
-        season_episodes = self._netdisk_season_episodes(torrent)
+        season_episodes = self._netdisk_season_episodes(torrent, windows=windows)
         if not season_episodes:
             return None
         episodes: Set[int] = set()
@@ -256,7 +259,7 @@ class _BatchDownloadRun:
         return sorted(episodes) or None
 
     def _netdisk_season_episodes(
-            self, torrent: TorrentInfo,
+            self, torrent: TorrentInfo, *, windows: Optional[Dict[int, Set[int]]] = None,
     ) -> Optional[Dict[Optional[int], Set[int]]]:
         """
         从网盘分享的文件清单按季归集覆盖集数。
@@ -264,7 +267,12 @@ class _BatchDownloadRun:
         季号优先取文件名中的 `Sxx`/`第N季`，其次取相对路径目录名；无法解析季号的
         文件归入 None 键。只有视频文件参与统计。
 
+        通用规则解析不出集数时，用窗口模式兜底：站点为规避网盘审核只标集数
+        （如 `140_179.mp4`、`140.4K.mp4`），窗口取候选标题声明的集数范围。
+        显式季号的文件只用自己的季窗口，避免把其他季的同集号算进目标季。
+
         :param torrent: 网盘候选
+        :param windows: 季号到集数窗口的映射；为空时取候选标题声明的范围
         :return: 季号到集号集合的映射；分享不可读或没有可解析集数时返回 None
         """
         from app.application.netdisk.resolve import NetdiskResolveService
@@ -283,17 +291,49 @@ class _BatchDownloadRun:
         except Exception as error:  # noqa: BLE001 - 网络异常按不可读处理
             logger.warn(f"网盘分享读取异常：{type(error).__name__}")
             return None
+        allowed = windows
+        if allowed is None:
+            # 未显式给窗口时，用候选标题声明的季集范围兜底。
+            allowed = episode_rules.declared_episode_window(
+                str(getattr(torrent, "title", "") or ""),
+            )
+        fallback: Set[int] = set()
+        for window in allowed.values():
+            fallback.update(window)
         seasons: Dict[Optional[int], Set[int]] = {}
         for item in walked.files:
             relative = str(getattr(item, "path", "") or getattr(item, "name", "") or "")
             name = Path(relative).name
             if Path(name).suffix.lower() not in _VIDEO_SUFFIXES:
                 continue
+            season = self._netdisk_season_of(relative)
             episodes = episode_rules.episode_numbers(name)
+            if not episodes and fallback:
+                window = fallback if season is None else allowed.get(season, set())
+                episodes = episode_rules.windowed_episode_numbers(name, window)
             if not episodes:
                 continue
-            seasons.setdefault(self._netdisk_season_of(relative), set()).update(episodes)
+            seasons.setdefault(season, set()).update(episodes)
         return seasons or None
+
+    @staticmethod
+    def _netdisk_windows(
+            torrent: TorrentInfo, targets: Dict[int, Set[int]],
+    ) -> Dict[int, Set[int]]:
+        """
+        把标题声明的季集范围并入各目标季的集数窗口。
+
+        :param torrent: 网盘候选
+        :param targets: 本批目标季到集号的映射
+        :return: 季号到窗口集号的映射
+        """
+        declared = episode_rules.declared_episode_window(
+            str(getattr(torrent, "title", "") or ""),
+        )
+        return {
+            season: set(episodes) | declared.get(season, set())
+            for season, episodes in targets.items()
+        }
 
     @staticmethod
     def _netdisk_season_of(relative: str) -> Optional[int]:
@@ -467,7 +507,9 @@ class _BatchDownloadRun:
         assert torrent is not None
         is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
         if is_netdisk:
-            season_episodes = self._netdisk_season_episodes(torrent)
+            required = _selection.get_required_episodes(self.no_exists, media_key, season)
+            windows = self._netdisk_windows(torrent, {season: set(required)})
+            season_episodes = self._netdisk_season_episodes(torrent, windows=windows)
             if not season_episodes:
                 meta = context.meta_info
                 assert meta is not None
@@ -576,7 +618,14 @@ class _BatchDownloadRun:
         assert torrent is not None
         meta = context.meta_info
         assert meta is not None
-        season_episodes = self._netdisk_season_episodes(torrent)
+        windows = self._netdisk_windows(
+            torrent,
+            {
+                season: set(_selection.get_required_episodes(self.no_exists, media_key, season))
+                for season in seasons
+            },
+        )
+        season_episodes = self._netdisk_season_episodes(torrent, windows=windows)
         if not season_episodes:
             logger.info(f"{meta.org_string} 网盘分享内未解析到可用集数")
             return None
@@ -727,7 +776,8 @@ class _BatchDownloadRun:
             self._report_skip(context, "本批目标集数为空")
             return set()
         if is_netdisk and torrent is not None:
-            season_episodes = self._netdisk_season_episodes(torrent) or {}
+            windows = self._netdisk_windows(torrent, {season: set(effective)})
+            season_episodes = self._netdisk_season_episodes(torrent, windows=windows) or {}
             share_episodes = self._netdisk_target_season_episodes(season_episodes, season)
             if not share_episodes:
                 self._report_skip(context, f"分享内没有可解析的目标季 S{season} 集数")
@@ -845,9 +895,16 @@ class _BatchDownloadRun:
         is_netdisk = str(getattr(torrent, "download_type", "torrent") or "torrent") == "netdisk"
         if is_netdisk:
             if season is None:
-                episodes = set(self._netdisk_episodes(torrent) or [])
+                windows = {
+                    key: set(value) for key, value
+                    in episode_rules.declared_episode_window(
+                        str(getattr(torrent, "title", "") or ""),
+                    ).items()
+                }
+                episodes = set(self._netdisk_episodes(torrent, windows=windows) or [])
             else:
-                season_episodes = self._netdisk_season_episodes(torrent) or {}
+                windows = self._netdisk_windows(torrent, {season: set(effective)})
+                season_episodes = self._netdisk_season_episodes(torrent, windows=windows) or {}
                 episodes = self._netdisk_target_season_episodes(season_episodes, season)
             if not episodes:
                 self._report_skip(context, f"分享内没有可解析的目标季 S{season} 集数")

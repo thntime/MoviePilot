@@ -298,7 +298,7 @@ def test_inspect_whole_season_pack_requires_parseable_share(batch, monkeypatch):
     candidate = _context("multiseason")
     candidate.torrent_info.download_type = "netdisk"
     run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing()}})
-    monkeypatch.setattr(run, "_netdisk_season_episodes", lambda _torrent: None)
+    monkeypatch.setattr(run, "_netdisk_season_episodes", lambda _torrent, **_: None)
 
     assert run._inspect_whole_season_pack(  # pylint: disable=protected-access
         candidate, "tmdb:1", [1, 2], [1],
@@ -312,7 +312,7 @@ def test_inspect_whole_season_pack_returns_none_without_target_season(batch, mon
     candidate = _context("multiseason")
     candidate.torrent_info.download_type = "netdisk"
     run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing()}})
-    monkeypatch.setattr(run, "_netdisk_season_episodes", lambda _torrent: {1: {1}})
+    monkeypatch.setattr(run, "_netdisk_season_episodes", lambda _torrent, **_: {1: {1}})
 
     assert run._inspect_whole_season_pack(  # pylint: disable=protected-access
         candidate, "tmdb:1", [2], [1],
@@ -326,7 +326,7 @@ def test_inspect_whole_season_pack_stops_when_target_season_unusable(batch, monk
     candidate = _context("multiseason")
     candidate.torrent_info.download_type = "netdisk"
     run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing()}})
-    monkeypatch.setattr(run, "_netdisk_season_episodes", lambda _torrent: {2: {1}})
+    monkeypatch.setattr(run, "_netdisk_season_episodes", lambda _torrent, **_: {2: {1}})
 
     assert run._inspect_whole_season_pack(  # pylint: disable=protected-access
         candidate, "tmdb:1", [1], [1],
@@ -415,7 +415,7 @@ def test_submit_partial_pack_without_season_uses_share_union(batch, monkeypatch)
     candidate = _context("flat")
     candidate.torrent_info.download_type = "netdisk"
     run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing((1,))}})
-    monkeypatch.setattr(run, "_netdisk_episodes", lambda _torrent: [1, 2])
+    monkeypatch.setattr(run, "_netdisk_episodes", lambda _torrent, **_: [1, 2])
 
     assert run._submit_partial_pack(candidate, {1}) == {1}  # pylint: disable=protected-access
     batch.chain.download_single.assert_called_once()
@@ -430,7 +430,7 @@ def test_submit_partial_pack_reports_unparseable_target_season(batch, monkeypatc
     candidate.torrent_info.download_type = "netdisk"
     governance, calls = _governance_stub()
     run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing((1,))}}, governance)
-    monkeypatch.setattr(run, "_netdisk_season_episodes", lambda _torrent: {})
+    monkeypatch.setattr(run, "_netdisk_season_episodes", lambda _torrent, **_: {})
 
     assert run._submit_partial_pack(candidate, {1}, 1) == set()  # pylint: disable=protected-access
     batch.chain.download_single.assert_not_called()
