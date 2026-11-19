@@ -357,24 +357,34 @@ class _BatchDownloadRun:
 
     @staticmethod
     def _netdisk_target_season_episodes(
-            season_episodes: Dict[Optional[int], Set[int]], season: int,
+            season_episodes: Dict[Optional[int], Set[int]], season: int, *,
+            allow_single_season_fallback: bool = True,
     ) -> Set[int]:
         """
-        取目标季集数；整棵分享树没有任何显式季号时，用无季号文件的集号兜底。
+        取目标季集数；分享只声明第 1 季时按集号对齐到目标季。
 
-        平铺根目录的 `第01集.mp4`/`01.mp4` 会被归入 None 键。仅当不存在任何显式
-        季键时才兜底，避免把真实多季分享里的无季号文件误算进目标季。
+        平铺根目录的 `第01集.mp4`/`01.mp4` 会被归入 None 键，仅当不存在任何显式
+        季键时才兜底。站点常把年番整季标成 S01（文件名为 `S01E180.mp4`），而订阅
+        可能是 S05；此时分享只有 S01 一个季键，按集号对齐到目标季。其它季号属于
+        真信息，多季分享仍严格按季隔离。
 
         :param season_episodes: 季号到集号的映射
         :param season: 目标季
+        :param allow_single_season_fallback: 是否允许只有 S01 时对齐到目标季
         :return: 目标季集号；无法确定时为空集合
         """
         episodes = set(season_episodes.get(season, set()))
         if episodes:
             return episodes
-        if set(season_episodes) - {None}:
-            return set()
-        return set(season_episodes.get(None, set()))
+        explicit = set(season_episodes) - {None}
+        if not explicit:
+            return set(season_episodes.get(None, set()))
+        if allow_single_season_fallback and explicit == {1}:
+            # 站点不认识季概念时统一写 S01/第一季，S01 等价于「没有季信息」；
+            # 其它季号是真信息，不许拿来对齐，避免 S02 的集号被当成 S01。
+            logger.info(f"分享只声明第 1 季，集号按目标季 {season} 对齐")
+            return set(season_episodes[1])
+        return set()
 
     def _read_torrent(
             self, context: Context, *, partial: bool = False,
@@ -553,18 +563,21 @@ class _BatchDownloadRun:
     def _inspect_netdisk_season(
             self, context: Context, media_key: str, season: int,
             season_episodes: Dict[Optional[int], Set[int]], *,
-            update_meta: bool = True,
+            update_meta: bool = True, allow_cross_season: bool = True,
     ) -> Optional[Tuple[bytes, bool, Set[int]]]:
         """
         核对网盘分享中目标季的覆盖范围，不把其他季的集号计入目标季。
 
         :param season_episodes: 季号到集号的映射
         :param update_meta: 是否按目标季集数改写元数据；多季整包需要保留原始识别范围
+        :param allow_cross_season: 分享只有 S01 时是否按集号对齐到目标季
         :return: (下载内容, 是否完整覆盖, 目标集数)；目标季没有目标集时返回 None
         """
         meta = context.meta_info
         assert meta is not None
-        episodes = self._netdisk_target_season_episodes(season_episodes, season)
+        episodes = self._netdisk_target_season_episodes(
+            season_episodes, season, allow_single_season_fallback=allow_cross_season,
+        )
         if not episodes:
             logger.info(f"{meta.org_string} 网盘分享内没有目标季 {season} 的集数")
             governance = self.options.get("governance")
@@ -638,6 +651,7 @@ class _BatchDownloadRun:
         for season in target_seasons:
             inspected = self._inspect_netdisk_season(
                 context, media_key, season, season_episodes, update_meta=False,
+                allow_cross_season=False,
             )
             if inspected is None:
                 return None
