@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from app.application.subscription.contract import SubscriptionHistorySnapshot, SubscriptionSnapshot
 from app.application.subscription.sitebudget import SubscriptionSearchCancelled, SubscriptionSearchDeferred
+from app.domain.netdisk import parse_share_link
 from app.runtime.log import logger
 from app.schemas.common import JsonData
 
@@ -43,6 +44,30 @@ def _detail_objects(details: Mapping[str, JsonData], field_name: str) -> list[di
     """
     values = details.get(field_name)
     return [value for value in values if isinstance(value, dict)] if isinstance(values, list) else []
+
+
+def _netdisk_share_detail(torrent: object) -> dict[str, JsonData]:
+    """
+    提取网盘候选的分享事实，供活动明细展示可直接打开的网盘链接。
+
+    只有 CD/PS 站点产出的网盘候选才携带分享链接；PT 候选或缺少链接时一律不写字段，
+    避免把下载地址一类的敏感信息带进活动明细。
+
+    :param torrent: 候选种子或网盘资源对象
+    :return: 平台标识、分享码与分享链接；不适用时返回空字典
+    """
+    if str(getattr(torrent, "download_type", "torrent") or "torrent") != "netdisk":
+        return {}
+    share_url = str(getattr(torrent, "enclosure", "") or "").strip()
+    if not share_url:
+        return {}
+    reference = parse_share_link(share_url)
+    platform = reference.platform.value if reference else str(getattr(torrent, "netdisk_platform", "") or "")
+    return {
+        "netdisk_platform": platform,
+        "share_code": reference.share_id if reference and reference.share_id else "",
+        "share_url": share_url,
+    }
 
 
 def activity_time() -> str:
@@ -263,13 +288,15 @@ class SubscriptionActivityRun:
             # 跟踪去重键不保留下载地址、passkey、磁力链接或站点原始响应。
             self._make_detail_room(key, decision)
             if key in self._resources or len(self._resources) < DETAIL_LIMIT:
-                self._resources[key] = {
+                detail: dict[str, JsonData] = {
                     "resource_id": key, "title": title, "site": str(getattr(torrent, "site_name", "") or ""),
                     "decision": decision, "reason": reason,
                     "subscription_download": copy.deepcopy(getattr(context, "subscription_download", None)
                                                            or (previous or {}).get("subscription_download"))
                     if decision == "submitted" else None,
                 }
+                detail.update(_netdisk_share_detail(torrent))
+                self._resources[key] = detail
             resources: list[dict[str, JsonData]] = sorted(
                 self._resources.values(),
                 key=lambda item: -_decision_rank(str(item["decision"])),

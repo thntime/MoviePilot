@@ -386,3 +386,49 @@ def test_resumed_site_request_keeps_the_original_planned_denominator():
     event = stored["resumed-sites"]
     assert event.counts["sites"] == event.counts["requested_sites"] == 8
     assert event.counts["discovered"] == 8 and event.counts["waiting_sites"] == 0
+
+
+def _netdisk_resource(url="https://pan.quark.cn/s/d30c5af5d776", platform="quark", site=2):
+    """
+    生成 CD/PS 站点产出的网盘候选，携带分享链接与平台标识。
+    """
+    return SimpleNamespace(torrent_info=SimpleNamespace(
+        title="Perfect.World.S01E289", site=site, site_name="CloudSaver",
+        download_type="netdisk", netdisk_platform=platform, enclosure=url,
+    ))
+
+
+def test_netdisk_resources_expose_share_link_for_detail_view():
+    """
+    网盘候选在活动明细里带上平台、分享码与分享链接，界面据此给出可点击入口。
+    """
+    run = SubscriptionActivityRun(_snapshot(), "search", "manual")
+    run.resource(_netdisk_resource(), "rejected", "分享内没有可解析的目标季 S1 集数")
+    detail = run.details["resources"][0]
+    assert detail["netdisk_platform"] == "quark"
+    assert detail["share_code"] == "d30c5af5d776"
+    assert detail["share_url"] == "https://pan.quark.cn/s/d30c5af5d776"
+
+
+def test_pt_resources_keep_no_netdisk_share_fields():
+    """
+    PT 候选不写网盘字段，下载地址不会借新字段进入活动明细。
+    """
+    run = SubscriptionActivityRun(_snapshot(), "search", "manual")
+    run.resource(_resource(), "related")
+    detail = run.details["resources"][0]
+    assert "netdisk_platform" not in detail
+    assert "share_code" not in detail
+    assert "share_url" not in detail
+
+
+def test_netdisk_resource_without_share_code_keeps_link():
+    """
+    分享码解析不出来时仍保留平台与链接，界面还能让用户打开分享核对。
+    """
+    run = SubscriptionActivityRun(_snapshot(), "search", "manual")
+    run.resource(_netdisk_resource(url="https://example.test/share/abc", platform="tianyi"), "rejected", "集数不符")
+    detail = run.details["resources"][0]
+    assert detail["netdisk_platform"] == "tianyi"
+    assert detail["share_code"] == ""
+    assert detail["share_url"] == "https://example.test/share/abc"
