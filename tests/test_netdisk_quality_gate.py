@@ -243,6 +243,14 @@ def test_archive_size_dominant_share_is_dropped() -> None:
     assert _passed("斗破苍穹 年番", entries) is False
 
 
+def test_single_foreign_file_does_not_break_title_match() -> None:
+    """个别文件名带别的片名时不足以否掉整包，要求陌生片名覆盖多数正片。"""
+    entries = [_entry(f"凡人修仙传 {index:02d} 4K.mkv") for index in range(1, 10)]
+    entries.append(_entry("预告 斗罗大陆 4K.mkv"))
+
+    assert _passed("凡人修仙传 (2025) 4K 高码率 更200集", entries) is True
+
+
 def test_arc_named_files_in_title_folder_are_kept() -> None:
     """按篇章命名的文件放在以片名命名的分享目录里时不算命名冲突。"""
     entries = [

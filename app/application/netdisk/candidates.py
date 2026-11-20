@@ -911,7 +911,8 @@ def _title_conflict(title: str, groups: FileGroups) -> bool:
 
     只在两边都有足够长的片名、且互不包含时判为冲突；片名太短（如「好资源」
     「仙逆」这类泛称）一律放行，避免把频道文案式标题误杀。文件一侧取相对路径
-    的全部片段，分享根目录通常就是片名，能救回「按篇章命名」的正常整包。
+    的全部片段，分享根目录通常就是片名，能救回「按篇章命名」的正常整包；并且
+    要求这个陌生片名覆盖六成以上的正片，单个花絮或杂项文件名不足以否掉整包。
 
     :param title: 候选标题
     :param groups: 文件分类结果
@@ -920,17 +921,18 @@ def _title_conflict(title: str, groups: FileGroups) -> bool:
     name = _title_name(title)
     if len(name) < _TITLE_NAME_MIN_CHARS:
         return False
-    segments = {
-        segment
-        for entry in groups.feature[:20]
-        for segment in _CJK_SEGMENT.findall(_entry_path(entry))
-        if len(segment) >= 3
-    }
-    if not segments:
+    sample = groups.feature[:20]
+    counts: Dict[str, int] = {}
+    for entry in sample:
+        for segment in set(_CJK_SEGMENT.findall(_entry_path(entry))):
+            if len(segment) >= 3:
+                counts[segment] = counts.get(segment, 0) + 1
+    if not counts:
         return False
-    if any(segment in name or name in segment for segment in segments):
+    if any(segment in name or name in segment for segment in counts):
         return False
-    return True
+    majority = max(2, len(sample) * 0.6)
+    return any(count >= majority for count in counts.values())
 
 
 def _form_token(form: EpisodeForm) -> Optional[str]:
