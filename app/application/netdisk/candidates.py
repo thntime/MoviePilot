@@ -910,7 +910,8 @@ def _title_conflict(title: str, groups: FileGroups) -> bool:
     判断标题片名与正片文件名里的片名是否完全对不上。
 
     只在两边都有足够长的片名、且互不包含时判为冲突；片名太短（如「好资源」
-    「仙逆」这类泛称）一律放行，避免把频道文案式标题误杀。
+    「仙逆」这类泛称）一律放行，避免把频道文案式标题误杀。文件一侧取相对路径
+    的全部片段，分享根目录通常就是片名，能救回「按篇章命名」的正常整包。
 
     :param title: 候选标题
     :param groups: 文件分类结果
@@ -922,7 +923,7 @@ def _title_conflict(title: str, groups: FileGroups) -> bool:
     segments = {
         segment
         for entry in groups.feature[:20]
-        for segment in _CJK_SEGMENT.findall(_entry_name(entry))
+        for segment in _CJK_SEGMENT.findall(_entry_path(entry))
         if len(segment) >= 3
     }
     if not segments:

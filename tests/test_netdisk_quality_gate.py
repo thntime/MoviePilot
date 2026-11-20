@@ -243,6 +243,16 @@ def test_archive_size_dominant_share_is_dropped() -> None:
     assert _passed("斗破苍穹 年番", entries) is False
 
 
+def test_arc_named_files_in_title_folder_are_kept() -> None:
+    """按篇章命名的文件放在以片名命名的分享目录里时不算命名冲突。"""
+    entries = [
+        _entry(f"慕兰之战 {index:02d}.mkv", path=f"凡人修仙传 年番/慕兰之战 {index:02d}.mkv")
+        for index in range(1, 6)
+    ]
+
+    assert _passed("凡人修仙传 (2025) 4K 高码率 国漫 更200集 纯净版", entries) is True
+
+
 def test_declared_episode_count_rescues_unnumbered_files() -> None:
     """标题声明「更200集」时，文件名里落在范围内的数字算作可解析，整包不再被误杀。"""
     entries = [_entry(f"凡人修仙传 年番4 S04E{index:02d}.mkv") for index in range(1, 11)]
