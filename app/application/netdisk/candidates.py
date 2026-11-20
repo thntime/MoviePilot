@@ -92,6 +92,8 @@ _TITLE_NOISE_PATTERN = re.compile(
 )
 # 片名片段：连续两个以上的汉字。
 _CJK_SEGMENT = re.compile(r"[\u4e00-\u9fff]{2,}")
+# 文件名里的独立数字，两侧不能紧邻字母数字，避免把 4K、1080P 当成集数。
+_BARE_NUMBER = re.compile(r"(?<![0-9A-Za-z])(\d{1,4})(?![0-9A-Za-z])")
 # 合集判定：单个正片至少这么大（或这么久）才算一部独立作品。
 _COLLECTION_MIN_MB = 500
 _COLLECTION_MIN_SECONDS = 3000
@@ -443,6 +445,57 @@ def title_flags(title: str) -> List[str]:
     return sorted({matched.group(0) for matched in _TITLE_FLAG_PATTERN.finditer(text)})
 
 
+def _coverage_ratio(
+    features: List[Dict[str, Any]],
+    numbers: List[List[int]],
+    title: str,
+) -> float:
+    """
+    计算集号可解析比例。
+
+    严格解析不出集号时，若标题声明了集数上限（「更200集」「更新至218集」），
+    把文件名里落在 1..上限 的数字也算作可解析：站点为规避网盘审核，常把部分
+    集数写成 `140.4K.mp4` 或干脆不带集号，只按严格规则会把这些整包误杀。
+    这些数字只参与「集数是否清晰」的判定，不写回候选集号，避免造假集数。
+
+    :param features: 正片文件条目
+    :param numbers: 每个正片文件严格解析出的集号
+    :param title: 候选标题
+    :return: 可解析比例（0-1）
+    """
+    if not features:
+        return 0.0
+    parsed = sum(1 for item in numbers if item)
+    ratio = parsed / len(features)
+    if ratio >= _EPISODE_COVERAGE_THRESHOLD:
+        return ratio
+    declared_max = max(episode_rules.title_episode_numbers(title) or [0])
+    if declared_max <= 1:
+        return ratio
+    lenient = parsed
+    for entry, item in zip(features, numbers):
+        if item:
+            continue
+        if _has_number_within(_entry_name(entry), declared_max):
+            lenient += 1
+    return lenient / len(features)
+
+
+def _has_number_within(name: str, upper: int) -> bool:
+    """
+    判断文件名里是否有落在 1..upper 的独立数字。
+
+    :param name: 文件名
+    :param upper: 集数上限
+    :return: 命中返回 True
+    """
+    for matched in _BARE_NUMBER.finditer(str(name or "")):
+        value = int(matched.group(1))
+        if 0 < value <= upper and is_plausible_episode(value):
+            return True
+    return False
+
+
 def episode_form(torrent: TorrentInfo, groups: FileGroups) -> Optional[EpisodeForm]:
     """
     判定候选属于哪种集数形态，并给出季号与集号。
@@ -463,12 +516,11 @@ def episode_form(torrent: TorrentInfo, groups: FileGroups) -> Optional[EpisodeFo
     for numbers in windows.values():
         window.update(numbers)
     numbers = [_entry_episodes(entry, window) for entry in features]
-    parsed = sum(1 for item in numbers if item)
     if features and all(_is_bluray(entry) for entry in features):
         # 蓝光原盘：文件全是 00001.m2ts 这类命名，不能按集数判断。
         return EpisodeForm("feature", season, (), "path")
     if len(features) >= 2:
-        if parsed / len(features) >= _EPISODE_COVERAGE_THRESHOLD:
+        if _coverage_ratio(features, numbers, str(torrent.title or "")) >= _EPISODE_COVERAGE_THRESHOLD:
             union = sorted({number for item in numbers for number in item})
             return EpisodeForm("series", season, tuple(union), "file")
         if _looks_like_collection(features):

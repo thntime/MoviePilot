@@ -243,6 +243,25 @@ def test_archive_size_dominant_share_is_dropped() -> None:
     assert _passed("斗破苍穹 年番", entries) is False
 
 
+def test_declared_episode_count_rescues_unnumbered_files() -> None:
+    """标题声明「更200集」时，文件名里落在范围内的数字算作可解析，整包不再被误杀。"""
+    entries = [_entry(f"凡人修仙传 年番4 S04E{index:02d}.mkv") for index in range(1, 11)]
+    entries += [_entry(f"凡人修仙传 年番4 {index}.4K.mkv") for index in range(11, 21)]
+
+    torrent = _run("凡人修仙传 年番4 (2026)【更200集】【4K.高码率】", entries)
+
+    assert torrent.episode_kind == "series"
+    assert torrent.episodes == list(range(1, 11))
+
+
+def test_unnumbered_files_without_declared_count_still_dropped() -> None:
+    """标题没声明集数时，无法解析的文件仍按集数不清晰丢弃。"""
+    entries = [_entry(f"凡人修仙传 S04E{index:02d}.mkv") for index in range(1, 3)]
+    entries += [_entry(f"凡人修仙传 慕兰之战 4K.mkv") for _ in range(8)]
+
+    assert _passed("凡人修仙传 年番4", entries) is False
+
+
 def test_archive_dominant_share_is_dropped() -> None:
     """主要集数在压缩包里时丢弃，避免误报整季可用。"""
     entries = [_entry(f"斗破苍穹 S01E{index:02d}.mkv") for index in range(1, 3)]
