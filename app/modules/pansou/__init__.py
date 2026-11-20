@@ -128,6 +128,20 @@ class PansouModule(_ModuleBase):
             return ""
         return str(value).strip()
 
+    @staticmethod
+    def _as_flag(value: Any) -> bool:
+        """
+        将接口字段转换为布尔值。
+
+        :param value: 原始字段值，可能是布尔、数字或文本
+        :return: 真值时返回 True
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
     @classmethod
     def _site_address(cls, site: Dict[str, Any]) -> str:
         """
@@ -147,6 +161,27 @@ class PansouModule(_ModuleBase):
         :return: token 文本
         """
         return cls._as_text(site.get("token"))
+
+    @classmethod
+    def _site_username(cls, site: Dict[str, Any]) -> str:
+        """
+        读取站点登录用户名，使用 token 认证时为空。
+
+        :param site: PS 站点配置
+        :return: 用户名文本
+        """
+        return cls._as_text(site.get("username"))
+
+    @classmethod
+    def _site_password(cls, site: Dict[str, Any]) -> str:
+        """
+        读取站点登录密码，使用 token 认证时为空。
+
+        :param site: PS 站点配置
+        :return: 密码原文
+        """
+        password = site.get("password")
+        return password if isinstance(password, str) else ""
 
     @classmethod
     def _site_timeout(cls, site: Dict[str, Any]) -> int:
@@ -175,7 +210,9 @@ class PansouModule(_ModuleBase):
         key = self._site_key(site)
         address = self._site_address(site)
         token = self._site_token(site)
-        fingerprint = (address, token, self._site_timeout(site))
+        username = self._site_username(site)
+        password = self._site_password(site)
+        fingerprint = (address, token, username, password, self._site_timeout(site))
         with self._client_lock:
             cached = self._clients.get(key)
             if cached and cached[0] == fingerprint:
@@ -183,6 +220,8 @@ class PansouModule(_ModuleBase):
             client = PansouClient(
                 base_url=address,
                 token=token,
+                username=username,
+                password=password,
                 timeout=self._site_timeout(site),
             )
             self._clients[key] = (fingerprint, client)
@@ -587,7 +626,10 @@ class PansouModule(_ModuleBase):
 
     def test_netdisk_site(self, site: Dict[str, Any]) -> Optional[Tuple[bool, str]]:
         """
-        调用 /api/health 验证 PS 站点地址与 token 是否可用。
+        验证 PS 站点地址与凭据是否可用。
+
+        先读公开的 /api/health 确认地址可达；服务端开了认证时，health 仍然返回
+        200，必须再验一次凭据，否则凭据缺失或错误也会被报成可用。
 
         :param site: PS 站点配置；非 ps 站点返回 None
         :return: 是否可用及失败原因
@@ -596,8 +638,9 @@ class PansouModule(_ModuleBase):
             return None
         if not self._site_address(site):
             return False, "PS 站点缺少 PanSou 地址"
+        client = self._get_client(site)
         try:
-            payload = self._get_client(site).health()
+            payload = client.health()
         except PansouError as err:
             return False, str(err)
         except Exception as err:  # noqa: BLE001 - 未预期异常统一按连接失败返回
@@ -605,4 +648,14 @@ class PansouModule(_ModuleBase):
         status = self._as_text(payload.get("status")).lower()
         if status and status != "ok":
             return False, f"PanSou 状态异常：{status}"
+        if not self._as_flag(payload.get("auth_enabled")):
+            return True, ""
+        if not (self._site_username(site) and self._site_password(site)) and not self._site_token(site):
+            return False, "PanSou 已开启认证：请填写用户名密码或 Bearer token"
+        try:
+            client.verify_credentials()
+        except PansouError as err:
+            return False, str(err)
+        except Exception as err:  # noqa: BLE001 - 未预期异常统一按连接失败返回
+            return False, f"PanSou 连接失败：{err}"
         return True, ""

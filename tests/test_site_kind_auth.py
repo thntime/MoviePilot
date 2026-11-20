@@ -358,3 +358,69 @@ async def test_create_ps_site_skips_user_auth_level_gate():
     mutation = dependencies["repository"].stage_create.await_args.args[0]
     assert mutation.values["name"] == "PanSou 主站"
     assert mutation.values["auth_type"] == "api"
+
+@pytest.mark.asyncio
+async def test_create_ps_site_accepts_auth_with_credentials():
+    """
+    PS 站点可以用账号密码认证，凭据原样写入。
+    """
+    command, dependencies = _command()
+
+    result = await command.create(
+        {
+            "url": "http://pansou.example:3303",
+            "kind": "ps",
+            "auth_type": "auth",
+            "username": "admin",
+            "password": "secret",
+        }
+    )
+
+    assert result.success is True
+    mutation = dependencies["repository"].stage_create.await_args.args[0]
+    assert mutation.values["kind"] == "ps"
+    assert mutation.values["auth_type"] == "auth"
+    assert mutation.values["username"] == "admin"
+    assert mutation.values["timeout"] == 30
+
+
+@pytest.mark.asyncio
+async def test_create_ps_site_infers_auth_from_username():
+    """
+    PS 站点填了用户名却没写认证方式时按账号认证处理。
+    """
+    command, dependencies = _command()
+
+    result = await command.create(
+        {
+            "url": "http://pansou.example:3303",
+            "kind": "ps",
+            "username": "admin",
+            "password": "secret",
+        }
+    )
+
+    assert result.success is True
+    mutation = dependencies["repository"].stage_create.await_args.args[0]
+    assert mutation.values["auth_type"] == "auth"
+
+
+@pytest.mark.asyncio
+async def test_create_ps_site_rejects_auth_without_password():
+    """
+    PS 站点选了账号认证却缺密码时，在写库前被拒绝。
+    """
+    command, dependencies = _command()
+
+    result = await command.create(
+        {
+            "url": "http://pansou.example:3303",
+            "kind": "ps",
+            "auth_type": "auth",
+            "username": "admin",
+        }
+    )
+
+    assert result.success is False
+    assert result.message == "PS 站点使用账号认证时必须填写用户名和密码"
+    dependencies["repository"].stage_create.assert_not_awaited()

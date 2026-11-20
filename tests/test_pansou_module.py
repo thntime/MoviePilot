@@ -61,12 +61,26 @@ class FakeServer:
         """
         初始化空的请求记录与默认响应。
         """
-        self.responses: Dict[str, FakeResponse] = {}
+        self.responses: Dict[str, Any] = {}
+        self.post_responses: Dict[str, Any] = {}
         self.requests: List[Dict[str, Any]] = []
+        self.posts: List[Dict[str, Any]] = []
+
+    @staticmethod
+    def _next(response: Any) -> FakeResponse:
+        """
+        按队列返回预设响应，列表里只剩一个时反复返回它。
+
+        :param response: 单个响应或响应列表
+        :return: 本次应返回的响应
+        """
+        if isinstance(response, list):
+            return response.pop(0) if len(response) > 1 else response[0]
+        return response
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """
-        把 RequestUtils.get_res 替换为按路径返回预设响应的替身。
+        把 RequestUtils 的 GET 与 POST 替换为按路径返回预设响应的替身。
         """
         def fake_get_res(
             self_http: Any,
@@ -75,16 +89,39 @@ class FakeServer:
             **kwargs: Any,
         ) -> Optional[FakeResponse]:
             """
-            记录请求并返回按路径匹配的预设响应。
+            记录 GET 请求并返回按路径匹配的预设响应。
             """
             del self_http
             self.requests.append({"url": url, "params": params, "headers": kwargs.get("headers") or {}})
             for path, response in self.responses.items():
                 if url.endswith(path):
-                    return response
+                    return self._next(response)
+            return FakeResponse({"code": 0, "message": "success", "data": {}})
+
+        def fake_post_res(
+            self_http: Any,
+            url: str,
+            data: Any = None,
+            params: Optional[Dict[str, Any]] = None,
+            json: Optional[Dict[str, Any]] = None,
+            **kwargs: Any,
+        ) -> Optional[FakeResponse]:
+            """
+            记录 POST 请求并返回按路径匹配的预设响应。
+            """
+            del self_http, params
+            self.posts.append({
+                "url": url,
+                "body": json if json is not None else data,
+                "headers": kwargs.get("headers") or {},
+            })
+            for path, response in self.post_responses.items():
+                if url.endswith(path):
+                    return self._next(response)
             return FakeResponse({"code": 0, "message": "success", "data": {}})
 
         monkeypatch.setattr(pansou_client_module.RequestUtils, "get_res", fake_get_res)
+        monkeypatch.setattr(pansou_client_module.RequestUtils, "post_res", fake_post_res)
 
     def last_headers(self) -> Dict[str, Any]:
         """
@@ -518,3 +555,70 @@ def test_platform_host_match_keeps_real_forms_and_rejects_lookalikes() -> None:
     assert PansouModule._platform_matches_host("uc", "https://fast.uc.cn/s/431c8fbe24474") is True
     assert PansouModule._platform_matches_host("tianyi", "https://cloud.189.cn/t/abcd") is True
     assert PansouModule._platform_matches_host("magnet", "magnet:?xt=urn:btih:abc") is True
+def test_auth_enabled_without_credentials_reports_missing(server: FakeServer) -> None:
+    """
+    服务端开了认证而站点没填凭据时，健康检查通过也不能报可用。
+    """
+    server.responses["/api/health"] = FakeResponse({"status": "ok", "auth_enabled": True})
+
+    ok, message = PansouModule().test_netdisk_site(_ps_site())
+
+    assert ok is False
+    assert message == "PanSou 已开启认证：请填写用户名密码或 Bearer token"
+
+
+def test_auth_enabled_with_valid_credentials_reports_usable(server: FakeServer) -> None:
+    """
+    服务端开了认证且账号密码正确时，连接测试通过。
+    """
+    server.responses["/api/health"] = FakeResponse({"status": "ok", "auth_enabled": True})
+    server.post_responses["/api/auth/login"] = FakeResponse({"token": "tk", "expires_at": 9999999999})
+
+    ok, message = PansouModule().test_netdisk_site(_ps_site(username="admin", password="secret"))
+
+    assert (ok, message) == (True, "")
+    assert server.posts[0]["body"] == {"username": "admin", "password": "secret"}
+
+
+def test_auth_enabled_with_wrong_password_reports_login_failure(server: FakeServer) -> None:
+    """
+    账号密码被服务端拒绝时，连接测试给出可读原因。
+    """
+    server.responses["/api/health"] = FakeResponse({"status": "ok", "auth_enabled": True})
+    server.post_responses["/api/auth/login"] = FakeResponse(b"", 401)
+
+    ok, message = PansouModule().test_netdisk_site(_ps_site(username="admin", password="bad"))
+
+    assert ok is False
+    assert "用户名或密码错误" in message
+
+
+def test_auth_enabled_with_invalid_token_reports_auth_failure(server: FakeServer) -> None:
+    """
+    只填 Bearer token 且令牌被拒时，连接测试失败而不是报可用。
+    """
+    server.responses["/api/health"] = FakeResponse({"status": "ok", "auth_enabled": True})
+    server.responses["/api/search"] = FakeResponse(b"", 401)
+
+    ok, message = PansouModule().test_netdisk_site(_ps_site(token="bad-token"))
+
+    assert ok is False
+    assert message == "PanSou 认证失败：Bearer token 无效或已过期"
+
+
+def test_search_relogins_once_when_token_rejected(server: FakeServer) -> None:
+    """
+    搜索遇到 401 时用账号密码重登一次并复用新令牌，第二次搜索不再登录。
+    """
+    server.post_responses["/api/auth/login"] = FakeResponse({"token": "fresh", "expires_at": 9999999999})
+    client = PansouClient("http://pansou.example:3303", username="admin", password="secret")
+    assert client.login() == "fresh"
+    server.responses["/api/search"] = [
+        FakeResponse(b"", 401),
+        FakeResponse(_merge_payload({}), 200),
+    ]
+
+    assert client.search("火影") == []
+    assert client.search("火影") == []
+    assert len(server.posts) == 2
+    assert server.last_headers()["Authorization"] == "Bearer fresh"

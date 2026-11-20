@@ -283,6 +283,19 @@ _netdisk_token_refreshed_at: Dict[int, float] = {}
 # 网盘站点类型：没有网页登录流程，凭据校验走模块的站点连接检测。
 _NETDISK_SITE_KINDS = frozenset({"cd", "ps"})
 
+# 网盘站点图标单文件上限与允许的图片魔数：站点常把不存在的路径回落到首页，
+# 不校验内容就会把 HTML 错误页当成图标存进库。
+_NETDISK_FAVICON_MAX_BYTES = 256 * 1024
+_NETDISK_FAVICON_SIGNATURES: Tuple[Tuple[bytes, str], ...] = (
+    (b"\x00\x00\x01\x00", "ico"),
+    (b"\x89png", "png"),
+    (b"gif8", "gif"),
+    (b"\xff\xd8\xff", "jpeg"),
+    (b"riff", "webp"),
+    (b"<svg", "svg"),
+    (b"<?xml", "svg"),
+)
+
 
 def _netdisk_site_dict(snapshot: SiteSnapshot) -> Dict[str, Any]:
     """
@@ -747,6 +760,15 @@ class SiteChain(InteractionChainMixin, ChainBase):
         cookie = siteinfo.cookie
         indexer = siteshelper.get_indexer(domain)
         if not indexer:
+            # 网盘站点不在官方站点资源包里，没有索引器，图标只能从站点自身抓。
+            if str(getattr(siteinfo, "kind", None) or "") in _NETDISK_SITE_KINDS:
+                self.cache_netdisk_icon({
+                    "kind": siteinfo.kind,
+                    "url": siteinfo.url,
+                    "domain": domain,
+                    "name": siteinfo.name,
+                })
+                return
             logger.warn(f"站点 {domain} 索引器不存在！")
             return
         logger.info(f"开始缓存站点 {indexer.get('name')} 图标 ...")
@@ -766,6 +788,85 @@ class SiteChain(InteractionChainMixin, ChainBase):
             logger.info(f"缓存站点 {indexer.get('name')} 图标成功")
         else:
             logger.warn(f"缓存站点 {indexer.get('name')} 图标失败")
+
+    @staticmethod
+    def __detect_image_mime(content: bytes) -> str:
+        """
+        按魔数识别图标类型。
+
+        :param content: 原始响应字节
+        :return: 图片类型；不是支持的图片时返回空字符串
+        """
+        head = content[:64].lstrip().lower()
+        for signature, mime in _NETDISK_FAVICON_SIGNATURES:
+            if head.startswith(signature):
+                return mime
+        return ""
+
+    @staticmethod
+    def __fetch_netdisk_favicon(url: str) -> Tuple[str, str]:
+        """
+        抓取网盘站点的图标，只接受真正的图片内容。
+
+        站点常把不存在的路径回落到首页，所以拿到字节后必须按魔数确认是图片。
+
+        :param url: 站点地址
+        :return: 图标完整地址与 Base64 内容；抓取失败或内容不是图片时内容为空
+        """
+        icon_url = urljoin(url, "favicon.ico")
+        with _open_site_response(method="GET", url=url, timeout=20) as res:
+            if not res:
+                logger.error(f"获取站点页面失败：{url_tools.url_origin_for_log(url)}")
+                return icon_url, ""
+            html_text = res.text
+        html = etree.HTML(html_text)
+        try:
+            if DomUtils.has_child_elements(html):
+                fav_link = html.xpath('//head/link[contains(@rel, "icon")]/@href')
+                if fav_link:
+                    icon_url = urljoin(url, fav_link[0])
+        finally:
+            if html is not None:
+                del html
+        with _open_site_response(method="GET", url=icon_url, timeout=15) as res:
+            if not res:
+                logger.error(f"获取站点图标失败：{url_tools.url_origin_for_log(icon_url)}")
+                return icon_url, ""
+            content = res.content or b""
+        if not content or len(content) > _NETDISK_FAVICON_MAX_BYTES:
+            logger.warn(f"站点图标大小异常，已丢弃：{url_tools.url_origin_for_log(icon_url)}")
+            return icon_url, ""
+        if not SiteChain.__detect_image_mime(content):
+            logger.warn(f"站点图标不是图片，已丢弃：{url_tools.url_origin_for_log(icon_url)}")
+            return icon_url, ""
+        return icon_url, base64.b64encode(content).decode()
+
+    def cache_netdisk_icon(self, site: Mapping[str, Any]) -> bool:
+        """
+        抓取并缓存网盘站点的图标。
+
+        :param site: 站点配置，需含 kind 与 url，domain 缺省时按地址推导
+        :return: 图标已写入时返回 True
+        """
+        kind = str(site.get("kind") or "")
+        if kind not in _NETDISK_SITE_KINDS:
+            return False
+        url = str(site.get("url") or "").strip()
+        domain = str(site.get("domain") or "").strip() or site_domain(url)
+        if not url or not domain:
+            return False
+        name = str(site.get("name") or "").strip() or domain
+        icon_url, icon_base64 = self.__fetch_netdisk_favicon(url)
+        if not icon_url or not icon_base64:
+            return False
+        self.site_repository.update_icon(
+            name=name,
+            domain=domain,
+            icon_url=icon_url,
+            icon_base64=icon_base64,
+        )
+        logger.info(f"缓存站点 {name} 图标成功")
+        return True
 
     @eventmanager.register(EventType.SiteUpdated)
     def clear_site_data(self, event: Event) -> None:

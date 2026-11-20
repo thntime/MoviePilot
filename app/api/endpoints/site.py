@@ -2,6 +2,7 @@
 提供站点配置、认证、数据查询和状态管理接口。
 """
 
+import asyncio
 from typing import Annotated, Any, List, Literal, Optional
 
 from fastapi import Depends, HTTPException, Query, Response
@@ -697,6 +698,19 @@ async def site_icon(
     if not site.domain:
         return _SchemaResponse(success=False, message="站点域名未配置")
     icon = await query.icon(site.domain)
+    if not icon and _is_netdisk_site(site):
+        # 网盘站点没有官方索引器，图标只能在首次请求时补抓一次，老站点不必重新保存。
+        fetched = await asyncio.to_thread(
+            SiteChain().cache_netdisk_icon,
+            {
+                "kind": site.kind,
+                "url": site.url,
+                "domain": site.domain,
+                "name": site.name,
+            },
+        )
+        if fetched:
+            icon = await query.icon(site.domain)
     if not icon:
         return _SchemaResponse(success=False, message="站点图标不存在！")
     return _SchemaResponse(success=True, data=icon.model_dump())

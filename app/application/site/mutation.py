@@ -35,19 +35,29 @@ DomainExtractor = Callable[[str], str]
 UrlNormalizer = Callable[[str], str]
 
 # tg 为前端 TG 频道沿用的历史类型值，行为与 PT 一致，仅用于保留既有创建流程。
-# ps 表示 PanSou 网盘搜索服务，凭据是可选的 Bearer token，因此只允许 api 认证方式。
+# ps 表示 PanSou 网盘搜索服务，凭据可以是 Bearer token，也可以是账号密码登录。
 _SITE_KINDS = frozenset({"pt", "cd", "tg", "ps"})
 _SITE_AUTH_TYPES = frozenset({"cookie", "api", "auth"})
 _SITE_KIND_AUTH_TYPES = {
     "pt": frozenset({"cookie", "api"}),
     "cd": frozenset({"auth"}),
     "tg": frozenset({"cookie", "api"}),
-    "ps": frozenset({"api"}),
+    "ps": frozenset({"api", "auth"}),
 }
-# 网盘站点类型：不依赖官方站点资源包，也没有用户名密码登录流程。
+# 网盘站点类型：不依赖官方站点资源包，凭据校验走模块自己的站点连接检测。
 _NETDISK_SITE_KINDS = frozenset({"cd", "ps"})
 # 未显式声明认证方式时，各网盘站点类型推导出的唯一可用认证方式。
 _NETDISK_KIND_DEFAULT_AUTH = {"cd": "auth", "ps": "api"}
+
+
+def _has_text(value: JsonData) -> bool:
+    """
+    判断字段是否为非空文本。
+
+    :param value: 待判断的字段值
+    :return: 去空白后非空时返回 True
+    """
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _resolve_site_kind_auth(
@@ -69,6 +79,9 @@ def _resolve_site_kind_auth(
     raw_auth_type = values.get("auth_type")
     if isinstance(raw_auth_type, str) and raw_auth_type:
         auth_type = raw_auth_type
+    elif kind == "ps" and _has_text(values.get("username")):
+        # PS 站点填了用户名即按账号认证处理，避免只改凭据不改认证方式时静默退化成 api。
+        auth_type = "auth"
     elif kind in _NETDISK_KIND_DEFAULT_AUTH:
         # 网盘站点只有一种可用认证方式，未显式提供时直接推导。
         auth_type = _NETDISK_KIND_DEFAULT_AUTH[kind]
@@ -220,7 +233,11 @@ class SiteMutationCommand:
 
         domain = self._domain_extractor(raw_url)
         if kind == "ps":
-            # PS 站点只填 PanSou 地址；凭据是可选 Bearer token，不做登录校验。
+            # PS 站点只填 PanSou 地址；凭据是 Bearer token 或账号密码，不做登录校验。
+            if auth_type == "auth" and not (
+                _has_text(values.get("username")) and _has_text(values.get("password"))
+            ):
+                return SiteMutationResult(False, "PS 站点使用账号认证时必须填写用户名和密码")
             if await self._repository.async_get_by_domain(domain):
                 return SiteMutationResult(False, f"{domain} 站点己存在")
             raw_name = values.get("name")

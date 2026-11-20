@@ -2,6 +2,8 @@
 站点配置与认证信息的数据访问入口，适配调用方会话及兼容事务执行器。
 """
 
+import base64
+import binascii
 from datetime import datetime
 from typing import Any, List, Mapping, Optional, Tuple
 
@@ -19,6 +21,37 @@ from app.db.models.sitestatistic import SiteStatistic
 from app.db.models.siteuserdata import SiteUserData
 from app.db.oper.query import literal_contains
 from app.schemas.exception import SiteDomainConflictError
+
+# 图标魔数到 data URL 图片类型的映射；认不出时按 ico 写入，兼容既有数据与调用方。
+_ICON_MIME_SIGNATURES: Tuple[Tuple[bytes, str], ...] = (
+    (b"\x00\x00\x01\x00", "ico"),
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+    (b"\xff\xd8\xff", "jpeg"),
+    (b"RIFF", "webp"),
+)
+
+
+def _icon_data_url(icon_base64: str) -> str:
+    """
+    把图标 Base64 文本包成带图片类型的 data URL。
+
+    :param icon_base64: 图标 Base64 文本
+    :return: data URL；空文本返回空字符串
+    """
+    if not icon_base64:
+        return ""
+    try:
+        head = base64.b64decode(icon_base64)[:16]
+    except (binascii.Error, ValueError):
+        head = b""
+    mime = "ico"
+    for signature, candidate in _ICON_MIME_SIGNATURES:
+        if head.startswith(signature):
+            mime = candidate
+            break
+    return f"data:image/{mime};base64,{icon_base64}"
 
 
 async def _async_first(session: AsyncSession, statement: Any) -> Optional[Site]:
@@ -732,7 +765,7 @@ class SiteOper(DbOper):
         """
         更新站点图标
         """
-        icon_base64 = f"data:image/ico;base64,{icon_base64}" if icon_base64 else ""
+        icon_base64 = _icon_data_url(icon_base64)
 
         def write(db: Session) -> None:
             """
