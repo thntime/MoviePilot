@@ -14,6 +14,7 @@ from app.application.classification.reference import (
 from app.application.configuration import get_configured_system_config
 from app.application.directory import DirectoryHelper
 from app.application.formatting import FormatParser
+from app.application.netdisk.download_verify import record_rejection, verify_downloaded_content
 from app.application.history.retry import (
     describe_history_gate,
     evaluate_history_gate,
@@ -99,6 +100,24 @@ def _normalize_transfer_identity(
                 "未识别到媒体信息，请检查媒体来源和媒体 ID 后重试",
             )
     return mediainfo, normalized_source, normalized_media_id, None
+
+
+def _episode_range_text(meta: Optional[MetaBase]) -> str:
+    """
+    把元数据里的集号范围拼成 Exx-Eyy 文本，供内容校验记录展示。
+
+    :param meta: 元数据对象
+    :return: 集号文本；没有集号时为空字符串
+    """
+    begin = int(getattr(meta, "begin_episode", 0) or 0)
+    end = int(getattr(meta, "end_episode", 0) or 0)
+    if begin <= 0:
+        return ""
+    if end < begin:
+        end = begin
+    if begin == end:
+        return f"E{begin:02d}"
+    return f"E{begin:02d}-E{end:02d}"
 
 
 class TransferWorkflowOwner(_TransferOwnerBase):
@@ -320,6 +339,83 @@ class TransferWorkflowOwner(_TransferOwnerBase):
                     shared_roots.add(category_root.as_posix())
 
         return shared_roots
+
+    def _verify_downloaded_content(
+        self,
+        *,
+        fileitem: FileItem,
+        file_items: List[FileItem],
+        meta: Optional[MetaBase],
+        mediainfo: Optional[Union[MediaInfo, MusicInfo, MusicAlbumInfo]],
+        batch_mtype: Optional[MediaType],
+        manual: bool,
+        preview: bool,
+        download_hash: Optional[str],
+    ) -> Optional[str]:
+        """
+        下载完成、整理之前做一次内容校验。
+
+        只对影视生效：预览、音乐、手动整理都跳过。判否时写一条待处理记录并返回
+        错误文案，由调用方按整理失败结算（回滚订阅并重搜换源）；模型不可用、
+        超时或异常一律放行，这道门不能成为整理链的硬依赖。
+
+        :param fileitem: 源文件项
+        :param file_items: 本次待整理的文件项
+        :param meta: 元数据
+        :param mediainfo: 媒体信息
+        :param batch_mtype: 批次媒体类型
+        :param manual: 是否手动整理
+        :param preview: 是否仅预览
+        :param download_hash: 下载任务标识
+        :return: 判否时的错误文案；放行时返回 None
+        """
+        if preview:
+            return None
+        media_value = str(getattr(batch_mtype, "value", batch_mtype) or "")
+        if media_value == MediaType.MUSIC.value:
+            return None
+        if manual:
+            logger.info(f"{fileitem.name} 手动整理，跳过内容校验")
+            return None
+        try:
+            result = verify_downloaded_content(
+                mediainfo=mediainfo,
+                meta=meta,
+                file_items=file_items,
+                task_name=str(getattr(fileitem, "name", "") or ""),
+                storage=str(getattr(fileitem, "storage", "local") or "local"),
+                download_hash=str(download_hash or ""),
+            )
+        except Exception as error:  # noqa: BLE001 - 校验异常一律放行
+            logger.warning(f"内容校验异常，已放行：{type(error).__name__}: {error}")
+            return None
+        if result.matched:
+            if result.checked:
+                logger.info(
+                    f"{fileitem.name} 内容校验通过"
+                    f"（得分 {result.score}，命中 {','.join(result.hits) or '无'}）"
+                )
+            return None
+        logger.info(
+            f"{fileitem.name} 内容校验不通过：{result.reason}（置信度 {result.confidence:.2f}）"
+        )
+        record_rejection(
+            file_items=file_items,
+            result=result,
+            src=str(getattr(fileitem, "path", "") or ""),
+            storage=str(getattr(fileitem, "storage", "local") or "local"),
+            title=str(
+                getattr(mediainfo, "title", "")
+                or getattr(meta, "name", "")
+                or getattr(fileitem, "name", "")
+                or ""
+            ),
+            media_type=str(getattr(getattr(mediainfo, "type", None), "value", "") or ""),
+            season=str(getattr(meta, "begin_season", "") or ""),
+            episodes=_episode_range_text(meta),
+            download_hash=str(download_hash or ""),
+        )
+        return f"内容校验不通过：{result.reason}"
 
     def _collect_transfer_candidates(
         self,
@@ -642,6 +738,18 @@ class TransferWorkflowOwner(_TransferOwnerBase):
         )
         if not file_items:
             return submission.result(True, [], preview=bool(preview), preview_items=[])
+        content_error = self._verify_downloaded_content(
+            fileitem=fileitem,
+            file_items=file_items,
+            meta=meta,
+            mediainfo=mediainfo,
+            batch_mtype=batch_mtype,
+            manual=bool(manual),
+            preview=bool(preview),
+            download_hash=download_hash,
+        )
+        if content_error:
+            return submission.result(False, [content_error], preview=False, preview_items=[])
         file_items, inherited_meta_map = candidate_planner._plan_file_items(file_items)
 
         selected_music_track_map, selected_music_error = self._selected_music_track_map(

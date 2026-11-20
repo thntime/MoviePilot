@@ -421,25 +421,30 @@ class CloudSaverModule(_ModuleBase):
         self,
         torrent: TorrentInfo,
         detail: Dict[str, Any],
+        media_type: Optional[Any] = None,
     ) -> bool:
         """
-        判断候选是否通过质量检查：文件树完整、媒体集数清晰、不是短剧、压缩包不主导。
+        判断候选是否通过质量检查：文件树完整、类型占比达标、集数可确定、不是短剧、压缩包不主导。
 
-        集数识别只使用视频与音乐文件；压缩包名称不参与集数映射。压缩包覆盖的集数
-        占主导、媒体文件覆盖不足时，候选应丢弃，避免误报「符合条件」。
+        集数识别只使用正片文件；压缩包名称不参与集数映射。压缩包覆盖的集数
+        占主导、正片覆盖不足时，候选应丢弃，避免误报「符合条件」。
 
-        检查通过时把真实大小与集数写回候选；不通过时候选应被丢弃。
+        检查通过时把真实大小、季号与集数写回候选；不通过时候选应被丢弃。
 
         :param torrent: 待检查的网盘候选
         :param detail: 分享详情，含 `_files` 文件树
+        :param media_type: 目标媒体类型，音乐只按音频占比判定
         :return: 通过返回 True
         """
-        return candidates.passes_quality(torrent, detail, get_configured_system_config)
+        return candidates.passes_quality(
+            torrent, detail, get_configured_system_config, media_type
+        )
 
     def _inspect_share(
         self,
         torrent: TorrentInfo,
         cached_detail: Optional[Dict[str, Any]] = None,
+        media_type: Optional[Any] = None,
     ) -> Tuple[Optional[Dict[str, Any]], bool]:
         """
         检查单个候选：统一走本机取链，可复用缓存并执行质量检查。
@@ -448,10 +453,11 @@ class CloudSaverModule(_ModuleBase):
 
         :param torrent: 待检查的网盘候选
         :param cached_detail: 缓存中已有的分享详情，含 `_files` 时跳过网络请求
+        :param media_type: 目标媒体类型，用于按影视或音乐分流判定
         :return: (分享详情, 是否通过质量检查)；无法判定时详情为 None
         """
         platform = str(torrent.netdisk_platform or "").strip()
-        return self._inspect_remote_share(torrent, platform, cached_detail)
+        return self._inspect_remote_share(torrent, platform, cached_detail, media_type)
 
     @staticmethod
     def _blacklist_hit(torrent: TorrentInfo) -> bool:
@@ -480,6 +486,7 @@ class CloudSaverModule(_ModuleBase):
         torrent: TorrentInfo,
         platform: str,
         cached_detail: Optional[Dict[str, Any]] = None,
+        media_type: Optional[Any] = None,
     ) -> Tuple[Optional[Dict[str, Any]], bool]:
         """
         用本机统一取链适配器检查网盘候选。
@@ -491,13 +498,14 @@ class CloudSaverModule(_ModuleBase):
         :param torrent: 待检查的网盘候选
         :param platform: 平台标识
         :param cached_detail: 缓存中已有的分享详情，含 `_files` 时跳过网络请求
+        :param media_type: 目标媒体类型，用于按影视或音乐分流判定
         :return: (分享详情, 是否通过质量检查)
         """
         from app.application.netdisk.resolve import NetdiskResolveService
         from app.domain.netdisk import NetdiskError, NetdiskErrorCode
 
         if cached_detail and cached_detail.get("_files"):
-            return cached_detail, self._passes_quality(torrent, cached_detail)
+            return cached_detail, self._passes_quality(torrent, cached_detail, media_type)
         try:
             service = NetdiskResolveService()
             walked = service.walk(
@@ -514,6 +522,7 @@ class CloudSaverModule(_ModuleBase):
         files = [
             {
                 "name": item.name,
+                "path": item.path or item.name,
                 "size": item.size,
                 "duration": int(getattr(item, "duration", 0) or 0),
             }
@@ -527,8 +536,9 @@ class CloudSaverModule(_ModuleBase):
             "file_names": [item.name for item in walked.detail.files],
             "stoken": walked.detail.stoken,
             "_files": files,
+            "truncated": bool(getattr(walked, "truncated", False)),
         }
-        return detail, self._passes_quality(torrent, detail)
+        return detail, self._passes_quality(torrent, detail, media_type)
 
     @staticmethod
     def _share_identity(torrent: TorrentInfo) -> Tuple[str, str]:
@@ -577,6 +587,7 @@ class CloudSaverModule(_ModuleBase):
         self,
         site: Dict[str, Any],
         torrents: List[TorrentInfo],
+        media_type: Optional[Any] = None,
     ) -> List[TorrentInfo]:
         """
         只保留确认有效的分享，并按发布时间优先检查最新的若干条。
@@ -587,6 +598,7 @@ class CloudSaverModule(_ModuleBase):
 
         :param site: CD 站点配置
         :param torrents: 去重后的网盘候选
+        :param media_type: 目标媒体类型，用于按影视或音乐分流判定
         :return: 确认有效的候选，保持原顺序
         """
         if not torrents:
@@ -616,7 +628,7 @@ class CloudSaverModule(_ModuleBase):
             executor = ThreadPoolExecutor(max_workers=_ALIVE_WORKERS)
             try:
                 futures = {
-                    executor.submit(self._inspect_share, torrent, cached_detail): (torrent, cache_key)
+                    executor.submit(self._inspect_share, torrent, cached_detail, media_type): (torrent, cache_key)
                     for torrent, cache_key, cached_detail in pending
                 }
                 for future in as_completed(futures, timeout=_ALIVE_BUDGET_SECONDS):
@@ -667,7 +679,7 @@ class CloudSaverModule(_ModuleBase):
 
         :param site: CD 站点配置；非 cd 站点返回 None 交由其他模块处理
         :param keyword: 搜索关键词
-        :param mtype: 媒体类型，CloudSaver 搜索不使用
+        :param mtype: 媒体类型，用于区分影视与音乐的质量门判据
         :param page: 页码，CloudSaver 搜索不使用
         :return: 网盘候选列表；非 cd 站点返回 None，失败时返回空列表
         """
@@ -692,7 +704,7 @@ class CloudSaverModule(_ModuleBase):
             logger.warn(f"CD 站点 {site_name} 网盘搜索失败：{err}")
             report_site_search_outcome(attempted=True, outcome="error", error=str(err))
             return []
-        torrents = self._filter_alive_shares(site, self._build_torrents(site, entries))
+        torrents = self._filter_alive_shares(site, self._build_torrents(site, entries), mtype)
         report_site_search_outcome(attempted=True, outcome="success")
         report_site_search_page(raw_count=len(torrents), has_more=False)
         return torrents

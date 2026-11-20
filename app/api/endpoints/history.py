@@ -5,6 +5,7 @@
 import asyncio
 import time
 from collections.abc import Coroutine
+from pathlib import Path
 from typing import Any, Callable, List, Literal, Optional
 
 from fastapi import Depends, HTTPException, Response
@@ -62,6 +63,9 @@ from app.runtime.tasks import TaskRegistry
 from app.schemas.common import BatchProgressKeyData as _SchemaBatchProgressKeyData
 from app.schemas.common import ProgressKeyData as _SchemaProgressKeyData
 from app.schemas.history import BatchTransferHistoryRedoRequest as _SchemaBatchTransferHistoryRedoRequest
+from app.schemas.history import ContentVerifyActionRequest as _SchemaContentVerifyActionRequest
+from app.schemas.history import ContentVerifyActionResult as _SchemaContentVerifyActionResult
+from app.schemas.history import ContentVerifyPage as _SchemaContentVerifyPage
 from app.schemas.history import DownloadHistory as _SchemaDownloadHistory
 from app.schemas.history import TransferHistory as _SchemaTransferHistory
 from app.schemas.history import TransferHistoryDeleteResult as _SchemaTransferHistoryDeleteResult
@@ -657,3 +661,168 @@ def empty_transfer_history(
     兼容旧客户端的清空入口；新调用应使用 DELETE /transfer/all。
     """
     return _clear_transfer_history(command)
+
+
+def _path_within_download_dirs(target: Path) -> bool:
+    """
+    判断路径是否落在已配置的下载目录内。
+
+    :param target: 待删除路径
+    :return: 落在下载目录内返回 True
+    """
+    from app.application.directory import DirectoryHelper
+
+    try:
+        resolved = target.resolve()
+    except OSError:
+        return False
+    for info in DirectoryHelper().get_download_dirs():
+        raw = getattr(info, "download_path", None)
+        if not raw:
+            continue
+        try:
+            root = Path(raw).resolve()
+        except OSError:
+            continue
+        if resolved == root or root in resolved.parents:
+            return True
+    return False
+
+
+def _remove_local_path(target: Path) -> bool:
+    """
+    删除本地文件或目录。
+
+    :param target: 待删除路径
+    :return: 删除成功返回 True
+    """
+    import shutil
+
+    try:
+        if target.is_dir():
+            shutil.rmtree(target)
+            return True
+        if target.is_file():
+            target.unlink()
+            return True
+    except OSError as error:
+        logger.warning(f"删除内容校验文件失败：{target} - {error}")
+    return False
+
+
+@router.get(
+    "/verify",
+    summary="查询待处理的内容校验记录",
+    response_model=_SchemaContentVerifyPage,
+)
+async def content_verify_list(
+    page: Optional[int] = 1,
+    count: Optional[int] = 30,
+    _: _SchemaTokenPayload = Depends(verify_token),
+) -> Any:
+    """
+    按判定时间倒序查询待处理的下载内容校验记录。
+
+    :param page: 页码
+    :param count: 每页数量
+    :return: 分页结果与待处理占用
+    """
+    from app.application.netdisk.content_verify import get_content_verify_store
+
+    records = await asyncio.to_thread(get_content_verify_store().list)
+    current = max(1, int(page or 1))
+    size = max(1, min(int(count or 30), 200))
+    start = (current - 1) * size
+    return {
+        "items": [record.to_dict() for record in records[start:start + size]],
+        "total": len(records),
+        "pending_size": sum(record.total_size for record in records),
+    }
+
+
+@router.post(
+    "/verify/accept",
+    summary="人工放行一条内容校验记录",
+    response_model=_SchemaContentVerifyActionResult,
+)
+async def content_verify_accept(
+    payload: _SchemaContentVerifyActionRequest,
+    _: _SchemaTokenPayload = Depends(verify_token),
+) -> Any:
+    """
+    人工放行：按原路径强制整理一次，成功后把记录标记为已处理。
+
+    :param payload: 处理请求
+    :return: 处理结果
+    """
+    from app.application.netdisk.content_verify import DECISION_MANUAL, get_content_verify_store
+    from app.chain.transfer.facade import TransferChain
+    from app.schemas.file import FileItem
+
+    store = get_content_verify_store()
+    record = await asyncio.to_thread(store.get, payload.id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    source = Path(record.src)
+    fileitem = FileItem(
+        path=record.src,
+        storage=record.storage or "local",
+        type="dir" if source.is_dir() else "file",
+        name=source.name,
+        basename=source.stem,
+        extension=source.suffix[1:],
+    )
+
+    def _run_transfer() -> Any:
+        """
+        执行一次强制整理。
+
+        :return: 整理结果
+        """
+        return TransferChain().do_transfer(
+            fileitem=fileitem, manual=True, force=True, background=False
+        )
+
+    try:
+        success, message = await asyncio.to_thread(_run_transfer)
+    except Exception as error:  # noqa: BLE001 - 整理异常按失败回执返回
+        logger.error(f"内容校验记录人工放行失败：{record.src} - {error}")
+        raise HTTPException(status_code=500, detail=f"整理失败：{error}") from error
+    if success:
+        await asyncio.to_thread(store.update_decision, record.id, DECISION_MANUAL)
+    return {"success": bool(success), "message": str(message or "")}
+
+
+@router.post(
+    "/verify/delete",
+    summary="删除一条内容校验记录的本地文件",
+    response_model=_SchemaContentVerifyActionResult,
+)
+async def content_verify_delete(
+    payload: _SchemaContentVerifyActionRequest,
+    _: _SchemaTokenPayload = Depends(verify_token),
+) -> Any:
+    """
+    删除本地下载副本，并把记录标记为已删除。
+
+    只允许删除落在已配置下载目录内的本地路径，越界一律拒绝。
+
+    :param payload: 处理请求
+    :return: 处理结果
+    """
+    from app.application.netdisk.content_verify import DECISION_DELETED, get_content_verify_store
+
+    store = get_content_verify_store()
+    record = await asyncio.to_thread(store.get, payload.id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    if (record.storage or "local") != "local":
+        raise HTTPException(status_code=400, detail="只支持删除本地文件")
+    target = Path(record.src)
+    if not _path_within_download_dirs(target):
+        raise HTTPException(status_code=400, detail="路径不在下载目录内，已拒绝删除")
+    removed = await asyncio.to_thread(_remove_local_path, target)
+    if not removed:
+        raise HTTPException(status_code=400, detail="文件不存在或删除失败")
+    await asyncio.to_thread(store.update_decision, record.id, DECISION_DELETED)
+    return {"success": True, "message": "已删除本地文件"}

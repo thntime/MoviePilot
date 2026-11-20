@@ -281,3 +281,89 @@ class TransferHistoryDeleteResult(BaseModel):
         return self.history == "deleted"
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ContentVerifyItem(BaseModel):
+    """
+    一条待处理的下载内容校验记录。
+
+    :param id: 记录标识
+    :param src: 源路径
+    :param storage: 源存储
+    :param title: 媒体标题
+    :param media_type: 媒体类型
+    :param season: 季号
+    :param episodes: 集号文本
+    :param score: 本地证据得分
+    :param confidence: 模型置信度
+    :param reason: 判否原因
+    :param hits: 命中的本地证据
+    :param frames: 抽帧图路径
+    :param file_count: 文件数
+    :param total_size: 总大小（字节）
+    :param median_duration: 单集中位时长（秒）
+    :param platform: 网盘平台
+    :param share_code: 分享码
+    :param download_hash: 下载任务标识
+    :param created_at: 创建时间
+    :param updated_at: 更新时间
+    :param decision: 处理状态
+    """
+
+    id: str = Field(default="", description="记录标识")
+    src: str = Field(default="", description="源路径")
+    storage: str = Field(default="local", description="源存储")
+    title: str = Field(default="", description="媒体标题")
+    media_type: str = Field(default="", description="媒体类型")
+    season: str = Field(default="", description="季号")
+    episodes: str = Field(default="", description="集号文本")
+    score: int = Field(default=0, description="本地证据得分")
+    confidence: float = Field(default=0.0, description="模型置信度")
+    reason: str = Field(default="", description="判否原因")
+    hits: List[str] = Field(default_factory=list, description="命中的本地证据")
+    frames: List[str] = Field(default_factory=list, description="抽帧图路径")
+    file_count: int = Field(default=0, description="文件数")
+    total_size: int = Field(default=0, description="总大小（字节）")
+    median_duration: int = Field(default=0, description="单集中位时长（秒）")
+    platform: str = Field(default="", description="网盘平台")
+    share_code: str = Field(default="", description="分享码")
+    download_hash: str = Field(default="", description="下载任务标识")
+    created_at: str = Field(default="", description="创建时间")
+    updated_at: str = Field(default="", description="更新时间")
+    decision: str = Field(default="reject", description="处理状态")
+
+
+class ContentVerifyPage(BaseModel):
+    """
+    待处理内容校验记录的分页结果。
+
+    :param items: 当前页记录
+    :param total: 待处理总数
+    :param pending_size: 待处理文件总占用（字节）
+    """
+
+    items: List[ContentVerifyItem] = Field(default_factory=list, description="当前页记录")
+    total: int = Field(default=0, description="待处理总数")
+    pending_size: int = Field(default=0, description="待处理文件总占用（字节）")
+
+
+class ContentVerifyActionRequest(BaseModel):
+    """
+    内容校验记录的处理请求。
+
+    :param id: 记录标识
+    """
+
+    id: str = Field(description="记录标识")
+
+
+class ContentVerifyActionResult(BaseModel):
+    """
+    内容校验记录的处理结果。
+
+    :param success: 是否处理成功
+    :param message: 处理说明
+    """
+
+    success: bool = Field(description="是否处理成功")
+    message: str = Field(default="", description="处理说明")

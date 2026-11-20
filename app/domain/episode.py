@@ -1,4 +1,4 @@
-﻿"""
+"""
 剧集编号的解析与显示规则。
 
 解析入口供搜索结果、网盘下载器与整理兜底共用，避免各模块各写一套正则。
@@ -45,6 +45,18 @@ DECLARED_WINDOW_PATTERN = re.compile(
 )
 # 标题声明窗口的集数上限，异常标题不展开成超大窗口。
 DECLARED_WINDOW_LIMIT = 2000
+# 中文数字与单位：网盘分享常用「第十二集」「两百集」这类写法。
+_CN_DIGIT_VALUES = {
+    "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+_CN_UNIT_VALUES = {"十": 10, "百": 100, "千": 1000}
+# 只在「集/话/期」前的中文数字才归一，避免把片名里的数字词改坏。
+_CN_EPISODE_PATTERN = re.compile(r"([零〇一二两三四五六七八九十百千]{1,8})(\s*[集话話期])")
+# 标题里声明集号的写法：第197集 / 更新至218集 / 全80集 / 共24话 / 197集。
+TITLE_EPISODE_PATTERN = re.compile(r"(?:第|更新至?|全集?|共)?\s*(\d{1,4})\s*[集话話期]")
+# 标题里声明集号区间的写法：140-179集。
+TITLE_EPISODE_RANGE_PATTERN = re.compile(r"(\d{1,4})\s*[-~—至到]\s*(\d{1,4})\s*[集话話期]")
 # 窗口识别只看独立数字：前后不能紧邻字母，避免把 4K 的 K 前数字算进来。
 WINDOW_NUMBER_PATTERN = re.compile(r"(?<![0-9A-Za-z])(\d{1,4})(?![0-9A-Za-z])")
 
@@ -96,6 +108,89 @@ def is_plausible_episode(value: int) -> bool:
     return 0 < value <= 9999 and value not in RESOLUTION_TOKENS and not YEAR_MIN <= value <= YEAR_MAX
 
 
+def _chinese_number_to_int(text: str) -> Optional[int]:
+    """
+    把一段中文数字转成整数。
+
+    支持「十二」「二十」「一百九十七」「两百」「一千零一」这类常见写法；
+    无法解析时返回 None。
+
+    :param text: 只含中文数字与单位的文本
+    :return: 整数值；无法解析时返回 None
+    """
+    if not text:
+        return None
+    total = 0
+    number = 0
+    for char in text:
+        digit = _CN_DIGIT_VALUES.get(char)
+        if digit is not None:
+            number = digit
+            continue
+        unit = _CN_UNIT_VALUES.get(char)
+        if unit is None:
+            return None
+        if number == 0:
+            number = 1
+        total += number * unit
+        number = 0
+    return total + number
+
+
+def chinese_numerals_to_arabic(text: str) -> str:
+    """
+    把「第X集」里的中文数字换成阿拉伯数字，其它文本原样保留。
+
+    只处理紧跟「集/话/期」的中文数字，片名里的数字词（如「一人之下」）
+    不会被改写；转换失败或数值异常时保留原文。
+
+    :param text: 文件名或标题
+    :return: 归一化后的文本
+    """
+    value = str(text or "")
+    if not value:
+        return value
+
+    def _replace(matched: "re.Match[str]") -> str:
+        """
+        替换单个中文集号。
+
+        :param matched: 正则匹配结果
+        :return: 替换文本
+        """
+        number = _chinese_number_to_int(matched.group(1))
+        if number is None or number <= 0 or number > DECLARED_WINDOW_LIMIT:
+            return matched.group(0)
+        return f"{number}{matched.group(2)}"
+
+    return _CN_EPISODE_PATTERN.sub(_replace, value)
+
+
+def title_episode_numbers(title: str) -> List[int]:
+    """
+    从候选标题里取声明的集号。
+
+    只认「集/话/期」前的数字（第197集、更新至218集、全80集、140-179集），
+    避免把片名里的数字当成集号；年份与分辨率由集数可信度规则排除。
+
+    :param title: 候选标题
+    :return: 升序去重的集号列表
+    """
+    text = chinese_numerals_to_arabic(str(title or ""))
+    if not text:
+        return []
+    numbers: Set[int] = set()
+    for matched in TITLE_EPISODE_RANGE_PATTERN.finditer(text):
+        begin, end = int(matched.group(1)), int(matched.group(2))
+        if 0 < begin <= end <= DECLARED_WINDOW_LIMIT:
+            numbers.update(range(begin, end + 1))
+    for matched in TITLE_EPISODE_PATTERN.finditer(text):
+        value = int(matched.group(1))
+        if is_plausible_episode(value):
+            numbers.add(value)
+    return sorted(numbers)
+
+
 def bare_episode(file_name: str) -> Optional[int]:
     """
     从文件名中提取裸数字集数，只在能明确判定时返回。
@@ -125,7 +220,7 @@ def episode_numbers(file_name: str) -> List[int]:
     :param file_name: 文件名或目录名
     :return: 该名称包含的集数列表；无法识别时为空
     """
-    text = str(file_name or "")
+    text = chinese_numerals_to_arabic(str(file_name or ""))
     if OBFUSCATED_PATTERN.search(text) or NON_EPISODE_PATTERN.search(text):
         return []
     numbers: List[int] = []
@@ -160,7 +255,7 @@ def windowed_episode_numbers(file_name: str, window: Iterable[int]) -> List[int]
     :return: 落在窗口内的集号，升序去重；特典文件始终为空
     """
     allowed = {int(value) for value in window or ()}
-    text = str(file_name or "")
+    text = chinese_numerals_to_arabic(str(file_name or ""))
     if not allowed or is_special_name(text):
         return []
     numbers: Set[int] = set()

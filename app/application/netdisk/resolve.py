@@ -45,6 +45,8 @@ _LINK_CACHE_LIMIT = 256
 _LINK_CACHE_MARGIN = timedelta(minutes=1)
 # 本应用创建的临时转存目录前缀；清理时只删除这些目录，绝不触碰用户文件。
 _TEMP_DIR_PREFIXES = ("mp_tr_", "MoviePilot临时转存")
+# 单个分享最多读取的文件数，超出后按已读到的部分判定并标记截断。
+_MAX_SHARE_FILES = 3000
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +62,7 @@ class ResolvedShare:
     ref: ShareRef
     detail: ShareDetail
     files: tuple[ShareFile, ...] = ()
+    truncated: bool = False
 
 
 class NetdiskResolveService:
@@ -186,17 +189,23 @@ class NetdiskResolveService:
         platform: object = None,
         account_id: Optional[int] = None,
         *,
-        max_depth: int = 3,
+        max_depth: int = 5,
+        max_files: int = _MAX_SHARE_FILES,
         share_token: str = "",
     ) -> ResolvedShare:
         """
         递归展开分享内的全部文件。
+
+        目录层级默认展开五层：剧名/季/子目录/文件 这类结构只有两层目录时
+        第三层之后的文件会被漏掉，导致候选被判成「文件树不完整」。单分享
+        文件数超过上限时按已读到的部分返回，并由 `truncated` 标记。
 
         :param url: 分享链接
         :param password: 提取码
         :param platform: 平台标识
         :param account_id: 指定账号
         :param max_depth: 最大递归深度
+        :param max_files: 单个分享最多读取的文件数
         :param share_token: 候选透传的分享令牌
         :return: 分享引用、详情与文件列表
         """
@@ -204,6 +213,7 @@ class NetdiskResolveService:
         account = self._optional_account(adapter, account_id)
         detail = self._call(adapter, lambda: adapter.share_detail(ref, account))
         files: list[ShareFile] = []
+        truncated = False
         pending = [(item, 1, "") for item in detail.files]
         while pending:
             item, depth, prefix = pending.pop(0)
@@ -220,9 +230,12 @@ class NetdiskResolveService:
                 child_prefix = f"{prefix}{item.name}/"
                 pending.extend((child, depth + 1, child_prefix) for child in children)
                 continue
+            if len(files) >= max_files:
+                truncated = True
+                break
             # 保留相对路径，目录名里的季号（第二季/Season 2）不能丢。
             files.append(replace(item, path=f"{prefix}{item.name}"))
-        return ResolvedShare(ref=ref, detail=detail, files=tuple(files))
+        return ResolvedShare(ref=ref, detail=detail, files=tuple(files), truncated=truncated)
 
     def resolve_file(
         self,
