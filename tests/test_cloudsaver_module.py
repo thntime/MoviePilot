@@ -609,9 +609,9 @@ def test_search_drops_invalid_shares(monkeypatch: pytest.MonkeyPatch) -> None:
     assert server.share_check_count == 0
 
 
-def test_search_keeps_undecidable_shares_marked_unverified(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_search_drops_undecidable_shares(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    本机没有可用账号时保留候选并标注未验证。
+    本机没有可用账号、无法判定有效性时丢弃候选，不再标未验证放行。
     """
     FakeWalk.errors_by_code["unknownshare"] = NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "未登录")
     server = FakeCloudSaverServer()
@@ -635,9 +635,7 @@ def test_search_keeps_undecidable_shares_marked_unverified(monkeypatch: pytest.M
 
     assert results is not None
     titles = [strip_episode(item.title) for item in results]
-    assert titles == ["无法判定资源", "有效资源"]
-    undecided = next(item for item in results if strip_episode(item.title) == "无法判定资源")
-    assert "（未验证）" in str(undecided.description or "")
+    assert titles == ["有效资源"]
     assert len(FakeWalk.calls) == 2
     assert server.share_check_count == 0
     # 无法判定的分享不写入有效性缓存，下次搜索仍会重新检查。
@@ -1223,9 +1221,9 @@ def test_quark_local_walk_drops_invalid_share(monkeypatch: pytest.MonkeyPatch) -
     assert server.share_check_count == 0
 
 
-def test_quark_local_walk_keeps_share_without_account(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_quark_local_walk_drops_share_without_account(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    本机没有可用账号时保留夸克候选并标注未验证。
+    本机没有可用账号、无法判定夸克分享时丢弃候选，不再标未验证放行。
     """
     FakeWalk.errors_by_code["localshare"] = NetdiskError(NetdiskErrorCode.AUTH_EXPIRED, "未登录")
     server = FakeCloudSaverServer()
@@ -1234,9 +1232,7 @@ def test_quark_local_walk_keeps_share_without_account(monkeypatch: pytest.Monkey
 
     results = CloudSaverModule().search_netdisk_torrents(make_site(), "关键词")
 
-    assert results is not None
-    assert len(results) == 1
-    assert "（未验证）" in str(results[0].description or "")
+    assert results == []
     assert FakeWalk.calls == ["https://pan.quark.cn/s/localshare"]
     assert server.share_check_count == 0
 
@@ -1270,9 +1266,9 @@ def test_apply_share_detail_replaces_existing_range_marker() -> None:
     assert torrent.title == "仙逆 S01E153"
 
 
-def test_search_keeps_candidates_over_check_budget_marked_unverified(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_search_drops_candidates_over_check_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    分享有效性检查超出总预算时，未完成的候选保留并标注未验证。
+    分享有效性检查超出总预算时，未跑完的候选丢弃，不再标未验证放行。
     """
     server = FakeCloudSaverServer()
     FakeWalk.delays_by_code["slowshare"] = 0.2
@@ -1298,9 +1294,7 @@ def test_search_keeps_candidates_over_check_budget_marked_unverified(monkeypatch
 
     assert results is not None
     titles = [strip_episode(item.title) for item in results]
-    assert titles == ["慢响应资源", "快速响应资源"]
-    slow = next(item for item in results if strip_episode(item.title) == "慢响应资源")
-    assert "（未验证）" in str(slow.description or "")
+    assert titles == ["快速响应资源"]
     assert server.share_check_count == 0
 
 

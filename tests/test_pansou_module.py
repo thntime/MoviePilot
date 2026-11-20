@@ -205,7 +205,10 @@ def _install_walk(
     monkeypatch.setattr(NetdiskResolveService, "walk", fake_walk)
 
 
-def test_search_parses_merge_response_into_candidates(server: FakeServer) -> None:
+def test_search_parses_merge_response_into_candidates(
+    server: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     merge 响应按平台分组展开成候选，标题、提取码与来源标签都保留。
     """
@@ -218,6 +221,9 @@ def test_search_parses_merge_response_into_candidates(server: FakeServer) -> Non
             "source": "plugin:xiaokupan",
         }],
     }))
+    _install_walk(monkeypatch, files={
+        "abc123": [ShareFile(file_id="f1", name="火影忍者 全集 1080p.mkv", size=1024)],
+    })
 
     results = PansouModule().search_netdisk_torrents(_ps_site(), "火影")
 
@@ -233,7 +239,10 @@ def test_search_parses_merge_response_into_candidates(server: FakeServer) -> Non
     assert candidate.site == 7
 
 
-def test_search_decodes_utf8_title_without_charset_header(server: FakeServer) -> None:
+def test_search_decodes_utf8_title_without_charset_header(
+    server: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     响应头没有 charset 时仍按 UTF-8 解码，中文标题不能变成乱码。
     """
@@ -241,6 +250,9 @@ def test_search_decodes_utf8_title_without_charset_header(server: FakeServer) ->
         "quark": [{"url": "https://pan.quark.cn/s/cn123", "note": "流浪地球 2 4K"}],
     }), ensure_ascii=False).encode("utf-8")
     server.responses["/api/search"] = FakeResponse(body)
+    _install_walk(monkeypatch, files={
+        "cn123": [ShareFile(file_id="f1", name="正片.mkv", size=1024)],
+    })
 
     results = PansouModule().search_netdisk_torrents(_ps_site(), "流浪地球")
 
@@ -306,20 +318,16 @@ def test_invalid_share_is_dropped(server: FakeServer, monkeypatch: pytest.Monkey
     assert PansouModule().search_netdisk_torrents(_ps_site(), "火影") == []
 
 
-def test_undecidable_share_kept_as_unverified(server: FakeServer, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_undecidable_share_is_dropped(server: FakeServer, monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    鉴权或网络异常无法判定时保留候选并标注未验证。
+    鉴权或网络异常无法判定时丢弃候选，不再标未验证放行。
     """
     server.responses["/api/search"] = FakeResponse(_merge_payload({
         "quark": [{"url": "https://pan.quark.cn/s/unknown1", "note": "待验证资源"}],
     }))
     _install_walk(monkeypatch, errors={"unknown1": RuntimeError("网络超时")})
 
-    results = PansouModule().search_netdisk_torrents(_ps_site(), "火影")
-
-    assert results is not None
-    assert len(results) == 1
-    assert "（未验证）" in (results[0].description or "")
+    assert PansouModule().search_netdisk_torrents(_ps_site(), "火影") == []
 
 
 def test_unsupported_platform_is_filtered(server: FakeServer, monkeypatch: pytest.MonkeyPatch) -> None:

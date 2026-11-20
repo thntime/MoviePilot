@@ -70,6 +70,13 @@ _TASK_POLL_INTERVAL = 1.0
 # 登录态失效与游客大小限制的服务端错误码。
 _CODE_LOGIN_REQUIRED = 31001
 _CODE_GUEST_LIMIT = 23018
+# 分享文件令牌校验失败：换新 token 即可重试，不是登录态失效。
+_CODE_TOKEN_INVALID = 41020
+# 分享级失效的业务码：文件不存在、需要提取码、违规内容、已取消/已失效、分享者封禁。
+# 这些响应里有几个带 HTTP 403，必须按业务码先判，否则会被当成「登录态已失效」。
+_SHARE_INVALID_CODES = frozenset({41004, 41008, 41010, 41011, 41012, 41031})
+# 分享级失效的文案特征：服务端有时只给一句中文提示，不给业务码。
+_SHARE_INVALID_HINTS = ("失效", "违规", "封禁", "不存在", "需要提取码", "提取码错误", "已删除")
 # 游客取链的文件大小上限：超过该值的分享文件必须登录转存。
 _GUEST_MAX_BYTES = 50 * 1024 * 1024
 # 分享 stoken 的进程内缓存时长；任务开始时会强制换新，任务进行中复用同一 token，
@@ -158,15 +165,42 @@ def _set_cookie_header(response: Any) -> str:
     return str(value)
 
 
+def _is_share_invalid_message(message: str) -> bool:
+    """
+    判断服务端提示是否说明分享本身不可用。
+
+    夸克在部分失效形态下只给一句中文提示，没有业务码；这类响应必须按分享失效
+    处理，不能落到「无法判定」再被当成有效候选展示。
+
+    :param message: 服务端提示
+    :return: 命中分享级失效特征时返回 True
+    """
+    text = str(message or "")
+    if not text:
+        return False
+    if any(hint in text for hint in _SHARE_INVALID_HINTS):
+        return True
+    # 「取消」单独出现太宽泛（如「取消下载」），只有和「分享」同现才算分享被取消。
+    return "分享" in text and "取消" in text
+
+
 def _classify(code: int, status: int, message: str) -> NetdiskErrorCode:
     """
     把夸克服务端错误码收敛为统一错误分类。
+
+    判定顺序是契约的一部分：先认文件令牌失效，再认分享级失效，最后才按
+    401/403 兜底登录态。顺序颠倒会把 403 上的分享失效（如 41031 分享者封禁）
+    误报成「登录态已失效」，搜索结果就会把死链当成无法判定放行。
 
     :param code: 服务端业务错误码
     :param status: 响应 status 字段
     :param message: 服务端提示
     :return: 统一错误分类
     """
+    if code == _CODE_TOKEN_INVALID:
+        return NetdiskErrorCode.LINK_EXPIRED
+    if code in _SHARE_INVALID_CODES or _is_share_invalid_message(message):
+        return NetdiskErrorCode.SHARE_INVALID
     if code == _CODE_LOGIN_REQUIRED or status in (401, 403):
         return NetdiskErrorCode.AUTH_EXPIRED
     if code == _CODE_GUEST_LIMIT:
@@ -175,8 +209,6 @@ def _classify(code: int, status: int, message: str) -> NetdiskErrorCode:
         return NetdiskErrorCode.RATE_LIMITED
     if status == 412:
         return NetdiskErrorCode.LINK_EXPIRED
-    if "提取码" in message or ("分享" in message and "失效" in message):
-        return NetdiskErrorCode.SHARE_INVALID
     if "空间" in message:
         return NetdiskErrorCode.SPACE_INSUFFICIENT
     return NetdiskErrorCode.UNKNOWN
@@ -250,33 +282,39 @@ class _QuarkHttp(NetdiskHttp):
         """
         self.last_set_cookie = _set_cookie_header(response)
         if response is not None and getattr(response, "status_code", 0) == 404:
-            # 夸克分享被取消/过期时返回 HTTP 404 + 41011/41012，直接提示分享失效，
-            # 不要只显示「HTTP 404」让人误以为是代码或网络问题。
+            # 夸克分享类接口的 404 就是分享没了：41004 文件不存在、41010 违规内容、
+            # 41011/41012 已取消/已失效，也有只给一句 message 的情况。一律按分享失效
+            # 上报，别把「HTTP 404」丢给用户，也别让它落到「无法判定」被当有效候选。
             try:
                 payload = response.json()
-            except Exception:  # noqa: BLE001 - 非 JSON 响应交给基类处理
+            except Exception:  # noqa: BLE001 - 非 JSON 响应按分享失效兜底
                 payload = {}
-            code = as_int(payload.get("code")) if isinstance(payload, dict) else 0
             message = as_text(payload.get("message")) if isinstance(payload, dict) else ""
-            if code in (41011, 41012) or "分享" in message:
-                raise NetdiskError(
-                    NetdiskErrorCode.SHARE_INVALID,
-                    f"夸克分享已失效：{message or '分享地址已失效'}",
-                    platform=NetdiskPlatform.QUARK,
-                )
+            raise NetdiskError(
+                NetdiskErrorCode.SHARE_INVALID,
+                f"夸克分享已失效：{message or '分享地址已失效'}",
+                platform=NetdiskPlatform.QUARK,
+            )
         if response is not None and getattr(response, "status_code", 0) in (401, 403):
             # 41020 是 share_fid_token 过期/不匹配，不是登录态失效；映射为 LINK_EXPIRED
             # 才能让取链逻辑换新 token 重试，而不是让用户去重新登录。
+            # 41031（分享者封禁链接查看受限）等分享级码同样带 403，必须按业务码先判。
             try:
                 payload = response.json()
             except Exception:  # noqa: BLE001 - 非 JSON 响应交给基类处理
                 payload = {}
             code = as_int(payload.get("code")) if isinstance(payload, dict) else 0
             message = as_text(payload.get("message")) if isinstance(payload, dict) else ""
-            if code == 41020 or "token校验" in message:
+            if code == _CODE_TOKEN_INVALID or "token校验" in message:
                 raise NetdiskError(
                     NetdiskErrorCode.LINK_EXPIRED,
                     f"夸克文件令牌校验失败：{message or 'token 已失效'}",
+                    platform=NetdiskPlatform.QUARK,
+                )
+            if code in _SHARE_INVALID_CODES or _is_share_invalid_message(message):
+                raise NetdiskError(
+                    NetdiskErrorCode.SHARE_INVALID,
+                    f"夸克分享已失效：{message or '分享地址已失效'}",
                     platform=NetdiskPlatform.QUARK,
                 )
         return super()._json(response)

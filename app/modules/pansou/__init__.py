@@ -350,16 +350,26 @@ class PansouModule(_ModuleBase):
             _alive_cache[key] = (time.time(), alive, detail if alive else None)
 
     @staticmethod
-    def _mark_unverified(torrent: TorrentInfo) -> None:
+    def _blacklist_hit(torrent: TorrentInfo) -> bool:
         """
-        在候选描述中标注未验证状态，避免与已确认有效的分享混淆。
+        判断候选的分享是否已在下载阶段被判为不可用（分享黑名单）。
+
+        下载失败时分享会被拉黑；搜索阶段先查一遍，既省掉一次必然失败的取链，
+        也让订阅不会反复选中同一个坏分享。
 
         :param torrent: 网盘候选
+        :return: 命中黑名单返回 True
         """
-        marker = "（未验证）"
-        description = str(torrent.description or "")
-        if marker not in description:
-            torrent.description = f"{description}{marker}" if description else marker
+        from app.application.netdisk.share_blacklist import get_share_blacklist
+
+        ref = parse_share_link(str(torrent.enclosure or ""), torrent.share_password)
+        if ref is None or not ref.share_id:
+            return False
+        platform = str(torrent.netdisk_platform or ref.platform.value or "")
+        try:
+            return get_share_blacklist().is_blacklisted(platform, ref.share_id) is not None
+        except Exception:  # noqa: BLE001 - 黑名单读取失败不阻断搜索
+            return False
 
     @staticmethod
     def _inspect_remote_share(
@@ -370,8 +380,9 @@ class PansouModule(_ModuleBase):
         """
         用本机统一取链适配器检查网盘候选。
 
-        明确失效返回 `alive=False`；鉴权、超时或网络异常返回未验证标记，
-        由调用方保留候选而不是直接丢弃。缓存中已有完整文件树时直接复用，避免重复遍历。
+        明确失效返回 `alive=False`；鉴权、超时或网络异常返回 `unverified`，
+        由调用方丢弃而不是当成有效候选展示。缓存中已有完整文件树时直接复用，
+        避免重复遍历。
 
         :param torrent: 待检查的网盘候选
         :param platform: 平台标识
@@ -497,19 +508,43 @@ class PansouModule(_ModuleBase):
         # 没有可解析分享码时保留完整地址，避免同一域名下不同分享共用缓存键。
         return url.rstrip("/") or url
 
+    @staticmethod
+    def _log_filter_summary(
+        site: Dict[str, Any],
+        checked: int,
+        kept: int,
+        dropped: Dict[str, int],
+    ) -> None:
+        """
+        汇总一次搜索的候选过滤结果，让「结果变少」有据可查。
+
+        :param site: PS 站点配置
+        :param checked: 参与校验的候选数
+        :param kept: 最终保留的候选数
+        :param dropped: 各类丢弃原因的计数
+        """
+        site_name = PansouModule._as_text(site.get("name") or site.get("id")) or "未知站点"
+        logger.info(
+            f"PS 站点 {site_name} 分享校验：候选 {checked}，保留 {kept}，"
+            f"丢弃失效 {dropped.get('invalid', 0)}、无法确认 {dropped.get('undecidable', 0)}、"
+            f"质量不符 {dropped.get('quality', 0)}、黑名单 {dropped.get('blocked', 0)}"
+        )
+
     def _filter_alive_shares(
         self,
         site: Dict[str, Any],
         torrents: List[TorrentInfo],
     ) -> List[TorrentInfo]:
         """
-        保留有效或无法判定的分享，丢弃明确失效的分享，并按发布时间优先检查最新的若干条。
+        只保留确认有效的分享，并按发布时间优先检查最新的若干条。
 
-        无法判定（鉴权、超时、网络异常）的候选保留并在描述中标注未验证。
+        结果页与订阅都不该出现「点开是分享已失效」的卡片：明确失效、命中分享
+        黑名单、以及无法判定（鉴权、限流、网络异常、预算内没跑完）的候选一律
+        丢弃，不再标未验证放行，丢弃原因按类别计数进日志。
 
         :param site: PS 站点配置
         :param torrents: 去重后的网盘候选
-        :return: 有效分享候选，保持原顺序
+        :return: 确认有效的候选，保持原顺序
         """
         if not torrents:
             return []
@@ -519,12 +554,18 @@ class PansouModule(_ModuleBase):
             reverse=True,
         )[:_MAX_ALIVE_CHECKS]
         alive_flags: Dict[int, bool] = {}
+        dropped = {"invalid": 0, "undecidable": 0, "quality": 0, "blocked": 0}
         pending: List[Tuple[TorrentInfo, str, Optional[Dict[str, Any]]]] = []
         for torrent in ordered:
+            if self._blacklist_hit(torrent):
+                alive_flags[id(torrent)] = False
+                dropped["blocked"] += 1
+                continue
             cache_key = self._alive_cache_key(site, self._share_identity(torrent))
             cached = self._cached_alive(cache_key)
             if cached is not None and not cached[0]:
                 alive_flags[id(torrent)] = False
+                dropped["invalid"] += 1
                 continue
             pending.append((torrent, cache_key, cached[1] if cached else None))
         if pending:
@@ -538,32 +579,37 @@ class PansouModule(_ModuleBase):
                     torrent, cache_key = futures[future]
                     try:
                         detail, passed = future.result()
-                    except Exception:  # noqa: BLE001 - 无法判定按未验证保留
+                    except Exception:  # noqa: BLE001 - 无法判定同样不展示
                         detail, passed = {"alive": True, "unverified": True}, True
                     if detail is None:
                         detail, passed = {"alive": True, "unverified": True}, True
                     if not detail.get("alive"):
                         self._store_alive(cache_key, False)
                         alive_flags[id(torrent)] = False
+                        dropped["invalid"] += 1
+                        continue
+                    if detail.get("unverified"):
+                        alive_flags[id(torrent)] = False
+                        dropped["undecidable"] += 1
                         continue
                     if not passed:
                         alive_flags[id(torrent)] = False
+                        dropped["quality"] += 1
                         continue
-                    if detail.get("unverified"):
-                        self._mark_unverified(torrent)
-                    else:
-                        self._store_alive(cache_key, True, detail)
+                    self._store_alive(cache_key, True, detail)
                     alive_flags[id(torrent)] = True
             except TimeoutError:
-                logger.debug("PS 站点分享有效性检查超时，未完成的候选按未验证保留")
+                logger.debug("PS 站点分享有效性检查超时，未完成的候选按无法确认丢弃")
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)
         for torrent in ordered:
             if id(torrent) in alive_flags:
                 continue
-            alive_flags[id(torrent)] = True
-            self._mark_unverified(torrent)
-        return [torrent for torrent in ordered if alive_flags.get(id(torrent))]
+            alive_flags[id(torrent)] = False
+            dropped["undecidable"] += 1
+        kept = [torrent for torrent in ordered if alive_flags.get(id(torrent))]
+        self._log_filter_summary(site, len(ordered), len(kept), dropped)
+        return kept
 
     def search_netdisk_torrents(
         self,

@@ -93,9 +93,13 @@ UC_ERROR_CODES: dict[int, tuple[NetdiskErrorCode, str]] = {
     31001: (NetdiskErrorCode.AUTH_EXPIRED, "该分享需要登录 UC 网盘后才能访问"),
     14001: (NetdiskErrorCode.SHARE_INVALID, "UC 分享已失效或提取码有误"),
     404: (NetdiskErrorCode.SHARE_INVALID, "UC 分享已失效或已被删除"),
+    41027: (NetdiskErrorCode.SHARE_INVALID, "UC 分享不存在或已被删除"),
     41020: (NetdiskErrorCode.LINK_EXPIRED, "UC 文件令牌已过期，请重新解析分享"),
     23018: (NetdiskErrorCode.UNSUPPORTED, "该文件超出当前取链方式的限制"),
 }
+# 分享级失效的业务码：即便响应带 HTTP 401/403，也必须先按这些码判成分享失效，
+# 否则会被当成「登录态已失效」保留为无法判定的候选。
+UC_SHARE_INVALID_CODES = frozenset({14001, 404, 41027})
 
 
 def strip_puus(cookie: str) -> str:
@@ -207,10 +211,22 @@ class UCHttp(NetdiskHttp):
         """
         捕获响应 Cookie 后按基类规则解析 JSON。
 
+        分享级失效的业务码（14001/404/41027）会带 401/403 返回，必须在基类
+        按状态码兜底成「登录态失效」之前先认出来，否则失效分享会被当成无法判定。
+
         :param response: HTTP 响应
         :return: JSON 对象
         """
         self._capture(response)
+        if response is not None and getattr(response, "status_code", 0) in (401, 403):
+            try:
+                payload = response.json()
+            except Exception:  # noqa: BLE001 - 非 JSON 响应交给基类处理
+                payload = {}
+            code = as_int(payload.get("code")) if isinstance(payload, dict) else 0
+            if code in UC_SHARE_INVALID_CODES:
+                error_code, message = UC_ERROR_CODES[code]
+                raise NetdiskError(error_code, message, platform=NetdiskPlatform.UC)
         return super()._json(response)
 
     def drain_set_cookies(self) -> list[str]:
