@@ -243,6 +243,14 @@ def test_archive_size_dominant_share_is_dropped() -> None:
     assert _passed("斗破苍穹 年番", entries) is False
 
 
+def test_scrambled_file_names_skip_title_conflict() -> None:
+    """文件名被打乱成乱码时不做片名比对，避免把整包误判成另一部作品。"""
+    entries = [_entry(f"{index}！9#={index}&.mp4") for index in range(1, 8)]
+    entries += [_entry(f"{index} 4K.mp4") for index in range(190, 194)]
+
+    assert _passed("凡人修仙传 年番4 (2026)【更200集】", entries) is True
+
+
 def test_single_foreign_file_does_not_break_title_match() -> None:
     """个别文件名带别的片名时不足以否掉整包，要求陌生片名覆盖多数正片。"""
     entries = [_entry(f"凡人修仙传 {index:02d} 4K.mkv") for index in range(1, 10)]

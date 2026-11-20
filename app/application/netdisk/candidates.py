@@ -99,6 +99,8 @@ _COLLECTION_MIN_MB = 500
 _COLLECTION_MIN_SECONDS = 3000
 # 标题片名至少这么长才参与「标题与文件名冲突」判定，避免泛称误杀。
 _TITLE_NAME_MIN_CHARS = 4
+# 正片里被打乱命名的比例达到该值时，放弃用文件名反推片名。
+_SCRAMBLED_RATIO_THRESHOLD = 0.3
 
 
 @dataclass(frozen=True)
@@ -922,6 +924,10 @@ def _title_conflict(title: str, groups: FileGroups) -> bool:
     if len(name) < _TITLE_NAME_MIN_CHARS:
         return False
     sample = groups.feature[:20]
+    scrambled = sum(1 for entry in sample if _looks_scrambled(_entry_name(entry)))
+    if sample and scrambled / len(sample) >= _SCRAMBLED_RATIO_THRESHOLD:
+        # 文件名被上传者打乱成 `1！9#=4&.mp4` 这类乱码，片名比对没有意义。
+        return False
     counts: Dict[str, int] = {}
     for entry in sample:
         for segment in set(_CJK_SEGMENT.findall(_entry_path(entry))):
@@ -933,6 +939,23 @@ def _title_conflict(title: str, groups: FileGroups) -> bool:
         return False
     majority = max(2, len(sample) * 0.6)
     return any(count >= majority for count in counts.values())
+
+
+def _looks_scrambled(name: str) -> bool:
+    """
+    判断文件名是否被上传者打乱成乱码。
+
+    打乱后的名字既没有连续汉字，也没有任何集号形态，只剩数字与符号。
+
+    :param name: 文件名
+    :return: 像乱码返回 True
+    """
+    text = str(name or "")
+    if not text:
+        return True
+    if _CJK_SEGMENT.search(text):
+        return False
+    return not episode_numbers(text)
 
 
 def _form_token(form: EpisodeForm) -> Optional[str]:
