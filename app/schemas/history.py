@@ -4,7 +4,7 @@
 
 from pathlib import Path as _Path
 from pathlib import PurePosixPath as _PurePosixPath
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 from typing import Self as _Self
 from unicodedata import category as _category
 
@@ -335,16 +335,18 @@ class ContentVerifyItem(BaseModel):
 
 class ContentVerifyPage(BaseModel):
     """
-    待处理内容校验记录的分页结果。
+    内容校验记录的分页结果。
 
     :param items: 当前页记录
-    :param total: 待处理总数
-    :param pending_size: 待处理文件总占用（字节）
+    :param total: 当前筛选条件下的记录总数
+    :param pending_size: 待处理记录的文件总占用（字节）
+    :param counts: 各状态的记录数
     """
 
     items: List[ContentVerifyItem] = Field(default_factory=list, description="当前页记录")
-    total: int = Field(default=0, description="待处理总数")
-    pending_size: int = Field(default=0, description="待处理文件总占用（字节）")
+    total: int = Field(default=0, description="当前筛选条件下的记录总数")
+    pending_size: int = Field(default=0, description="待处理记录的文件总占用（字节）")
+    counts: Dict[str, int] = Field(default_factory=dict, description="各状态的记录数")
 
 
 class ContentVerifyActionRequest(BaseModel):

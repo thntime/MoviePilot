@@ -14,7 +14,7 @@ from app.application.classification.reference import (
 from app.application.configuration import get_configured_system_config
 from app.application.directory import DirectoryHelper
 from app.application.formatting import FormatParser
-from app.application.netdisk.download_verify import record_rejection, verify_downloaded_content
+from app.application.netdisk.download_verify import record_for_result, verify_downloaded_content
 from app.application.history.retry import (
     describe_history_gate,
     evaluate_history_gate,
@@ -395,11 +395,13 @@ class TransferWorkflowOwner(_TransferOwnerBase):
                     f"{fileitem.name} 内容校验通过"
                     f"（得分 {result.score}，命中 {','.join(result.hits) or '无'}）"
                 )
-            return None
-        logger.info(
-            f"{fileitem.name} 内容校验不通过：{result.reason}（置信度 {result.confidence:.2f}）"
-        )
-        record_rejection(
+            else:
+                logger.info(f"{fileitem.name} 内容校验未判定，已放行：{result.reason}")
+        else:
+            logger.info(
+                f"{fileitem.name} 内容校验不通过：{result.reason}（置信度 {result.confidence:.2f}）"
+            )
+        record_for_result(
             file_items=file_items,
             result=result,
             src=str(getattr(fileitem, "path", "") or ""),
@@ -415,6 +417,8 @@ class TransferWorkflowOwner(_TransferOwnerBase):
             episodes=_episode_range_text(meta),
             download_hash=str(download_hash or ""),
         )
+        if result.matched:
+            return None
         return f"内容校验不通过：{result.reason}"
 
     def _collect_transfer_candidates(

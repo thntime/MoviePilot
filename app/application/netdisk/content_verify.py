@@ -49,11 +49,20 @@ SCORE_TOTAL = (
     SCORE_FILE_NAME + SCORE_DIR_NAME + SCORE_TITLE
     + SCORE_DURATION + SCORE_EPISODE_HIT + SCORE_EPISODE_COUNT
 )
-# 记录状态：待处理、人工放行、已删除。
+# 记录状态：待处理、人工放行、已删除、自动通过、未判定。
 DECISION_REJECT = "reject"
 DECISION_MANUAL = "manual"
 DECISION_DELETED = "deleted"
 DECISION_PASS = "pass"
+DECISION_SKIPPED = "skipped"
+# 全部状态取值，供接口校验与前端筛选使用。
+DECISION_VALUES = (
+    DECISION_REJECT,
+    DECISION_PASS,
+    DECISION_MANUAL,
+    DECISION_DELETED,
+    DECISION_SKIPPED,
+)
 # 音频后缀，用于判断「音频占多数」。
 _AUDIO_SUFFIXES = {
     ".mp3", ".flac", ".wav", ".aac", ".m4a", ".ogg", ".ape", ".wma", ".opus", ".dsf", ".dff",
@@ -402,7 +411,7 @@ class ContentVerifyRepository(Protocol):
         """
         按状态读取记录。
 
-        :param decision: 处理状态；为空时返回待处理记录
+        :param decision: 处理状态；为空时返回全部状态的记录
         :return: 记录列表，按判定时间倒序
         """
         ...

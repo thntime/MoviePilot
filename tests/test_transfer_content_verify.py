@@ -356,6 +356,98 @@ def test_preview_skips_check(monkeypatch: pytest.MonkeyPatch) -> None:
     assert error is None
 
 
+def test_record_for_result_maps_verdict_to_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    """通过写已通过、未判定写未判定、判否写待处理，三种结论都留痕。"""
+    saved: List[Any] = []
+
+    class _Repository:
+        """收集写入记录的内存仓库。"""
+
+        def save(self, record: Any) -> Any:
+            """保存一条记录。
+
+            :param record: 待写入记录
+            :return: 保存后的记录
+            """
+            saved.append(record)
+            return record
+
+        def list(self, decision: Any = None) -> List[Any]:
+            """列出记录。
+
+            :param decision: 处理状态
+            :return: 记录列表
+            """
+            return list(saved)
+
+    monkeypatch.setattr(content_verify, "get_content_verify_store", lambda: _Repository())
+
+    def _result(matched: bool, checked: bool) -> SimpleNamespace:
+        """构造一个校验结论。
+
+        :param matched: 是否判定为目标影视
+        :param checked: 是否真的执行了校验
+        :return: 结论替身
+        """
+        return SimpleNamespace(
+            matched=matched,
+            checked=checked,
+            score=7,
+            confidence=0.9,
+            reason="判定说明",
+            hits=("标题",),
+            frames=(),
+        )
+
+    download_verify.record_for_result(file_items=[_item("第01集.mkv")], result=_result(True, True))
+    download_verify.record_for_result(file_items=[_item("第02集.mkv")], result=_result(True, False))
+    download_verify.record_for_result(file_items=[_item("第03集.mkv")], result=_result(False, True))
+
+    assert [record.decision for record in saved] == [
+        content_verify.DECISION_PASS,
+        content_verify.DECISION_SKIPPED,
+        content_verify.DECISION_REJECT,
+    ]
+
+
+def test_pass_writes_record_and_keeps_transfer_going(monkeypatch: pytest.MonkeyPatch) -> None:
+    """判定通过时也写一条记录（审核必走留痕），且不阻断整理。"""
+    captured: List[Any] = []
+    monkeypatch.setattr(
+        "app.chain.transfer.workflow.verify_downloaded_content",
+        lambda **kwargs: SimpleNamespace(
+            matched=True,
+            checked=True,
+            reason="本地证据充分",
+            score=9,
+            confidence=0.0,
+            frames=(),
+            hits=("标题",),
+        ),
+    )
+    monkeypatch.setattr(
+        "app.chain.transfer.workflow.record_for_result",
+        lambda **kwargs: captured.append(kwargs),
+    )
+
+    error = TransferWorkflowOwner._verify_downloaded_content(
+        None,
+        fileitem=_item("光阴之外 S01E49.mkv"),
+        file_items=[_item("光阴之外 S01E49.mkv")],
+        meta=_meta(),
+        mediainfo=_mediainfo(),
+        batch_mtype=MediaType.TV,
+        manual=False,
+        preview=False,
+        download_hash="h1",
+    )
+
+    assert error is None
+    assert len(captured) == 1
+    assert captured[0]["result"].matched is True
+    assert captured[0]["download_hash"] == "h1"
+
+
 def test_rejection_writes_pending_record(monkeypatch: pytest.MonkeyPatch) -> None:
     """判否时写一条待处理记录，供内容审核列表处理。"""
     saved: List[Any] = []
@@ -447,7 +539,7 @@ def test_transfer_workflow_stops_on_reject(monkeypatch: pytest.MonkeyPatch) -> N
             direct=False,
         ),
     )
-    monkeypatch.setattr("app.chain.transfer.workflow.record_rejection", lambda **kwargs: None)
+    monkeypatch.setattr("app.chain.transfer.workflow.record_for_result", lambda **kwargs: None)
 
     success, message = chain._run_transfer_workflow(
         fileitem=item,

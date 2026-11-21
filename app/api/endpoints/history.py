@@ -712,31 +712,51 @@ def _remove_local_path(target: Path) -> bool:
 
 @router.get(
     "/verify",
-    summary="查询待处理的内容校验记录",
+    summary="查询内容校验记录",
     response_model=_SchemaContentVerifyPage,
 )
 async def content_verify_list(
     page: Optional[int] = 1,
     count: Optional[int] = 30,
+    status: Optional[str] = "all",
     _: _SchemaTokenPayload = Depends(verify_token),
 ) -> Any:
     """
-    按判定时间倒序查询待处理的下载内容校验记录。
+    按判定时间倒序查询内容校验记录。
+
+    每次经过内容校验的下载都会留一条记录：判否为待处理、真正判定通过为已通过、
+    没真正判定（模型不可用等）为未判定，因此「订阅-下载-审核-整理」全程可查。
 
     :param page: 页码
     :param count: 每页数量
-    :return: 分页结果与待处理占用
+    :param status: 状态筛选，all 或具体状态取值
+    :return: 分页结果、各状态计数与待处理占用
     """
-    from app.application.netdisk.content_verify import get_content_verify_store
+    from app.application.netdisk.content_verify import (
+        DECISION_REJECT,
+        DECISION_VALUES,
+        get_content_verify_store,
+    )
 
-    records = await asyncio.to_thread(get_content_verify_store().list)
+    wanted = str(status or "all").strip().lower()
+    if wanted != "all" and wanted not in DECISION_VALUES:
+        raise HTTPException(status_code=400, detail=f"不支持的内容校验状态：{wanted}")
+    records = await asyncio.to_thread(get_content_verify_store().list, None)
+    counts: dict[str, int] = {value: 0 for value in DECISION_VALUES}
+    for record in records:
+        counts[record.decision] = counts.get(record.decision, 0) + 1
+    if wanted != "all":
+        records = [record for record in records if record.decision == wanted]
     current = max(1, int(page or 1))
     size = max(1, min(int(count or 30), 200))
     start = (current - 1) * size
     return {
         "items": [record.to_dict() for record in records[start:start + size]],
         "total": len(records),
-        "pending_size": sum(record.total_size for record in records),
+        "pending_size": sum(
+            record.total_size for record in records if record.decision == DECISION_REJECT
+        ),
+        "counts": counts,
     }
 
 

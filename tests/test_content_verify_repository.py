@@ -70,15 +70,23 @@ def test_save_assigns_id_and_timestamps(
     assert saved.decision == content_verify.DECISION_REJECT
 
 
-def test_list_returns_pending_only(repository: SqlAlchemyContentVerifyRepository) -> None:
-    """默认只列出待处理记录，处理过的不再出现。"""
+def test_list_returns_all_states_and_filters_by_decision(
+    repository: SqlAlchemyContentVerifyRepository,
+) -> None:
+    """默认列出全部状态的记录，按状态过滤时只返回该状态的记录。"""
     pending = repository.save(_record(src="/downloads/a.mkv"))
-    repository.save(_record(src="/downloads/b.mkv", decision=content_verify.DECISION_MANUAL))
+    passed = repository.save(_record(src="/downloads/b.mkv", decision=content_verify.DECISION_PASS))
+    repository.save(_record(src="/downloads/c.mkv", decision=content_verify.DECISION_MANUAL))
 
     rows = repository.list()
 
-    assert [row.id for row in rows] == [pending.id]
-    assert rows[0].src == "/downloads/a.mkv"
+    assert [row.decision for row in rows] == [
+        content_verify.DECISION_MANUAL,
+        content_verify.DECISION_PASS,
+        content_verify.DECISION_REJECT,
+    ]
+    assert [row.id for row in repository.list(content_verify.DECISION_REJECT)] == [pending.id]
+    assert [row.id for row in repository.list(content_verify.DECISION_PASS)] == [passed.id]
 
 
 def test_round_trips_all_fields(repository: SqlAlchemyContentVerifyRepository) -> None:
@@ -109,5 +117,5 @@ def test_update_decision_moves_record_out_of_pending(
     updated = repository.update_decision(saved.id, content_verify.DECISION_MANUAL)
 
     assert updated is not None and updated.decision == content_verify.DECISION_MANUAL
-    assert repository.list() == []
+    assert repository.list(content_verify.DECISION_REJECT) == []
     assert repository.list(content_verify.DECISION_MANUAL)[0].id == saved.id

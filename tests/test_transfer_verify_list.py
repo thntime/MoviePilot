@@ -1,5 +1,5 @@
 """
-验证「内容审核」列表：列表只出待处理、人工放行、删除路径校验与状态流转。
+验证「内容审核」列表：默认列出全部状态、按状态筛选、人工放行、删除路径校验与状态流转。
 """
 
 import asyncio
@@ -43,11 +43,12 @@ class MemoryContentVerifyRepository:
         """
         按状态列出记录。
 
-        :param decision: 处理状态；为空时返回待处理记录
+        :param decision: 处理状态；为空时返回全部记录
         :return: 记录列表
         """
-        target = decision or content_verify.DECISION_REJECT
-        return [row for row in self._rows.values() if row.decision == target]
+        if not decision:
+            return list(self._rows.values())
+        return [row for row in self._rows.values() if row.decision == decision]
 
     def get(self, record_id: str) -> content_verify.VerifyRecord | None:
         """
@@ -117,16 +118,42 @@ def store(monkeypatch: pytest.MonkeyPatch) -> MemoryContentVerifyRepository:
     return instance
 
 
-def test_list_returns_only_pending(store: MemoryContentVerifyRepository) -> None:
-    """列表只返回待处理记录，已处理的不再出现。"""
+def test_list_returns_all_states_by_default(store: MemoryContentVerifyRepository) -> None:
+    """默认列出全部状态：待处理与已通过的记录都在列表里。"""
     store.save(_record("/downloads/a/a.mkv"))
-    store.save(_record("/downloads/b/b.mkv", decision=content_verify.DECISION_MANUAL))
+    store.save(_record("/downloads/b/b.mkv", decision=content_verify.DECISION_PASS))
 
     payload = asyncio.run(history_api.content_verify_list(page=1, count=30, _=None))
 
+    assert payload["total"] == 2
+    assert {item["src"] for item in payload["items"]} == {"/downloads/a/a.mkv", "/downloads/b/b.mkv"}
+    assert payload["counts"]["reject"] == 1
+    assert payload["counts"]["pass"] == 1
+    assert payload["pending_size"] == 2048
+
+
+def test_list_filters_by_status(store: MemoryContentVerifyRepository) -> None:
+    """按状态筛选时只返回该状态的记录，计数仍给出全部状态。"""
+    store.save(_record("/downloads/a/a.mkv"))
+    store.save(_record("/downloads/b/b.mkv", decision=content_verify.DECISION_PASS))
+
+    payload = asyncio.run(
+        history_api.content_verify_list(page=1, count=30, status="reject", _=None)
+    )
+
     assert payload["total"] == 1
     assert payload["items"][0]["src"] == "/downloads/a/a.mkv"
-    assert payload["pending_size"] == 2048
+    assert payload["counts"]["pass"] == 1
+
+
+def test_list_rejects_unknown_status(store: MemoryContentVerifyRepository) -> None:
+    """未知状态直接拒绝，避免静默返回空列表。"""
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(
+            history_api.content_verify_list(page=1, count=30, status="unknown", _=None)
+        )
+
+    assert error.value.status_code == 400
 
 
 def test_list_exposes_score_and_confidence(store: MemoryContentVerifyRepository) -> None:
@@ -143,10 +170,15 @@ def test_list_exposes_score_and_confidence(store: MemoryContentVerifyRepository)
 
 
 def test_list_returns_empty_when_nothing_pending(store: MemoryContentVerifyRepository) -> None:
-    """没有待处理记录时返回空列表而不是报错。"""
+    """没有记录时返回空列表与全零计数，而不是报错。"""
     payload = asyncio.run(history_api.content_verify_list(page=1, count=30, _=None))
 
-    assert payload == {"items": [], "total": 0, "pending_size": 0}
+    assert payload == {
+        "items": [],
+        "total": 0,
+        "pending_size": 0,
+        "counts": {"reject": 0, "pass": 0, "manual": 0, "deleted": 0, "skipped": 0},
+    }
 
 
 def test_accept_marks_manual(
@@ -237,7 +269,7 @@ def test_delete_removes_file_and_marks_deleted(
     assert payload["success"] is True
     assert not target.exists()
     assert store.get(saved.id).decision == content_verify.DECISION_DELETED
-    assert store.list() == []
+    assert store.list(content_verify.DECISION_REJECT) == []
 
 
 def test_delete_rejects_remote_storage(

@@ -197,10 +197,11 @@ def verify_downloaded_content(
     )
 
 
-def record_rejection(
+def record_verification(
     *,
     file_items: Sequence[Any],
     result: VerifyResult,
+    decision: str = content_verify.DECISION_REJECT,
     target: Optional[TargetMedia] = None,
     src: str = "",
     storage: str = "local",
@@ -213,10 +214,11 @@ def record_rejection(
     download_hash: str = "",
 ) -> Optional[VerifyRecord]:
     """
-    把一次判否写成待处理记录，供「内容审核」列表展示与处理。
+    把一次内容校验写成审核记录，供「内容审核」列表展示与处理。
 
     :param file_items: 本次整理的源文件项
     :param result: 校验结论
+    :param decision: 记录状态，默认判否待处理
     :param target: 目标媒体
     :param src: 源路径
     :param storage: 源存储
@@ -244,6 +246,7 @@ def record_rejection(
         reason=str(result.reason or ""),
         hits=list(result.hits),
         frames=list(result.frames),
+        decision=str(decision or content_verify.DECISION_REJECT),
         file_count=len(list(file_items)),
         total_size=sum(sizes),
         median_duration=int(sorted(durations)[len(durations) // 2]) if durations else 0,
@@ -253,9 +256,86 @@ def record_rejection(
     )
     try:
         return content_verify.get_content_verify_store().save(record)
-    except Exception as error:  # noqa: BLE001 - 记录失败不阻断判否
+    except Exception as error:  # noqa: BLE001 - 记录失败不阻断整理
         logger.warning(f"写入内容校验记录失败：{type(error).__name__}: {error}")
         return None
+
+
+def record_for_result(
+    *,
+    file_items: Sequence[Any],
+    result: VerifyResult,
+    **kwargs: Any,
+) -> Optional[VerifyRecord]:
+    """
+    按校验结论自动选择状态并写一条审核记录。
+
+    判否写待处理、真正判定通过写已通过、没真正判定（模型不可用、缺目标媒体、
+    没有可校验文件）写未判定，这样「订阅-下载-审核-整理」每一步都留痕可查。
+
+    :param file_items: 本次整理的源文件项
+    :param result: 校验结论
+    :param kwargs: 其余记录字段
+    :return: 写入的记录；失败时返回 None
+    """
+    if not result.matched:
+        decision = content_verify.DECISION_REJECT
+    elif result.checked:
+        decision = content_verify.DECISION_PASS
+    else:
+        decision = content_verify.DECISION_SKIPPED
+    return record_verification(
+        file_items=file_items, result=result, decision=decision, **kwargs
+    )
+
+
+def record_rejection(
+    *,
+    file_items: Sequence[Any],
+    result: VerifyResult,
+    target: Optional[TargetMedia] = None,
+    src: str = "",
+    storage: str = "local",
+    title: str = "",
+    media_type: str = "",
+    season: str = "",
+    episodes: str = "",
+    platform: str = "",
+    share_code: str = "",
+    download_hash: str = "",
+) -> Optional[VerifyRecord]:
+    """
+    把一次判否写成待处理记录（保留旧入口）。
+
+    :param file_items: 本次整理的源文件项
+    :param result: 校验结论
+    :param target: 目标媒体
+    :param src: 源路径
+    :param storage: 源存储
+    :param title: 媒体标题
+    :param media_type: 媒体类型
+    :param season: 季号
+    :param episodes: 集号文本
+    :param platform: 网盘平台
+    :param share_code: 分享码
+    :param download_hash: 下载任务标识
+    :return: 写入的记录；失败时返回 None
+    """
+    return record_verification(
+        file_items=file_items,
+        result=result,
+        decision=content_verify.DECISION_REJECT,
+        target=target,
+        src=src,
+        storage=storage,
+        title=title,
+        media_type=media_type,
+        season=season,
+        episodes=episodes,
+        platform=platform,
+        share_code=share_code,
+        download_hash=download_hash,
+    )
 
 
 def _reject(

@@ -80,11 +80,10 @@ class SqlAlchemyContentVerifyRepository:
         """
         按状态读取记录。
 
-        :param decision: 处理状态；为空时返回待处理记录
+        :param decision: 处理状态；为空时返回全部状态的记录
         :return: 记录列表
         """
-        target = decision or DECISION_REJECT
-        rows = self._read(lambda oper: oper.list_all(target))
+        rows = self._read(lambda oper: oper.list_all(decision))
         return [record_from_dict(row) for row in rows]
 
     def get(self, record_id: str) -> Optional[VerifyRecord]:
