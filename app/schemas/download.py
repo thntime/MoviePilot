@@ -2,7 +2,7 @@
 下载任务、下载器状态和源文件分类接口的数据结构。
 """
 
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 from pydantic import model_validator as _model_validator
@@ -40,6 +40,26 @@ class DownloadDirectory(BaseModel):
     media_category_id: Optional[str] = Field(default=None, description="适用媒体分类稳定 ID")
 
 
+class DownloadMediaAlternative(BaseModel):
+    """
+    同名多版本识别时的一个候选版本。
+
+    :param media_source: 媒体元数据来源
+    :param media_id: 来源内媒体标识
+    :param title: 媒体标题
+    :param year: 年份
+    :param type: 媒体类型（电影/电视剧）
+    :param poster: 海报地址
+    """
+
+    media_source: str = Field(description="媒体元数据来源")
+    media_id: str = Field(description="来源内媒体标识")
+    title: str = Field(default="", description="媒体标题")
+    year: Optional[str] = Field(default=None, description="年份")
+    type: Optional[str] = Field(default=None, description="媒体类型（电影/电视剧）")
+    poster: Optional[str] = Field(default=None, description="海报地址")
+
+
 class DownloadAddedData(BaseModel):
     """
     下载任务添加结果。
@@ -49,6 +69,10 @@ class DownloadAddedData(BaseModel):
     requires_confirmation: bool = Field(
         default=False,
         description="是否需要用户确认后下载未识别资源",
+    )
+    alternatives: List[DownloadMediaAlternative] = Field(
+        default_factory=list,
+        description="同名多版本识别时的候选版本列表，非空时要求用户选择版本",
     )
 
 

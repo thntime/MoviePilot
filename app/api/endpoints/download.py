@@ -137,6 +137,93 @@ def _build_unrecognized_media_info(
     )
 
 
+def _normalize_media_title(title: str) -> str:
+    """
+    归一化媒体标题用于同名版本比较。
+
+    :param title: 原始标题
+    :return: 去掉空白与标点差异的小写标题
+    """
+    return "".join(character for character in str(title or "").lower() if character.isalnum())
+
+
+def _recognized_title_keys(recognized: MediaInfo | MusicInfo) -> set[str]:
+    """
+    收集识别结果的标题、原名与英文名，用于跨语言比较同名版本。
+
+    TMDB 对中文标题的搜索可能返回英文原名（如斗破苍穹返回 Fights Break Sphere），
+    只比较中文标题会漏掉同一作品的不同版本。
+
+    :param recognized: 识别命中的媒体信息
+    :return: 归一化标题集合
+    """
+    values = [
+        getattr(recognized, "title", ""),
+        getattr(recognized, "original_title", ""),
+        getattr(recognized, "en_title", ""),
+        getattr(recognized, "original_name", ""),
+    ]
+    values.extend(getattr(recognized, "names", None) or [])
+    return {_normalize_media_title(value) for value in values if _normalize_media_title(value)}
+
+
+def _same_title_alternatives(
+    recognized: MediaInfo | MusicInfo,
+    candidates: list[MediaInfo] | list[MusicInfo] | None,
+) -> list[MediaInfo]:
+    """
+    从标题搜索候选里挑出与识别结果同名但身份不同的版本。
+
+    下载入口没有媒体身份时按标题重新识别，同名多版本（动漫与真人剧、翻拍等）
+    会被静默归到搜索排序第一的版本上，下载和整理全程跟着错。这里把同名不同
+    身份的版本全部找出来交给用户选。
+
+    :param recognized: 识别命中的媒体信息
+    :param candidates: 标题搜索返回的候选列表
+    :return: 同名版本列表（含识别命中项），不足两个时为空列表
+    """
+    if not candidates:
+        return []
+    title_keys = _recognized_title_keys(recognized)
+    if not title_keys:
+        return []
+    same_title: dict[str, MediaInfo] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, MediaInfo):
+            continue
+        if _normalize_media_title(candidate.title) not in title_keys:
+            continue
+        key = f"{candidate.media_source}:{candidate.media_id}"
+        same_title.setdefault(key, candidate)
+    if len(same_title) < 2:
+        return []
+    return sorted(
+        same_title.values(),
+        key=lambda item: (item.year or "", item.media_id or ""),
+        reverse=True,
+    )
+
+
+def _alternatives_payload(alternatives: list[MediaInfo]) -> list[dict]:
+    """
+    把同名版本列表投影成响应里的候选结构。
+
+    :param alternatives: 同名版本列表
+    :return: 候选字典列表
+    """
+    return [
+        {
+            "media_source": str(item.media_source or ""),
+            "media_id": str(item.media_id or ""),
+            "title": str(item.title or ""),
+            "year": str(item.year) if item.year is not None else None,
+            "type": str(getattr(item.type, "value", item.type) or "") or None,
+            "poster": str(item.poster_path or "") or None,
+        }
+        for item in alternatives
+    ]
+
+
 def _resolve_add_media(
     torrent_in: _SchemaTorrentInfo,
     media_source: MediaSource | None,
@@ -201,6 +288,24 @@ def _resolve_add_media(
             mtype=MediaType.MUSIC if is_music else None,
             music_type=normalized_music_type,
         )
+        if mediainfo and not is_music and not allow_unrecognized:
+            # 无身份下载按标题识别，同名多版本时必须让用户选，不许静默挑一个。
+            # 用识别后的干净标题做广搜，避免「年番」等词或电视剧限定漏掉同名版本。
+            candidates = MediaChain().search_medias(MetaInfo(title=mediainfo.title))
+            alternatives = _same_title_alternatives(mediainfo, candidates)
+            if alternatives:
+                return (
+                    metainfo,
+                    None,
+                    _SchemaResponse(
+                        success=False,
+                        message=f"《{mediainfo.title}》有多个同名版本，请选择要下载的版本",
+                        data=_SchemaDownloadAddedData(
+                            requires_confirmation=True,
+                            alternatives=_alternatives_payload(alternatives),
+                        ),
+                    ),
+                )
     if mediainfo:
         return metainfo, mediainfo, None
     if not allow_unrecognized:
