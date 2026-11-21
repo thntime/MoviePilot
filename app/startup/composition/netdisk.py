@@ -36,7 +36,9 @@ def configure_netdisk_composition() -> None:
     from app.adapters.external.netdisk.xunlei import XunleiAdapter
     from app.adapters.system.netdisk_speed import JsonNetdiskSpeedStore
     from app.application.configuration import get_token_runtime_config
+    from app.application.netdisk.content_verify import configure_content_verify_repository
     from app.application.netdisk.contract import NetdiskAdapter
+    from app.db.adapters.contentverify import SqlAlchemyContentVerifyRepository
     from app.db.adapters.netdiskaccount import TransactionalNetdiskAccountRepository
     from app.db.session import SessionFactory
     from app.domain.netdisk import NetdiskAccountRecord, NetdiskPlatform
@@ -100,6 +102,9 @@ def configure_netdisk_composition() -> None:
             http.credential_refresher = refresh_credential
 
     configure_netdisk_adapters(cast(dict[NetdiskPlatform, NetdiskAdapter], adapters))
+    configure_content_verify_repository(
+        SqlAlchemyContentVerifyRepository(sync_session=SessionFactory)
+    )
     selection.configure_speed_store(JsonNetdiskSpeedStore())
     configure_netdisk_services(
         account_store=store,
@@ -114,5 +119,8 @@ def reset_netdisk_composition() -> None:
     """
     释放网盘端口，支持重复 lifespan 与失败回滚。
     """
+    from app.application.netdisk.content_verify import configure_content_verify_repository
+
+    configure_content_verify_repository(None)
     selection.configure_speed_store(None)
     reset_netdisk_services()

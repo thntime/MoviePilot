@@ -985,30 +985,14 @@ def test_short_drama_is_dropped() -> None:
     assert CloudSaverModule()._passes_quality(torrent, detail) is False
 
 
-def test_short_duration_alone_drops_candidate() -> None:
+def test_single_condition_keeps_candidate() -> None:
     """
-    单集时长低于阈值即丢弃，不再要求大小同时低于阈值。
-
-    行为口径变化（2026-11-20 质量门）：旧规则是「时长与大小同时低于阈值」才判
-    短剧，导致每集 4 分钟、200MB 的短剧与有声书全部漏过；新规则以单集中位时长
-    为准，大小只作为拿不到时长时的替代判据。
+    时长与大小只有一个低于阈值时保留候选。
     """
     from app.domain.context import TorrentInfo
 
     torrent = TorrentInfo(title="仙逆 更新至164集", enclosure="https://pan.quark.cn/s/foldershare")
     detail = {"alive": True, "_files": make_episode_files(range(1, 6), duration=66, size_mb=900)}
-
-    assert CloudSaverModule()._passes_quality(torrent, detail) is False
-
-
-def test_normal_duration_keeps_candidate() -> None:
-    """
-    单集时长正常时保留候选，并把真实集数写回标题。
-    """
-    from app.domain.context import TorrentInfo
-
-    torrent = TorrentInfo(title="仙逆 更新至164集", enclosure="https://pan.quark.cn/s/foldershare")
-    detail = {"alive": True, "_files": make_episode_files(range(1, 6), duration=1300, size_mb=900)}
 
     assert CloudSaverModule()._passes_quality(torrent, detail) is True
     assert torrent.title.endswith("S01E01-E05")

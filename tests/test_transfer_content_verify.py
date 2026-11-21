@@ -17,6 +17,8 @@ from app.schemas.types import MediaType
 
 _MB = 1024 * 1024
 _RUNTIME_MINUTES = 45
+# 夹具会把模块属性替换成固定串，这里先留一份真实实现供提示词用例直接调用。
+_REAL_RENDER_PROMPT = download_verify._render_prompt
 
 
 def _item(name: str, size_mb: int = 800, path: str = "") -> FileItem:
@@ -97,7 +99,7 @@ def _environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         download_verify,
         "_render_prompt",
-        lambda target, evidence, score, task_name: "PROMPT",
+        lambda target, evidence, score, task_name, frames=(): "PROMPT",
     )
 
 
@@ -354,10 +356,52 @@ def test_preview_skips_check(monkeypatch: pytest.MonkeyPatch) -> None:
     assert error is None
 
 
-def test_rejection_writes_pending_record(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rejection_writes_pending_record(monkeypatch: pytest.MonkeyPatch) -> None:
     """判否时写一条待处理记录，供内容审核列表处理。"""
-    store = content_verify.ContentVerifyStore(tmp_path / "content_verify.json")
-    monkeypatch.setattr(content_verify, "get_content_verify_store", lambda: store)
+    saved: List[Any] = []
+
+    class _Repository:
+        """记录判否写入的内存仓库。"""
+
+        def save(self, record: Any) -> Any:
+            """保存一条记录。
+
+            :param record: 待处理记录
+            :return: 保存后的记录
+            """
+            saved.append(record)
+            return record
+
+        def list(self, decision: Any = None) -> List[Any]:
+            """列出记录。
+
+            :param decision: 处理状态
+            :return: 记录列表
+            """
+            return list(saved)
+
+        def get(self, record_id: str) -> Any:
+            """按标识读取记录。
+
+            :param record_id: 记录标识
+            :return: 记录
+            """
+            return next((item for item in saved if item.id == record_id), None)
+
+        def update_decision(self, record_id: str, decision: str) -> Any:
+            """更新处理状态。
+
+            :param record_id: 记录标识
+            :param decision: 新状态
+            :return: 更新后的记录
+            """
+            record = self.get(record_id)
+            if record is not None:
+                record.decision = decision
+            return record
+
+    repository = _Repository()
+    monkeypatch.setattr(content_verify, "get_content_verify_store", lambda: repository)
     model = _FakeModel(['{"match": false, "confidence": 0.95, "reason": "文件名是另一部作品"}'])
     monkeypatch.setattr(download_verify, "_call_model", model)
 
@@ -374,7 +418,7 @@ def test_rejection_writes_pending_record(tmp_path: Any, monkeypatch: pytest.Monk
     )
 
     assert error is not None and "内容校验不通过" in error
-    records = store.list()
+    records = repository.list()
     assert len(records) == 1
     assert records[0].reason == "文件名是另一部作品"
     assert records[0].decision == content_verify.DECISION_REJECT
@@ -418,3 +462,48 @@ def test_transfer_workflow_stops_on_reject(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert success is False
     assert "内容校验不通过" in str(message)
+
+
+def test_frames_are_sent_to_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    """抽帧图要作为图片随提示词一起提交给模型，不能只落盘存证。"""
+    frame = tmp_path / "frame.jpg"
+    frame.write_bytes(b"\xff\xd8\xff\xd9")
+    captured: List[Tuple[str, ...]] = []
+
+    async def _model(prompt: str, images: Tuple[str, ...] = ()) -> str:
+        """记录收到的图片并回放判定。
+
+        :param prompt: 提示词
+        :param images: 图片
+        :return: 模型输出
+        """
+        captured.append(tuple(images))
+        return '{"match": true, "confidence": 0.9, "reason": "画面是正片"}'
+
+    monkeypatch.setattr(download_verify, "_call_model", _model)
+    monkeypatch.setattr(content_verify, "extract_frames", lambda paths: (str(frame),))
+
+    download_verify.verify_downloaded_content(
+        mediainfo=_mediainfo(),
+        meta=_meta(),
+        file_items=[_item("启运丹田.mkv")],
+        task_name="启运丹田",
+    )
+
+    assert captured, "模型没有被调用"
+    assert captured[0], "模型没有收到图片"
+    assert captured[0][0].startswith("data:image/jpeg;base64,")
+
+
+def test_prompt_reports_attached_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    """提示词要告诉模型附带了几张截图。"""
+    from app.agent.prompt import prompt_manager
+    from app.application.netdisk.content_verify import build_evidence, build_target, score_evidence
+
+    monkeypatch.setattr("app.application.agent.get_prompt_manager", lambda: prompt_manager)
+    target = build_target(_mediainfo(), _meta())
+    evidence = build_evidence([_item("启运丹田.mkv")])
+    score = score_evidence(target, evidence, task_name="启运丹田")
+    prompt = _REAL_RENDER_PROMPT(target, evidence, score, "启运丹田", ("a.jpg", "b.jpg"))
+
+    assert "2 still frames" in prompt

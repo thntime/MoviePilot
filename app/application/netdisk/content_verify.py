@@ -1,25 +1,22 @@
 """
-下载后内容校验的证据打分、抽帧与待处理记录存储。
+下载后内容校验的证据打分、抽帧与待处理记录端口。
 
 打分只做本地能算的事（文件名、目录名、标题、时长、集号），据此决定是否需要
-请模型介入、是否需要抽帧；抽帧用 ffmpeg 截两帧存证，供人工复核与列表详情展示。
-待处理记录写在配置目录下的 JSON 文件里，由「内容审核」列表读写。
+请模型介入、是否需要抽帧；抽帧用 ffmpeg 截两帧，既作为多模态证据交给模型，
+也随记录存证供人工复核。待处理记录通过 `ContentVerifyRepository` 端口持久化，
+具体实现由组合根注入。
 """
 
 from __future__ import annotations
 
-import json
-import os
 import shutil
 import statistics
 import subprocess
-import tempfile
-import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 from app.domain.episode import episode_numbers
 from app.foundation.environment import get_config_path
@@ -40,8 +37,6 @@ DURATION_TOLERANCE_SECONDS = 180
 DIRECT_REJECT_RATIO = 0.5
 # 证据得分达到该值时不再问模型。
 SCORE_SKIP_MODEL = 5
-# 证据得分低于该值时跳过文本轮，直接抽帧问。
-SCORE_FRAME_FIRST = 2
 # 文件名、目录名、标题、时长、集号、集数各自的分值。
 SCORE_FILE_NAME = 3
 SCORE_DIR_NAME = 2
@@ -64,7 +59,6 @@ _AUDIO_SUFFIXES = {
     ".mp3", ".flac", ".wav", ".aac", ".m4a", ".ogg", ".ape", ".wma", ".opus", ".dsf", ".dff",
 }
 _FRAME_DIR_NAME = "content_verify_frames"
-_STORE_FILE_NAME = "content_verify.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,13 +308,14 @@ def frame_policy(result: ScoreResult) -> str:
     """
     根据得分决定是否需要模型介入以及是否需要抽帧。
 
+    只要名字证据不足以直接放行，就抽帧带图问模型：画面是判断「这到底是不是
+    这部剧」最直接的证据，只给文件名和标题容易在频道文案串作品时判错。
+
     :param result: 打分结果
-    :return: `skip`（直接放行）、`text`（先纯文本问）、`frames`（直接带图问）
+    :return: `skip`（名字证据充分，直接放行）、`frames`（抽帧带图问模型）
     """
     if result.score >= SCORE_SKIP_MODEL:
         return "skip"
-    if result.score >= SCORE_FRAME_FIRST:
-        return "text"
     return "frames"
 
 
@@ -387,80 +382,39 @@ def cleanup_expired_frames(now: Optional[datetime] = None) -> int:
     return removed
 
 
-class ContentVerifyStore:
+class ContentVerifyRepository(Protocol):
     """
-    待处理内容校验记录的 JSON 存储。
+    待处理内容校验记录的持久化端口。
 
-    记录量级很小（只有判否的下载），用单文件加锁读写足够；写入走临时文件
-    加原子替换，避免进程中断留下半截 JSON。
+    具体实现由组合根注入（当前是数据库表 `contentverify`），应用层只依赖本协议。
     """
-
-    def __init__(self, path: Path) -> None:
-        """
-        保存存储路径。
-
-        :param path: JSON 文件路径
-        """
-        self._path = path
-        self._lock = threading.Lock()
-
-    @property
-    def path(self) -> Path:
-        """
-        返回存储文件路径。
-
-        :return: 路径
-        """
-        return self._path
 
     def save(self, record: VerifyRecord) -> VerifyRecord:
         """
-        新增或覆盖一条记录。
+        新增一条记录。
 
-        :param record: 记录
+        :param record: 待写入记录
         :return: 写入后的记录
         """
-        now = _now_text()
-        if not record.id:
-            record.id = uuid.uuid4().hex[:16]
-        if not record.created_at:
-            record.created_at = now
-        record.updated_at = now
-        with self._lock:
-            records = self._load()
-            records[record.id] = record.to_dict()
-            self._write(records)
-        return record
+        ...
 
     def list(self, decision: Optional[str] = None) -> List[VerifyRecord]:
         """
-        按状态读取记录，默认只返回待处理。
+        按状态读取记录。
 
         :param decision: 处理状态；为空时返回待处理记录
-        :return: 记录列表，按创建时间倒序
+        :return: 记录列表，按判定时间倒序
         """
-        with self._lock:
-            payload = self._load()
-        target = decision or DECISION_REJECT
-        records = [
-            _record_from_dict(item)
-            for item in payload.values()
-            if str(item.get("decision") or "") == target
-        ]
-        records.sort(key=lambda item: item.created_at, reverse=True)
-        return records
+        ...
 
     def get(self, record_id: str) -> Optional[VerifyRecord]:
         """
         读取单条记录。
 
         :param record_id: 记录标识
-        :return: 记录；不存在时返回 None
+        :return: 记录；不存在时为空
         """
-        with self._lock:
-            payload = self._load()
-        item = payload.get(record_id)
-        return _record_from_dict(item) if item else None
+        ...
 
     def update_decision(self, record_id: str, decision: str) -> Optional[VerifyRecord]:
         """
@@ -468,73 +422,38 @@ class ContentVerifyStore:
 
         :param record_id: 记录标识
         :param decision: 新状态
-        :return: 更新后的记录；不存在时返回 None
+        :return: 更新后的记录；不存在时为空
         """
-        with self._lock:
-            payload = self._load()
-            item = payload.get(record_id)
-            if item is None:
-                return None
-            item["decision"] = decision
-            item["updated_at"] = _now_text()
-            payload[record_id] = item
-            self._write(payload)
-        return _record_from_dict(item)
+        ...
 
-    def _load(self) -> Dict[str, Dict[str, Any]]:
-        """
-        读取全部记录。
 
-        :return: 记录字典
-        """
-        if not self._path.exists():
-            return {}
-        try:
-            payload = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
-            logger.warning(f"读取内容校验记录失败：{error}")
-            return {}
-        return payload if isinstance(payload, dict) else {}
+_repository: Optional[ContentVerifyRepository] = None
 
-    def _write(self, payload: Dict[str, Dict[str, Any]]) -> None:
-        """
-        原子写入全部记录。
 
-        :param payload: 记录字典
-        """
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        handle = tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=str(self._path.parent),
-            prefix=f".{self._path.name}.", delete=False,
+def configure_content_verify_repository(
+    repository: Optional[ContentVerifyRepository],
+) -> None:
+    """
+    由组合根注册待处理记录仓库。
+
+    :param repository: 仓库实现；传 None 表示释放
+    """
+    global _repository
+    _repository = repository
+
+
+def get_content_verify_store() -> ContentVerifyRepository:
+    """
+    返回已装配的待处理记录仓库。
+
+    :return: 仓库实现
+    :raises RuntimeError: 组合根尚未装配
+    """
+    if _repository is None:
+        raise RuntimeError(
+            "内容校验记录仓库未装配：请先在组合根调用 configure_content_verify_repository"
         )
-        try:
-            with handle as stream:
-                json.dump(payload, stream, ensure_ascii=False, indent=2)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(handle.name, self._path)
-        except BaseException:
-            Path(handle.name).unlink(missing_ok=True)
-            raise
-
-
-_store: Optional[ContentVerifyStore] = None
-_store_lock = threading.Lock()
-
-
-def get_content_verify_store() -> ContentVerifyStore:
-    """
-    返回进程内共享的内容校验记录存储。
-
-    :return: 存储单例
-    """
-    global _store
-    if _store is not None:
-        return _store
-    with _store_lock:
-        if _store is None:
-            _store = ContentVerifyStore(get_config_path() / _STORE_FILE_NAME)
-        return _store
+    return _repository
 
 
 def _frame_root() -> Path:
@@ -544,15 +463,6 @@ def _frame_root() -> Path:
     :return: 目录路径
     """
     return get_config_path() / _FRAME_DIR_NAME
-
-
-def _now_text() -> str:
-    """
-    返回当前时间文本。
-
-    :return: `YYYY-mm-dd HH:MM:SS`
-    """
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _compact(numbers: Sequence[int]) -> str:
@@ -752,9 +662,11 @@ def _grab_frame(ffmpeg: str, path: Path, position: float, output: Path) -> bool:
     return result.returncode == 0 and output.is_file()
 
 
-def _record_from_dict(payload: Dict[str, Any]) -> VerifyRecord:
+def record_from_dict(payload: Dict[str, Any]) -> VerifyRecord:
     """
     把字典还原成记录对象。
+
+    持久化实现把数据库行投影成同名字典后，用它还原成领域记录。
 
     :param payload: 字典
     :return: 记录对象

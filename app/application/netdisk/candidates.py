@@ -9,7 +9,6 @@ CD 站点与 PanSou 站点共用同一套规则：平台是否可用、文件类
 from __future__ import annotations
 
 import re
-import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -59,10 +58,6 @@ _JUNK_SUFFIXES = {
 _MEDIA_COVERAGE_THRESHOLD = 0.8
 # 正片（或音频）占媒体总大小的下限，用来区分影视与有声书/音乐分享。
 _TYPE_RATIO_THRESHOLD = 0.8
-# 单集中位时长超过该值时按电影/合集处理，不再套短剧判据。
-_LONG_FEATURE_SECONDS = 7200
-# 没有时长信息时，平均单集低于该大小且集数偏多，按疑似有声书丢弃。
-_SUSPECT_AUDIO_BOOK_EPISODES = 20
 # 正片文件名里出现这些词说明不是正片，不能计入正片集合。
 _NON_FEATURE_PATTERN = re.compile(
     r"花絮|预告|特典|番外|OST|主题曲|片头|片尾|sample|trailer|广告|公众号|更多资源|最新地址",
@@ -642,7 +637,7 @@ def passes_quality(
             f"（正片 {len(groups.feature)} 个，可解析 {parsed} 个）"
         )
         return False
-    if _too_short(torrent, groups, form, config_getter):
+    if _too_short(torrent, groups, config_getter):
         return False
     if _archive_dominant(groups):
         logger.info(f"{torrent.title} 压缩包资源暂不支持，已丢弃")
@@ -834,40 +829,33 @@ def _looks_like_collection(features: List[Dict[str, Any]]) -> bool:
 def _too_short(
     torrent: TorrentInfo,
     groups: FileGroups,
-    form: EpisodeForm,
     config_getter: Optional[Callable[[], Any]],
 ) -> bool:
     """
-    判断正片是否短得像预告、短剧或有声书。
+    判断正片是否短得像短剧：平均单集时长与平均单集大小同时低于阈值。
 
-    有单集时长时按中位时长判；拿不到时长（除夸克外所有平台）时，用
-    「平均单集偏小且集数偏多」作为疑似有声书的替代判据。
+    沿用项目原有口径，两个条件必须同时成立才算短剧。只有时长偏低、或只有
+    体积偏小的分享一律保留，避免把码率低或单集短的正片误杀；拿不到时长时
+    同样不丢，交给标题、类型占比与内容校验兜底。
 
     :param torrent: 待判定的网盘候选
     :param groups: 文件分类结果
-    :param form: 集数形态
     :param config_getter: 读取系统配置的入口
     :return: 需要丢弃返回 True
     """
     duration_limit, size_limit = quality_limits(config_getter)
     durations = [_entry_duration(entry) for entry in groups.feature]
     durations = [value for value in durations if value > 0]
-    if durations:
-        median = statistics.median(durations)
-        if median > _LONG_FEATURE_SECONDS:
-            return False
-        if median < duration_limit:
-            logger.info(f"{torrent.title} 单集中位时长 {median:.0f} 秒过短，已丢弃")
-            return True
-        return False
     sizes = [_entry_size(entry) for entry in groups.feature]
     sizes = [value for value in sizes if value > 0]
-    if not sizes or form.episode_count < _SUSPECT_AUDIO_BOOK_EPISODES:
+    if not durations or not sizes:
         return False
+    average_duration = sum(durations) / len(durations)
     average_mb = sum(sizes) / len(sizes) / 1024 / 1024
-    if average_mb < size_limit:
+    if average_duration < duration_limit and average_mb < size_limit:
         logger.info(
-            f"{torrent.title} 平均单集 {average_mb:.0f}MB 且 {form.episode_count} 集，疑似有声书，已丢弃"
+            f"{torrent.title} 平均单集 {average_duration:.0f} 秒 / {average_mb:.0f}MB，"
+            "时长与大小同时低于短剧阈值，已丢弃"
         )
         return True
     return False

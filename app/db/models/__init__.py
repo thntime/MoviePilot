@@ -13,6 +13,7 @@ _MODEL_EXPORTS = {
     "AgentInvocation": ("app.db.models.agentinvocation", "AgentInvocation"),
     "AgentTask": ("app.db.models.agenttask", "AgentTask"),
     "AgentTaskRun": ("app.db.models.agenttaskrun", "AgentTaskRun"),
+    "ContentVerify": ("app.db.models.contentverify", "ContentVerify"),
     "DownloadFailure": ("app.db.models.downloadfailure", "DownloadFailure"),
     "DownloadFiles": ("app.db.models.downloadhistory", "DownloadFiles"),
     "DownloadHistory": ("app.db.models.downloadhistory", "DownloadHistory"),

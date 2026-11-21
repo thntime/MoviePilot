@@ -201,11 +201,11 @@ def test_title_episode_is_written_back_for_single_file() -> None:
     assert torrent.raw_title == "🎬 凡人修仙传：慕兰之战  第197集"
 
 
-def test_short_drama_with_large_size_is_dropped() -> None:
-    """每集 4 分钟、200MB 的短剧按单集中位时长丢弃，不再要求大小同时超标。"""
+def test_short_drama_with_large_size_is_kept() -> None:
+    """时长低于阈值但单集体积够大时保留：短剧判定沿用双条件口径。"""
     entries = [_entry(f"某短剧 第{index:03d}集.mp4", size_mb=200, duration=240) for index in range(1, 81)]
 
-    assert _passed("某短剧 全80集", entries) is False
+    assert _passed("某短剧 全80集", entries) is True
 
 
 def test_audio_book_title_is_dropped() -> None:
@@ -215,11 +215,18 @@ def test_audio_book_title_is_dropped() -> None:
     assert _passed("斗破苍穹 有声小说 更新至20集", entries) is False
 
 
-def test_small_episodes_without_duration_are_dropped() -> None:
-    """拿不到时长时，平均单集偏小且集数偏多按疑似有声书丢弃。"""
+def test_short_drama_with_small_size_is_dropped() -> None:
+    """时长与大小同时低于阈值时才判短剧丢弃。"""
+    entries = [_entry(f"某短剧 第{index:03d}集.mp4", size_mb=80, duration=240) for index in range(1, 81)]
+
+    assert _passed("某短剧 全80集", entries) is False
+
+
+def test_small_episodes_without_duration_are_kept() -> None:
+    """拿不到时长时不判短剧，避免把非夸克平台的正常剧集误杀。"""
     entries = [_entry(f"斗破苍穹 第{index:03d}集.mp4", size_mb=100, duration=0) for index in range(1, 41)]
 
-    assert _passed("斗破苍穹 年番", entries) is False
+    assert _passed("斗破苍穹 年番", entries) is True
 
 
 def test_season_is_read_from_relative_path() -> None:

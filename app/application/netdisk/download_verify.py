@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.application.netdisk import content_verify
@@ -363,7 +364,7 @@ def _judge(
     :return: 判定结果；模型不可用或输出非法时返回 None
     """
     try:
-        prompt = _render_prompt(target, evidence, score, task_name)
+        prompt = _render_prompt(target, evidence, score, task_name, frames)
         output = _call_model_sync(prompt, frames)
         return _parse_verdict(output)
     except Exception as error:  # noqa: BLE001 - 模型失败一律放行
@@ -376,6 +377,7 @@ def _render_prompt(
     evidence: Sequence[FileEvidence],
     score: ScoreResult,
     task_name: str,
+    frames: Sequence[str] = (),
 ) -> str:
     """
     渲染后台系统任务提示词。
@@ -384,6 +386,7 @@ def _render_prompt(
     :param evidence: 文件证据
     :param score: 本地打分
     :param task_name: 下载任务名
+    :param frames: 抽帧图路径，用于告诉模型附带了几张截图
     :return: 完整提示词
     """
     from app.application.agent import get_prompt_manager
@@ -402,6 +405,7 @@ def _render_prompt(
         "task_name": task_name or "未知",
         "download_files": json.dumps(files, ensure_ascii=False),
         "evidence_summary": f"本地得分 {score.score}/{content_verify.SCORE_TOTAL}，命中 {','.join(score.hits) or '无'}",
+        "frame_count": len(list(frames)),
     }
     return get_prompt_manager().render_system_task_message(SYSTEM_TASK, template_context=context)
 
@@ -502,7 +506,7 @@ def _frame_images(frames: Sequence[str]) -> Tuple[str, ...]:
     images: List[str] = []
     for path in list(frames)[:4]:
         try:
-            raw = open(path, "rb").read()
+            raw = Path(path).read_bytes()
         except OSError:
             continue
         images.append("data:image/jpeg;base64," + _base64(raw))

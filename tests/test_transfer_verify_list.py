@@ -15,14 +15,64 @@ from app.application.netdisk import content_verify
 from app.schemas.history import ContentVerifyActionRequest
 
 
-def _store(tmp_path: Path) -> content_verify.ContentVerifyStore:
+class MemoryContentVerifyRepository:
     """
-    构造独立的记录存储。
+    内存版待处理记录仓库，替代数据库实现供接口用例使用。
+    """
 
-    :param tmp_path: 临时目录
-    :return: 存储实例
-    """
-    return content_verify.ContentVerifyStore(tmp_path / "content_verify.json")
+    def __init__(self) -> None:
+        """初始化空记录表。"""
+        self._rows: dict[str, content_verify.VerifyRecord] = {}
+        self._sequence = 0
+
+    def save(self, record: content_verify.VerifyRecord) -> content_verify.VerifyRecord:
+        """
+        新增一条记录并分配主键。
+
+        :param record: 待写入记录
+        :return: 写入后的记录
+        """
+        self._sequence += 1
+        record.id = record.id or str(self._sequence)
+        record.created_at = record.created_at or "2026-11-21 00:00:00"
+        record.updated_at = "2026-11-21 00:00:00"
+        self._rows[record.id] = record
+        return record
+
+    def list(self, decision: str | None = None) -> List[content_verify.VerifyRecord]:
+        """
+        按状态列出记录。
+
+        :param decision: 处理状态；为空时返回待处理记录
+        :return: 记录列表
+        """
+        target = decision or content_verify.DECISION_REJECT
+        return [row for row in self._rows.values() if row.decision == target]
+
+    def get(self, record_id: str) -> content_verify.VerifyRecord | None:
+        """
+        读取单条记录。
+
+        :param record_id: 记录标识
+        :return: 记录；不存在时为空
+        """
+        return self._rows.get(str(record_id))
+
+    def update_decision(
+        self, record_id: str, decision: str
+    ) -> content_verify.VerifyRecord | None:
+        """
+        更新处理状态。
+
+        :param record_id: 记录标识
+        :param decision: 新状态
+        :return: 更新后的记录
+        """
+        record = self._rows.get(str(record_id))
+        if record is None:
+            return None
+        record.decision = decision
+        return record
 
 
 def _record(src: str, decision: str = content_verify.DECISION_REJECT, **kwargs: Any) -> Any:
@@ -55,20 +105,19 @@ def _record(src: str, decision: str = content_verify.DECISION_REJECT, **kwargs: 
 
 
 @pytest.fixture()
-def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> content_verify.ContentVerifyStore:
+def store(monkeypatch: pytest.MonkeyPatch) -> MemoryContentVerifyRepository:
     """
-    装配独立存储并替换全局单例。
+    装配内存仓库并替换已注册的持久化实现。
 
-    :param tmp_path: 临时目录
     :param monkeypatch: pytest 补丁工具
-    :return: 存储实例
+    :return: 仓库实例
     """
-    instance = _store(tmp_path)
+    instance = MemoryContentVerifyRepository()
     monkeypatch.setattr(content_verify, "get_content_verify_store", lambda: instance)
     return instance
 
 
-def test_list_returns_only_pending(store: content_verify.ContentVerifyStore) -> None:
+def test_list_returns_only_pending(store: MemoryContentVerifyRepository) -> None:
     """列表只返回待处理记录，已处理的不再出现。"""
     store.save(_record("/downloads/a/a.mkv"))
     store.save(_record("/downloads/b/b.mkv", decision=content_verify.DECISION_MANUAL))
@@ -80,7 +129,7 @@ def test_list_returns_only_pending(store: content_verify.ContentVerifyStore) -> 
     assert payload["pending_size"] == 2048
 
 
-def test_list_exposes_score_and_confidence(store: content_verify.ContentVerifyStore) -> None:
+def test_list_exposes_score_and_confidence(store: MemoryContentVerifyRepository) -> None:
     """列表回显得分、置信度与原因，供人判断。"""
     store.save(_record("/downloads/a/a.mkv"))
 
@@ -93,7 +142,7 @@ def test_list_exposes_score_and_confidence(store: content_verify.ContentVerifySt
     assert item["hits"] == ["时长"]
 
 
-def test_list_returns_empty_when_nothing_pending(store: content_verify.ContentVerifyStore) -> None:
+def test_list_returns_empty_when_nothing_pending(store: MemoryContentVerifyRepository) -> None:
     """没有待处理记录时返回空列表而不是报错。"""
     payload = asyncio.run(history_api.content_verify_list(page=1, count=30, _=None))
 
@@ -101,7 +150,7 @@ def test_list_returns_empty_when_nothing_pending(store: content_verify.ContentVe
 
 
 def test_accept_marks_manual(
-    store: content_verify.ContentVerifyStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    store: MemoryContentVerifyRepository, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """人工放行后走一次强制整理，并把记录标记为已处理。"""
     source = tmp_path / "a.mkv"
@@ -132,7 +181,7 @@ def test_accept_marks_manual(
     assert store.get(saved.id).decision == content_verify.DECISION_MANUAL
 
 
-def test_accept_missing_record_returns_404(store: content_verify.ContentVerifyStore) -> None:
+def test_accept_missing_record_returns_404(store: MemoryContentVerifyRepository) -> None:
     """记录不存在时返回 404。"""
     with pytest.raises(HTTPException) as error:
         asyncio.run(
@@ -143,7 +192,7 @@ def test_accept_missing_record_returns_404(store: content_verify.ContentVerifySt
 
 
 def test_delete_rejects_path_outside_download_dirs(
-    store: content_verify.ContentVerifyStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    store: MemoryContentVerifyRepository, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """路径不在下载目录内时拒绝删除。"""
     download_dir = tmp_path / "downloads"
@@ -168,7 +217,7 @@ def test_delete_rejects_path_outside_download_dirs(
 
 
 def test_delete_removes_file_and_marks_deleted(
-    store: content_verify.ContentVerifyStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    store: MemoryContentVerifyRepository, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """下载目录内的文件删除成功，并把记录标记为已删除。"""
     download_dir = tmp_path / "downloads"
@@ -192,7 +241,7 @@ def test_delete_removes_file_and_marks_deleted(
 
 
 def test_delete_rejects_remote_storage(
-    store: content_verify.ContentVerifyStore, monkeypatch: pytest.MonkeyPatch
+    store: MemoryContentVerifyRepository, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """远程存储记录不允许本地删除。"""
     saved = store.save(_record("/remote/a.mkv", storage="cloud"))
