@@ -758,3 +758,25 @@ def test_client_search_without_cloud_types_keeps_request_unchanged(server: FakeS
     PansouClient("http://pansou.example:3303").search("火影")
 
     assert server.requests[-1]["params"] == {"kw": "火影", "res": "merge", "src": "all"}
+
+
+def test_search_checks_every_candidate_without_count_cap(
+    server: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    候选超过 200 条时全部参与分享校验，不再按条数截断。
+    """
+    merged = {
+        "quark": [
+            {"url": f"https://pan.quark.cn/s/keep{index}", "note": f"资源 {index}"}
+            for index in range(250)
+        ]
+    }
+    server.responses["/api/search"] = FakeResponse(_merge_payload(merged))
+    _install_walk(monkeypatch)
+
+    results = PansouModule().search_netdisk_torrents(_ps_site(), "火影")
+
+    assert results is not None
+    assert len(results) == 250

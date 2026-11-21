@@ -21,10 +21,9 @@ from app.modules.pansou.client import PansouClient, PansouError
 from app.runtime.log import logger
 from app.schemas.types import ModuleType, OtherModulesType
 
-# 分享有效性检查的并发数、总预算与单次搜索最多检查的候选数。
-_ALIVE_WORKERS = 16
-_ALIVE_BUDGET_SECONDS = 30
-_MAX_ALIVE_CHECKS = 200
+# 分享有效性检查的并发数与总预算：候选全量校验，不再按条数截断，靠高并发压住耗时。
+_ALIVE_WORKERS = 200
+_ALIVE_BUDGET_SECONDS = 180
 # 有效性结果缓存，避免同一分享在多次搜索中重复检查。
 _ALIVE_CACHE_TTL = 1800
 _ALIVE_CACHE_LIMIT = 2000
@@ -562,6 +561,7 @@ class PansouModule(_ModuleBase):
         checked: int,
         kept: int,
         dropped: Dict[str, int],
+        elapsed_seconds: float = 0.0,
     ) -> None:
         """
         汇总一次搜索的候选过滤结果，让「结果变少」有据可查。
@@ -570,12 +570,14 @@ class PansouModule(_ModuleBase):
         :param checked: 参与校验的候选数
         :param kept: 最终保留的候选数
         :param dropped: 各类丢弃原因的计数
+        :param elapsed_seconds: 本次校验耗时秒数
         """
         site_name = PansouModule._as_text(site.get("name") or site.get("id")) or "未知站点"
         logger.info(
             f"PS 站点 {site_name} 分享校验：候选 {checked}，保留 {kept}，"
             f"丢弃失效 {dropped.get('invalid', 0)}、无法确认 {dropped.get('undecidable', 0)}、"
-            f"质量不符 {dropped.get('quality', 0)}、黑名单 {dropped.get('blocked', 0)}"
+            f"质量不符 {dropped.get('quality', 0)}、黑名单 {dropped.get('blocked', 0)}，"
+            f"耗时 {elapsed_seconds:.1f}s（{_ALIVE_WORKERS} 并发）"
         )
 
     def _filter_alive_shares(
@@ -585,7 +587,7 @@ class PansouModule(_ModuleBase):
         media_type: Optional[Any] = None,
     ) -> List[TorrentInfo]:
         """
-        只保留确认有效的分享，并按发布时间优先检查最新的若干条。
+        只保留确认有效的分享，候选全量检查，不按条数截断。
 
         结果页与订阅都不该出现「点开是分享已失效」的卡片：明确失效、命中分享
         黑名单、以及无法判定（鉴权、限流、网络异常、预算内没跑完）的候选一律
@@ -598,11 +600,12 @@ class PansouModule(_ModuleBase):
         """
         if not torrents:
             return []
+        started_at = time.monotonic()
         ordered = sorted(
             torrents,
             key=lambda torrent: torrent.pubdate or "",
             reverse=True,
-        )[:_MAX_ALIVE_CHECKS]
+        )
         alive_flags: Dict[int, bool] = {}
         dropped = {"invalid": 0, "undecidable": 0, "quality": 0, "blocked": 0}
         pending: List[Tuple[TorrentInfo, str, Optional[Dict[str, Any]]]] = []
@@ -658,7 +661,13 @@ class PansouModule(_ModuleBase):
             alive_flags[id(torrent)] = False
             dropped["undecidable"] += 1
         kept = [torrent for torrent in ordered if alive_flags.get(id(torrent))]
-        self._log_filter_summary(site, len(ordered), len(kept), dropped)
+        self._log_filter_summary(
+            site,
+            len(ordered),
+            len(kept),
+            dropped,
+            elapsed_seconds=time.monotonic() - started_at,
+        )
         return kept
 
     def search_netdisk_torrents(
