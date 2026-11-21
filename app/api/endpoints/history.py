@@ -735,6 +735,7 @@ async def content_verify_list(
     from app.application.netdisk.content_verify import (
         DECISION_REJECT,
         DECISION_VALUES,
+        SCORE_TOTAL,
         get_content_verify_store,
     )
 
@@ -757,6 +758,7 @@ async def content_verify_list(
             record.total_size for record in records if record.decision == DECISION_REJECT
         ),
         "counts": counts,
+        "score_total": int(SCORE_TOTAL),
     }
 
 

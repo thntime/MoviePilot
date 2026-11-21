@@ -341,12 +341,14 @@ class ContentVerifyPage(BaseModel):
     :param total: 当前筛选条件下的记录总数
     :param pending_size: 待处理记录的文件总占用（字节）
     :param counts: 各状态的记录数
+    :param score_total: 证据得分满分，前端展示 N/满分 用
     """
 
     items: List[ContentVerifyItem] = Field(default_factory=list, description="当前页记录")
     total: int = Field(default=0, description="当前筛选条件下的记录总数")
     pending_size: int = Field(default=0, description="待处理记录的文件总占用（字节）")
     counts: Dict[str, int] = Field(default_factory=dict, description="各状态的记录数")
+    score_total: int = Field(default=0, description="证据得分满分")
 
 
 class ContentVerifyActionRequest(BaseModel):

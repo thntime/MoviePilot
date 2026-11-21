@@ -178,7 +178,18 @@ def test_list_returns_empty_when_nothing_pending(store: MemoryContentVerifyRepos
         "total": 0,
         "pending_size": 0,
         "counts": {"reject": 0, "pass": 0, "manual": 0, "deleted": 0, "skipped": 0},
+        "score_total": content_verify.SCORE_TOTAL,
     }
+
+
+def test_list_reports_score_total(store: MemoryContentVerifyRepository) -> None:
+    """列表带回证据得分满分，前端据此展示 N/满分，不再写死数字。"""
+    store.save(_record("/downloads/a/a.mkv"))
+
+    payload = asyncio.run(history_api.content_verify_list(page=1, count=30, _=None))
+
+    assert payload["score_total"] == 11
+    assert payload["score_total"] == content_verify.SCORE_TOTAL
 
 
 def test_accept_marks_manual(
