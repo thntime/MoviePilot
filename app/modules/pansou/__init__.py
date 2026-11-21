@@ -49,6 +49,19 @@ _PLATFORM_HOST_SUFFIXES = {
     "pan139": ("139.com",),
     "guangya": ("guangyapan.com",),
 }
+# PanSou 的 cloud_types 取值口径与本项目平台标识不同：115、123 去掉 pan 前缀，139 改叫 mobile。
+# 取值写错时服务端静默返回 0 条且不报错，故三个反直觉映射按实测写死并由用例锁住。
+_CLOUD_TYPE_BY_PLATFORM = {
+    "quark": "quark",
+    "uc": "uc",
+    "pan139": "mobile",
+    "pan123": "123",
+    "pan115": "115",
+    "guangya": "guangya",
+    "baidu": "baidu",
+    "xunlei": "xunlei",
+    "tianyi": "tianyi",
+}
 
 
 class PansouModule(_ModuleBase):
@@ -141,6 +154,27 @@ class PansouModule(_ModuleBase):
         if isinstance(value, (int, float)):
             return bool(value)
         return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _cloud_types() -> Optional[str]:
+        """
+        把启用平台集合转换成 PanSou 的 cloud_types 参数。
+
+        全部平台都启用时过滤是空操作，一个都没启用时不应限制平台，两种情形都返回
+        None，让请求保持改造前的形态；只有启用集合是全部平台的严格子集时才过滤，
+        避免把取链校验名额浪费在未启用平台上。
+
+        :return: 逗号分隔的 PanSou 平台取值；无需过滤时返回 None
+        """
+        from app.application.netdisk.settings import enabled_platforms
+        from app.domain.netdisk import NetdiskPlatform
+
+        enabled = enabled_platforms()
+        if not enabled or enabled >= frozenset(NetdiskPlatform):
+            return None
+        enabled_names = {platform.value for platform in enabled}
+        values = [cloud for platform, cloud in _CLOUD_TYPE_BY_PLATFORM.items() if platform in enabled_names]
+        return ",".join(values) or None
 
     @classmethod
     def _site_address(cls, site: Dict[str, Any]) -> str:
@@ -658,7 +692,7 @@ class PansouModule(_ModuleBase):
             )
             return []
         try:
-            entries = self._get_client(site).search(keyword)
+            entries = self._get_client(site).search(keyword, cloud_types=self._cloud_types())
         except PansouError as err:
             site_name = self._as_text(site.get("name") or site.get("id")) or "未知站点"
             logger.warn(f"PS 站点 {site_name} 网盘搜索失败：{err}")

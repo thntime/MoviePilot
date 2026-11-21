@@ -251,18 +251,20 @@ class PansouClient:
         if payload is None:
             raise PansouError("PanSou 连接失败：响应不是有效 JSON")
 
-    def search(self, keyword: str) -> List[Dict[str, Any]]:
+    def search(self, keyword: str, cloud_types: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         搜索关键词，把按平台归并的链接展开成逐条条目。
 
         :param keyword: 搜索关键词
+        :param cloud_types: 可选的 PanSou 网盘平台取值，多个用逗号分隔；为空时不带该参数
         :return: 条目列表，每条含 platform、url、password、title、source、pubdate
         :raises PansouError: 认证失败、HTTP 错误、接口返回失败或响应不是有效 JSON
         """
-        status, payload = self._authorized_json(
-            "/api/search",
-            params={"kw": keyword, "res": "merge", "src": "all"},
-        )
+        params: Dict[str, Any] = {"kw": keyword, "res": "merge", "src": "all"}
+        if cloud_types:
+            # 服务端只认逗号分隔的取值，写成竖线或空格会静默返回 0 条，故非空才加。
+            params["cloud_types"] = cloud_types
+        status, payload = self._authorized_json("/api/search", params=params)
         if status in (401, 403):
             if self.username and self.password:
                 raise PansouError("PanSou 认证失败：用户名或密码无效")

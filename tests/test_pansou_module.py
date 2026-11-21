@@ -630,3 +630,131 @@ def test_search_relogins_once_when_token_rejected(server: FakeServer) -> None:
     assert client.search("火影") == []
     assert len(server.posts) == 2
     assert server.last_headers()["Authorization"] == "Bearer fresh"
+
+
+def _patch_enabled_platforms(monkeypatch: pytest.MonkeyPatch, platforms: List[str]) -> None:
+    """
+    把启用平台集合替换为固定取值。
+
+    :param monkeypatch: pytest 补丁工具
+    :param platforms: 启用平台标识列表
+    """
+    monkeypatch.setattr(
+        "app.application.netdisk.settings.enabled_platforms",
+        lambda: frozenset(NetdiskPlatform(name) for name in platforms),
+    )
+
+
+def test_search_sends_cloud_types_for_enabled_platforms(
+    server: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    启用夸克与 UC 时，请求带 cloud_types=quark,uc，其余参数保持原样。
+    """
+    server.responses["/api/search"] = FakeResponse(_merge_payload({}))
+    _patch_enabled_platforms(monkeypatch, ["quark", "uc"])
+
+    PansouModule().search_netdisk_torrents(_ps_site(), "火影")
+
+    assert server.requests[-1]["params"] == {
+        "kw": "火影",
+        "res": "merge",
+        "src": "all",
+        "cloud_types": "quark,uc",
+    }
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [("pan115", "115"), ("pan123", "123"), ("pan139", "mobile")],
+)
+def test_cloud_types_use_measured_values_for_pan115_pan123_and_pan139(
+    server: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    expected: str,
+) -> None:
+    """
+    三个反直觉映射按实测取值发送：115、123 去掉 pan 前缀，139 改叫 mobile。
+
+    PanSou 对未知取值静默返回 0 条，写错不会报错，只能靠断言锁住。
+
+    :param platform: 本项目平台标识
+    :param expected: PanSou 的对应取值
+    """
+    server.responses["/api/search"] = FakeResponse(_merge_payload({}))
+    _patch_enabled_platforms(monkeypatch, [platform])
+
+    PansouModule().search_netdisk_torrents(_ps_site(), "火影")
+
+    assert server.requests[-1]["params"]["cloud_types"] == expected
+
+
+def test_search_omits_cloud_types_when_no_platform_enabled(
+    server: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    一个平台都没启用时不发 cloud_types，保持改造前的请求形态。
+    """
+    server.responses["/api/search"] = FakeResponse(_merge_payload({}))
+    _patch_enabled_platforms(monkeypatch, [])
+
+    PansouModule().search_netdisk_torrents(_ps_site(), "火影")
+
+    assert "cloud_types" not in server.requests[-1]["params"]
+
+
+def test_search_omits_cloud_types_when_every_platform_enabled(
+    server: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    全部平台都启用时过滤是空操作，请求与改造前完全一致。
+    """
+    server.responses["/api/search"] = FakeResponse(_merge_payload({}))
+    _patch_enabled_platforms(monkeypatch, [platform.value for platform in NetdiskPlatform])
+
+    PansouModule().search_netdisk_torrents(_ps_site(), "火影")
+
+    assert server.requests[-1]["params"] == {"kw": "火影", "res": "merge", "src": "all"}
+
+
+def test_credential_probe_does_not_send_cloud_types(
+    server: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    连接测试用的探测搜索不带 cloud_types，行为与改造前一致。
+    """
+    server.responses["/api/health"] = FakeResponse({"status": "ok", "auth_enabled": True})
+    server.responses["/api/search"] = FakeResponse(_merge_payload({}))
+    _patch_enabled_platforms(monkeypatch, ["quark", "uc"])
+
+    ok, message = PansouModule().test_netdisk_site(_ps_site(token="good-token"))
+
+    assert (ok, message) == (True, "")
+    assert "cloud_types" not in server.requests[-1]["params"]
+
+
+def test_client_search_passes_cloud_types_through(server: FakeServer) -> None:
+    """
+    客户端把调用方给的 cloud_types 原样放进查询参数。
+    """
+    server.responses["/api/search"] = FakeResponse(_merge_payload({}))
+
+    PansouClient("http://pansou.example:3303").search("火影", cloud_types="115,mobile")
+
+    assert server.requests[-1]["params"]["cloud_types"] == "115,mobile"
+
+
+def test_client_search_without_cloud_types_keeps_request_unchanged(server: FakeServer) -> None:
+    """
+    不传 cloud_types 时客户端仍只发三个参数，默认行为不变。
+    """
+    server.responses["/api/search"] = FakeResponse(_merge_payload({}))
+
+    PansouClient("http://pansou.example:3303").search("火影")
+
+    assert server.requests[-1]["params"] == {"kw": "火影", "res": "merge", "src": "all"}
