@@ -181,11 +181,13 @@ def test_chinese_numeral_episodes_are_recognized() -> None:
     assert torrent.title.endswith("S01E12-E14")
 
 
-def test_title_name_conflict_is_dropped() -> None:
-    """标题写斗破苍穹、文件名全是启运丹田时按命名冲突丢弃。"""
+def test_title_name_conflict_is_flagged_not_dropped() -> None:
+    """标题写斗破苍穹、文件名全是启运丹田时只标记，交给匹配层按别名判身份。"""
     entries = [_entry(f"启运丹田 {index:02d}.mp4", size_mb=800, duration=1300) for index in range(1, 41)]
 
-    assert _passed("斗破苍穹 年番", entries) is False
+    torrent = _run("斗破苍穹 年番", entries)
+
+    assert "标题与文件名不符" in list(getattr(torrent, "quality_flags", None) or [])
 
 
 def test_title_episode_is_written_back_for_single_file() -> None:

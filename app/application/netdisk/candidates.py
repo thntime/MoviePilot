@@ -96,6 +96,8 @@ _COLLECTION_MIN_SECONDS = 3000
 _TITLE_NAME_MIN_CHARS = 4
 # 正片里被打乱命名的比例达到该值时，放弃用文件名反推片名。
 _SCRAMBLED_RATIO_THRESHOLD = 0.3
+# 标题与文件名指向不同作品时打在候选上的标记词，只用于展示与排查。
+_CONFLICT_FLAG = "标题与文件名不符"
 
 
 @dataclass(frozen=True)
@@ -642,10 +644,16 @@ def passes_quality(
     if _archive_dominant(groups):
         logger.info(f"{torrent.title} 压缩包资源暂不支持，已丢弃")
         return False
-    if _title_conflict(str(torrent.title or ""), groups):
-        logger.info(f"{torrent.title} 标题与文件名指向不同作品，已丢弃")
-        return False
+    conflict = _title_conflict(str(torrent.title or ""), groups)
     apply_share_detail(torrent, detail, files, form=form, groups=groups)
+    if conflict:
+        # 只标记不丢弃：作品身份由匹配层按别名比对，这里再按文件名猜一次只会误杀
+        # （上传者常把片名拆成「凡丨人修丨X传」或塞进乱码目录来规避网盘审核）。
+        logger.info(f"{torrent.title} 标题与文件名指向不同作品，仅标记不丢弃")
+        flags = list(getattr(torrent, "quality_flags", None) or [])
+        if _CONFLICT_FLAG not in flags:
+            flags.append(_CONFLICT_FLAG)
+            torrent.quality_flags = flags
     return True
 
 
