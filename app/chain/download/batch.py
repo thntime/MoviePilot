@@ -5,7 +5,7 @@
 import copy
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, TypedDict, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, TypedDict, Union, cast
 
 from app.application.download import selection as _selection
 from app.application.download.admission import SubscriptionDownloadGovernance
@@ -671,6 +671,30 @@ class _BatchDownloadRun:
                         f"{episode_rules.format_ranges(sorted(selected))}")
         return content, complete, selected
 
+    @staticmethod
+    def _resolve_season_target(
+            required: Set[int], episodes: Set[int], info: Any,
+    ) -> Set[int]:
+        """
+        算出本次要提交的目标集。
+
+        要求完整覆盖时按目标范围求交；普通订阅（不要求完整覆盖）在整季缺失时
+        也必须与订阅目标范围求交，否则分享里的越界集（例如订阅只到 168 集、
+        分享却有 185 集）会被当成目标集一起下走。
+
+        :param required: 完整覆盖所需的目标集；空集表示普通订阅
+        :param episodes: 分享内目标季的集号
+        :param info: 该季的缺集信息
+        :return: 目标集号
+        """
+        if required:
+            return set(required).intersection(episodes)
+        total = int(getattr(info, "total_episode", 0) or 0) if info is not None else 0
+        if total <= 0:
+            return set(episodes)
+        start = int(getattr(info, "start_episode", 0) or 1)
+        return set(episodes).intersection(range(max(1, start), total + 1))
+
     def _inspect_netdisk_season(
             self, context: Context, media_key: str, season: int,
             season_episodes: Dict[Optional[int], Set[int]], *,
@@ -702,9 +726,9 @@ class _BatchDownloadRun:
         info = _selection.get_no_exist_media(self.no_exists, media_key, season)
         required = _selection.get_required_episodes(self.no_exists, media_key, season) \
             if _selection.requires_complete_coverage(info) else set()
-        target = set(required).intersection(episodes) if required else set(episodes)
+        target = self._resolve_season_target(required, episodes, info)
         if not target:
-            reason = "分享内没有目标集" if required else "分享内没有可下载集数"
+            reason = "分享内没有目标集" if required else "分享内没有目标范围内的集数"
             logger.info(
                 f"{meta.org_string} {reason}，目标 "
                 f"{episode_rules.format_ranges(sorted(required)) or '全部'}")

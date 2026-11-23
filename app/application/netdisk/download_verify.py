@@ -137,6 +137,20 @@ def verify_downloaded_content(
         )
     matched, confidence, reason = verdict
     if matched:
+        if not score.score and not frames:
+            # 本地零证据又没抽到帧：模型只是照「证据不足判通过」的口径作答，
+            # 把这种结论记成「已通过」等于假通过，降级为未判定交给人看。
+            unverified = VerifyResult(
+                matched=True,
+                checked=False,
+                reason=f"无有效证据：{reason}" if reason else "无有效证据",
+                score=score.score,
+                confidence=confidence,
+                frames=frames,
+                hits=score.hits,
+            )
+            _write_cache(cache_key, unverified)
+            return unverified
         result = VerifyResult(
             matched=True,
             checked=True,

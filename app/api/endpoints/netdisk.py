@@ -6,7 +6,6 @@
 
 import asyncio
 import base64
-import datetime
 import queue
 import secrets
 import time
@@ -39,6 +38,7 @@ from app.application.netdisk.share_blacklist import get_share_blacklist
 from app.chain.media import MediaChain
 from app.domain.episode import parse_episode_selection
 from app.domain.netdisk import NetdiskError, NetdiskErrorCode, ShareFile
+from app.domain.projection.aired import aired_seasons
 from app.runtime.execution import run_in_threadpool
 from app.runtime.log import logger
 from app.schemas.netdisk import (
@@ -269,30 +269,6 @@ async def preview_share(
     )
 
 
-def _audit_last_aired_point(info: Any) -> tuple[Optional[int], Optional[int]]:
-    """
-    从 TMDB 原始详情里取「最近播出的那一集」，用来判断连载剧播到哪。
-
-    TMDB 的 `tv/{id}` 详情带 `last_episode_to_air`，但统一媒体字段没有投影它，
-    这里直接读原始字典；其它数据源没有该字段时返回两个 None。
-
-    :param info: 识别出的媒体信息
-    :return: （季号, 集号）；拿不到时两个元素都是 None
-    """
-    tmdb_info = getattr(info, "tmdb_info", None)
-    if not isinstance(tmdb_info, dict):
-        return None, None
-    last = tmdb_info.get("last_episode_to_air")
-    if not isinstance(last, dict):
-        return None, None
-    try:
-        season = int(last.get("season_number"))
-        episode = int(last.get("episode_number"))
-    except (TypeError, ValueError):
-        return None, None
-    return season, episode
-
-
 def _audit_aired_seasons(info: Any) -> tuple[tuple[int, tuple[int, ...]], ...]:
     """
     从识别结果里取出已播出的季集，作为缺集计算的分母。
@@ -304,67 +280,7 @@ def _audit_aired_seasons(info: Any) -> tuple[tuple[int, tuple[int, ...]], ...]:
     :param info: 识别出的媒体信息
     :return: 季号到已播出集号集合的序列
     """
-    today = datetime.date.today().isoformat()
-    last_season, last_episode = _audit_last_aired_point(info)
-    aired: dict[int, set[int]] = {}
-    decided: set[int] = set()
-    for season in getattr(info, "season_info", None) or []:
-        if not isinstance(season, dict):
-            continue
-        number = season.get("season_number")
-        if number is None:
-            number = season.get("order")
-        if number is None:
-            continue
-        try:
-            season_number = int(number)
-        except (TypeError, ValueError):
-            continue
-        episodes = [item for item in (season.get("episodes") or []) if isinstance(item, dict)]
-        dated = [item for item in episodes if item.get("air_date")]
-        if dated:
-            picked: set[int] = set()
-            for episode in episodes:
-                value = episode.get("episode_number")
-                if value is None:
-                    continue
-                date = str(episode.get("air_date") or "")
-                if not date or date > today:
-                    continue
-                try:
-                    picked.add(int(value))
-                except (TypeError, ValueError):
-                    continue
-            if picked:
-                aired[season_number] = picked
-            decided.add(season_number)
-            continue
-        if last_season is not None and last_episode is not None:
-            if season_number < last_season:
-                count = season.get("episode_count")
-                if isinstance(count, int) and count > 0:
-                    aired[season_number] = set(range(1, count + 1))
-            elif season_number == last_season:
-                aired[season_number] = set(range(1, last_episode + 1))
-            decided.add(season_number)
-            continue
-        season_air_date = str(season.get("air_date") or "")
-        if season_air_date and season_air_date > today:
-            decided.add(season_number)
-    for number, numbers in (getattr(info, "seasons", None) or {}).items():
-        try:
-            season_number = int(number)
-        except (TypeError, ValueError):
-            continue
-        if season_number in decided or season_number in aired:
-            continue
-        try:
-            aired[season_number] = {int(value) for value in numbers or []}
-        except (TypeError, ValueError):
-            continue
-    return tuple(
-        (number, tuple(sorted(numbers))) for number, numbers in sorted(aired.items())
-    )
+    return aired_seasons(info)
 
 
 def _recognized_from_context(context: Any) -> Optional[RecognizedMedia]:

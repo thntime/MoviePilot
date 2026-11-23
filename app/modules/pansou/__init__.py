@@ -410,6 +410,7 @@ class PansouModule(_ModuleBase):
         platform: str,
         cached_detail: Optional[Dict[str, Any]] = None,
         media_type: Optional[Any] = None,
+        target_names: Tuple[str, ...] = (),
     ) -> Tuple[Optional[Dict[str, Any]], bool]:
         """
         用本机统一取链适配器检查网盘候选。
@@ -429,7 +430,7 @@ class PansouModule(_ModuleBase):
 
         if cached_detail and cached_detail.get("_files"):
             return cached_detail, PansouModule._passes_pansou_quality(
-                torrent, cached_detail, media_type
+                torrent, cached_detail, media_type, target_names
             )
         try:
             service = NetdiskResolveService()
@@ -463,7 +464,9 @@ class PansouModule(_ModuleBase):
             "_files": files,
             "truncated": bool(getattr(walked, "truncated", False)),
         }
-        return detail, PansouModule._passes_pansou_quality(torrent, detail, media_type)
+        return detail, PansouModule._passes_pansou_quality(
+            torrent, detail, media_type, target_names
+        )
 
     @classmethod
     def _passes_pansou_quality(
@@ -471,6 +474,7 @@ class PansouModule(_ModuleBase):
         torrent: TorrentInfo,
         detail: Dict[str, Any],
         media_type: Optional[Any] = None,
+        target_names: Tuple[str, ...] = (),
     ) -> bool:
         """
         在通用质量门之前先做 PanSou 来源专属的内容一致性检查。
@@ -487,7 +491,9 @@ class PansouModule(_ModuleBase):
         files = detail.get("_files")
         if isinstance(files, list) and cls._claim_conflicts(torrent.title or "", files):
             return False
-        return candidates.passes_quality(torrent, detail, media_type=media_type)
+        return candidates.passes_quality(
+            torrent, detail, media_type=media_type, target_names=target_names
+        )
 
     @staticmethod
     def _claim_conflicts(title: str, files: List[Dict[str, Any]]) -> bool:
@@ -526,6 +532,7 @@ class PansouModule(_ModuleBase):
         torrent: TorrentInfo,
         cached_detail: Optional[Dict[str, Any]] = None,
         media_type: Optional[Any] = None,
+        target_names: Tuple[str, ...] = (),
     ) -> Tuple[Optional[Dict[str, Any]], bool]:
         """
         检查单个候选：统一走本机取链，可复用缓存并执行质量检查。
@@ -538,7 +545,9 @@ class PansouModule(_ModuleBase):
         :return: (分享详情, 是否通过质量检查)；无法判定时详情为 None
         """
         platform = str(torrent.netdisk_platform or "").strip()
-        return self._inspect_remote_share(torrent, platform, cached_detail, media_type)
+        return self._inspect_remote_share(
+            torrent, platform, cached_detail, media_type, target_names
+        )
 
     @staticmethod
     def _share_identity(torrent: TorrentInfo) -> str:
@@ -585,6 +594,7 @@ class PansouModule(_ModuleBase):
         site: Dict[str, Any],
         torrents: List[TorrentInfo],
         media_type: Optional[Any] = None,
+        target_names: Tuple[str, ...] = (),
     ) -> List[TorrentInfo]:
         """
         只保留确认有效的分享，候选全量检查，不按条数截断。
@@ -625,7 +635,9 @@ class PansouModule(_ModuleBase):
             executor = ThreadPoolExecutor(max_workers=_ALIVE_WORKERS)
             try:
                 futures = {
-                    executor.submit(self._inspect_share, torrent, cached_detail, media_type): (torrent, cache_key)
+                    executor.submit(
+                self._inspect_share, torrent, cached_detail, media_type, target_names
+            ): (torrent, cache_key)
                     for torrent, cache_key, cached_detail in pending
                 }
                 for future in as_completed(futures, timeout=_ALIVE_BUDGET_SECONDS):
@@ -712,7 +724,9 @@ class PansouModule(_ModuleBase):
             logger.warn(f"PS 站点 {site_name} 网盘搜索失败：{err}")
             report_site_search_outcome(attempted=True, outcome="error", error=str(err))
             return []
-        torrents = self._filter_alive_shares(site, self._build_torrents(site, entries), mtype)
+        torrents = self._filter_alive_shares(
+            site, self._build_torrents(site, entries), mtype, (str(keyword or ""),)
+        )
         report_site_search_outcome(attempted=True, outcome="success")
         report_site_search_page(raw_count=len(torrents), has_more=False)
         return torrents

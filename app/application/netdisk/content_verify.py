@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 from app.domain.episode import episode_numbers
+from app.domain.netdisk import is_video_file_name
 from app.foundation.environment import get_config_path
 from app.runtime.log import logger
 
@@ -259,7 +260,13 @@ def build_evidence(
         path = str(getattr(item, "path", "") or "")
         size = int(getattr(item, "size", 0) or 0)
         duration = 0
-        if storage == "local" and probe is not None and probed < max_probe:
+        # 探测配额只给视频：字幕、封面、音频排在前面时不能把配额吃光。
+        if (
+            storage == "local"
+            and probe is not None
+            and probed < max_probe
+            and is_video_file_name(name)
+        ):
             probed += 1
             try:
                 value = probe(Path(path))
@@ -350,7 +357,9 @@ def extract_frames(paths: Sequence[str], limit: int = MAX_FRAME_FILES) -> Tuple[
         logger.warning(f"抽帧目录创建失败：{error}")
         return ()
     frames: List[str] = []
-    for index, path in enumerate(list(paths)[:limit]):
+    # 只对视频抽帧：字幕、封面、音频起不了 ffmpeg，排在前面会白占配额。
+    videos = [str(path) for path in paths if is_video_file_name(str(path))]
+    for index, path in enumerate(videos[:limit]):
         target = Path(path)
         if not target.is_file():
             continue

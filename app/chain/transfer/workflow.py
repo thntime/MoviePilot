@@ -102,6 +102,25 @@ def _normalize_transfer_identity(
     return mediainfo, normalized_source, normalized_media_id, None
 
 
+def _candidate_fileitems(candidates: Any) -> List[FileItem]:
+    """
+    把整理候选统一成文件项列表。
+
+    真实链路传进来的是「文件项 + 是否蓝光目录」二元组列表（见
+    `_TransferChain__get_trans_fileitems` 与 `_collect_transfer_candidates`），
+    内容校验只认文件项本身；直接对二元组取 name/path/size 会全部取到空值。
+
+    :param candidates: 整理候选，元素为 FileItem 或 (FileItem, bool)
+    :return: 文件项列表
+    """
+    items: List[FileItem] = []
+    for candidate in candidates or []:
+        item = candidate[0] if isinstance(candidate, tuple) else candidate
+        if item is not None:
+            items.append(item)
+    return items
+
+
 def _episode_range_text(meta: Optional[MetaBase]) -> str:
     """
     把元数据里的集号范围拼成 Exx-Eyy 文本，供内容校验记录展示。
@@ -340,6 +359,25 @@ class TransferWorkflowOwner(_TransferOwnerBase):
 
         return shared_roots
 
+    def _share_title_for_verify(self, download_hash: Optional[str]) -> str:
+        """
+        取下载任务的分享标题，供内容校验判定使用。
+
+        整理目录名只是分享码，拿它当标题等于白送一次判定机会；真实分享标题
+        存在下载历史里，取不到时才由调用方回退到文件项名称。
+
+        :param download_hash: 下载任务标识
+        :return: 分享标题；查不到时返回空字符串
+        """
+        if not download_hash:
+            return ""
+        try:
+            history = self.download_history_repository.get_by_hash(str(download_hash))
+        except Exception as error:  # noqa: BLE001 - 取不到标题不影响校验
+            logger.debug(f"读取下载历史标题失败：{type(error).__name__}: {error}")
+            return ""
+        return str(getattr(history, "torrent_name", "") or "")
+
     def _verify_downloaded_content(
         self,
         *,
@@ -377,12 +415,16 @@ class TransferWorkflowOwner(_TransferOwnerBase):
         if manual:
             logger.info(f"{fileitem.name} 手动整理，跳过内容校验")
             return None
+        # 真实链路传的是「文件项 + 是否蓝光目录」二元组，先还原成文件项再交给门，
+        # 否则门只能看到空文件名、空大小与空路径，证据永远为 0。
+        items = _candidate_fileitems(file_items)
+        share_title = self._share_title_for_verify(download_hash) if self is not None else ""
         try:
             result = verify_downloaded_content(
                 mediainfo=mediainfo,
                 meta=meta,
-                file_items=file_items,
-                task_name=str(getattr(fileitem, "name", "") or ""),
+                file_items=items,
+                task_name=share_title or str(getattr(fileitem, "name", "") or ""),
                 storage=str(getattr(fileitem, "storage", "local") or "local"),
                 download_hash=str(download_hash or ""),
             )
@@ -402,7 +444,7 @@ class TransferWorkflowOwner(_TransferOwnerBase):
                 f"{fileitem.name} 内容校验不通过：{result.reason}（置信度 {result.confidence:.2f}）"
             )
         record_for_result(
-            file_items=file_items,
+            file_items=items,
             result=result,
             src=str(getattr(fileitem, "path", "") or ""),
             storage=str(getattr(fileitem, "storage", "local") or "local"),

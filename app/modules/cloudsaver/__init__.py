@@ -422,6 +422,7 @@ class CloudSaverModule(_ModuleBase):
         torrent: TorrentInfo,
         detail: Dict[str, Any],
         media_type: Optional[Any] = None,
+        target_names: Tuple[str, ...] = (),
     ) -> bool:
         """
         判断候选是否通过质量检查：文件树完整、类型占比达标、集数可确定、不是短剧、压缩包不主导。
@@ -437,7 +438,7 @@ class CloudSaverModule(_ModuleBase):
         :return: 通过返回 True
         """
         return candidates.passes_quality(
-            torrent, detail, get_configured_system_config, media_type
+            torrent, detail, get_configured_system_config, media_type, target_names
         )
 
     def _inspect_share(
@@ -445,6 +446,7 @@ class CloudSaverModule(_ModuleBase):
         torrent: TorrentInfo,
         cached_detail: Optional[Dict[str, Any]] = None,
         media_type: Optional[Any] = None,
+        target_names: Tuple[str, ...] = (),
     ) -> Tuple[Optional[Dict[str, Any]], bool]:
         """
         检查单个候选：统一走本机取链，可复用缓存并执行质量检查。
@@ -457,7 +459,9 @@ class CloudSaverModule(_ModuleBase):
         :return: (分享详情, 是否通过质量检查)；无法判定时详情为 None
         """
         platform = str(torrent.netdisk_platform or "").strip()
-        return self._inspect_remote_share(torrent, platform, cached_detail, media_type)
+        return self._inspect_remote_share(
+            torrent, platform, cached_detail, media_type, target_names
+        )
 
     @staticmethod
     def _blacklist_hit(torrent: TorrentInfo) -> bool:
@@ -487,6 +491,7 @@ class CloudSaverModule(_ModuleBase):
         platform: str,
         cached_detail: Optional[Dict[str, Any]] = None,
         media_type: Optional[Any] = None,
+        target_names: Tuple[str, ...] = (),
     ) -> Tuple[Optional[Dict[str, Any]], bool]:
         """
         用本机统一取链适配器检查网盘候选。
@@ -505,7 +510,9 @@ class CloudSaverModule(_ModuleBase):
         from app.domain.netdisk import NetdiskError, NetdiskErrorCode
 
         if cached_detail and cached_detail.get("_files"):
-            return cached_detail, self._passes_quality(torrent, cached_detail, media_type)
+            return cached_detail, self._passes_quality(
+                torrent, cached_detail, media_type, target_names
+            )
         try:
             service = NetdiskResolveService()
             walked = service.walk(
@@ -538,7 +545,7 @@ class CloudSaverModule(_ModuleBase):
             "_files": files,
             "truncated": bool(getattr(walked, "truncated", False)),
         }
-        return detail, self._passes_quality(torrent, detail, media_type)
+        return detail, self._passes_quality(torrent, detail, media_type, target_names)
 
     @staticmethod
     def _share_identity(torrent: TorrentInfo) -> Tuple[str, str]:
@@ -588,6 +595,7 @@ class CloudSaverModule(_ModuleBase):
         site: Dict[str, Any],
         torrents: List[TorrentInfo],
         media_type: Optional[Any] = None,
+        target_names: Tuple[str, ...] = (),
     ) -> List[TorrentInfo]:
         """
         只保留确认有效的分享，并按发布时间优先检查最新的若干条。
@@ -628,7 +636,9 @@ class CloudSaverModule(_ModuleBase):
             executor = ThreadPoolExecutor(max_workers=_ALIVE_WORKERS)
             try:
                 futures = {
-                    executor.submit(self._inspect_share, torrent, cached_detail, media_type): (torrent, cache_key)
+                    executor.submit(
+                        self._inspect_share, torrent, cached_detail, media_type, target_names
+                    ): (torrent, cache_key)
                     for torrent, cache_key, cached_detail in pending
                 }
                 for future in as_completed(futures, timeout=_ALIVE_BUDGET_SECONDS):
@@ -704,7 +714,9 @@ class CloudSaverModule(_ModuleBase):
             logger.warn(f"CD 站点 {site_name} 网盘搜索失败：{err}")
             report_site_search_outcome(attempted=True, outcome="error", error=str(err))
             return []
-        torrents = self._filter_alive_shares(site, self._build_torrents(site, entries), mtype)
+        torrents = self._filter_alive_shares(
+            site, self._build_torrents(site, entries), mtype, (str(keyword or ""),)
+        )
         report_site_search_outcome(attempted=True, outcome="success")
         report_site_search_page(raw_count=len(torrents), has_more=False)
         return torrents

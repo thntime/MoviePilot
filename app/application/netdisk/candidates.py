@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from app.application.configuration import get_configured_system_config
 from app.domain import episode as episode_rules
@@ -596,6 +596,7 @@ def passes_quality(
     detail: Dict[str, Any],
     config_getter: Optional[Callable[[], Any]] = None,
     media_type: Optional[Any] = None,
+    target_names: Sequence[str] = (),
 ) -> bool:
     """
     判断候选是否通过质量检查。
@@ -608,6 +609,7 @@ def passes_quality(
     :param detail: 分享详情，含 `_files` 文件树
     :param config_getter: 读取系统配置的入口；为空时使用宿主默认实现
     :param media_type: 目标媒体类型，MUSIC 时只按音频占比判定
+    :param target_names: 目标作品的标题与别名；给了才会按目标名判标题党
     :return: 通过返回 True
     """
     files = detail.get("_files")
@@ -645,6 +647,9 @@ def passes_quality(
         logger.info(f"{torrent.title} 压缩包资源暂不支持，已丢弃")
         return False
     conflict = _title_conflict(str(torrent.title or ""), groups)
+    if _target_mismatch(str(torrent.title or ""), groups, target_names):
+        logger.info(f"{torrent.title} 标题自称目标作品，正片文件名却指向别的作品，已丢弃")
+        return False
     apply_share_detail(torrent, detail, files, form=form, groups=groups)
     if conflict:
         # 只标记不丢弃：作品身份由匹配层按别名比对，这里再按文件名猜一次只会误杀
@@ -932,6 +937,58 @@ def _title_conflict(title: str, groups: FileGroups) -> bool:
     if not counts:
         return False
     if any(segment in name or name in segment for segment in counts):
+        return False
+    majority = max(2, len(sample) * 0.6)
+    return any(count >= majority for count in counts.values())
+
+
+def _normalize_text(text: str) -> str:
+    """
+    归一化文本：只保留字母、数字与汉字并统一小写，用于片名包含判定。
+
+    :param text: 原始文本
+    :return: 归一化文本
+    """
+    return "".join(
+        char.lower() for char in str(text or "")
+        if char.isalnum() or "\u4e00" <= char <= "\u9fff"
+    )
+
+
+def _target_mismatch(title: str, groups: FileGroups, target_names: Sequence[str]) -> bool:
+    """
+    判断分享标题自称目标作品、正片文件名却指向别的作品。
+
+    只在给了目标名时生效：标题里出现目标名（这条分享自称是目标作品），而正片
+    文件名里一个目标名都不出现，且某个陌生片名覆盖六成以上正片。这种标题党分享
+    是「把别部作品当目标下走」的源头；没给目标名时保持原有「只标记不丢弃」。
+
+    :param title: 候选标题
+    :param groups: 文件分类结果
+    :param target_names: 目标作品的标题与别名
+    :return: 判定为标题与内容不符时返回 True
+    """
+    names = [_normalize_text(item) for item in target_names or ()]
+    names = [name for name in names if len(name) >= 2]
+    if not names:
+        return False
+    if not any(name in _normalize_text(title) for name in names):
+        return False
+    sample = list(groups.feature[:20])
+    if not sample:
+        return False
+    scrambled = sum(1 for entry in sample if _looks_scrambled(_entry_name(entry)))
+    if scrambled / len(sample) >= _SCRAMBLED_RATIO_THRESHOLD:
+        return False
+    normalized_paths = [_normalize_text(_entry_path(entry)) for entry in sample]
+    if any(name in path for path in normalized_paths for name in names):
+        return False
+    counts: Dict[str, int] = {}
+    for entry in sample:
+        for segment in set(_CJK_SEGMENT.findall(_entry_path(entry))):
+            if len(segment) >= 2:
+                counts[segment] = counts.get(segment, 0) + 1
+    if not counts:
         return False
     majority = max(2, len(sample) * 0.6)
     return any(count >= majority for count in counts.values())

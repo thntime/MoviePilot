@@ -954,11 +954,10 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             (task_dir / _TASK_MARKER).touch(exist_ok=True)
         except Exception as err:  # noqa: BLE001
             logger.warn(f"创建网盘下载目录失败：{task_dir} - {err}")
-        store.upsert_task(task_key, {
+        self._begin_netdisk_task(task_key, {
             "title": f"{platform.value}:{code}",
             "name": code,
             "downloader": name,
-            "state": "downloading",
             "error": None,
             "progress": 0.0,
             "size": 0.0,
@@ -1062,11 +1061,10 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
             (task_dir / _TASK_MARKER).touch(exist_ok=True)
         except Exception as err:  # noqa: BLE001
             logger.warn(f"创建网盘已有文件下载目录失败：{task_dir} - {err}")
-        store.upsert_task(task_key, {
+        self._begin_netdisk_task(task_key, {
             "title": _as_text(title) or entries[0].name,
             "name": entries[0].name,
             "downloader": name,
-            "state": "downloading",
             "error": None,
             "progress": 0.0,
             "size": float(sum(int(item.size or 0) for item in entries)),
@@ -2824,6 +2822,21 @@ class NetdiskModule(_DownloaderModuleBase[Any]):
                 self._cleanup_persisted_handles(task_hash, record)
                 cleaned += 1
         return cleaned
+
+    def _begin_netdisk_task(self, task_key: str, fields: Dict[str, Any]) -> None:
+        """
+        开始一轮网盘下载任务：写状态时同时复位对账标志。
+
+        同一分享二次提交会复用任务 hash，`reconciled` 若保持 True，失败对账会直接
+        跳过该任务，订阅集数不回滚、缺集被永久跳过，所以每次开始都要复位。
+
+        :param task_key: 任务标识
+        :param fields: 本次任务的其它状态字段
+        """
+        payload = dict(fields)
+        payload["state"] = "downloading"
+        payload["reconciled"] = False
+        store.upsert_task(task_key, payload)
 
     def mark_reconciled(self, hashs: Union[str, list[str]],
                         downloader: Optional[str] = None) -> None:

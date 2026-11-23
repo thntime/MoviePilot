@@ -27,6 +27,7 @@ from app.chain.subscribe.metadata import SubscribeMetadataOwner
 from app.chain.subscribe.poll import SubscriptionRefreshPoll
 from app.chain.tmdb import TmdbChain
 from app.chain.torrents import TorrentsChain
+from app.domain.projection.aired import aired_episode_cap
 from app.domain.context import (
     MediaInfo,
 )
@@ -549,6 +550,12 @@ class SubscribeRefreshOwner(SubscribeMetadataOwner):
         if subscribe.season is None:
             return current_total
         media_total = len((mediainfo.seasons or {}).get(subscribe.season) or [])
+        # 已播出集号封顶：季清单里的未来集不能算进目标范围，否则订阅会一直去搜
+        # 还没播的集，最后从别的作品的集号里凑出「命中」。
+        aired_cap = aired_episode_cap(mediainfo, subscribe.season)
+        if aired_cap:
+            media_total = min(media_total, aired_cap) if media_total else aired_cap
+            current_total = min(current_total, aired_cap)
         if media_total > current_total:
             return media_total
         return current_total
@@ -642,6 +649,12 @@ class SubscribeRefreshOwner(SubscribeMetadataOwner):
             return subscribe
 
         current_total_episode = len((mediainfo.seasons or {}).get(subscribe.season) or [])
+        # 落库口径同样按已播出集号封顶，避免把未播出的集写进订阅总集数。
+        aired_cap = aired_episode_cap(mediainfo, subscribe.season)
+        if aired_cap:
+            current_total_episode = (
+                min(current_total_episode, aired_cap) if current_total_episode else aired_cap
+            )
         # 外部事件只能向上覆盖主程序本次识别到的 TMDB 当前季总集数，已有订阅回落由主程序跟随本次识别结果持久化。
         new_total_episode = self._SubscribeChain__apply_episodes_refresh(
             current_total_episode,
