@@ -2,15 +2,18 @@
 保护批量下载各阶段之间的状态传递与副作用顺序。
 """
 
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+import app.application.netdisk.share_blacklist as share_blacklist_module
 import app.chain.download.batch as download_batch
 import app.chain.download.selection as download_selection
 from app.application.netdisk.resolve import NetdiskResolveService, ResolvedShare
+from app.application.netdisk.share_blacklist import ShareBlacklistStore
 from app.application.torrent.download import TorrentHelper
 from app.chain.download import DownloadChain
 from app.domain.context import Context, MediaInfo, TorrentInfo
@@ -852,3 +855,80 @@ def test_labelled_pack_magnet_only_selects_subscribed_episodes(batch):
     assert remaining == {}
     assert batch.chain.download_single.call_args.kwargs["episodes"] == {5, 6}
     assert labelled.confirmed_full_coverage is True
+
+def _counting_walk(monkeypatch, paths):
+    """
+    让网盘取链返回固定文件清单，并记录真实读目录的次数。
+    """
+    files = tuple(
+        ShareFile(file_id=f"f{index}", name=Path(path).name, size=100, path=path)
+        for index, path in enumerate(paths)
+    )
+    urls: list[str] = []
+
+    def fake_walk(self, url, password=None, platform=None, account_id=None, **kwargs):
+        urls.append(url)
+        return ResolvedShare(
+            ref=ShareRef(platform=NetdiskPlatform.UC, share_id="b442f632b23c4", url=url),
+            detail=ShareDetail(title="xianni", size=len(files) * 100, files=files),
+            files=files,
+        )
+
+    monkeypatch.setattr(NetdiskResolveService, "walk", fake_walk)
+    return urls
+
+
+def _netdisk_candidate() -> Context:
+    """
+    构造带真实 UC 分享链接的网盘候选，供黑名单写入断言使用。
+    """
+    candidate = _context("xianni")
+    candidate.torrent_info.download_type = "netdisk"
+    candidate.torrent_info.netdisk_platform = "uc"
+    candidate.torrent_info.enclosure = "https://drive.uc.cn/s/b442f632b23c4"
+    return candidate
+
+
+def _isolate_blacklist(monkeypatch, tmp_path) -> ShareBlacklistStore:
+    """
+    把分享黑名单单例指到临时文件，避免测试写进真实配置目录。
+    """
+    store = ShareBlacklistStore(tmp_path / "blacklist.json")
+    monkeypatch.setattr(share_blacklist_module, "_store", store)
+    return store
+
+
+def test_no_target_episodes_blacklists_share_for_one_day(batch, monkeypatch, tmp_path):
+    """
+    分享内没有目标集时按 24 小时写进分享黑名单，下一轮搜索才会跳过它。
+    """
+    store = _isolate_blacklist(monkeypatch, tmp_path)
+    candidate = _netdisk_candidate()
+    _counting_walk(monkeypatch, ["S01/第167集.mp4"])
+    missing = {"tmdb:1": {1: _missing((182,), total=200)}}
+
+    batch.chain.batch_download([candidate], missing)
+
+    entry = store.is_blacklisted("uc", "b442f632b23c4")
+    assert entry is not None
+    assert entry.reason.startswith("分享内没有目标集数")
+    assert "167" in entry.reason
+    assert "182" in entry.reason
+    created = datetime.fromisoformat(entry.created_at)
+    expires = datetime.fromisoformat(entry.expires_at)
+    assert expires - created == timedelta(days=1)
+    batch.chain.download_single.assert_not_called()
+
+
+def test_netdisk_share_directory_is_read_once_per_batch(batch, monkeypatch, tmp_path):
+    """
+    整季阶段与拆包阶段核对同一分享时，只真读一次分享目录。
+    """
+    _isolate_blacklist(monkeypatch, tmp_path)
+    candidate = _netdisk_candidate()
+    urls = _counting_walk(monkeypatch, ["S01/第167集.mp4"])
+    missing = {"tmdb:1": {1: _missing((182,), total=200)}}
+
+    batch.chain.batch_download([candidate], missing)
+
+    assert urls == ["https://drive.uc.cn/s/b442f632b23c4"]

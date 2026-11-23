@@ -26,6 +26,9 @@ _FORMAT_VERSION = 1
 # 默认封禁天数。
 _DEFAULT_DAYS = 7
 
+# 选源阶段实测「分享内没有目标集」的封禁天数：分享内容会持续更新，只压一天。
+NO_TARGET_EPISODE_DAYS = 1
+
 
 @dataclass(frozen=True)
 class ShareBlacklistEntry:

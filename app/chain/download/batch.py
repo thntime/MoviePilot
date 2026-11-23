@@ -178,6 +178,10 @@ class _BatchDownloadRun:
         self.failures: Dict[str, Optional[DownloadFailureSnapshot]] = {}
         # 同一候选可能在多个阶段被跳过，只保留第一条原因，避免前端重复行。
         self._reported_skips: Set[int] = set()
+        # 整季与拆包阶段会各自核对同一分享，目录清单按分享缓存，只真读一次。
+        self._share_files: Dict[Tuple[str, str, str, str], Optional[List[str]]] = {}
+        # 本批判定「分享内没有目标集」的分享，批次结束时统一写黑名单。
+        self._share_skips: Dict[Tuple[str, str, str, str], Tuple[TorrentInfo, str]] = {}
         words = options["custom_words"]
         self.custom_words = words.splitlines() if words else None
 
@@ -205,6 +209,7 @@ class _BatchDownloadRun:
         if self.no_exists:
             self._download_partial_packs()
         logger.info(f"成功下载种子数：{len(self.downloaded)}，剩余未下载的剧集：{self.no_exists}")
+        self._flush_share_blacklist()
 
     def _in_failure_cooldown(self, context: Context) -> bool:
         """
@@ -258,6 +263,126 @@ class _BatchDownloadRun:
             episodes.update(numbers)
         return sorted(episodes) or None
 
+    @staticmethod
+    def _share_key(torrent: TorrentInfo) -> Tuple[str, str, str, str]:
+        """
+        生成分享在本批内的稳定键，供目录缓存与拉黑去重共用。
+
+        :param torrent: 网盘候选
+        :return: 分享链接、提取码、平台与分享令牌组成的键
+        """
+        return (
+            str(getattr(torrent, "enclosure", "") or ""),
+            str(getattr(torrent, "share_password", "") or ""),
+            str(getattr(torrent, "netdisk_platform", "") or ""),
+            str(getattr(torrent, "netdisk_share_token", "") or ""),
+        )
+
+    def _netdisk_share_files(self, torrent: TorrentInfo) -> Optional[List[str]]:
+        """
+        读取分享内的相对路径清单，同一批次内同一分享只真读一次目录。
+
+        整季阶段与拆包阶段各会核对一次同一分享，重复取链既慢又容易触发网盘限流。
+
+        :param torrent: 网盘候选
+        :return: 相对路径列表；分享不可读时返回 None
+        """
+        key = self._share_key(torrent)
+        if key in self._share_files:
+            return self._share_files[key]
+        from app.application.netdisk.resolve import NetdiskResolveService
+        from app.domain.netdisk import NetdiskError
+
+        paths: Optional[List[str]] = None
+        try:
+            walked = NetdiskResolveService().walk(
+                key[0],
+                getattr(torrent, "share_password", None),
+                getattr(torrent, "netdisk_platform", None),
+                share_token=key[3],
+            )
+            paths = [
+                str(getattr(item, "path", "") or getattr(item, "name", "") or "")
+                for item in walked.files
+            ]
+        except NetdiskError as error:
+            logger.warn(f"网盘分享读取失败：{error.message}")
+        except Exception as error:  # noqa: BLE001 - 网络异常按不可读处理
+            logger.warn(f"网盘分享读取异常：{type(error).__name__}")
+        self._share_files[key] = paths
+        return paths
+
+    @staticmethod
+    def _no_target_reason(share_episodes: Set[int], wanted: Set[int]) -> str:
+        """
+        生成分享级跳过原因，带上实测集数与目标集数便于事后回溯。
+
+        :param share_episodes: 分享内实测集数
+        :param wanted: 本批目标集数
+        :return: 写入分享黑名单的原因文本
+        """
+        measured = episode_rules.format_ranges(sorted(share_episodes)) or "无"
+        target = episode_rules.format_ranges(sorted(wanted)) or "无"
+        return f"分享内没有目标集数（实测 {measured}，目标 {target}）"
+
+    def _record_share_skip(self, torrent: TorrentInfo, reason: str) -> None:
+        """
+        记下本批判定「分享内没有目标集」的分享，等批次结束再决定是否拉黑。
+
+        :param torrent: 网盘候选
+        :param reason: 写入黑名单的原因
+        """
+        self._share_skips.setdefault(self._share_key(torrent), (torrent, reason))
+
+    def _flush_share_blacklist(self) -> None:
+        """
+        批次结束时把全程没出过一份可下内容的分享写进分享黑名单。
+
+        同一分享可能只缺某个季，只要有任一季成功提交下载就不拉黑，避免多季分享
+        因为别的季不匹配被整体挡掉；黑名单按 24 小时过期，分享更新后会自动重试。
+        """
+        if not self._share_skips:
+            return
+        submitted = {
+            self._share_key(context.torrent_info)
+            for context in self.downloaded if context.torrent_info is not None
+        }
+        for key, (torrent, reason) in self._share_skips.items():
+            if key in submitted:
+                continue
+            self._write_share_blacklist(torrent, reason)
+
+    @staticmethod
+    def _write_share_blacklist(torrent: TorrentInfo, reason: str) -> None:
+        """
+        把分享写进分享黑名单，写入失败只记日志，不阻断本轮搜索与下载。
+
+        :param torrent: 网盘候选
+        :param reason: 加入黑名单的原因
+        """
+        from app.application.netdisk.share_blacklist import (
+            NO_TARGET_EPISODE_DAYS, get_share_blacklist,
+        )
+        from app.domain.netdisk import parse_share_link
+
+        reference = parse_share_link(
+            str(getattr(torrent, "enclosure", "") or ""),
+            getattr(torrent, "share_password", None),
+        )
+        if reference is None or not reference.share_id:
+            return
+        platform = str(getattr(torrent, "netdisk_platform", "") or reference.platform.value or "")
+        try:
+            get_share_blacklist().add(
+                platform, reference.share_id, reason, days=NO_TARGET_EPISODE_DAYS,
+            )
+            logger.info(
+                f"分享内没有目标集，加入分享黑名单 {NO_TARGET_EPISODE_DAYS} 天："
+                f"{platform}:{reference.share_id}"
+            )
+        except Exception:  # noqa: BLE001 - 黑名单写入失败不阻断本轮
+            logger.warning(f"分享黑名单写入失败：{platform}:{reference.share_id}", exc_info=True)
+
     def _netdisk_season_episodes(
             self, torrent: TorrentInfo, *, windows: Optional[Dict[int, Set[int]]] = None,
     ) -> Optional[Dict[Optional[int], Set[int]]]:
@@ -275,21 +400,8 @@ class _BatchDownloadRun:
         :param windows: 季号到集数窗口的映射；为空时取候选标题声明的范围
         :return: 季号到集号集合的映射；分享不可读或没有可解析集数时返回 None
         """
-        from app.application.netdisk.resolve import NetdiskResolveService
-        from app.domain.netdisk import NetdiskError
-
-        try:
-            walked = NetdiskResolveService().walk(
-                str(getattr(torrent, "enclosure", "") or ""),
-                getattr(torrent, "share_password", None),
-                getattr(torrent, "netdisk_platform", None),
-                share_token=str(getattr(torrent, "netdisk_share_token", "") or ""),
-            )
-        except NetdiskError as error:
-            logger.warn(f"网盘分享读取失败：{error.message}")
-            return None
-        except Exception as error:  # noqa: BLE001 - 网络异常按不可读处理
-            logger.warn(f"网盘分享读取异常：{type(error).__name__}")
+        relative_paths = self._netdisk_share_files(torrent)
+        if relative_paths is None:
             return None
         allowed = windows
         if allowed is None:
@@ -301,8 +413,7 @@ class _BatchDownloadRun:
         for window in allowed.values():
             fallback.update(window)
         seasons: Dict[Optional[int], Set[int]] = {}
-        for item in walked.files:
-            relative = str(getattr(item, "path", "") or getattr(item, "name", "") or "")
+        for relative in relative_paths:
             name = Path(relative).name
             if Path(name).suffix.lower() not in _VIDEO_SUFFIXES:
                 continue
@@ -800,6 +911,9 @@ class _BatchDownloadRun:
             target = share_episodes.intersection(effective)
             if not target:
                 self._report_skip(context, "分享内没有目标集数")
+                self._record_share_skip(
+                    torrent, self._no_target_reason(share_episodes, effective),
+                )
                 logger.info(
                     f"{meta.org_string} 分享内没有目标集，"
                     f"目标 {episode_rules.format_ranges(sorted(effective))}")
@@ -938,6 +1052,7 @@ class _BatchDownloadRun:
         selected = set(episodes).intersection(effective)
         if not selected:
             self._report_skip(context, "分享内没有需要的集数")
+            self._record_share_skip(torrent, self._no_target_reason(episodes, effective))
             logger.info(f"{torrent.site_name} - {torrent.title} 没有需要的集，跳过...")
             return set()
         logger.info(f"{torrent.site_name} - {torrent.title} 选中集数：{selected}")
