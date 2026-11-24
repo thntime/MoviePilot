@@ -6,6 +6,7 @@ TMDB 会把还没播出的集也列进季清单（`episode_count` 200，实际�
 口径与拿不到播出信息时的回退口径。
 """
 
+import dataclasses
 from typing import Any, Dict, List
 
 import pytest
@@ -142,5 +143,39 @@ def test_resolve_subscribe_missing_keeps_series_open(monkeypatch: pytest.MonkeyP
         mediakey="203483",
     )
     assert captured["totals"] == {1: _TOTAL}
+    assert exist_flag is False
+    assert no_exists["203483"][1].episodes == []
+
+
+def test_clip_does_not_mark_series_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+    """媒体库缺的集被 note 抵消、未播出的集被裁掉时，仍不得判整季完成。"""
+    from app.chain.subscribe import refresh as refresh_module
+
+    missing_now = [100, 259] + list(range(_AIRED + 1, _TOTAL + 1))
+
+    class _FakeDownloadChain:
+        """返回「媒体库缺两集 + 未播出的集」的缺集结果。"""
+
+        def get_no_exists_info(self, meta, mediainfo, totals, totals_are_episode_numbers=False):
+            """返回未裁剪的缺集。"""
+            return False, {
+                "203483": {
+                    1: NotExistMediaInfo(
+                        season=1,
+                        episodes=list(missing_now),
+                        total_episode=_TOTAL,
+                        start_episode=1,
+                    )
+                }
+            }
+
+    monkeypatch.setattr(refresh_module, "DownloadChain", _FakeDownloadChain)
+    subscribe = dataclasses.replace(_subscribe(), note=[100, 259])
+    exist_flag, no_exists = SubscribeChain().resolve_subscribe_missing(
+        subscribe=subscribe,
+        meta=None,
+        mediainfo=_mediainfo(aired=_AIRED),
+        mediakey="203483",
+    )
     assert exist_flag is False
     assert no_exists["203483"][1].episodes == []

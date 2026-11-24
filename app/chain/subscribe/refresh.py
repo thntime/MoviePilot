@@ -401,9 +401,6 @@ class SubscribeRefreshOwner(SubscribeMetadataOwner):
                 meta=meta, mediainfo=mediainfo, totals=totals,
                 totals_are_episode_numbers=bool(subscribe.manual_total_episode),
             )
-            no_exists = self._SubscribeChain__clip_no_exists_to_aired(
-                no_exists, mediainfo, subscribe
-            )
         elif meta.type != MediaType.TV and self._SubscribeChain__is_best_version_complete(subscribe):
             return True, {}
         else:
@@ -453,23 +450,23 @@ class SubscribeRefreshOwner(SubscribeMetadataOwner):
             downloaded = []
         downloaded = self._exclude_failed_netdisk_episodes(subscribe, meta, downloaded)
         if meta.type == MediaType.TV:
-            return cast(
-                Tuple[bool, Dict[Union[int, str], Dict[int, _SchemaNotExistMediaInfo]]],
-                self._SubscribeChain__get_subscribe_no_exits(
-                    subscribe_name=f"{subscribe.name} {meta.season}",
-                    no_exists=no_exists,
-                    mediakey=mediakey,
-                    # 搜索词未带季号时识别元数据没有 begin_season，
-                    # 回落到订阅目标季以覆盖原缺失视图。
-                    begin_season=(
-                        meta.begin_season
-                        if meta.begin_season is not None
-                        else subscribe.season
-                    ),
-                    total_episode=effective_total_episode,
-                    start_episode=subscribe.start_episode,
-                    downloaded_episodes=downloaded,
+            # 完成判定必须用未裁剪的缺集：裁剪只用来把未播出的集挡在搜索目标外，
+            # 若先裁剪再判定，「已播出的都下完了」会被误判成整季完结并删掉订阅。
+            exist_flag, no_exists = self._SubscribeChain__get_subscribe_no_exits(
+                subscribe_name=f"{subscribe.name} {meta.season}",
+                no_exists=no_exists,
+                mediakey=mediakey,
+                begin_season=(
+                    meta.begin_season
+                    if meta.begin_season is not None
+                    else subscribe.season
                 ),
+                total_episode=effective_total_episode,
+                start_episode=subscribe.start_episode,
+                downloaded_episodes=downloaded,
+            )
+            return exist_flag, self._SubscribeChain__clip_no_exists_to_aired(
+                no_exists, mediainfo, subscribe
             )
         if meta.type in (MediaType.MOVIE, MediaType.MUSIC):
             return bool(downloaded), no_exists
