@@ -178,6 +178,7 @@ def test_list_returns_empty_when_nothing_pending(store: MemoryContentVerifyRepos
         "total": 0,
         "pending_size": 0,
         "counts": {"reject": 0, "pass": 0, "manual": 0, "deleted": 0, "skipped": 0},
+        "tier_counts": {"reject": 0, "manual": 0, "ai": 0, "system": 0},
         "score_total": content_verify.SCORE_TOTAL,
     }
 

@@ -719,6 +719,7 @@ async def content_verify_list(
     page: Optional[int] = 1,
     count: Optional[int] = 30,
     status: Optional[str] = "all",
+    tier: Optional[str] = "all",
     _: _SchemaTokenPayload = Depends(verify_token),
 ) -> Any:
     """
@@ -730,24 +731,35 @@ async def content_verify_list(
     :param page: 页码
     :param count: 每页数量
     :param status: 状态筛选，all 或具体状态取值
+    :param tier: 档位筛选，all 或具体档位取值
     :return: 分页结果、各状态计数与待处理占用
     """
     from app.application.netdisk.content_verify import (
         DECISION_REJECT,
         DECISION_VALUES,
         SCORE_TOTAL,
+        TIER_VALUES,
         get_content_verify_store,
     )
 
     wanted = str(status or "all").strip().lower()
     if wanted != "all" and wanted not in DECISION_VALUES:
         raise HTTPException(status_code=400, detail=f"不支持的内容校验状态：{wanted}")
+    wanted_tier = str(tier or "all").strip().lower()
+    if wanted_tier != "all" and wanted_tier not in TIER_VALUES:
+        raise HTTPException(status_code=400, detail=f"不支持的内容审核档位：{wanted_tier}")
     records = await asyncio.to_thread(get_content_verify_store().list, None)
     counts: dict[str, int] = {value: 0 for value in DECISION_VALUES}
+    tier_counts: dict[str, int] = {value: 0 for value in TIER_VALUES}
     for record in records:
         counts[record.decision] = counts.get(record.decision, 0) + 1
+        record_tier = getattr(record, "tier", "") or ""
+        if record_tier:
+            tier_counts[record_tier] = tier_counts.get(record_tier, 0) + 1
     if wanted != "all":
         records = [record for record in records if record.decision == wanted]
+    if wanted_tier != "all":
+        records = [record for record in records if (getattr(record, "tier", "") or "") == wanted_tier]
     current = max(1, int(page or 1))
     size = max(1, min(int(count or 30), 200))
     start = (current - 1) * size
@@ -758,6 +770,7 @@ async def content_verify_list(
             record.total_size for record in records if record.decision == DECISION_REJECT
         ),
         "counts": counts,
+        "tier_counts": tier_counts,
         "score_total": int(SCORE_TOTAL),
     }
 

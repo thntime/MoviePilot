@@ -64,6 +64,19 @@ DECISION_VALUES = (
     DECISION_DELETED,
     DECISION_SKIPPED,
 )
+
+# 审核档位：按组合矩阵把判定结果分流到四种处理方式。
+TIER_REJECT = "reject"
+TIER_MANUAL = "manual"
+TIER_AI = "ai"
+TIER_SYSTEM = "system"
+
+TIER_VALUES = (
+    TIER_REJECT,
+    TIER_MANUAL,
+    TIER_AI,
+    TIER_SYSTEM,
+)
 # 音频后缀，用于判断「音频占多数」。
 _AUDIO_SUFFIXES = {
     ".mp3", ".flac", ".wav", ".aac", ".m4a", ".ogg", ".ape", ".wma", ".opus", ".dsf", ".dff",
@@ -167,6 +180,7 @@ class VerifyRecord:
     :param hits: 命中的证据
     :param frames: 抽帧图路径
     :param decision: 处理状态
+    :param tier: 审核档位，取值见 TIER_VALUES
     :param file_count: 文件数
     :param total_size: 总大小（字节）
     :param median_duration: 单集中位时长（秒）
@@ -190,6 +204,7 @@ class VerifyRecord:
     hits: List[str] = field(default_factory=list)
     frames: List[str] = field(default_factory=list)
     decision: str = DECISION_REJECT
+    tier: str = ""
     file_count: int = 0
     total_size: int = 0
     median_duration: int = 0

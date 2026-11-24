@@ -14,7 +14,7 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -61,6 +61,7 @@ class VerifyResult:
     :param frames: 抽帧图路径
     :param hits: 命中的本地证据
     :param direct: 是否由本地证据直接否决，未调用模型
+    :param tier: 审核档位，取值见 content_verify.TIER_VALUES
     """
 
     matched: bool = True
@@ -71,9 +72,81 @@ class VerifyResult:
     frames: Tuple[str, ...] = ()
     hits: Tuple[str, ...] = ()
     direct: bool = False
+    tier: str = ""
 
 
 def verify_downloaded_content(
+    *,
+    mediainfo: Any = None,
+    meta: Any = None,
+    file_items: Sequence[Any] = (),
+    task_name: str = "",
+    storage: str = "local",
+    download_hash: str = "",
+    use_cache: bool = True,
+) -> VerifyResult:
+    """
+    校验一批已下载文件是否属于目标影视作品，并给出审核档位。
+
+    :param mediainfo: 目标媒体信息
+    :param meta: 目标元数据
+    :param file_items: 待校验的源文件项
+    :param task_name: 任务名（通常是分享标题，用于标题证据）
+    :param storage: 源存储类型
+    :param download_hash: 下载任务标识
+    :param use_cache: 是否对相同证据的结论做缓存
+    :return: 带档位的校验结论；任何异常都按放行处理
+    """
+    return _with_tier(
+        _verify_impl(
+            mediainfo=mediainfo,
+            meta=meta,
+            file_items=file_items,
+            task_name=task_name,
+            storage=storage,
+            download_hash=download_hash,
+            use_cache=use_cache,
+        )
+    )
+
+
+def _with_tier(result: VerifyResult) -> VerifyResult:
+    """
+    给判定结论补上审核档位。
+
+    :param result: 未带档位的判定结论
+    :return: 带档位的判定结论
+    """
+    tier = _resolve_tier(result)
+    if result.tier == tier:
+        return result
+    return replace(result, tier=tier)
+
+
+def _resolve_tier(result: VerifyResult) -> str:
+    """
+    按组合矩阵把判定结论落到四档。
+
+    硬负（直接否决或模型强判否）落完全不可信；时长与名字双证据且分数达到
+    免问模型的阈值落系统确认；其余通过落 AI 确认；未真正校验、零证据、未知
+    或拿不准一律落人工确认——未知绝不当作异常。
+
+    :param result: 判定结论
+    :return: 档位
+    """
+    if result.direct or (not result.matched and result.confidence >= REJECT_CONFIDENCE):
+        return content_verify.TIER_REJECT
+    if not result.checked or not result.matched:
+        return content_verify.TIER_MANUAL
+    hits = set(result.hits or ())
+    duration_ok = "时长" in hits
+    name_ok = "文件名" in hits or "目录名" in hits
+    if duration_ok and name_ok and result.score >= content_verify.SCORE_SKIP_MODEL:
+        return content_verify.TIER_SYSTEM
+    return content_verify.TIER_AI
+
+
+def _verify_impl(
     *,
     mediainfo: Any = None,
     meta: Any = None,
@@ -261,6 +334,7 @@ def record_verification(
         hits=list(result.hits),
         frames=list(result.frames),
         decision=str(decision or content_verify.DECISION_REJECT),
+        tier=str(getattr(result, "tier", "") or ""),
         file_count=len(list(file_items)),
         total_size=sum(sizes),
         median_duration=int(sorted(durations)[len(durations) // 2]) if durations else 0,
@@ -371,6 +445,7 @@ def _reject(
     return VerifyResult(
         matched=False,
         checked=True,
+        tier=content_verify.TIER_REJECT,
         reason=reason or "内容与目标影视不符",
         score=result_score.score,
         confidence=confidence,

@@ -308,6 +308,7 @@ class ContentVerifyItem(BaseModel):
     :param created_at: 创建时间
     :param updated_at: 更新时间
     :param decision: 处理状态
+    :param tier: 审核档位
     """
 
     id: str = Field(default="", description="记录标识")
@@ -331,6 +332,7 @@ class ContentVerifyItem(BaseModel):
     created_at: str = Field(default="", description="创建时间")
     updated_at: str = Field(default="", description="更新时间")
     decision: str = Field(default="reject", description="处理状态")
+    tier: str = Field(default="", description="审核档位")
 
 
 class ContentVerifyPage(BaseModel):
@@ -341,6 +343,7 @@ class ContentVerifyPage(BaseModel):
     :param total: 当前筛选条件下的记录总数
     :param pending_size: 待处理记录的文件总占用（字节）
     :param counts: 各状态的记录数
+    :param tier_counts: 各档位的记录数
     :param score_total: 证据得分满分，前端展示 N/满分 用
     """
 
@@ -348,6 +351,7 @@ class ContentVerifyPage(BaseModel):
     total: int = Field(default=0, description="当前筛选条件下的记录总数")
     pending_size: int = Field(default=0, description="待处理记录的文件总占用（字节）")
     counts: Dict[str, int] = Field(default_factory=dict, description="各状态的记录数")
+    tier_counts: Dict[str, int] = Field(default_factory=dict, description="各档位的记录数")
     score_total: int = Field(default=0, description="证据得分满分")
 
 

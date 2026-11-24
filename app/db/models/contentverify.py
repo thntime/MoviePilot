@@ -58,6 +58,8 @@ class ContentVerify(Base):
     download_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     # 处理状态：reject 待处理 / manual 已人工放行 / deleted 已删除
     decision: Mapped[str] = mapped_column(String(16), nullable=False, default="reject")
+    # 审核档位：reject 完全不可信 / manual 人工确认 / ai AI 确认 / system 系统确认
+    tier: Mapped[str] = mapped_column(String(16), nullable=False, default="")
     # 判定时间
     created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, server_default=func.now())
     # 最后处理时间
