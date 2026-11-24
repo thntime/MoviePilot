@@ -8,10 +8,13 @@ TMDB 会把还没播出的集也列进季清单（`episode_count` 200，实际�
 
 from typing import Any, Dict, List
 
+import pytest
+
 from app.application.subscription.contract import SubscriptionSnapshot
 from app.chain.subscribe.facade import SubscribeChain
 from app.domain.context import MediaInfo
 from app.domain.projection.aired import aired_episode_cap
+from app.schemas.mediaserver import NotExistMediaInfo
 from app.schemas.types import MediaType
 
 _TOTAL = 200
@@ -77,9 +80,9 @@ def test_aired_episode_cap_reads_last_aired_point() -> None:
     assert aired_episode_cap(_mediainfo(aired=_AIRED), None) is None
 
 
-def test_effective_total_episode_is_capped_by_aired() -> None:
-    """TMDB 声明 200 集、实际播到 168 集时，有效总集数是 168。"""
-    assert _effective(_subscribe(), _mediainfo(aired=_AIRED)) == _AIRED
+def test_effective_total_episode_ignores_aired_cap() -> None:
+    """有效总集数不能按已播出集号压小：它同时决定整季是否下完。"""
+    assert _effective(_subscribe(), _mediainfo(aired=_AIRED)) == _TOTAL
 
 
 def test_effective_total_episode_keeps_metadata_when_aired_unknown() -> None:
@@ -90,3 +93,54 @@ def test_effective_total_episode_keeps_metadata_when_aired_unknown() -> None:
 def test_effective_total_episode_respects_manual_total() -> None:
     """手工指定总集数时不被播出信息改写。"""
     assert _effective(_subscribe(manual=1), _mediainfo(aired=_AIRED)) == _TOTAL
+
+
+def test_clip_no_exists_drops_unaired_episodes() -> None:
+    """缺集列表裁到已播出范围内，未播出的集不进搜索目标。"""
+    clip = SubscribeChain._SubscribeChain__clip_no_exists_to_aired
+    no_exists = {
+        "203483": {
+            1: NotExistMediaInfo(
+                season=1, episodes=[100, 169, 170], total_episode=_TOTAL, start_episode=1,
+            )
+        }
+    }
+    clipped = clip(no_exists, _mediainfo(aired=_AIRED), _subscribe())
+    assert clipped["203483"][1].episodes == [100]
+    assert clipped["203483"][1].total_episode == _TOTAL
+
+
+def test_resolve_subscribe_missing_keeps_series_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """媒体库只覆盖已播出的集时，订阅不得被判成整季完成（否则会被删掉）。"""
+    from app.chain.subscribe import refresh as refresh_module
+
+    captured: Dict[str, Any] = {}
+
+    class _FakeDownloadChain:
+        """替换下载链，返回「只缺未播出集」的结果。"""
+
+        def get_no_exists_info(self, meta, mediainfo, totals, totals_are_episode_numbers=False):
+            """返回整季目标下的缺失集。"""
+            captured["totals"] = dict(totals)
+            missing = list(range(_AIRED + 1, _TOTAL + 1))
+            return False, {
+                "203483": {
+                    1: NotExistMediaInfo(
+                        season=1,
+                        episodes=missing,
+                        total_episode=totals.get(1, 0),
+                        start_episode=1,
+                    )
+                }
+            }
+
+    monkeypatch.setattr(refresh_module, "DownloadChain", _FakeDownloadChain)
+    exist_flag, no_exists = SubscribeChain().resolve_subscribe_missing(
+        subscribe=_subscribe(),
+        meta=None,
+        mediainfo=_mediainfo(aired=_AIRED),
+        mediakey="203483",
+    )
+    assert captured["totals"] == {1: _TOTAL}
+    assert exist_flag is False
+    assert no_exists["203483"][1].episodes == []

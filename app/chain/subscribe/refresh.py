@@ -325,6 +325,47 @@ class SubscribeRefreshOwner(SubscribeMetadataOwner):
         if progress_callback:
             progress_callback(value=100, text="订阅日历预缓存完成")
 
+    @staticmethod
+    def _SubscribeChain__clip_no_exists_to_aired(
+        no_exists: Dict[Union[int, str], Dict[int, _SchemaNotExistMediaInfo]],
+        mediainfo: MediaInfo,
+        subscribe: SubscriptionSnapshot,
+    ) -> Dict[Union[int, str], Dict[int, _SchemaNotExistMediaInfo]]:
+        """
+        把缺集列表裁到已播出范围内，未播出的集不进入搜索目标。
+
+        只裁剪 episodes，不动调用方拿到的 exist_flag：媒体库覆盖了已播出的集
+        不等于整季完结，否则连载剧会被判成「已全部下载」并删掉订阅。
+
+        :param no_exists: 缺失集数信息
+        :param mediainfo: 媒体信息
+        :param subscribe: 订阅快照
+        :return: 裁剪后的缺失集数信息
+        """
+        if not no_exists or subscribe.type != MediaType.TV.value:
+            return no_exists
+        if subscribe.manual_total_episode or subscribe.season is None:
+            return no_exists
+        cap = aired_episode_cap(mediainfo, subscribe.season)
+        if not cap:
+            return no_exists
+        clipped: Dict[Union[int, str], Dict[int, _SchemaNotExistMediaInfo]] = {}
+        for mediakey, seasons in (no_exists or {}).items():
+            seasons_out: Dict[int, _SchemaNotExistMediaInfo] = {}
+            for season, info in (seasons or {}).items():
+                episodes = [
+                    episode for episode in (info.episodes or []) if episode <= cap
+                ]
+                seasons_out[season] = _SchemaNotExistMediaInfo(
+                    season=info.season,
+                    episodes=episodes,
+                    total_episode=info.total_episode,
+                    start_episode=info.start_episode,
+                    require_complete_coverage=info.require_complete_coverage,
+                )
+            clipped[mediakey] = seasons_out
+        return clipped
+
     def resolve_subscribe_missing(
         self,
         subscribe: SubscriptionSnapshot,
@@ -359,6 +400,9 @@ class SubscribeRefreshOwner(SubscribeMetadataOwner):
             exist_flag, no_exists = DownloadChain().get_no_exists_info(
                 meta=meta, mediainfo=mediainfo, totals=totals,
                 totals_are_episode_numbers=bool(subscribe.manual_total_episode),
+            )
+            no_exists = self._SubscribeChain__clip_no_exists_to_aired(
+                no_exists, mediainfo, subscribe
             )
         elif meta.type != MediaType.TV and self._SubscribeChain__is_best_version_complete(subscribe):
             return True, {}
@@ -550,12 +594,9 @@ class SubscribeRefreshOwner(SubscribeMetadataOwner):
         if subscribe.season is None:
             return current_total
         media_total = len((mediainfo.seasons or {}).get(subscribe.season) or [])
-        # 已播出集号封顶：季清单里的未来集不能算进目标范围，否则订阅会一直去搜
-        # 还没播的集，最后从别的作品的集号里凑出「命中」。
-        aired_cap = aired_episode_cap(mediainfo, subscribe.season)
-        if aired_cap:
-            media_total = min(media_total, aired_cap) if media_total else aired_cap
-            current_total = min(current_total, aired_cap)
+        # 这里不能按已播出集号封顶：这个值同时决定「整季是否下完」，压小会把
+        # 连载剧的「已播出的都下完了」误判成整季完结并删掉订阅；未播出的集改由
+        # __clip_no_exists_to_aired 从缺集列表里剔除，只影响搜索目标范围。
         if media_total > current_total:
             return media_total
         return current_total
@@ -649,13 +690,8 @@ class SubscribeRefreshOwner(SubscribeMetadataOwner):
             return subscribe
 
         current_total_episode = len((mediainfo.seasons or {}).get(subscribe.season) or [])
-        # 落库口径同样按已播出集号封顶，避免把未播出的集写进订阅总集数。
-        aired_cap = aired_episode_cap(mediainfo, subscribe.season)
-        if aired_cap:
-            current_total_episode = (
-                min(current_total_episode, aired_cap) if current_total_episode else aired_cap
-            )
-        # 外部事件只能向上覆盖主程序本次识别到的 TMDB 当前季总集数，已有订阅回落由主程序跟随本次识别结果持久化。
+        # 落库口径不能按已播出集号封顶：订阅总集数是「整季完结」的判据，压小会让
+        # 连载剧提前完成；未播出的集只在缺集列表里剔除。
         new_total_episode = self._SubscribeChain__apply_episodes_refresh(
             current_total_episode,
             season=subscribe.season,
