@@ -98,7 +98,7 @@ def test_effective_total_episode_respects_manual_total() -> None:
 
 def test_clip_no_exists_drops_unaired_episodes() -> None:
     """缺集列表裁到已播出范围内，未播出的集不进搜索目标。"""
-    clip = SubscribeChain._SubscribeChain__clip_no_exists_to_aired
+    from app.chain.subscribe.metadata import _clip_missing_to_aired as clip
     no_exists = {
         "203483": {
             1: NotExistMediaInfo(
@@ -144,7 +144,8 @@ def test_resolve_subscribe_missing_keeps_series_open(monkeypatch: pytest.MonkeyP
     )
     assert captured["totals"] == {1: _TOTAL}
     assert exist_flag is False
-    assert no_exists["203483"][1].episodes == []
+    # resolve 不再裁剪：完整缺集留给进度与完成判定，裁剪只发生在搜索目标
+    assert no_exists["203483"][1].episodes == list(range(_AIRED + 1, _TOTAL + 1))
 
 
 def test_clip_does_not_mark_series_complete(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -178,4 +179,28 @@ def test_clip_does_not_mark_series_complete(monkeypatch: pytest.MonkeyPatch) -> 
         mediakey="203483",
     )
     assert exist_flag is False
-    assert no_exists["203483"][1].episodes == []
+    # note 里记账过的 100、259 被抵消，只剩未播出的 169-200 仍然缺失
+    assert no_exists["203483"][1].episodes == list(range(_AIRED + 1, _TOTAL + 1))
+
+
+def test_lack_episode_uses_full_missing() -> None:
+    """缺失数按完整缺集算；空缺集在既有语义里等于整季未找到。"""
+    from app.application.subscription.contract import subscribe_media_keys
+    from app.application.subscription.priority import compute_lack_episode
+
+    subscribe = dataclasses.replace(_subscribe(), media_source="themoviedb", media_id="203483")
+    key = (subscribe_media_keys(subscribe) or ["203483"])[0]
+    aired_missing = list(range(_AIRED + 1, _TOTAL + 1))
+    no_exists = {
+        key: {
+            1: NotExistMediaInfo(
+                season=1, episodes=aired_missing, total_episode=_TOTAL, start_episode=1,
+            )
+        }
+    }
+    assert compute_lack_episode(subscribe, no_exists=no_exists) == _TOTAL - _AIRED
+
+    empty = {
+        key: {1: NotExistMediaInfo(season=1, episodes=[], total_episode=_TOTAL, start_episode=1)}
+    }
+    assert compute_lack_episode(subscribe, no_exists=empty) == _TOTAL

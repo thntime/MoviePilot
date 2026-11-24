@@ -4,7 +4,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Optional, TypeVar, cast
+from typing import Any, Dict, Optional, TypeVar, cast
 
 from app.application.classification.reference import (
     subscription_classification_override,
@@ -20,6 +20,7 @@ from app.chain.subscribe.contract import _SubscribeOwnerBase
 from app.chain.subscribe.identity import subscribe_recognize_kwargs
 from app.domain.context import MediaInfo, MusicInfo
 from app.domain.meta.metabase import MetaBase
+from app.domain.projection.aired import aired_episode_cap
 from app.runtime.log import logger
 from app.schemas.media import resolve_media_identity
 from app.schemas.mediaserver import NotExistMediaInfo
@@ -45,6 +46,38 @@ class SubscriptionSearchTarget:
     media: MediaInfo | MusicInfo
     missing: dict[str, dict[int, NotExistMediaInfo]]
     media_key: Optional[str | int]
+
+
+def _clip_missing_to_aired(
+    missing: Dict[Any, Any],
+    mediainfo: MediaInfo,
+    subscribe: SubscriptionSnapshot,
+) -> Dict[Any, Any]:
+    """
+    把搜索用的缺集裁到已播出范围内，未播出的集不进入搜索目标。
+
+    只在构造搜索目标时使用：进度与完成判定仍按完整缺集计算，否则连载剧
+    「已播出的都下完了」会被当成整季完结。
+
+    :param missing: 完整缺集
+    :param mediainfo: 媒体信息
+    :param subscribe: 订阅快照
+    :return: 裁剪后的缺集
+    """
+    if not missing or subscribe.manual_total_episode or subscribe.season is None:
+        return missing
+    cap = aired_episode_cap(mediainfo, subscribe.season)
+    if not cap:
+        return missing
+    clipped: Dict[Any, Any] = {}
+    for media_key, seasons in (missing or {}).items():
+        seasons_out: Dict[Any, Any] = {}
+        for season, info in (seasons or {}).items():
+            episodes = [episode for episode in (getattr(info, "episodes", None) or []) if episode <= cap]
+            copy = info.model_copy(update={"episodes": episodes}) if hasattr(info, "model_copy") else info
+            seasons_out[season] = copy
+        clipped[media_key] = seasons_out
+    return clipped
 
 
 def prepare_search_target(owner: _SubscribeOwnerBase, subscribe: SubscriptionSnapshot,
@@ -77,7 +110,11 @@ def prepare_search_target(owner: _SubscribeOwnerBase, subscribe: SubscriptionSna
     exists, missing = owner.check_and_handle_existing_media(
         subscribe=subscribe, meta=meta, mediainfo=media, mediakey=key,
     )
-    return None if exists else SubscriptionSearchTarget(subscribe, meta, media, missing, key)
+    if exists:
+        return None
+    return SubscriptionSearchTarget(
+        subscribe, meta, media, _clip_missing_to_aired(missing, media, subscribe), key,
+    )
 
 
 def apply_subscription_classification(
