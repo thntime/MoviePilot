@@ -11,7 +11,7 @@ import pytest
 from app.domain.netdisk import ShareFile
 from app.modules.netdisk import NetdiskModule
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _share_file(file_id: str, name: str) -> ShareFile:

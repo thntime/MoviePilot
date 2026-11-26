@@ -432,7 +432,7 @@ def test_submit_partial_pack_reports_unparseable_target_season(batch, monkeypatc
     run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing((1,))}}, governance)
     monkeypatch.setattr(run, "_netdisk_season_episodes", lambda _torrent, **_: {})
 
-    assert run._submit_partial_pack(candidate, {1}, 1) == set()  # pylint: disable=protected-access
+    assert run._submit_partial_pack(candidate, {1}, season=1) == set()  # pylint: disable=protected-access
     batch.chain.download_single.assert_not_called()
     assert calls == [(candidate, "rejected", "分享内没有可解析的目标季 S1 集数")]
 

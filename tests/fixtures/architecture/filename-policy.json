@@ -178,6 +178,16 @@
       "evidence": "由网盘搜索与订阅链路共用，作为 application/netdisk 包内单文件用例。"
     },
     {
+      "path": "app/application/netdisk/content_verify.py",
+      "reason": "网盘下载后内容校验的证据打分、抽帧与待处理记录端口，属单一应用能力，未构成独立包。",
+      "evidence": "被 app/api/endpoints/history.py、app/application/netdisk/download_verify.py、app/db/adapters/contentverify.py 与启动组合根共同注入使用，ContentVerifyRepository 端口由组合根提供实现。"
+    },
+    {
+      "path": "app/application/netdisk/download_verify.py",
+      "reason": "整理前的内容校验门：串起本地打分、模型判定与抽帧复核，失败一律放行，属单一应用能力。",
+      "evidence": "仅被 app/chain/transfer/workflow.py 调用，与 content_verify 同属 application/netdisk 包内的校验能力。"
+    },
+    {
       "path": "app/application/netdisk/share_blacklist.py",
       "reason": "网盘分享失效黑名单用例与持久化端口，被搜索、下载与对账共同使用。",
       "evidence": "app/modules/cloudsaver 与 app/chain/download 通过该模块读写黑名单，尚无同名子包。"
