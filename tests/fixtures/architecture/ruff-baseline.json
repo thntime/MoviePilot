@@ -53,44 +53,20 @@
   "scripts/perf/task_registry_ab.py": {
     "E402": 1
   },
-  "tests/agent/runtime/test_agent_session_status.py": {
-    "I001": 1
-  },
-  "tests/db/migrations/test_database_migration_startup.py": {
-    "F841": 1
+  "tests/application/messaging/test_interaction_router.py": {
+    "E402": 5
   },
   "tests/db/base/test_db_declarative_2_0.py": {
     "E402": 1
   },
-  "tests/integration/download/test_episode_format_helper.py": {
+  "tests/db/migrations/test_database_migration_startup.py": {
     "F841": 1
   },
-  "tests/tooling/skills/test_feedback_issue_repository_routing.py": {
-    "I001": 1
-  },
-  "tests/tooling/skills/test_feedback_issue_scripts.py": {
-    "I001": 1
-  },
-  "tests/application/messaging/test_interaction_router.py": {
-    "E402": 5
-  },
-  "tests/tooling/setup/test_local_setup_config_dir.py": {
+  "tests/integration/download/test_episode_format_helper.py": {
     "F841": 1
   },
   "tests/integration/media/test_media_interaction.py": {
     "F841": 1
-  },
-  "tests/chain/media/test_media_source_signature_compatibility.py": {
-    "I001": 1
-  },
-  "tests/integration/mediaserver/test_mediaserver_image_signing.py": {
-    "I001": 1
-  },
-  "tests/modules/messaging/test_message_channel_permissions.py": {
-    "I001": 1
-  },
-  "tests/integration/plugin/test_plugin_sdk.py": {
-    "I001": 3
   },
   "tests/integration/plugin/test_plugin_virtual_instances.py": {
     "E731": 1
@@ -100,5 +76,14 @@
   },
   "tests/modules/themoviedb/test_tmdb_retry_and_errors.py": {
     "F811": 1
+  },
+  "tests/tooling/setup/test_local_setup_config_dir.py": {
+    "F841": 1
+  },
+  "tests/tooling/skills/test_feedback_issue_repository_routing.py": {
+    "I001": 1
+  },
+  "tests/tooling/skills/test_feedback_issue_scripts.py": {
+    "I001": 1
   }
 }
