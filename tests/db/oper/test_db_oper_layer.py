@@ -645,6 +645,52 @@ def test_mediaserver_oper_cleanup_entry_points(db):
     assert MediaServerItem.get_by_itemid(db.session, "ms-c3") is None
 
 
+
+def test_mediaserver_oper_get_season_episodes_reads_snapshot(db):
+    """
+    季集快照要能按季取出已入库集号，缺失与损坏一律按「未确认」返回空集合。
+
+    上层用空集合表示「不知道」，误判成缺失会让整季被重复下载。
+    """
+    oper = MediaServerOper(db=db.session)
+    oper.add(
+        **_server_item(
+            "ms-ep",
+            media_id="5500",
+            item_type="电视剧",
+            seasoninfo={"1": [1, 2, 3], "2": ["4", "坏值", None]},
+        )
+    )
+
+    assert oper.get_season_episodes(media_source=TMDB, media_id="5500", mtype="电视剧", season=1) == {1, 2, 3}
+    # 快照经 JSON 往返后键可能变成字符串，损坏的集号跳过而不是整体失败。
+    assert oper.get_season_episodes(media_source=TMDB, media_id="5500", mtype="电视剧", season=2) == {4}
+    # 没有这一季、没有季快照、没有 season 参数都返回空集合。
+    assert oper.get_season_episodes(media_source=TMDB, media_id="5500", mtype="电视剧", season=3) == set()
+    assert oper.get_season_episodes(media_source=TMDB, media_id="5500", mtype="电视剧") == set()
+    assert oper.get_season_episodes(media_source=TMDB, media_id="5999", mtype="电视剧", season=1) == set()
+
+    oper.add(**_server_item("ms-noseasoninfo", media_id="5600", item_type="电视剧"))
+    assert oper.get_season_episodes(media_source=TMDB, media_id="5600", mtype="电视剧", season=1) == set()
+
+
+def test_mediaserver_oper_async_get_season_episodes_matches_sync(db):
+    """
+    异步版本与同步版本必须给出相同结果，否则同步链路与异步链路会互相打架。
+    """
+    oper = MediaServerOper(db=db.session)
+    oper.add(**_server_item("ms-ep-async", media_id="5700", item_type="电视剧", seasoninfo={"1": [1, 2]}))
+    db.session.commit()
+
+    assert asyncio.run(
+        oper.async_get_season_episodes(media_source=TMDB, media_id="5700", mtype="电视剧", season=1)
+    ) == {1, 2}
+    assert asyncio.run(
+        oper.async_get_season_episodes(media_source=TMDB, media_id="5700", mtype="电视剧", season=9)
+    ) == set()
+    assert asyncio.run(oper.async_get_season_episodes(media_source=TMDB, media_id="5700", mtype="电视剧")) == set()
+
+
 # --------------------------------------------------------------------------- #
 # DownloadHistoryOper
 # --------------------------------------------------------------------------- #

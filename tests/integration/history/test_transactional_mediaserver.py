@@ -3,7 +3,7 @@
 """
 
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -234,3 +234,57 @@ async def test_query_service_names_item_ref_fields(found, expected) -> None:
         media_id="1001",
         season=2,
     )
+
+def test_upsert_serializes_note_and_seasoninfo(session_factory) -> None:
+    """
+    备注与季集快照要按 JSON 结构落库，而不是原样塞字符串。
+
+    上层读回来时按字典/列表取用；落成字符串会让季集快照解析不出集号。
+    """
+    repository = TransactionalMediaServerRepository(session_factory)
+    item = replace(_sync_item(title="带备注", sync_time="2026-08-13 10:00:00"), note_json='{"k": "v"}')
+
+    assert repository.upsert(item) is True
+
+    with session_factory() as session:
+        stored = MediaServerItem.get_by_server_itemid(session, "plex", "item-1")
+        assert stored.note == {"k": "v"}
+        assert stored.seasoninfo == {"1": [1, 2]}
+
+
+def test_get_season_episodes_returns_scalar_after_short_session_closes(session_factory) -> None:
+    """
+    短会话关闭后仍能拿到集号集合，未命中或没有该季时返回空集合。
+    """
+    repository = TransactionalMediaServerRepository(session_factory)
+    repository.upsert(_sync_item(title="季集", sync_time="2026-08-13 10:00:00"))
+
+    assert repository.get_season_episodes(
+        server="plex", title="季集", year="2026", mtype="电影", season=1
+    ) == {1, 2}
+    assert repository.get_season_episodes(
+        server="plex", title="季集", year="2026", mtype="电影", season=9
+    ) == set()
+    assert repository.get_season_episodes(server="plex", title="查无此片") == set()
+
+
+def test_delete_stale_and_excluded_servers_report_counts(session_factory) -> None:
+    """
+    两种清理入口都返回实际删除条数，供同步报告统计。
+
+    `delete_stale` 按同步时间清理本轮未更新的条目，`delete_excluded_servers` 按启用
+    服务器清单清理停用服务器的条目。
+    """
+    repository = TransactionalMediaServerRepository(session_factory)
+    repository.upsert(_sync_item(title="本轮更新", sync_time="2026-08-13 10:00:00"))
+    repository.upsert(
+        replace(_sync_item(title="上一轮", sync_time="2026-01-01 10:00:00"), item_id="item-2")
+    )
+    repository.upsert(
+        replace(_sync_item(title="已停用服务器", sync_time="2026-08-13 10:00:00"), server="emby", item_id="item-3")
+    )
+
+    assert repository.delete_stale(server="plex", sync_time="2026-08-13 10:00:00") == 1
+    # 只保留启用服务器：传入启用列表后，停用服务器的条目会被清掉。
+    assert repository.delete_excluded_servers(["plex"]) == 1
+    assert repository.delete_excluded_servers(["plex"]) == 0
