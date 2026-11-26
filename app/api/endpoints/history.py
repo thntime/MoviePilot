@@ -267,6 +267,35 @@ def _submit_batch_ai_redo(
     )
 
 
+def _load_content_verify_fileitem(
+    store: Any, record_id: str
+) -> tuple[Any, Any]:
+    """
+    读取内容校验记录并构造整理用的文件项。
+
+    记录读取与文件类型判断都是同步 IO，统一放在线程里执行，避免阻塞事件循环。
+
+    :param store: 内容校验记录存储
+    :param record_id: 记录 ID（接口层以字符串传递）
+    :return: （记录, 文件项）；记录不存在时文件项为 None
+    """
+    from app.schemas.file import FileItem
+
+    record = store.get(record_id)
+    if record is None:
+        return None, None
+    source = Path(record.src)
+    fileitem = FileItem(
+        path=record.src,
+        storage=record.storage or "local",
+        type="dir" if source.is_dir() else "file",
+        name=source.name,
+        basename=source.stem,
+        extension=source.suffix[1:],
+    )
+    return record, fileitem
+
+
 def _resolve_download_history_username(token: _SchemaTokenPayload) -> Optional[str]:
     """
     解析下载历史查询应限定的用户名；管理员和下载管理权限用户返回 None 以查看全局记录。
@@ -841,21 +870,11 @@ async def content_verify_accept(
     """
     from app.application.netdisk.content_verify import DECISION_MANUAL, get_content_verify_store
     from app.chain.transfer.facade import TransferChain
-    from app.schemas.file import FileItem
 
     store = get_content_verify_store()
-    record = await asyncio.to_thread(store.get, payload.id)
+    record, fileitem = await asyncio.to_thread(_load_content_verify_fileitem, store, payload.id)
     if record is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    source = Path(record.src)
-    fileitem = FileItem(
-        path=record.src,
-        storage=record.storage or "local",
-        type="dir" if source.is_dir() else "file",
-        name=source.name,
-        basename=source.stem,
-        extension=source.suffix[1:],
-    )
 
     def _run_transfer() -> Any:
         """
