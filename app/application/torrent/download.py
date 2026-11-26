@@ -795,8 +795,8 @@ class TorrentHelper:
 
     @staticmethod
     def _alias_matches(
-            media_names: set,
-            meta_names: set,
+            media_names: set[str],
+            meta_names: set[str],
             mediainfo: MediaInfo,
             torrent: TorrentInfo,
     ) -> bool:

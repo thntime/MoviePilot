@@ -152,7 +152,7 @@ def _accepted_result(
     confidence: float,
     reason: str,
     frames: Tuple[str, ...],
-    cache_key: str,
+    cache_key: Tuple[str, Tuple[str, ...]],
 ) -> VerifyResult:
     """
     模型判通过时的结论。
@@ -201,7 +201,7 @@ def _review_rejection(
     frames: Tuple[str, ...],
     confidence: float,
     reason: str,
-    cache_key: str,
+    cache_key: Tuple[str, Tuple[str, ...]],
 ) -> Tuple[Tuple[str, ...], Optional[VerifyResult], float, str]:
     """
     中等置信度判否时抽帧复核。

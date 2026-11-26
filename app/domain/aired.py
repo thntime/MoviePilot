@@ -43,7 +43,7 @@ def last_aired_point(info: Any) -> Tuple[Optional[int], Optional[int]]:
     return season, episode
 
 
-def _season_number_of(season: dict) -> Optional[int]:
+def _season_number_of(season: dict[str, Any]) -> Optional[int]:
     """
     取季字典里的季号，兼容以 `order` 标注季号的数据源。
 
@@ -61,7 +61,7 @@ def _season_number_of(season: dict) -> Optional[int]:
         return None
 
 
-def _dated_aired_episodes(episodes: list, current_day: str) -> set[int]:
+def _dated_aired_episodes(episodes: list[dict[str, Any]], current_day: str) -> set[int]:
     """
     按每集播出日期筛出已播出的集号。
 
@@ -85,7 +85,7 @@ def _dated_aired_episodes(episodes: list, current_day: str) -> set[int]:
 
 
 def _aired_from_last_point(
-    season: dict,
+    season: dict[str, Any],
     season_number: int,
     last_season: Optional[int],
     last_episode: Optional[int],

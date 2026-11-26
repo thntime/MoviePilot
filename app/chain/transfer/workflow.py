@@ -128,7 +128,7 @@ def _empty_candidates_result(
     preview: bool,
     has_episode_format_template: bool,
     matched_episode_format_template: bool,
-) -> Any:
+) -> tuple[bool, str | dict[str, Any]]:
     """
     候选为空时的返回结果。
 
@@ -144,7 +144,7 @@ def _empty_candidates_result(
     if has_episode_format_template and not matched_episode_format_template:
         logger.info(f"{fileitem.path} 未匹配到集数定位模板，跳过整理")
         submission.record(fileitem, "skipped", "未匹配到集数定位模板，跳过整理")
-        return submission.result(True, [], preview=preview, preview_items=[])
+        return cast(tuple[bool, str | dict[str, Any]], submission.result(True, [], preview=preview, preview_items=[]))
     logger.warn(f"{fileitem.path} 没有找到可整理的媒体文件")
     return False, f"{fileitem.name} 没有找到可整理的媒体文件"
 
