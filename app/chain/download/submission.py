@@ -486,6 +486,36 @@ def convert_download_identity_to_tmdb(
     return candidate_meta, converted, origin_media
 
 
+def _apply_selected_episodes(
+    context: Context,
+    episodes: Optional[Set[int]],
+    meta: Any,
+) -> None:
+    """
+    把本次下载选中的集数写回上下文，供后续整理与记录使用。
+
+    :param context: 下载上下文
+    :param episodes: 本次显式选中的集数
+    :param meta: 资源自身的标题解析元数据
+    """
+    if episodes is not None:
+        context.selected_episodes = sorted(set(episodes))
+    elif meta.episode_list:
+        context.selected_episodes = sorted(set(meta.episode_list))
+    else:
+        context.selected_episodes = []
+
+
+def _folder_name_of(prepared: Any) -> str:
+    """
+    取种子顶层目录名，网盘任务没有种子目录时归一为空串。
+
+    :param prepared: 已准备好的下载提交参数
+    :return: 顶层目录名；没有时为空串
+    """
+    return prepared.folder_name or ""
+
+
 @dataclass(frozen=True, slots=True)
 class _PreparedDownload:
     """
@@ -1036,7 +1066,7 @@ class _DownloadResourceOwner(_DownloadOwnerBase):
             origin=source,
             downloader=downloader or prepared.site_downloader,
             save_path=prepared.download_uri,
-            folder_name=prepared.folder_name or "",
+            folder_name=_folder_name_of(prepared),
             file_list=list(prepared.file_list),
             user_specified=user_specified,
             options={
@@ -1349,12 +1379,7 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
         torrent, media, meta = synced
         site_downloader = torrent.site_downloader
         download_episodes = episode_rules.format_ranges(list(episodes)) if episodes else None
-        if episodes is not None:
-            context.selected_episodes = sorted(set(episodes))
-        elif meta.episode_list:
-            context.selected_episodes = sorted(set(meta.episode_list))
-        else:
-            context.selected_episodes = []
+        _apply_selected_episodes(context, episodes, meta)
         download_error = "下载种子内容为空"
 
         def remember_failure(error_msg: str) -> None:
@@ -1762,7 +1787,7 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             media=prepared.media,
             meta=prepared.meta,
             torrent=prepared.torrent,
-            folder_name=prepared.folder_name or "",
+            folder_name=_folder_name_of(prepared),
             file_list=prepared.file_list,
             download_dir=download_dir,
             layout=layout,

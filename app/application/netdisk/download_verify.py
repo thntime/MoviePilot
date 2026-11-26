@@ -146,6 +146,100 @@ def _resolve_tier(result: VerifyResult) -> str:
     return content_verify.TIER_AI
 
 
+def _accepted_result(
+    *,
+    score: Any,
+    confidence: float,
+    reason: str,
+    frames: Tuple[str, ...],
+    cache_key: str,
+) -> VerifyResult:
+    """
+    模型判通过时的结论。
+
+    本地零证据又没抽到帧时，模型只是照「证据不足判通过」的口径作答，把它记成
+    「已通过」等于假通过，降级为未判定交给人看。
+
+    :param score: 本地证据打分结果
+    :param confidence: 模型给出的置信度
+    :param reason: 模型给出的理由
+    :param frames: 抽帧图路径
+    :param cache_key: 结论缓存键
+    :return: 判定结论
+    """
+    if not score.score and not frames:
+        unverified = VerifyResult(
+            matched=True,
+            checked=False,
+            reason=f"无有效证据：{reason}" if reason else "无有效证据",
+            score=score.score,
+            confidence=confidence,
+            frames=frames,
+            hits=score.hits,
+        )
+        _write_cache(cache_key, unverified)
+        return unverified
+    result = VerifyResult(
+        matched=True,
+        checked=True,
+        reason=reason,
+        score=score.score,
+        confidence=confidence,
+        frames=frames,
+        hits=score.hits,
+    )
+    _write_cache(cache_key, result)
+    return result
+
+
+def _review_rejection(
+    *,
+    target: TargetMedia,
+    evidence: Sequence[Any],
+    score: Any,
+    task_name: str,
+    frames: Tuple[str, ...],
+    confidence: float,
+    reason: str,
+    cache_key: str,
+) -> Tuple[Tuple[str, ...], Optional[VerifyResult], float, str]:
+    """
+    中等置信度判否时抽帧复核。
+
+    :param target: 目标媒体
+    :param evidence: 文件证据
+    :param score: 本地证据打分结果
+    :param task_name: 下载任务名
+    :param frames: 已有抽帧图路径
+    :param confidence: 文本判否的置信度
+    :param reason: 文本判否的理由
+    :param cache_key: 结论缓存键
+    :return: （抽帧图路径, 复核放行结论或 None, 复核后的置信度, 复核后的理由）
+    """
+    if not frames:
+        frames = content_verify.extract_frames([item.path for item in evidence])
+    if not frames:
+        return frames, None, confidence, reason
+    review = _judge(target, evidence, score, task_name, frames)
+    if review is None:
+        return frames, None, confidence, reason
+    matched, reviewed_confidence, reviewed_reason = review
+    if not matched:
+        return frames, None, reviewed_confidence, reviewed_reason
+    logger.info(f"抽帧复核推翻文本判否，已放行：{reviewed_reason}")
+    result = VerifyResult(
+        matched=True,
+        checked=True,
+        reason=f"抽帧复核放行：{reviewed_reason}",
+        score=score.score,
+        confidence=reviewed_confidence,
+        frames=frames,
+        hits=score.hits,
+    )
+    _write_cache(cache_key, result)
+    return frames, result, reviewed_confidence, reviewed_reason
+
+
 def _verify_impl(
     *,
     mediainfo: Any = None,
@@ -210,31 +304,13 @@ def _verify_impl(
         )
     matched, confidence, reason = verdict
     if matched:
-        if not score.score and not frames:
-            # 本地零证据又没抽到帧：模型只是照「证据不足判通过」的口径作答，
-            # 把这种结论记成「已通过」等于假通过，降级为未判定交给人看。
-            unverified = VerifyResult(
-                matched=True,
-                checked=False,
-                reason=f"无有效证据：{reason}" if reason else "无有效证据",
-                score=score.score,
-                confidence=confidence,
-                frames=frames,
-                hits=score.hits,
-            )
-            _write_cache(cache_key, unverified)
-            return unverified
-        result = VerifyResult(
-            matched=True,
-            checked=True,
-            reason=reason,
-            score=score.score,
+        return _accepted_result(
+            score=score,
             confidence=confidence,
+            reason=reason,
             frames=frames,
-            hits=score.hits,
+            cache_key=cache_key,
         )
-        _write_cache(cache_key, result)
-        return result
     if confidence >= STRONG_REJECT_CONFIDENCE:
         rejected = _reject(
             result_score=score, confidence=confidence, reason=reason, frames=frames
@@ -252,25 +328,18 @@ def _verify_impl(
             hits=score.hits,
         )
     # 中等置信度的判否先抽帧复核，复核仍判否且够把握才拦。
-    if not frames:
-        frames = content_verify.extract_frames([item.path for item in evidence])
-    if frames:
-        review = _judge(target, evidence, score, task_name, frames)
-        if review is not None:
-            matched, confidence, reason = review
-            if matched:
-                logger.info(f"抽帧复核推翻文本判否，已放行：{reason}")
-                result = VerifyResult(
-                    matched=True,
-                    checked=True,
-                    reason=f"抽帧复核放行：{reason}",
-                    score=score.score,
-                    confidence=confidence,
-                    frames=frames,
-                    hits=score.hits,
-                )
-                _write_cache(cache_key, result)
-                return result
+    frames, reviewed, confidence, reason = _review_rejection(
+        target=target,
+        evidence=evidence,
+        score=score,
+        task_name=task_name,
+        frames=frames,
+        confidence=confidence,
+        reason=reason,
+        cache_key=cache_key,
+    )
+    if reviewed is not None:
+        return reviewed
     if confidence >= REJECT_CONFIDENCE:
         return _reject(result_score=score, confidence=confidence, reason=reason, frames=frames)
     return VerifyResult(

@@ -121,6 +121,34 @@ def _candidate_fileitems(candidates: Any) -> List[FileItem]:
     return items
 
 
+def _empty_candidates_result(
+    *,
+    fileitem: FileItem,
+    submission: Any,
+    preview: bool,
+    has_episode_format_template: bool,
+    matched_episode_format_template: bool,
+) -> Any:
+    """
+    候选为空时的返回结果。
+
+    存在自定义集数模板但没命中时按「跳过」结算，其余情况报没有可整理的文件。
+
+    :param fileitem: 本次整理的源文件项
+    :param submission: 提交上下文
+    :param preview: 是否预览
+    :param has_episode_format_template: 是否存在自定义集数模板
+    :param matched_episode_format_template: 是否命中自定义集数模板
+    :return: 调用方直接返回的结果
+    """
+    if has_episode_format_template and not matched_episode_format_template:
+        logger.info(f"{fileitem.path} 未匹配到集数定位模板，跳过整理")
+        submission.record(fileitem, "skipped", "未匹配到集数定位模板，跳过整理")
+        return submission.result(True, [], preview=preview, preview_items=[])
+    logger.warn(f"{fileitem.path} 没有找到可整理的媒体文件")
+    return False, f"{fileitem.name} 没有找到可整理的媒体文件"
+
+
 def _episode_range_text(meta: Optional[MetaBase]) -> str:
     """
     把元数据里的集号范围拼成 Exx-Eyy 文本，供内容校验记录展示。
@@ -879,12 +907,13 @@ class TransferWorkflowOwner(_TransferOwnerBase):
             return submission.result(False, [f"{fileitem.name} 已取消"], preview=False, preview_items=[])
 
         if not file_items:
-            if has_episode_format_template and not matched_episode_format_template:
-                logger.info(f"{fileitem.path} 未匹配到集数定位模板，跳过整理")
-                submission.record(fileitem, "skipped", "未匹配到集数定位模板，跳过整理")
-                return submission.result(True, [], preview=bool(preview), preview_items=[])
-            logger.warn(f"{fileitem.path} 没有找到可整理的媒体文件")
-            return False, f"{fileitem.name} 没有找到可整理的媒体文件"
+            return _empty_candidates_result(
+                fileitem=fileitem,
+                submission=submission,
+                preview=bool(preview),
+                has_episode_format_template=has_episode_format_template,
+                matched_episode_format_template=matched_episode_format_template,
+            )
 
         file_items = self._filter_manual_transfer_history(file_items, bool(manual and skip_success), submission.record_history_skip)
         file_items = self._filter_automatic_pending_transfers(
@@ -894,7 +923,7 @@ class TransferWorkflowOwner(_TransferOwnerBase):
             return submission.result(True, [], preview=bool(preview), preview_items=[])
         content_error = self._verify_downloaded_content(
             fileitem=fileitem,
-            file_items=[item for item, _ in file_items],
+            file_items=_candidate_fileitems(file_items),
             meta=meta,
             mediainfo=mediainfo,
             batch_mtype=batch_mtype,

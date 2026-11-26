@@ -43,6 +43,105 @@ def last_aired_point(info: Any) -> Tuple[Optional[int], Optional[int]]:
     return season, episode
 
 
+def _season_number_of(season: dict) -> Optional[int]:
+    """
+    取季字典里的季号，兼容以 `order` 标注季号的数据源。
+
+    :param season: 单个季的原始字典
+    :return: 季号；缺失或无法转换时返回 None
+    """
+    number = season.get("season_number")
+    if number is None:
+        number = season.get("order")
+    if number is None:
+        return None
+    try:
+        return int(number)
+    except (TypeError, ValueError):
+        return None
+
+
+def _dated_aired_episodes(episodes: list, current_day: str) -> set[int]:
+    """
+    按每集播出日期筛出已播出的集号。
+
+    :param episodes: 该季的单集清单
+    :param current_day: 今天的日期文本（YYYY-MM-DD）
+    :return: 已播出集号集合
+    """
+    picked: set[int] = set()
+    for episode in episodes:
+        value = episode.get("episode_number")
+        if value is None:
+            continue
+        date = str(episode.get("air_date") or "")
+        if not date or date > current_day:
+            continue
+        try:
+            picked.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return picked
+
+
+def _aired_from_last_point(
+    season: dict,
+    season_number: int,
+    last_season: Optional[int],
+    last_episode: Optional[int],
+) -> Optional[set[int]]:
+    """
+    用最近播出点推断该季已播出的集号。
+
+    更早的季视为整季播完（用集数清单），当前季播到最近播出点，更晚的季视为未开播。
+
+    :param season: 单个季的原始字典
+    :param season_number: 该季季号
+    :param last_season: 最近播出点所在季号
+    :param last_episode: 最近播出点集号
+    :return: 已播出集号集合；没有最近播出点时返回 None 表示无法判定
+    """
+    if last_season is None or last_episode is None:
+        return None
+    if season_number < last_season:
+        count = season.get("episode_count")
+        if isinstance(count, int) and count > 0:
+            return set(range(1, count + 1))
+        return set()
+    if season_number == last_season:
+        return set(range(1, last_episode + 1))
+    return set()
+
+
+def _apply_fallback_seasons(
+    info: Any,
+    aired: dict[int, set[int]],
+    decided: set[int],
+    include_fallback: bool,
+) -> None:
+    """
+    没有任何播出证据时，退回该季集数清单。
+
+    :param info: 识别出的媒体信息
+    :param aired: 已确定的季号到已播出集号映射，就地更新
+    :param decided: 已有播出证据的季号
+    :param include_fallback: 是否允许退回集数清单
+    """
+    if not include_fallback:
+        return
+    for number, numbers in (getattr(info, "seasons", None) or {}).items():
+        try:
+            season_number = int(number)
+        except (TypeError, ValueError):
+            continue
+        if season_number in decided or season_number in aired:
+            continue
+        try:
+            aired[season_number] = {int(value) for value in numbers or []}
+        except (TypeError, ValueError):
+            continue
+
+
 def aired_seasons(info: Any, today: Optional[str] = None, include_fallback: bool = True) -> AiredSeasons:
     """
     取已播出的季集，作为缺集计算的分母。
@@ -64,59 +163,26 @@ def aired_seasons(info: Any, today: Optional[str] = None, include_fallback: bool
     for season in getattr(info, "season_info", None) or []:
         if not isinstance(season, dict):
             continue
-        number = season.get("season_number")
-        if number is None:
-            number = season.get("order")
-        if number is None:
-            continue
-        try:
-            season_number = int(number)
-        except (TypeError, ValueError):
+        season_number = _season_number_of(season)
+        if season_number is None:
             continue
         episodes = [item for item in (season.get("episodes") or []) if isinstance(item, dict)]
-        dated = [item for item in episodes if item.get("air_date")]
-        if dated:
-            picked: set[int] = set()
-            for episode in episodes:
-                value = episode.get("episode_number")
-                if value is None:
-                    continue
-                date = str(episode.get("air_date") or "")
-                if not date or date > current_day:
-                    continue
-                try:
-                    picked.add(int(value))
-                except (TypeError, ValueError):
-                    continue
+        if any(item.get("air_date") for item in episodes):
+            picked = _dated_aired_episodes(episodes, current_day)
             if picked:
                 aired[season_number] = picked
             decided.add(season_number)
             continue
-        if last_season is not None and last_episode is not None:
-            if season_number < last_season:
-                count = season.get("episode_count")
-                if isinstance(count, int) and count > 0:
-                    aired[season_number] = set(range(1, count + 1))
-            elif season_number == last_season:
-                aired[season_number] = set(range(1, last_episode + 1))
+        by_last_point = _aired_from_last_point(season, season_number, last_season, last_episode)
+        if by_last_point is not None:
+            if by_last_point:
+                aired[season_number] = by_last_point
             decided.add(season_number)
             continue
         season_air_date = str(season.get("air_date") or "")
         if season_air_date and season_air_date > current_day:
             decided.add(season_number)
-    for number, numbers in (getattr(info, "seasons", None) or {}).items():
-        try:
-            season_number = int(number)
-        except (TypeError, ValueError):
-            continue
-        if season_number in decided or season_number in aired:
-            continue
-        if not include_fallback:
-            continue
-        try:
-            aired[season_number] = {int(value) for value in numbers or []}
-        except (TypeError, ValueError):
-            continue
+    _apply_fallback_seasons(info, aired, decided, include_fallback)
     return tuple(
         (number, tuple(sorted(numbers))) for number, numbers in sorted(aired.items())
     )

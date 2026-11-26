@@ -213,6 +213,82 @@ class SiteMutationCommand:
         self._publish_updated = publish_updated
         self._publish_deleted = publish_deleted
 
+    async def _prepare_cd_site(
+        self,
+        values: dict[str, JsonData],
+        domain: str,
+        raw_url: str,
+    ) -> Optional[SiteMutationResult]:
+        """
+        校验并补齐 CD 站点字段。
+
+        :param values: 待写入的站点字段，就地补齐
+        :param domain: 已解析出的站点域名
+        :param raw_url: 原始站点地址
+        :return: 校验失败时的结果；通过时返回 None
+        """
+        username = values.get("username")
+        password = values.get("password")
+        if not isinstance(username, str) or not username.strip():
+            return SiteMutationResult(False, "CD 站点必须填写用户名")
+        if not isinstance(password, str) or not password:
+            return SiteMutationResult(False, "CD 站点必须填写密码")
+        if await self._repository.async_get_by_domain(domain):
+            return SiteMutationResult(False, f"{domain} 站点己存在")
+        raw_name = values.get("name")
+        name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else domain
+        values.update(
+            {
+                "domain": domain,
+                "url": self._url_normalizer(raw_url),
+                "name": name,
+                "public": 0,
+            }
+        )
+        if values.get("timeout") is None:
+            values["timeout"] = 90
+        if values.get("auth_refresh_interval") is None:
+            values["auth_refresh_interval"] = 300
+        return None
+
+    async def _prepare_ps_site(
+        self,
+        values: dict[str, JsonData],
+        domain: str,
+        raw_url: str,
+        auth_type: Optional[str],
+    ) -> Optional[SiteMutationResult]:
+        """
+        校验并补齐 PS 站点字段。
+
+        PS 站点只填 PanSou 地址；凭据是 Bearer token 或账号密码，不做登录校验。
+
+        :param values: 待写入的站点字段，就地补齐
+        :param domain: 已解析出的站点域名
+        :param raw_url: 原始站点地址
+        :param auth_type: 认证类型
+        :return: 校验失败时的结果；通过时返回 None
+        """
+        if auth_type == "auth" and not (
+            _has_text(values.get("username")) and _has_text(values.get("password"))
+        ):
+            return SiteMutationResult(False, "PS 站点使用账号认证时必须填写用户名和密码")
+        if await self._repository.async_get_by_domain(domain):
+            return SiteMutationResult(False, f"{domain} 站点己存在")
+        raw_name = values.get("name")
+        name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else domain
+        values.update(
+            {
+                "domain": domain,
+                "url": self._url_normalizer(raw_url),
+                "name": name,
+                "public": 0,
+            }
+        )
+        if values.get("timeout") is None:
+            values["timeout"] = 30
+        return None
+
     async def create(
         self,
         payload: Mapping[str, JsonData],
@@ -235,48 +311,13 @@ class SiteMutationCommand:
 
         domain = self._domain_extractor(raw_url)
         if kind == "ps":
-            # PS 站点只填 PanSou 地址；凭据是 Bearer token 或账号密码，不做登录校验。
-            if auth_type == "auth" and not (
-                _has_text(values.get("username")) and _has_text(values.get("password"))
-            ):
-                return SiteMutationResult(False, "PS 站点使用账号认证时必须填写用户名和密码")
-            if await self._repository.async_get_by_domain(domain):
-                return SiteMutationResult(False, f"{domain} 站点己存在")
-            raw_name = values.get("name")
-            name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else domain
-            values.update(
-                {
-                    "domain": domain,
-                    "url": self._url_normalizer(raw_url),
-                    "name": name,
-                    "public": 0,
-                }
-            )
-            if values.get("timeout") is None:
-                values["timeout"] = 30
+            ps_result = await self._prepare_ps_site(values, domain, raw_url, auth_type)
+            if ps_result is not None:
+                return ps_result
         elif kind == "cd":
-            username = values.get("username")
-            password = values.get("password")
-            if not isinstance(username, str) or not username.strip():
-                return SiteMutationResult(False, "CD 站点必须填写用户名")
-            if not isinstance(password, str) or not password:
-                return SiteMutationResult(False, "CD 站点必须填写密码")
-            if await self._repository.async_get_by_domain(domain):
-                return SiteMutationResult(False, f"{domain} 站点己存在")
-            raw_name = values.get("name")
-            name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else domain
-            values.update(
-                {
-                    "domain": domain,
-                    "url": self._url_normalizer(raw_url),
-                    "name": name,
-                    "public": 0,
-                }
-            )
-            if values.get("timeout") is None:
-                values["timeout"] = 90
-            if values.get("auth_refresh_interval") is None:
-                values["auth_refresh_interval"] = 300
+            cd_result = await self._prepare_cd_site(values, domain, raw_url)
+            if cd_result is not None:
+                return cd_result
         else:
             site_info = await self._indexer_loader(domain)
             if not site_info:

@@ -794,6 +794,54 @@ class TorrentHelper:
             self._invalid_torrents[url] = True
 
     @staticmethod
+    def _alias_matches(
+            media_names: set,
+            meta_names: set,
+            mediainfo: MediaInfo,
+            torrent: TorrentInfo,
+    ) -> bool:
+        """
+        判断种子名称是否命中目标的别名或译名。
+
+        :param media_names: 目标侧的别名与译名
+        :param meta_names: 种子侧的识别名称
+        :param mediainfo: 需要匹配的媒体信息
+        :param torrent: 种子信息
+        :return: 命中别名或译名时返回 True
+        """
+        if not media_names:
+            return False
+        if meta_names.intersection(media_names):
+            logger.info(f'{mediainfo.title} 通过别名或译名匹配到资源：{torrent.site_name} - {torrent.title}')
+            return True
+        return False
+
+    @staticmethod
+    def _identity_matches(
+            mediainfo: MediaInfo,
+            torrent_meta: MetaBase,
+            torrent: TorrentInfo,
+    ) -> bool:
+        """
+        判断种子与目标是否通过词表指定的主身份匹配。
+
+        :param mediainfo: 需要匹配的媒体信息
+        :param torrent_meta: 种子识别信息
+        :param torrent: 种子信息
+        :return: 主身份一致时返回 True
+        """
+        torrent_identity = resolve_media_identity(media=torrent_meta)
+        media_identity = resolve_media_identity(media=mediainfo)
+        if all(torrent_identity) and torrent_identity == media_identity:
+            logger.info(
+                f'{mediainfo.title} 通过词表指定媒体身份 '
+                f'{torrent_identity[0]}:{torrent_identity[1]} 匹配到资源：'
+                f'{torrent.site_name} - {torrent.title}'
+            )
+            return True
+        return False
+
+    @staticmethod
     def match_torrent(
             mediainfo: MediaInfo,
             torrent_meta: MetaBase,
@@ -813,14 +861,7 @@ class TorrentHelper:
         :return: 资源按显式媒体身份或名称、年份及季集范围匹配时返回 True
         """
         # 显式标题标签与识别结果使用同一主身份比较。
-        torrent_identity = resolve_media_identity(media=torrent_meta)
-        media_identity = resolve_media_identity(media=mediainfo)
-        if all(torrent_identity) and torrent_identity == media_identity:
-            logger.info(
-                f'{mediainfo.title} 通过词表指定媒体身份 '
-                f'{torrent_identity[0]}:{torrent_identity[1]} 匹配到资源：'
-                f'{torrent.site_name} - {torrent.title}'
-            )
+        if TorrentHelper._identity_matches(mediainfo, torrent_meta, torrent):
             return True
         media_titles = {
             text_tools.normalize_upper(mediainfo.title),
@@ -865,10 +906,8 @@ class TorrentHelper:
         if meta_names.intersection(media_titles):
             logger.info(f'{mediainfo.title} 通过标题匹配到资源：{torrent.site_name} - {torrent.title}')
             return True
-        if media_names:
-            if meta_names.intersection(media_names):
-                logger.info(f'{mediainfo.title} 通过别名或译名匹配到资源：{torrent.site_name} - {torrent.title}')
-                return True
+        if TorrentHelper._alias_matches(media_names, meta_names, mediainfo, torrent):
+            return True
         if torrent_meta.org_string:
             # 完整英文名称已在上方比较，拆分后的英文单词不能单独证明作品身份。
             titles = _title_fragments(torrent_meta.org_string, r'[\s/【】.\[\]\-]+')
