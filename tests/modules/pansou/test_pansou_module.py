@@ -5,6 +5,7 @@
 """
 
 import json
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -137,6 +138,18 @@ def _server(monkeypatch: pytest.MonkeyPatch) -> FakeServer:
     from app.modules.pansou import _alive_cache
 
     _alive_cache.clear()
+    # 质量门会读系统配置里的时长/大小门槛；不钉住配置源的话，同一进程里其它用例
+    # 改过的配置会漏进来，让本目录的用例随分片顺序变红。
+    monkeypatch.setattr(
+        "app.application.netdisk.candidates.get_configured_system_config",
+        lambda: SimpleNamespace(get=lambda key: None),
+    )
+    # 分享黑名单是持久化状态，同进程里其它用例拉黑过的分享会漏进本目录，
+    # 让候选在搜索阶段就被丢掉；这里换成空黑名单，保证用例只验证自己的输入。
+    monkeypatch.setattr(
+        "app.application.netdisk.share_blacklist.get_share_blacklist",
+        lambda: SimpleNamespace(is_blacklisted=lambda platform, share_id: None),
+    )
     fake = FakeServer()
     fake.install(monkeypatch)
     yield fake
