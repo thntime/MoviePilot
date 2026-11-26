@@ -263,7 +263,11 @@ policy).
   enforces non-growing Ruff `C901 <= 15` and `PLR1702 <= 5` ratchets, and
   `scripts/architecture/concurrency.py` tracks lexical-owner baselines for
   threads, processes, executors and async task spawns so unmanaged concurrency
-  primitives cannot be added silently.
+  primitives cannot be added silently. A new concurrency fact may only be added
+  through `tests/fixtures/architecture/concurrency-policy.json`: each entry names
+  the file-and-primitive key, the owning functions with their exact counts, and a
+  reason. The declared count is the ceiling — exceeding it still fails, and a
+  registration left above the real count must be lowered or removed.
 
 ## Permitted Call Directions
 

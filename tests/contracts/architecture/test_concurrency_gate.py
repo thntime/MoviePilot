@@ -5,7 +5,9 @@
 import textwrap
 from pathlib import Path
 
-from scripts.architecture.concurrency import collect_concurrency, compare_concurrency
+import pytest
+
+from scripts.architecture.concurrency import collect_concurrency, compare_concurrency, load_policy
 
 
 def _write_source(root: Path, relative: str, source: str) -> None:
@@ -176,3 +178,68 @@ def test_concurrency_ratchet_rejects_growth_and_stale_low_water() -> None:
     assert any("Runtime.run 3>2" in problem for problem in problems)
     assert any("Runtime.new 1>0" in problem for problem in problems)
     assert any("Runtime.old 0<1" in problem for problem in problems)
+
+
+def test_concurrency_policy_allows_reviewed_new_fact() -> None:
+    """
+    已登记的新增并发事实可以放行，未登记的仍然拒绝。
+    """
+    current = {
+        "app/api/endpoints/sample.py:asyncio.to_thread": {
+            "target": "asyncio.to_thread",
+            "owners": {"run_sample": 2},
+        },
+    }
+    reviewed = {"app/api/endpoints/sample.py:asyncio.to_thread": {"run_sample": 2}}
+
+    assert compare_concurrency({}, current, reviewed) == []
+    assert compare_concurrency({}, current) != []
+
+
+def test_concurrency_policy_rejects_undeclared_growth() -> None:
+    """
+    登记值就是上限：实际调用数超过登记值仍按增长处理。
+    """
+    baseline = {
+        "app/api/endpoints/sample.py:asyncio.to_thread": {
+            "target": "asyncio.to_thread",
+            "owners": {"run_sample": 1},
+        },
+    }
+    current = {
+        "app/api/endpoints/sample.py:asyncio.to_thread": {
+            "target": "asyncio.to_thread",
+            "owners": {"run_sample": 3},
+        },
+    }
+    reviewed = {"app/api/endpoints/sample.py:asyncio.to_thread": {"run_sample": 2}}
+
+    problems = compare_concurrency(baseline, current, reviewed)
+
+    assert any("run_sample 3>1" in problem for problem in problems)
+
+
+def test_concurrency_policy_rejects_stale_registration(tmp_path: Path) -> None:
+    """
+    登记高于实际或缺少理由都算配置错误，避免登记变成只增不减的挡箭牌。
+    """
+    policy_path = tmp_path / "concurrency-policy.json"
+    policy_path.write_text(
+        '{"reviewed": [{"key": "app/x.py:asyncio.to_thread", "owners": {"run": 2}, '
+        '"reason": "说明"}]}',
+        encoding="utf-8",
+    )
+    current = {
+        "app/x.py:asyncio.to_thread": {"target": "asyncio.to_thread", "owners": {"run": 1}},
+    }
+
+    problems = compare_concurrency({}, current, load_policy(policy_path))
+
+    assert any("登记高于实际" in problem for problem in problems)
+
+    policy_path.write_text(
+        '{"reviewed": [{"key": "app/x.py:asyncio.to_thread", "owners": {"run": 1}, "reason": ""}]}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        load_policy(policy_path)

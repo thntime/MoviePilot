@@ -13,6 +13,7 @@ from typing import Iterable, TypedDict, cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BASELINE = PROJECT_ROOT / "tests/fixtures/architecture/concurrency-baseline.json"
+DEFAULT_POLICY = PROJECT_ROOT / "tests/fixtures/architecture/concurrency-policy.json"
 SCAN_ROOTS = ("app",)
 # 插件副本、SDK 和兼容层由各自的兼容契约治理，不计入宿主调用债务。
 EXCLUDED_ROOTS = ("app/plugins", "app/sdk", "app/runtime/compat")
@@ -382,19 +383,64 @@ def collect_concurrency(
     return dict(sorted(records.items()))
 
 
+def load_policy(path: Path = DEFAULT_POLICY) -> dict[str, dict[str, int]]:
+    """
+    读取已复核的并发事实登记。
+
+    登记是「允许新增」的唯一通道：每条必须写明文件与原语组成的键、归属函数计数和
+    理由。没有理由或没有归属函数的条目直接视为配置错误，避免登记退化成白名单。
+
+    :param path: 登记文件路径
+    :return: 文件与原语组成的键到归属函数计数的映射
+    """
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    reviewed: dict[str, dict[str, int]] = {}
+    for entry in payload.get("reviewed", []):
+        key = str(entry.get("key") or "").strip()
+        reason = str(entry.get("reason") or "").strip()
+        owners = entry.get("owners") or {}
+        if not key:
+            raise ValueError("并发事实登记缺少 key")
+        if not reason:
+            raise ValueError(f"并发事实登记缺少理由：{key}")
+        if not owners:
+            raise ValueError(f"并发事实登记缺少归属函数：{key}")
+        reviewed[key] = {str(owner): int(count) for owner, count in owners.items()}
+    return reviewed
+
+
 def compare_concurrency(
     baseline: dict[str, ConcurrencyRecord],
     current: dict[str, ConcurrencyRecord],
+    reviewed: dict[str, dict[str, int]] | None = None,
 ) -> list[str]:
     """
-    拒绝新增/增长，并要求事实减少时同步下调低水位基线。
+    拒绝未登记的新增/增长，并要求事实减少时同步下调低水位基线与登记。
+
+    已登记的事实允许出现在基线之外，但实际计数不得超过登记值；登记值高于实际同样
+    算错，必须下调或删除，免得登记变成只增不减的挡箭牌。
+
+    :param baseline: 低水位基线
+    :param current: 当前采集到的并发事实
+    :param reviewed: 已复核登记，缺省表示不允许任何新增
+    :return: 问题清单
     """
+    allowed_by_key = reviewed or {}
     problems: list[str] = []
     for key in sorted(baseline.keys() | current.keys()):
         previous = baseline.get(key)
         record = current.get(key)
+        allowed = allowed_by_key.get(key, {})
         if previous is None and record is not None:
-            problems.append(f"新增原生并发事实：{key} owners={record['owners']}")
+            undeclared = [
+                f"{owner}({count}>{allowed.get(owner, 0)})"
+                for owner, count in sorted(record["owners"].items())
+                if count > allowed.get(owner, 0)
+            ]
+            if undeclared:
+                problems.append(f"新增原生并发事实：{key} owners={record['owners']}")
             continue
         if record is None and previous is not None:
             problems.append(f"并发低水位已下降，请刷新基线：{key}")
@@ -410,13 +456,22 @@ def compare_concurrency(
             new_count = current_owners.get(owner, 0)
             if not owner:
                 problems.append(f"并发事实缺少 owner：{key}")
-            elif new_count > old_count:
+            elif new_count > old_count and new_count > allowed.get(owner, 0):
                 problems.append(
                     f"并发调用新增或增长：{key} owner={owner} {new_count}>{old_count}"
                 )
             elif new_count < old_count:
                 problems.append(
                     f"并发低水位已下降，请刷新基线：{key} owner={owner} {new_count}<{old_count}"
+                )
+    for key, owners in sorted(allowed_by_key.items()):
+        record = current.get(key)
+        actual_owners = (record or {}).get("owners", {})
+        for owner, count in sorted(owners.items()):
+            actual = actual_owners.get(owner, 0)
+            if actual < count:
+                problems.append(
+                    f"并发事实登记高于实际，请下调或删除：{key} owner={owner} {count}>{actual}"
                 )
     return problems
 
@@ -428,6 +483,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--write", action="store_true", help="写入当前并发事实基线")
     parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
+    parser.add_argument("--policy", type=Path, default=DEFAULT_POLICY, help="已复核登记文件")
     args = parser.parse_args()
     current = collect_concurrency()
     if args.write:
@@ -442,7 +498,7 @@ def main() -> int:
         dict[str, ConcurrencyRecord],
         json.loads(args.baseline.read_text(encoding="utf-8")),
     )
-    problems = compare_concurrency(baseline, current)
+    problems = compare_concurrency(baseline, current, load_policy(args.policy))
     if problems:
         print("\n".join(problems))
         return 1

@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "reviewed": [
+    {
+      "key": "app/api/endpoints/history.py:asyncio.to_thread",
+      "owners": {
+        "content_verify_accept": 3,
+        "content_verify_delete": 3,
+        "content_verify_list": 1
+      },
+      "reason": "内容校验队列的存储层是同步 sqlite 仓储（ContentVerifyRepository），接口本身是 async，只能把同步读写挪到线程里，否则会阻塞事件循环。存储层改异步是独立一件事，未在本轮范围内。"
+    },
+    {
+      "key": "app/api/endpoints/site.py:asyncio.to_thread",
+      "owners": {
+        "site_icon": 1
+      },
+      "reason": "站点图标要现场抓取远程图片并写缓存，同步 HTTP 客户端没有异步版本；接口是 async，只能挪到线程里。"
+    },
+    {
+      "key": "app/application/netdisk/audit.py:app.runtime.execution.run_in_threadpool",
+      "owners": {
+        "ShareAuditService.audit": 1
+      },
+      "reason": "分享审核要先跑同步的分享有效性探测再落库，探测用的是同步网盘客户端；走宿主既有的 run_in_threadpool 是为了不阻塞事件循环。"
+    },
+    {
+      "key": "app/application/netdisk/download_verify.py:threading.Thread",
+      "owners": {
+        "_call_model_sync": 1
+      },
+      "reason": "内容校验要在同步函数里等一次模型判定，而调用点本身处在同步整理链路中；用一次性线程加超时是为了给模型调用设上限，避免整理线程被挂死。"
+    },
+    {
+      "key": "app/modules/pansou/__init__.py:asyncio.to_thread",
+      "owners": {
+        "PansouModule.async_search_netdisk_torrents": 1
+      },
+      "reason": "PanSou 搜索走同步 requests 客户端，插件接口是 async，只能把同步搜索挪到线程里。"
+    },
+    {
+      "key": "app/modules/pansou/__init__.py:concurrent.futures.Executor.submit",
+      "owners": {
+        "PansouModule._filter_alive_shares": 1
+      },
+      "reason": "分享存活探测要并发探多个候选链接，串行探测会让搜索超时；线程池大小固定为小值，随调用结束即释放。"
+    },
+    {
+      "key": "app/modules/pansou/__init__.py:concurrent.futures.ThreadPoolExecutor",
+      "owners": {
+        "PansouModule._filter_alive_shares": 1
+      },
+      "reason": "同上：为并发探测分享存活创建固定大小线程池，属于一次性短生命周期资源。"
+    }
+  ]
+}
