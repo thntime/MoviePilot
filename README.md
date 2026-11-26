@@ -75,6 +75,7 @@ curl -fsSL https://raw.githubusercontent.com/thntime/MoviePilot/v3/scripts/boots
 - [MoviePilot-Server](https://github.com/thntime/MoviePilot-Server)
 - [MoviePilot-Rust](https://github.com/jxxghp/MoviePilot-Rust)
 - [MoviePilot-Wiki](https://github.com/thntime/MoviePilot-Wiki)
+- [MoviePilot-App](https://github.com/jxxghp/MoviePilot-App)
 
 ## 免责申明
 
