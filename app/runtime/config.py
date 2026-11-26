@@ -701,7 +701,7 @@ class ConfigModel(BaseModel):
     # 服务地址配置
     MP_SERVER_HOST: str = Field(
         default="https://movie-pilot.org",
-        description='服务器地址，对应 https://github.com/jxxghp/MoviePilot-Server 项目',
+        description='服务器地址，对应 https://github.com/thntime/MoviePilot-Server 项目',
     )
     MEDIA_RECOGNIZE_SHARE_API: Optional[str] = Field(
         default=None,
@@ -716,7 +716,7 @@ class ConfigModel(BaseModel):
 
     # 插件配置
     PLUGIN_MARKET: str = Field(
-        default="https://github.com/jxxghp/MoviePilot-Plugins",
+        default="https://github.com/thntime/MoviePilot-Plugins",
         description='插件市场仓库地址，多个地址使用,分隔，地址以/结尾',
     )
     PLUGIN_STATISTIC_SHARE: bool = Field(default=True, description='插件安装数据共享')

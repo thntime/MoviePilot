@@ -112,7 +112,7 @@ class PluginMarketSyncRequest(BaseModel):
     """
 
     wiki_url: Optional[str] = Field(
-        default="https://raw.githubusercontent.com/jxxghp/MoviePilot-Wiki/main/plugin.md",
+        default="https://raw.githubusercontent.com/thntime/MoviePilot-Wiki/main/plugin.md",
         description="Wiki 插件文档 Markdown 原始文件地址",
     )
 

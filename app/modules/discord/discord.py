@@ -1408,7 +1408,7 @@ class Discord:
         )
         embed = discord.Embed(
             title=title,
-            url=link or "https://github.com/jxxghp/MoviePilot",
+            url=link or "https://github.com/thntime/MoviePilot",
             description=description if description else None,
             color=0xE67E22,
         )

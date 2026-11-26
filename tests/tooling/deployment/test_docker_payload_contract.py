@@ -207,8 +207,8 @@ def test_release_workflows_pin_and_record_external_payload_identities() -> None:
         ):
             assert label in workflow
 
-        assert "git ls-remote https://github.com/jxxghp/MoviePilot-Plugins.git" in workflow
-        assert "git ls-remote https://github.com/jxxghp/MoviePilot-Resources.git" in workflow
+        assert "git ls-remote https://github.com/thntime/MoviePilot-Plugins.git" in workflow
+        assert "git ls-remote https://github.com/thntime/MoviePilot-Resources.git" in workflow
         assert "sha256:*) frontend_sha256=" in workflow
         assert "^[0-9a-f]{40}$" in workflow
         assert "^[0-9a-f]{64}$" in workflow

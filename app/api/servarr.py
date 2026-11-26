@@ -142,7 +142,7 @@ async def arr_system_status(
         "runtimeName": "",
         "startTime": "",
         "packageVersion": "",
-        "packageAuthor": "jxxghp",
+        "packageAuthor": "thntime",
         "packageUpdateMechanism": "builtIn",
         "packageUpdateMechanismMessage": "",
     })

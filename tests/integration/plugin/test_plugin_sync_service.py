@@ -33,7 +33,7 @@ from app.runtime.extensions.plugin.sync import LocalPluginSyncService, PluginSyn
 from app.schemas.plugin import PluginRuntimeStatus
 from app.startup.initializers import plugins as plugins_initializer
 
-REPO_URL = "https://github.com/jxxghp/MoviePilot-Plugins"
+REPO_URL = "https://github.com/thntime/MoviePilot-Plugins"
 
 
 def _merge_catalog_plugins(higher, base, markets):
@@ -425,7 +425,7 @@ async def test_market_sync_preserves_generation_priority_through_gateway(
     """
     online = PluginMarketCandidate(
         plugin_id="DownloadCenter",
-        source_key="github:jxxghp/moviepilot-plugins",
+        source_key="github:thntime/moviepilot-plugins",
         source_type=TrustedPluginSourceType.OFFICIAL,
         repo_url=REPO_URL,
         package_generation="v3",
@@ -554,7 +554,7 @@ async def test_market_sync_blocks_activation_when_gateway_selected_local_fails(
     competing_repo_url = "https://github.com/example/MoviePilot-Plugins"
     official = PluginMarketCandidate(
         plugin_id="DemoPlugin",
-        source_key="github:jxxghp/moviepilot-plugins",
+        source_key="github:thntime/moviepilot-plugins",
         source_type=TrustedPluginSourceType.OFFICIAL,
         repo_url=REPO_URL,
         package_generation="v3",
@@ -711,7 +711,7 @@ async def test_market_sync_reuses_startup_lease_through_real_gateway(
     )
     official_candidate = PluginMarketCandidate(
         plugin_id=plugin.id,
-        source_key="github:jxxghp/moviepilot-plugins",
+        source_key="github:thntime/moviepilot-plugins",
         source_type=TrustedPluginSourceType.OFFICIAL,
         repo_url=REPO_URL,
         package_generation="v3",
@@ -743,7 +743,7 @@ async def test_market_sync_reuses_startup_lease_through_real_gateway(
         plugin_id=plugin.id,
         normalized_plugin_id="demoplugin",
         trusted_source_type=TrustedPluginSourceType.OFFICIAL,
-        trusted_source_key="github:jxxghp/moviepilot-plugins",
+        trusted_source_key="github:thntime/moviepilot-plugins",
         binding_basis=PluginBindingBasis.OFFICIAL_DEFAULT,
         payload_source_type=PluginPayloadSourceType.LOCAL,
         payload_source_key=None,

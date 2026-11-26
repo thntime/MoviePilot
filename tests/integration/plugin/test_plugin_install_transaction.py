@@ -65,10 +65,10 @@ def _identity(
         plugin_id=plugin_id,
         normalized_plugin_id=plugin_id.lower(),
         trusted_source_type=TrustedPluginSourceType.OFFICIAL,
-        trusted_source_key="github:jxxghp/moviepilot-plugins",
+        trusted_source_key="github:thntime/moviepilot-plugins",
         binding_basis=PluginBindingBasis.OFFICIAL_DEFAULT,
         payload_source_type=PluginPayloadSourceType.OFFICIAL,
-        payload_source_key="github:jxxghp/moviepilot-plugins",
+        payload_source_key="github:thntime/moviepilot-plugins",
         declared_version=version,
         package_generation="v3",
         declared_metadata=PluginDeclaredMetadata.from_package(

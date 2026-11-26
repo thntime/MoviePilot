@@ -1,7 +1,7 @@
 """
 临时事件循环退出时共享异步 HTTP 连接池的回收回归。
 
-复现 jxxghp/MoviePilot#7580：插件在临时循环（asyncio.run）里调用
+复现 thntime/MoviePilot#7580：插件在临时循环（asyncio.run）里调用
 AsyncRequestUtils 后，循环绑定的共享 transport 从不关闭，每次泄漏一个
 连接；WeakKeyDictionary 的桶也因值链持有循环引用而无法被 GC 回收。
 """

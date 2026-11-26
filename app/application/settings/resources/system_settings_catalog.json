@@ -937,7 +937,7 @@
       "source_file": "app\\runtime\\config.py"
     },
     "MP_SERVER_HOST": {
-      "description": "服务器地址，对应 https://github.com/jxxghp/MoviePilot-Server 项目",
+      "description": "服务器地址，对应 https://github.com/thntime/MoviePilot-Server 项目",
       "group": "services",
       "source_file": "app\\runtime\\config.py"
     },

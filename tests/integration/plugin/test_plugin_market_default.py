@@ -38,7 +38,7 @@ def test_extract_plugin_market_repos_uses_marked_section_and_deduplicates() -> N
     markdown = """
 - https://github.com/outside/ignored
 <!-- plugin-market-repos:start -->
-- https://github.com/jxxghp/MoviePilot-Plugins/
+- https://github.com/thntime/MoviePilot-Plugins/
 - https://github.com/demo/Market.git
 - https://github.com/demo/Market
 <!-- plugin-market-repos:end -->

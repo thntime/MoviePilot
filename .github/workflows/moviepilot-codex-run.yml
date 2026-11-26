@@ -1,4 +1,4 @@
-# 为 jxxghp/MoviePilot 执行可信任务；受保护的控制代码引用跟随 main 分支。
+# 为 thntime/MoviePilot 执行可信任务；受保护的控制代码引用跟随 main 分支。
 name: MoviePilot Codex trusted run
 
 on:
@@ -38,9 +38,9 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
-    uses: jxxghp/MoviePilot-Maintenance/.github/workflows/codex-event.yml@main
+    uses: thntime/MoviePilot-Maintenance/.github/workflows/codex-event.yml@main
     with:
-      control_repository: jxxghp/MoviePilot-Maintenance
+      control_repository: thntime/MoviePilot-Maintenance
       control_ref: main
       prompt_name: ${{ inputs.prompt_name }}
       codex_model: ${{ vars.CODEX_MODEL }}
@@ -64,9 +64,9 @@ jobs:
       contents: read
       issues: write
       pull-requests: read
-    uses: jxxghp/MoviePilot-Maintenance/.github/workflows/codex-propose.yml@main
+    uses: thntime/MoviePilot-Maintenance/.github/workflows/codex-propose.yml@main
     with:
-      control_repository: jxxghp/MoviePilot-Maintenance
+      control_repository: thntime/MoviePilot-Maintenance
       control_ref: main
       prompt_name: ${{ inputs.prompt_name }}
       codex_model: ${{ vars.CODEX_MODEL }}

@@ -22,10 +22,10 @@ from app.schemas.plugin import PluginRuntimeStatus
 NOW = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
 
 
-REPO_URL = "https://github.com/jxxghp/MoviePilot-Plugins"
+REPO_URL = "https://github.com/thntime/MoviePilot-Plugins"
 
 
-SOURCE_KEY = "github:jxxghp/moviepilot-plugins"
+SOURCE_KEY = "github:thntime/moviepilot-plugins"
 
 
 RECEIPT = "sha256:" + "a" * 64

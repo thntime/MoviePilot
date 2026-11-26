@@ -2,14 +2,14 @@
 
 [简体中文](README.md) | English
 
-![GitHub Repo stars](https://img.shields.io/github/stars/jxxghp/MoviePilot?style=for-the-badge)
-![GitHub forks](https://img.shields.io/github/forks/jxxghp/MoviePilot?style=for-the-badge)
-![GitHub contributors](https://img.shields.io/github/contributors/jxxghp/MoviePilot?style=for-the-badge)
-![GitHub repo size](https://img.shields.io/github/repo-size/jxxghp/MoviePilot?style=for-the-badge)
-![GitHub issues](https://img.shields.io/github/issues/jxxghp/MoviePilot?style=for-the-badge)
+![GitHub Repo stars](https://img.shields.io/github/stars/thntime/MoviePilot?style=for-the-badge)
+![GitHub forks](https://img.shields.io/github/forks/thntime/MoviePilot?style=for-the-badge)
+![GitHub contributors](https://img.shields.io/github/contributors/thntime/MoviePilot?style=for-the-badge)
+![GitHub repo size](https://img.shields.io/github/repo-size/thntime/MoviePilot?style=for-the-badge)
+![GitHub issues](https://img.shields.io/github/issues/thntime/MoviePilot?style=for-the-badge)
 ![Docker Pulls](https://img.shields.io/docker/pulls/jxxghp/moviepilot?style=for-the-badge)
 ![Docker Pulls V2](https://img.shields.io/docker/pulls/jxxghp/moviepilot-v2?style=for-the-badge)
-![Docker Pulls V3](https://img.shields.io/docker/pulls/jxxghp/moviepilot-v3?style=for-the-badge)
+![Docker Pulls V3](https://img.shields.io/docker/pulls/thntime/moviepilot-v3?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20Synology-blue?style=for-the-badge)
 
 Redesigned from parts of [NAStool](https://github.com/NAStool/nas-tools), with a stronger focus on core automation scenarios while reducing issues and making the project easier to extend and maintain.
@@ -27,7 +27,7 @@ Release channel: https://t.me/moviepilot_channel
 
 ## Installation and Usage
 
-Docker is the recommended deployment model. V3 uses the dedicated `jxxghp/moviepilot-v3` image; V2 and legacy images keep their existing names. Compose examples, environment variables, volume mappings, and upgrade notes are maintained in the official wiki:
+Docker is the recommended deployment model. V3 uses the dedicated `thntime/moviepilot-v3` image; V2 and legacy images keep their existing names. Compose examples, environment variables, volume mappings, and upgrade notes are maintained in the official wiki:
 
 - Official wiki: https://wiki.movie-pilot.org
 - PostgreSQL setup: [docs/postgresql-setup.md](docs/postgresql-setup.md)
@@ -35,7 +35,7 @@ Docker is the recommended deployment model. V3 uses the dedicated `jxxghp/moviep
 MoviePilot can also be installed and managed from source with the local CLI:
 
 ```shell
-curl -fsSL https://raw.githubusercontent.com/jxxghp/MoviePilot/v3/scripts/bootstrap-local.sh | bash
+curl -fsSL https://raw.githubusercontent.com/thntime/MoviePilot/v3/scripts/bootstrap-local.sh | bash
 ```
 
 After installation, use the `moviepilot` command for initialization, service management, updates, and configuration. See [docs/cli.md](docs/cli.md) for the full command reference.
@@ -46,7 +46,7 @@ After installation, use the `moviepilot` command for initialization, service man
 2. Other agents can import the repository `skills/` directory to gain MoviePilot operation capabilities. Environments that support the `skills` CLI can use:
 
    ```shell
-   npx skills add https://github.com/jxxghp/MoviePilot
+   npx skills add https://github.com/thntime/MoviePilot
    ```
 
    Built-in skills live in [skills/](skills/). For custom skill authoring, see [skills/create-moviepilot-skill/SKILL.md](skills/create-moviepilot-skill/SKILL.md).
@@ -60,19 +60,19 @@ Before contributing, read the repository rules and local environment guide, keep
 - Development setup and local source run: [docs/development-setup.md](docs/development-setup.md)
 - Testing guide: [docs/testing.md](docs/testing.md)
 - Site API integration requirements (Chinese): [docs/site-api-integration.md](docs/site-api-integration.md), covering API capabilities, authentication, fields, and integration acceptance criteria for site developers.
-- New site adapter capture and Feature Request submission: [MoviePilot-Site-Collector](https://github.com/jxxghp/MoviePilot-Site-Collector/blob/main/docs/site-adapter-capture.md)
-- Site collector downloads: [independent repository Release](https://github.com/jxxghp/MoviePilot-Site-Collector/releases/latest), published only when collector inputs change.
+- New site adapter capture and Feature Request submission: [MoviePilot-Site-Collector](https://github.com/thntime/MoviePilot-Site-Collector/blob/main/docs/site-adapter-capture.md)
+- Site collector downloads: [independent repository Release](https://github.com/thntime/MoviePilot-Site-Collector/releases/latest), published only when collector inputs change.
 - REST API documentation: https://api.movie-pilot.org
 - Plugin development guide: https://wiki.movie-pilot.org/zh/plugindev
 
 ## Related Projects
 
-- [MoviePilot-Frontend](https://github.com/jxxghp/MoviePilot-Frontend)
-- [MoviePilot-Resources](https://github.com/jxxghp/MoviePilot-Resources)
-- [MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins)
-- [MoviePilot-Server](https://github.com/jxxghp/MoviePilot-Server)
+- [MoviePilot-Frontend](https://github.com/thntime/MoviePilot-Frontend)
+- [MoviePilot-Resources](https://github.com/thntime/MoviePilot-Resources)
+- [MoviePilot-Plugins](https://github.com/thntime/MoviePilot-Plugins)
+- [MoviePilot-Server](https://github.com/thntime/MoviePilot-Server)
 - [MoviePilot-Rust](https://github.com/jxxghp/MoviePilot-Rust)
-- [MoviePilot-Wiki](https://github.com/jxxghp/MoviePilot-Wiki)
+- [MoviePilot-Wiki](https://github.com/thntime/MoviePilot-Wiki)
 
 ## Disclaimer
 
@@ -82,6 +82,6 @@ Before contributing, read the repository rules and local environment guide, keep
 
 ## Contributors
 
-<a href="https://github.com/jxxghp/MoviePilot/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=jxxghp/MoviePilot" />
+<a href="https://github.com/thntime/MoviePilot/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=thntime/MoviePilot" />
 </a>

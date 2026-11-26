@@ -20,7 +20,7 @@ from app.application.plugin.source import (
     select_plugin_candidate,
 )
 
-OFFICIAL_SOURCE = "github:jxxghp/moviepilot-plugins"
+OFFICIAL_SOURCE = "github:thntime/moviepilot-plugins"
 THIRD_PARTY_SOURCE = "github:example/moviepilot-plugins"
 OTHER_SOURCE = "github:other/moviepilot-plugins"
 
@@ -525,7 +525,7 @@ def test_official_candidate_is_selectable_and_local_projection_hides_path() -> N
                 (_online(
                     OFFICIAL_SOURCE,
                     source_type=TrustedPluginSourceType.OFFICIAL,
-                    repo_url="https://github.com/jxxghp/moviepilot-plugins",
+                    repo_url="https://github.com/thntime/moviepilot-plugins",
                 ),),
             ),
         ),

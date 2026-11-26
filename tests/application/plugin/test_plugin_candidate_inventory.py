@@ -10,7 +10,7 @@ from app.application.plugin.identity import TrustedPluginSourceType
 from app.application.plugin.inventory import PluginCandidateInventoryReader
 from app.application.plugin.source import LocalCandidateReadStatus, MarketReadStatus
 
-OFFICIAL_MARKET = "https://github.com/jxxghp/MoviePilot-Plugins"
+OFFICIAL_MARKET = "https://github.com/thntime/MoviePilot-Plugins"
 THIRD_PARTY_MARKET = "https://github.com/example/moviepilot-plugins"
 
 
@@ -118,14 +118,14 @@ def test_official_source_is_classified_and_public_candidate_uses_plugin_version(
 
     candidate = reader.load([OFFICIAL_MARKET]).online_candidates[0]
 
-    assert candidate.source_key == "github:jxxghp/moviepilot-plugins"
+    assert candidate.source_key == "github:thntime/moviepilot-plugins"
     assert candidate.source_type is TrustedPluginSourceType.OFFICIAL
     assert candidate.plugin_version == "3.1.0"
     assert candidate.public_dict() == {
         "plugin_id": "DemoPlugin",
-        "source_key": "github:jxxghp/moviepilot-plugins",
+        "source_key": "github:thntime/moviepilot-plugins",
         "source_type": "official",
-        "repo_url": "https://github.com/jxxghp/MoviePilot-Plugins",
+        "repo_url": "https://github.com/thntime/MoviePilot-Plugins",
         "package_generation": "v3",
         "plugin_version": "3.1.0",
     }

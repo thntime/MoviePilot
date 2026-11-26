@@ -253,7 +253,7 @@ def test_public_download_request_omits_github_authorization(monkeypatch, tmp_pat
     manager._request()
     destination = tmp_path / "backend.zip"
     downloaded, content_length = manager._download_file(
-        "https://github.com/jxxghp/MoviePilot/archive/refs/tags/v3.0.2.zip",
+        "https://github.com/thntime/MoviePilot/archive/refs/tags/v3.0.2.zip",
         destination,
         0,
         0,

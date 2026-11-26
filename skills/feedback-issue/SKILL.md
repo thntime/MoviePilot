@@ -31,12 +31,12 @@ replies should match the user's language.
 
 ## Scope
 
-- File core backend bugs to `jxxghp/MoviePilot`.
-- File frontend bugs to `jxxghp/MoviePilot-Frontend`.
+- File core backend bugs to `thntime/MoviePilot`.
+- File frontend bugs to `thntime/MoviePilot-Frontend`.
 - File plugin bugs directly to the plugin's repository. Use
-  `jxxghp/MoviePilot-Plugins` only when the plugin actually comes from
+  `thntime/MoviePilot-Plugins` only when the plugin actually comes from
   that repository; otherwise use the plugin's own market/source repo.
-- Escalate a plugin symptom to `jxxghp/MoviePilot` only when the
+- Escalate a plugin symptom to `thntime/MoviePilot` only when the
   evidence shows the host plugin framework, API, event bus, scheduler,
   or compatibility layer is at fault rather than the plugin code.
 - Do not file installation, configuration, token, cookie, network, disk
@@ -133,11 +133,11 @@ Decide `target_repo` before drafting:
 
 | Evidence | `issue_type` | `target_repo` |
 | --- | --- | --- |
-| Backend chain/module/API/CLI/agent bug | `主程序运行问题` | `jxxghp/MoviePilot` |
-| Frontend UI bug | `其他问题` | `jxxghp/MoviePilot-Frontend` |
+| Backend chain/module/API/CLI/agent bug | `主程序运行问题` | `thntime/MoviePilot` |
+| Frontend UI bug | `其他问题` | `thntime/MoviePilot-Frontend` |
 | Plugin log, plugin page, plugin config, plugin command, plugin task, or one plugin only fails | `插件问题` | Plugin source repo |
 | Feature request for core/frontend/plugin | `功能请求` | Repository that owns the requested feature |
-| Multiple unrelated plugins fail because a host extension point changed | `主程序运行问题` | `jxxghp/MoviePilot` |
+| Multiple unrelated plugins fail because a host extension point changed | `主程序运行问题` | `thntime/MoviePilot` |
 
 For plugin issues, identify the plugin repository from installed plugin
 metadata, market entry `repo_url`, plugin README/help URL, icon/raw URL,
@@ -148,8 +148,8 @@ submitting to the main repository.
 Normalize repository values as `owner/repo`, for example:
 
 ```text
-jxxghp/MoviePilot
-jxxghp/MoviePilot-Frontend
+thntime/MoviePilot
+thntime/MoviePilot-Frontend
 InfinityPacer/MoviePilot-Plugins
 hotlcc/MoviePilot-Plugins-Third
 ```
@@ -170,7 +170,7 @@ Bug report example:
   "version": "v2.x.x",
   "environment": "Docker",
   "issue_type": "主程序运行问题",
-  "target_repo": "jxxghp/MoviePilot",
+  "target_repo": "thntime/MoviePilot",
   "description": "## 现象\n- ...\n\n## 复现步骤\n1. ...\n\n## 期望行为\n- ...\n\n## 已定位 / 推测\n- ...\n\n## 已尝试的处理\n- ...",
   "original_user_request": "<用户原话>",
   "diagnostics_file": "<collect 脚本返回的 diagnostics_file>"
@@ -185,7 +185,7 @@ Feature request example:
   "version": "v2.x.x",
   "environment": "Docker",
   "issue_type": "功能请求",
-  "target_repo": "jxxghp/MoviePilot",
+  "target_repo": "thntime/MoviePilot",
   "description": "## 需求背景\n- ...\n\n## 使用场景\n1. ...\n\n## 期望能力\n- ...",
   "original_user_request": "<用户原话>",
   "diagnostics_file": "<collect 脚本返回的 diagnostics_file>"
@@ -208,7 +208,7 @@ Do not invent version numbers, GitHub usernames, email addresses, or
 logs. Separate verified findings from speculation.
 
 If `issue_type` is `插件问题`, `target_repo` must be the plugin's
-repository and must not be `jxxghp/MoviePilot`.
+repository and must not be `thntime/MoviePilot`.
 
 If `issue_type` is `功能请求`, use title prefix `[功能请求]:`. The submit
 script uses the GitHub label `feature request`; bug reports use `bug`

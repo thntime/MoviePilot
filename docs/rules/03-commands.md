@@ -134,7 +134,7 @@ moviepilot logs --stdio --follow
 
 ```bash
 # 下载并运行本地安装引导脚本
-curl -fsSL https://raw.githubusercontent.com/jxxghp/MoviePilot/v3/scripts/bootstrap-local.sh | bash
+curl -fsSL https://raw.githubusercontent.com/thntime/MoviePilot/v3/scripts/bootstrap-local.sh | bash
 
 # 安装后端依赖
 moviepilot install deps
@@ -299,7 +299,7 @@ bash scripts/collect-site-adapter.sh
 **Rules:**
 - The default collector asks only for the site HTTPS address, opens an isolated local Chrome/Edge profile, and reads the completed search page after the user confirms.
 - Users must not be asked to inspect HTML or copy Cookie/User-Agent values in the default flow. `--manual-cookie` is an advanced fallback only.
-- Run only the collector from a trusted local [MoviePilot-Site-Collector checkout](https://github.com/jxxghp/MoviePilot-Site-Collector) or its [official Release](https://github.com/jxxghp/MoviePilot-Site-Collector/releases/latest). Do not pipe a remote branch script into a shell.
+- Run only the collector from a trusted local [MoviePilot-Site-Collector checkout](https://github.com/thntime/MoviePilot-Site-Collector) or its [official Release](https://github.com/thntime/MoviePilot-Site-Collector/releases/latest). Do not pipe a remote branch script into a shell.
 - Never put a Cookie or other credential in command arguments or shell history.
 - Feature Request attachments are public. Review all four files in the generated ZIP before attaching it, and never attach raw HTML, HAR, or browser network archives.
 
@@ -316,7 +316,7 @@ python -m scripts.generate_plugin_market_default \
 
 **Rules:**
 - The Wiki document must contain exactly one `plugin-market-repos:start/end` marker pair.
-- The marked list must be nonempty and include `jxxghp/MoviePilot-Plugins`.
+- The marked list must be nonempty and include `thntime/MoviePilot-Plugins`.
 - This command rewrites only `ConfigModel.PLUGIN_MARKET`; inspect the resulting diff before committing or packaging.
 
 *Last Updated: 2026-08-19*

@@ -572,8 +572,8 @@ def _build_github_proxy_rules(
     构建 GitHub 页面、API、源码和归档下载连通性目标。
     """
     headers = _freeze_headers(settings("GITHUB_HEADERS", None))
-    github_readme_url = "https://github.com/jxxghp/MoviePilot/blob/v2/README.md"
-    raw_readme_url = "https://raw.githubusercontent.com/jxxghp/MoviePilot/v2/README.md"
+    github_readme_url = "https://github.com/thntime/MoviePilot/blob/v2/README.md"
+    raw_readme_url = "https://raw.githubusercontent.com/thntime/MoviePilot/v2/README.md"
     return [
         NetworkTestRule(
             id="github_proxy_web",
@@ -639,7 +639,7 @@ def _build_fixed_service_rules(
     保留插件市场和 MoviePilot 等非模块固定服务目标。
     """
     rules: list[NetworkTestRule] = []
-    plugin_repo_url = "https://github.com/jxxghp/MoviePilot-Plugins"
+    plugin_repo_url = "https://github.com/thntime/MoviePilot-Plugins"
     plugin_repo_prefix = f"{plugin_repo_url}/"
     plugin_proxy_prefix = f"{github_proxy}{plugin_repo_prefix}" if github_proxy else None
     rules.append(

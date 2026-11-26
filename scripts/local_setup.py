@@ -57,13 +57,13 @@ ENV_FILE = CONFIG_DIR / "app.env"
 
 DEFAULT_NODE_VERSION = "20.12.1"
 FRONTEND_LATEST_API = (
-    "https://api.github.com/repos/jxxghp/MoviePilot-Frontend/releases/latest"
+    "https://api.github.com/repos/thntime/MoviePilot-Frontend/releases/latest"
 )
 FRONTEND_TAG_API = (
-    "https://api.github.com/repos/jxxghp/MoviePilot-Frontend/releases/tags/{tag}"
+    "https://api.github.com/repos/thntime/MoviePilot-Frontend/releases/tags/{tag}"
 )
 RESOURCES_MAIN_ZIP = (
-    "https://github.com/jxxghp/MoviePilot-Resources/archive/refs/heads/main.zip"
+    "https://github.com/thntime/MoviePilot-Resources/archive/refs/heads/main.zip"
 )
 RESOURCE_VERSION_FLAG = "v3"
 # 提供商目录不可用时仍能提供常用平台的初始化默认值，不代替运行时能力目录。

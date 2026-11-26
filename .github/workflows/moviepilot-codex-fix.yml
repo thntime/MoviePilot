@@ -22,9 +22,9 @@ permissions:
 jobs:
   codex:
     if: ${{ vars.CODEX_ENABLED == 'true' && vars.CODEX_AUTOFIX_ENABLED == 'true' }}
-    uses: jxxghp/MoviePilot-Maintenance/.github/workflows/codex-fix.yml@main
+    uses: thntime/MoviePilot-Maintenance/.github/workflows/codex-fix.yml@main
     with:
-      control_repository: jxxghp/MoviePilot-Maintenance
+      control_repository: thntime/MoviePilot-Maintenance
       control_ref: main
       prompt_name: ${{ inputs.prompt_name }}
       codex_model: ${{ vars.CODEX_MODEL }}

@@ -25,7 +25,7 @@ def test_update_proxy_prefix_matches_docker(monkeypatch, tmp_path, proxy, prefix
     """
     代理首尾空白、路径及尾斜杠兼容规则在两种部署更新入口保持一致。
     """
-    url = "https://github.com/jxxghp/MoviePilot/archive/refs/tags/v3.1.9.zip"
+    url = "https://github.com/thntime/MoviePilot/archive/refs/tags/v3.1.9.zip"
     monkeypatch.setattr(update_module, "get_runtime_setting", lambda _key: proxy)
     updater = Path(__file__).resolve().parents[3] / "docker" / "update.sh"
     result = subprocess.run(

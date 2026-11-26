@@ -3233,7 +3233,7 @@ class MusicBrainzModule(_ModuleBase):
                         headers={
                             "User-Agent": (
                                 f"{get_runtime_setting('USER_AGENT')} "
-                                "(https://github.com/jxxghp/MoviePilot)"
+                                "(https://github.com/thntime/MoviePilot)"
                             ),
                             "Accept": "application/json",
                         },
@@ -3391,7 +3391,7 @@ class MusicBrainzModule(_ModuleBase):
                 return None
             response = await AsyncRequestUtils(
                 headers={
-                    "User-Agent": f"{get_runtime_setting('USER_AGENT')} (https://github.com/jxxghp/MoviePilot)",
+                    "User-Agent": f"{get_runtime_setting('USER_AGENT')} (https://github.com/thntime/MoviePilot)",
                     "Accept": "application/json",
                 },
                 proxies=get_runtime_setting('PROXY'),

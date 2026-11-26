@@ -31,8 +31,8 @@ from app.runtime.extensions.plugin.dependency import PluginDependencyInstallResu
 from app.startup.initializers import plugins as plugins_initializer
 
 NOW = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
-OFFICIAL_REPO = "https://github.com/jxxghp/MoviePilot-Plugins"
-OFFICIAL_SOURCE = "github:jxxghp/moviepilot-plugins"
+OFFICIAL_REPO = "https://github.com/thntime/MoviePilot-Plugins"
+OFFICIAL_SOURCE = "github:thntime/moviepilot-plugins"
 THIRD_PARTY_REPO = "https://github.com/example/MoviePilot-Plugins"
 THIRD_PARTY_SOURCE = "github:example/moviepilot-plugins"
 

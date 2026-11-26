@@ -18,7 +18,7 @@ _ONLINE_SOURCE_KEY_PATTERN = re.compile(
     r"^github:[a-z0-9](?:[a-z0-9-]{0,38})/"
     r"[a-z0-9._-]{1,100}$"
 )
-OFFICIAL_PLUGIN_SOURCE_KEY = "github:jxxghp/moviepilot-plugins"
+OFFICIAL_PLUGIN_SOURCE_KEY = "github:thntime/moviepilot-plugins"
 
 
 class TrustedPluginSourceType(StrEnum):

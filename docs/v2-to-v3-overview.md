@@ -403,7 +403,7 @@ MoviePilot/app/application/site
 - 后端用户数据解析器可以自动探测 Gazelle、NexusPHP 等站点变种。
 - 解析模板支持更完整的标题、文件名、标签和可选字段回退。
 - 构建产物覆盖 Linux、Windows、macOS、x86_64、Arm64，以及 V3t 所需的 Python 3.14t ABI。
-- [站点采集器独立 Release](https://github.com/jxxghp/MoviePilot-Site-Collector/releases/latest) 提供生成脱敏样本的程序，维护者可通过自动化流程匹配模板并创建待审核的适配 PR。
+- [站点采集器独立 Release](https://github.com/thntime/MoviePilot-Site-Collector/releases/latest) 提供生成脱敏样本的程序，维护者可通过自动化流程匹配模板并创建待审核的适配 PR。
 
 ### 7.4 用户遇到站点问题时应如何判断
 
@@ -463,7 +463,7 @@ V3 仍支持 SQLite 和 PostgreSQL：
 V3 使用独立镜像：
 
 ```text
-jxxghp/moviepilot-v3:latest
+thntime/moviepilot-v3:latest
 ```
 
 标准 V3 是普通用户的默认选择。自由线程版本使用独立的 V3t 镜像，只有在确认插件和原生依赖兼容时才建议使用。
@@ -573,7 +573,7 @@ V3 本地运行要求 Python 3.14+，优先使用项目 `.venv` 和锁定依赖�
 - [PostgreSQL 部署说明](postgresql-setup.md)
 - [MCP API 说明](mcp-api.md)
 - [MoviePilot 官方 Wiki](https://wiki.movie-pilot.org)
-- [V3 插件开发与迁移文档](https://github.com/jxxghp/MoviePilot-Plugins/tree/main/docs)
+- [V3 插件开发与迁移文档](https://github.com/thntime/MoviePilot-Plugins/tree/main/docs)
 
 ---
 

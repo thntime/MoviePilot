@@ -368,7 +368,7 @@ Apple/VAPID 私钥只放在中心 Server，不放入 App 或用户容器。
 消息沿用现有类型开关和管理员/用户路由；“所有用户”范围会查询本实例所有启用账号的不可变通知身份，
 逐账号投递到各自绑定的设备。停用账号和空身份不会进入接收集合，组合路由中已投递的账号不重复发送。
 未经过该范围解析且缺少明确用户目标时不广播，其他渠道继续使用原有默认目标。部署与免费自签说明见
-[MoviePilot-Server](https://github.com/jxxghp/MoviePilot-Server#私有-app-消息推送)。
+[MoviePilot-Server](https://github.com/thntime/MoviePilot-Server#私有-app-消息推送)。
 
 Discord 仅指定 `userid` 的定向通知使用私聊；无法私聊时返回失败，不转发公共频道。
 `/skills` 安装和删除按展示时的条目身份操作，刷新或翻页后的旧按钮会失效，应使用最新列表重新选择。

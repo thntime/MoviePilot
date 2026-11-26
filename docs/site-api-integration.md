@@ -411,10 +411,10 @@ MP 已有 API Key 搜索及临时下载地址的实现案例，但不会自动�
 
 以下链接用于理解 MP 已有数据模型和适配方式，站点无须照搬内部字段或下载请求编码。
 
-- [搜索结果模型 TorrentInfo](https://github.com/jxxghp/MoviePilot/blob/52203041f7be117ddb3ec0ce8fcb7862ade26bda/app/domain/context.py)：标题、大小、发布时间、人数、计费倍率、媒体身份等。
-- [站点配置与用户数据模型](https://github.com/jxxghp/MoviePilot/blob/52203041f7be117ddb3ec0ce8fcb7862ade26bda/app/schemas/site.py)：API Key、Token、站点请求限流及用户统计字段。
-- [Rousi API 适配示例](https://github.com/jxxghp/MoviePilot/blob/52203041f7be117ddb3ec0ce8fcb7862ade26bda/app/modules/indexer/spider/rousi.py)：个人 API Key 搜索、分页，以及在下载时请求接口取得短时链接。
-- [MTorrent 适配示例](https://github.com/jxxghp/MoviePilot/blob/52203041f7be117ddb3ec0ce8fcb7862ade26bda/app/modules/indexer/spider/mtorrent.py)：搜索结果转换与下载凭据生成。
+- [搜索结果模型 TorrentInfo](https://github.com/thntime/MoviePilot/blob/52203041f7be117ddb3ec0ce8fcb7862ade26bda/app/domain/context.py)：标题、大小、发布时间、人数、计费倍率、媒体身份等。
+- [站点配置与用户数据模型](https://github.com/thntime/MoviePilot/blob/52203041f7be117ddb3ec0ce8fcb7862ade26bda/app/schemas/site.py)：API Key、Token、站点请求限流及用户统计字段。
+- [Rousi API 适配示例](https://github.com/thntime/MoviePilot/blob/52203041f7be117ddb3ec0ce8fcb7862ade26bda/app/modules/indexer/spider/rousi.py)：个人 API Key 搜索、分页，以及在下载时请求接口取得短时链接。
+- [MTorrent 适配示例](https://github.com/thntime/MoviePilot/blob/52203041f7be117ddb3ec0ce8fcb7862ade26bda/app/modules/indexer/spider/mtorrent.py)：搜索结果转换与下载凭据生成。
 
 实现参考核对日期为 2026 年 11 月 4 日。本文的接口路径、字段设计和验收建议是供双方协商的接入需求，不代表每个现有站点都已实现全部能力。
 

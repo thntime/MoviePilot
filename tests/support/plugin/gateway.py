@@ -10,7 +10,7 @@ from app.application.plugin.source import CandidateInventory, MarketRead, Plugin
 NOW = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
 
 
-REPO_URL = "https://github.com/jxxghp/MoviePilot-Plugins"
+REPO_URL = "https://github.com/thntime/MoviePilot-Plugins"
 
 
 def _inventory(plugin_version: str = "1.0.0") -> CandidateInventory:
@@ -23,7 +23,7 @@ def _inventory(plugin_version: str = "1.0.0") -> CandidateInventory:
             (
                 PluginMarketCandidate(
                     plugin_id="DemoPlugin",
-                    source_key="github:jxxghp/moviepilot-plugins",
+                    source_key="github:thntime/moviepilot-plugins",
                     source_type=TrustedPluginSourceType.OFFICIAL,
                     repo_url=REPO_URL,
                     package_generation="v3",

@@ -5,7 +5,7 @@
 ## 一键安装
 
 ```shell
-curl -fsSL https://raw.githubusercontent.com/jxxghp/MoviePilot/v3/scripts/bootstrap-local.sh | bash
+curl -fsSL https://raw.githubusercontent.com/thntime/MoviePilot/v3/scripts/bootstrap-local.sh | bash
 ```
 
 脚本会自动：
@@ -311,7 +311,7 @@ Gemini 3.8 Flash 不支持完全关闭思考，也不接受 `minimal`。选择�
 如果希望在自动化安装时直接预设超级管理员，也可以在一键安装脚本中透传：
 
 ```shell
-curl -fsSL https://raw.githubusercontent.com/jxxghp/MoviePilot/v3/scripts/bootstrap-local.sh | \
+curl -fsSL https://raw.githubusercontent.com/thntime/MoviePilot/v3/scripts/bootstrap-local.sh | \
   bash -s -- --superuser admin --superuser-password 'ChangeMe123!'
 ```
 
@@ -553,7 +553,7 @@ moviepilot config describe API_TOKEN --show-secrets
 - `ACOUSTID_API_KEY` 内置可用默认值，也可在前端“高级设置 - 媒体”或配置命令中覆盖；本地安装需要系统可执行路径中存在 Chromaprint `fpcalc`，官方 Docker 镜像已内置
 - `LRCLIB_BASE_URL` 默认使用官方实例，也可指向兼容 LRCLIB API 的自建实例；`LYRICS_BATCH_TIMEOUT` 限制单次专辑刮削的在线歌词总预算，`LYRICS_PROVIDER_RETRY_MAX_WAIT` 决定长 `Retry-After` 进入来源冷却而非阻塞批次
 - `AMLL_BASE_URL` 默认使用无需 API Key 的 AMLL TTML API，也可指向兼容原生接口的自建实例。来源优先按 ISRC 查询，再严格核对歌曲、艺术家及已有专辑信息；下载的 TTML 主唱时间轴转换为 Lyricsfile 和 LRC，限流时短暂冷却并让其他歌词来源继续处理
-- `THEAUDIODB_API_KEY` 用于音乐元数据及纯文本歌词兜底，默认 `123` 为官方公开 V1 Key；额外歌词来源可通过插件提供，接入方式见[歌词插件开发说明](https://github.com/jxxghp/MoviePilot-Plugins/blob/main/docs/faq/21-register-lyrics-provider.md)
+- `THEAUDIODB_API_KEY` 用于音乐元数据及纯文本歌词兜底，默认 `123` 为官方公开 V1 Key；额外歌词来源可通过插件提供，接入方式见[歌词插件开发说明](https://github.com/thntime/MoviePilot-Plugins/blob/main/docs/faq/21-register-lyrics-provider.md)
 - `MUSIC_METADATA_TO_SIMPLIFIED` 默认开启；开启后会将识别结果中的曲名、艺术家、专辑和分类等标准音乐元数据转换为简体中文，不转换歌词与来源原始响应
 - `MUSIC_COVER_FILE_PATTERNS` 控制同目录音乐封面的文件名匹配与选择顺序，逗号分隔、大小写不敏感；附加文件整理和内嵌封面回退共用此配置
 - `RMT_LYRICSEXT` 控制目录监控、工作流扫描和整理链识别的歌词文件后缀，逗号分隔，默认 `.lrc`；音乐仍兼容历史 `.txt` 和 `.lyricsfile.yaml` 旁挂文件

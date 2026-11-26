@@ -26,7 +26,7 @@ from app.runtime.settings import get_runtime_setting
 GITHUB_DEVICE_CLIENT_ID = "Ov23li8tweQw6odWQebz"
 
 # 社区勋章公开名单，由 MoviePilot-Wiki 定时任务计算与人工登记后发布。
-COMMUNITY_MEDALS_URL = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Wiki/main/community/medals.json"
+COMMUNITY_MEDALS_URL = "https://raw.githubusercontent.com/thntime/MoviePilot-Wiki/main/community/medals.json"
 
 # 已知字段的类型约束；名单记录中这些字段类型不符时整条丢弃，其余字段原样透传。
 _MEDAL_DATE = re.compile(r"\d{4}(-\d{2}-\d{2})?")

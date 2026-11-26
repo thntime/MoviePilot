@@ -243,7 +243,7 @@ def test_update_candidates_report_source_and_binding_relationship():
         schemas.Plugin(
             id="OfficialBound",
             plugin_version="2.0.0",
-            repo_url="https://github.com/jxxghp/MoviePilot-Plugins",
+            repo_url="https://github.com/thntime/MoviePilot-Plugins",
             has_update=True,
         ),
         schemas.Plugin(
@@ -255,7 +255,7 @@ def test_update_candidates_report_source_and_binding_relationship():
         schemas.Plugin(
             id="AlternativeOfficial",
             plugin_version="2.0.0",
-            repo_url="https://github.com/jxxghp/MoviePilot-Plugins",
+            repo_url="https://github.com/thntime/MoviePilot-Plugins",
             has_update=True,
         ),
         schemas.Plugin(
@@ -271,7 +271,7 @@ def test_update_candidates_report_source_and_binding_relationship():
             _plugin_identity(
                 plugin_id="OfficialBound",
                 source_type=TrustedPluginSourceType.OFFICIAL,
-                source_key="github:jxxghp/moviepilot-plugins",
+                source_key="github:thntime/moviepilot-plugins",
             ),
             _plugin_identity(
                 plugin_id="ThirdPartyBound",
@@ -323,7 +323,7 @@ def test_bound_repository_update_precedes_a_higher_alternative():
     alternative_update = schemas.Plugin(
         id="DemoPlugin",
         plugin_version="3.0.0",
-        repo_url="https://github.com/jxxghp/MoviePilot-Plugins",
+        repo_url="https://github.com/thntime/MoviePilot-Plugins",
         has_update=True,
     )
     persistence = MagicMock()
@@ -446,7 +446,7 @@ def test_market_endpoint_reads_source_preserving_candidates_for_bound_update():
     alternative_update = schemas.Plugin(
         id="DemoPlugin",
         plugin_version="3.0.0",
-        repo_url="https://github.com/jxxghp/MoviePilot-Plugins",
+        repo_url="https://github.com/thntime/MoviePilot-Plugins",
         has_update=True,
     )
     plugin_manager = MagicMock()

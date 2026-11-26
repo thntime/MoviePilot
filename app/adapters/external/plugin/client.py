@@ -228,7 +228,7 @@ PLUGIN_SYSTEM_VERSION_FIELD = "system_version"
 PLUGIN_MARKET_WIKI_START = "<!-- plugin-market-repos:start -->"
 PLUGIN_MARKET_WIKI_END = "<!-- plugin-market-repos:end -->"
 PLUGIN_MARKET_WIKI_URL = (
-    "https://raw.githubusercontent.com/jxxghp/MoviePilot-Wiki/main/plugin.md"
+    "https://raw.githubusercontent.com/thntime/MoviePilot-Wiki/main/plugin.md"
 )
 PLUGIN_MARKET_REPO_PATTERN = re.compile(
     r"https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?",

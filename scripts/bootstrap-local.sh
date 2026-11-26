@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-REPO_URL="https://github.com/jxxghp/MoviePilot.git"
+REPO_URL="https://github.com/thntime/MoviePilot.git"
 REPO_REF="v3"
 WORKDIR="$PWD"
 APP_DIR_NAME="MoviePilot"

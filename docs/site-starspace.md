@@ -24,7 +24,7 @@
 等级、加入时间、魔力、做种分页、Cookie 与分页隔离，以及已有 RSS 的读取与失败行为。
 这些用例不是报告者账号的页面录制，也不代表已在其群晖 Docker 实例或真实星空账号中完成验收。
 
-参考：[问题 #7494](https://github.com/jxxghp/MoviePilot/issues/7494)、
+参考：[问题 #7494](https://github.com/thntime/MoviePilot/issues/7494)、
 [公开的星空页面适配定义](https://github.com/pt-plugins/PT-depiler/blob/7817b40695537d0377b0640bbfe4bf0f991b98f8/src/packages/site/definitions/starspace.ts)。
 [RSS 页面协议参考](https://github.com/linyuan0213/nexus-media/blob/98419056c91484cceb3bfc1df90eb7e9ebdcfdac/src/app/plugin_framework/builtin_plugins/autogenrss/backend/handlers/starspace.py)。
 个人 Cookie、RSS key 和完整 RSS 地址均为凭据，请勿提交到公开 Issue。

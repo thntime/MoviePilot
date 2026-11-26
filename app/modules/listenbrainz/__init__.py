@@ -210,7 +210,7 @@ class ListenBrainzModule(_ModuleBase):
         """
         response = RequestUtils(
             headers={
-                "User-Agent": f"{get_runtime_setting('USER_AGENT')} (https://github.com/jxxghp/MoviePilot)",
+                "User-Agent": f"{get_runtime_setting('USER_AGENT')} (https://github.com/thntime/MoviePilot)",
                 "Accept": "application/json",
             },
             proxies=get_runtime_setting('PROXY'),

@@ -27,7 +27,7 @@ from app.application.plugin.source import (
 )
 
 NOW = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
-OFFICIAL = "github:jxxghp/moviepilot-plugins"
+OFFICIAL = "github:thntime/moviepilot-plugins"
 THIRD_PARTY = "github:example/moviepilot-plugins"
 
 
@@ -99,7 +99,7 @@ def test_same_source_update_preserves_binding_and_advances_payload() -> None:
         request=PluginInstallAdmissionRequest(
             plugin_id="DemoPlugin",
             generations=("v3", "v2", "v1"),
-            requested_repo_url="https://github.com/jxxghp/MoviePilot-Plugins",
+            requested_repo_url="https://github.com/thntime/MoviePilot-Plugins",
             explicit_source=False,
         ),
         identity=current,
@@ -126,7 +126,7 @@ def test_current_release_marks_declaration_as_matching_payload() -> None:
         request=PluginInstallAdmissionRequest(
             plugin_id="DemoPlugin",
             generations=("v3", "v2", "v1"),
-            requested_repo_url="https://github.com/jxxghp/MoviePilot-Plugins",
+            requested_repo_url="https://github.com/thntime/MoviePilot-Plugins",
         ),
         identity=None,
         now=NOW,
@@ -151,7 +151,7 @@ def test_historical_release_marks_declaration_as_not_matching_payload() -> None:
         request=PluginInstallAdmissionRequest(
             plugin_id="DemoPlugin",
             generations=("v3", "v2", "v1"),
-            requested_repo_url="https://github.com/jxxghp/MoviePilot-Plugins",
+            requested_repo_url="https://github.com/thntime/MoviePilot-Plugins",
         ),
         identity=None,
         now=NOW,
@@ -180,7 +180,7 @@ def test_first_online_binding_uses_payload_commit_time() -> None:
         request=PluginInstallAdmissionRequest(
             plugin_id="DemoPlugin",
             generations=("v3", "v2", "v1"),
-            requested_repo_url="https://github.com/jxxghp/MoviePilot-Plugins",
+            requested_repo_url="https://github.com/thntime/MoviePilot-Plugins",
             explicit_source=True,
         ),
         identity=None,

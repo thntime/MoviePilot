@@ -614,7 +614,7 @@ class TestNettestSecurity:
         assert resp.success
         assert captured["url"] == (
             "https://ghproxy.example/"
-            "https://github.com/jxxghp/MoviePilot/blob/v2/README.md"
+            "https://github.com/thntime/MoviePilot/blob/v2/README.md"
         )
         assert captured["proxy"] == {"https": "http://proxy.example:7890"}
         assert captured["headers"] == {"Authorization": "Bearer token"}

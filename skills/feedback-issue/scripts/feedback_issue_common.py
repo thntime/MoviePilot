@@ -67,7 +67,7 @@ def github_headers_for_repo(repo: str) -> dict[str, str]:
     return headers
 
 
-FEEDBACK_REPO_OWNER = "jxxghp"
+FEEDBACK_REPO_OWNER = "thntime"
 FEEDBACK_REPO_NAME = "MoviePilot"
 FEEDBACK_REPO = f"{FEEDBACK_REPO_OWNER}/{FEEDBACK_REPO_NAME}"
 FEEDBACK_ISSUE_TEMPLATE = "bug_report.yml"
@@ -371,7 +371,7 @@ def build_issue_body(
     body = (
         "### 确认\n\n"
         "- [x] 我的版本是最新版本，我的版本号与 "
-        "[version](https://github.com/jxxghp/MoviePilot/releases/latest) 相同。\n"
+        "[version](https://github.com/thntime/MoviePilot/releases/latest) 相同。\n"
         f"- [x] 我已经 [issue](https://github.com/{repo}/issues) "
         "中搜索过，确认我的问题没有被提出过。\n"
         "- [x] 我已经 [Telegram频道](https://t.me/moviepilot_channel) "

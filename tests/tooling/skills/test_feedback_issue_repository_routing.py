@@ -216,7 +216,7 @@ def test_feature_request_uses_feature_label(diagnostics_file):
             201,
             {
                 "number": 13,
-                "html_url": "https://github.com/jxxghp/MoviePilot/issues/13",
+                "html_url": "https://github.com/thntime/MoviePilot/issues/13",
             },
         ),
     ) as post:
@@ -244,7 +244,7 @@ def test_cli_environment_survives_preview_and_submission(diagnostics_file, issue
     assert "环境：CLI" in Path(prepared["preview_file"]).read_text(encoding="utf-8")
     with patch(
         "submit_feedback_issue.RequestUtils.post",
-        return_value=_FakeResponse(201, {"number": 14, "html_url": "https://github.com/jxxghp/MoviePilot/issues/14"}),
+        return_value=_FakeResponse(201, {"number": 14, "html_url": "https://github.com/thntime/MoviePilot/issues/14"}),
     ) as post:
         result = submit_script.submit_issue(prepared["payload_file"], username="admin")
 

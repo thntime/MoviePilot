@@ -397,7 +397,7 @@ def test_submit_returns_prefill_url_without_token() -> None:
 
     assert not result["success"]
     assert result["reason"] == "no_token"
-    assert "https://github.com/jxxghp/MoviePilot/issues/new" in result["prefill_url"]
+    assert "https://github.com/thntime/MoviePilot/issues/new" in result["prefill_url"]
 
 
 def test_submit_success_with_github_token() -> None:
@@ -416,7 +416,7 @@ def test_submit_success_with_github_token() -> None:
             201,
             payload={
                 "number": 9999,
-                "html_url": "https://github.com/jxxghp/MoviePilot/issues/9999",
+                "html_url": "https://github.com/thntime/MoviePilot/issues/9999",
             },
         ),
     ):

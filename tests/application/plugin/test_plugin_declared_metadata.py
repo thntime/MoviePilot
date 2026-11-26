@@ -17,7 +17,7 @@ from app.application.plugin.identity import (
 from app.schemas.plugin import Plugin, PluginRuntimeStatus
 
 NOW = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
-OFFICIAL_SOURCE = "github:jxxghp/moviepilot-plugins"
+OFFICIAL_SOURCE = "github:thntime/moviepilot-plugins"
 
 
 def _metadata(

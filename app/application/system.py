@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from app.application.github_auth import GithubAuthService
     from app.application.rules import AsyncRuleGroupMutationService
 
-PLUGIN_MARKET_WIKI_URL = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Wiki/main/plugin.md"
+PLUGIN_MARKET_WIKI_URL = "https://raw.githubusercontent.com/thntime/MoviePilot-Wiki/main/plugin.md"
 _DATABASE_BACKUP_SETTING_KEYS = {
     "DB_BACKUP_ENABLE",
     "DB_BACKUP_CRON",
@@ -626,7 +626,7 @@ class SystemService:
         return (
             parsed.scheme == "https"
             and (parsed.hostname or "").lower() == "raw.githubusercontent.com"
-            and bool(re.fullmatch(r"/jxxghp/MoviePilot-Wiki/[^/]+/plugin\.md", parsed.path))
+            and bool(re.fullmatch(r"/thntime/MoviePilot-Wiki/[^/]+/plugin\.md", parsed.path))
         )
 
     @staticmethod

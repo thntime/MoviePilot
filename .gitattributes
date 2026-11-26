@@ -1,2 +1,9 @@
-# 架构基线由脚本扫描代码生成，合并上游时保留本地版本，合并后再重新生成。
+# 下列文件都由仓库脚本从代码生成，合并上游时保留本地版本，合并后用脚本重新生成（见 sync-upstream.yml）。
+# 这样生成物的差异不会变成合并冲突，也不会为凑无冲突而丢内容。
 tests/fixtures/architecture/*-baseline.json merge=ours
+docs/architecture-overview.md merge=ours
+docs/mcp-api.md merge=ours
+app/schemas/exports.py merge=ours
+app/agent/policy/resources/api_mcp_schema.json merge=ours
+app/application/settings/resources/system_settings_catalog.json merge=ours
+skills/moviepilot-api/** merge=ours

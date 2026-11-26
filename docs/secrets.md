@@ -32,7 +32,7 @@ Web 设置通常写入 `app.env`；环境变量管理的项仍拒绝界面写回
 ```yaml
 services:
   moviepilot:
-    image: jxxghp/moviepilot-v3:latest
+    image: thntime/moviepilot-v3:latest
     volumes:
       - ./config:/config
     secrets:

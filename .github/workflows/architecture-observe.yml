@@ -27,7 +27,7 @@ jobs:
       - name: Checkout MoviePilot-Plugins
         uses: actions/checkout@v7
         with:
-          repository: jxxghp/MoviePilot-Plugins
+          repository: thntime/MoviePilot-Plugins
           ref: main
           path: MoviePilot-Plugins
 

@@ -588,7 +588,7 @@ async def test_http_source_identity_returns_current_cas_evidence(
     identity = SimpleNamespace(
         plugin_id="DemoPlugin",
         trusted_source_type=SimpleNamespace(value="official"),
-        trusted_source_key="github:jxxghp/moviepilot-plugins",
+        trusted_source_key="github:thntime/moviepilot-plugins",
         binding_basis=SimpleNamespace(value="official_default"),
         payload_source_type=SimpleNamespace(value="local"),
         payload_source_key=None,
@@ -610,7 +610,7 @@ async def test_http_source_identity_returns_current_cas_evidence(
     assert result.success is True
     assert isinstance(result.data, PluginSourceIdentity)
     assert result.data.plugin_id == "DemoPlugin"
-    assert result.data.trusted_source_key == "github:jxxghp/moviepilot-plugins"
+    assert result.data.trusted_source_key == "github:thntime/moviepilot-plugins"
     assert result.data.payload_source_type == "local"
     assert result.data.revision == 7
 
@@ -638,7 +638,7 @@ async def test_http_source_options_return_sanitized_candidates(monkeypatch) -> N
     identity = SimpleNamespace(
         plugin_id="DemoPlugin",
         trusted_source_type=SimpleNamespace(value="official"),
-        trusted_source_key="github:jxxghp/moviepilot-plugins",
+        trusted_source_key="github:thntime/moviepilot-plugins",
         binding_basis=SimpleNamespace(value="official_default"),
         payload_source_type=SimpleNamespace(value="local"),
         payload_source_key=None,
@@ -657,8 +657,8 @@ async def test_http_source_options_return_sanitized_candidates(monkeypatch) -> N
                 public_dict=lambda: {
                     "plugin_id": "DemoPlugin",
                     "source_type": "official",
-                    "source_key": "github:jxxghp/moviepilot-plugins",
-                    "repo_url": "https://github.com/jxxghp/MoviePilot-Plugins",
+                    "source_key": "github:thntime/moviepilot-plugins",
+                    "repo_url": "https://github.com/thntime/MoviePilot-Plugins",
                     "package_generation": "v3",
                     "plugin_version": "1.0.0",
                 }

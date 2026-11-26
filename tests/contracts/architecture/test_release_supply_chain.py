@@ -103,7 +103,7 @@ def _run_release_script(
             "GH_ERROR_FILE": str(error_file),
             "GH_EXIT_CODE": str(exit_code),
             "GH_LOG": str(tmp_path / "gh.log"),
-            "GITHUB_REPOSITORY": "jxxghp/MoviePilot",
+            "GITHUB_REPOSITORY": "thntime/MoviePilot",
             "GITHUB_ENV": str(tmp_path / "github.env"),
             "GITHUB_OUTPUT": str(tmp_path / "github.output"),
         }

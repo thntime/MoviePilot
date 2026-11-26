@@ -219,7 +219,7 @@ HTTPX 版本。不得调用 `httpx2.alias_httpx()` 在进程内替换 `httpx`，
 
 本地源码开发时，主程序需要读取资源文件和插件源码。相关文件需要放到主程序实际加载的目录下：
 
-- **资源文件**：将 [MoviePilot-Resources](https://github.com/jxxghp/MoviePilot-Resources) 仓库中 `resources.v3/` 下的文件同步到本仓库的 `app/application/site/` 目录下。CLI 安装和 Docker 构建流程只读取 V3 资源。
+- **资源文件**：将 [MoviePilot-Resources](https://github.com/thntime/MoviePilot-Resources) 仓库中 `resources.v3/` 下的文件同步到本仓库的 `app/application/site/` 目录下。CLI 安装和 Docker 构建流程只读取 V3 资源。
 - **插件源码**：需要开发或调试的插件放到本仓库的 `app/plugins/` 目录下，例如 `app/plugins/<插件目录>/`。主程序运行时从该目录加载插件，独立插件仓库只是源码来源。
 
 如果资源文件没有放到 `app/application/site/`，站点索引、规则和内置资源相关能力可能无法按本地开发预期工作；如果插件没有放到 `app/plugins/`，主程序也不会在本地运行时发现该插件。
@@ -230,7 +230,7 @@ HTTPX 版本。不得调用 `httpx2.alias_httpx()` 在进程内替换 `httpx`，
 
 生成过程遵循以下约束：
 
-- 标记必须唯一、顺序正确，清单不能为空且必须包含 `jxxghp/MoviePilot-Plugins`；不满足时直接终止构建。
+- 标记必须唯一、顺序正确，清单不能为空且必须包含 `thntime/MoviePilot-Plugins`；不满足时直接终止构建。
 - 生成脚本只替换 `ConfigModel` 中的 `PLUGIN_MARKET` 默认值，不写入运行时环境变量，因此用户仍可通过系统环境变量或 `/config/app.env` 覆盖。
 - 正式版工作流会创建仅由 Release Tag 引用的本地快照提交，Docker 镜像和 Tag 源码归档均来自该快照；Actions 不会将生成结果回写到 `v3` 分支。
 - Release Tag 快照提交信息和镜像标签会记录本次使用的 MoviePilot Wiki Commit，便于追溯清单来源。
@@ -288,7 +288,7 @@ dataclass、Pydantic 和 Protocol 的声明项逐项提供说明。Pydantic 字�
 报告，不自动更新基线。普通主仓改动不要求额外检出插件仓或运行观察任务。宿主架构门禁和 changed-file
 Pylint 由 `v3` PR/push 的 GitHub Actions 执行，`app/` 全量 Pylint 是建议性报告。
 
-站点采集器源码与构建工作流位于 [MoviePilot-Site-Collector](https://github.com/jxxghp/MoviePilot-Site-Collector)，使用独立的 `site-adapter-collector-v1.0.x` Release，仅在采集器发布输入变化时递增版本并构建，不跟随后端 Release。下载入口为 [采集器独立 Release](https://github.com/jxxghp/MoviePilot-Site-Collector/releases/latest)，自动版本和手动测试构建规则见 [采集器发布说明](https://github.com/jxxghp/MoviePilot-Site-Collector/blob/main/docs/site-adapter-collector-release.md#维护者发布流程)。
+站点采集器源码与构建工作流位于 [MoviePilot-Site-Collector](https://github.com/thntime/MoviePilot-Site-Collector)，使用独立的 `site-adapter-collector-v1.0.x` Release，仅在采集器发布输入变化时递增版本并构建，不跟随后端 Release。下载入口为 [采集器独立 Release](https://github.com/thntime/MoviePilot-Site-Collector/releases/latest)，自动版本和手动测试构建规则见 [采集器发布说明](https://github.com/thntime/MoviePilot-Site-Collector/blob/main/docs/site-adapter-collector-release.md#维护者发布流程)。
 
 Ruff/Mypy 基线只允许收紧，不接受新增诊断或类型错误增长。`mypy.ini` 默认严格检查整个 `app/`，
 仅排除由插件发布链路治理的运行时 `app/plugins/` 副本；新宿主文件自动纳入检查。
@@ -365,8 +365,8 @@ Python 3.14 还会在平台支持时输出 C 栈；关闭 GIL 时只转储当前
 
 - [uv 官方文档](https://docs.astral.sh/uv/)
 - [pip-audit](https://github.com/pypa/pip-audit)
-- [MoviePilot-Resources](https://github.com/jxxghp/MoviePilot-Resources)
-- [MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins)
+- [MoviePilot-Resources](https://github.com/thntime/MoviePilot-Resources)
+- [MoviePilot-Plugins](https://github.com/thntime/MoviePilot-Plugins)
 
 ### Agent 历史消息索引验证
 

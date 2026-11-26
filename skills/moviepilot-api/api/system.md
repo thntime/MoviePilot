@@ -221,6 +221,7 @@ This runtime model has no directly writable fields.
 - `is_dir` (boolean; default `False`): 是否目录
 - `name*` (string): 文件名
 - `parent_id` (string; default ``): 父目录标识
+- `path` (string; default ``): 分享内相对路径；个人盘条目为空
 - `size` (integer; default `0`): 字节数；目录为 0
 - `updated_at` (string|null): 修改时间
 

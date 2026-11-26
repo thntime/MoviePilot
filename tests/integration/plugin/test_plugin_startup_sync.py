@@ -167,9 +167,9 @@ async def test_startup_sync_retains_owner_and_recovers_plugins_serially(
         clock=lambda: datetime.now(timezone.utc),
         transaction_id_factory=lambda: uuid4().hex,
     )
-    repo_url = "https://github.com/jxxghp/MoviePilot-Plugins"
+    repo_url = "https://github.com/thntime/MoviePilot-Plugins"
     candidates = tuple(PluginMarketCandidate(
-        plugin_id=plugin_id, source_key="github:jxxghp/moviepilot-plugins",
+        plugin_id=plugin_id, source_key="github:thntime/moviepilot-plugins",
         source_type=TrustedPluginSourceType.OFFICIAL, repo_url=repo_url,
         package_generation="v3", plugin_version="1.0.0", dto={"v3": True},
     ) for plugin_id in plugin_ids)

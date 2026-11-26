@@ -1,7 +1,9 @@
 name: Sync Upstream
 
 # 每天定时把上游 v3 分支合并进来。前端仓库先跑（19:00 UTC），后端 30 分钟后跑。
-# 生成物（架构基线、架构文档、version.py）自动解决；其余冲突不推送，改开 issue 列出文件。
+# 生成物（架构基线、架构文档、schema 导出清单、技能文档、系统设置目录、version.py）
+# 自动采用上游版本，合并后由仓库脚本重新生成，因此不会因生成物差异卡住同步；
+# 其余冲突一律不推送，改开 issue 列出文件交人工处理。
 on:
   schedule:
     - cron: '30 19 * * *' # 03:30 Asia/Shanghai
@@ -19,7 +21,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     env:
-      UPSTREAM_REPO: jxxghp/MoviePilot
+      UPSTREAM_REPO: thntime/MoviePilot
       UPSTREAM_BRANCH: v3
       ISSUE_TITLE: 上游同步失败
     steps:
@@ -54,7 +56,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # .gitattributes 里登记的生成物用 ours 驱动，避免整份文件重写造成假冲突。
           git config merge.ours.driver true
-          # 步骤 shell 默认带 -e，必须显式吞掉 merge 的非零退出码，否则拿不到冲突清单。
+          # 步骤 shell 默认带 -e，必须显式咽掉 merge 的非零退出码，否则拿不到冲突清单。
           status=0
           git merge --no-edit "upstream/${UPSTREAM_BRANCH}" > /tmp/merge.log 2>&1 || status=$?
           cat /tmp/merge.log
@@ -68,8 +70,13 @@ jobs:
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             case "$file" in
-              # 版本号与架构文档只跟上游走，派生数字由后面的重新生成步骤修正。
-              version.py | docs/architecture-overview.md)
+              # 版本号与生成物只跟上游走，派生内容由后面的重新生成步骤修正。
+              version.py | docs/architecture-overview.md | docs/mcp-api.md | \
+              app/schemas/exports.py | app/agent/policy/resources/api_mcp_schema.json | \
+              app/application/settings/resources/system_settings_catalog.json | \
+              skills/moviepilot-api/* | skills/downloader-operation/* | \
+              skills/mediaserver-operation/* | skills/database-operation/* | \
+              tests/fixtures/architecture/*-baseline.json)
                 git checkout --theirs -- "$file"
                 git add -- "$file"
                 echo "已自动采用上游版本：$file"
@@ -100,19 +107,41 @@ jobs:
         if: steps.fetch.outputs.behind != '0' && steps.merge.outputs.conflicted == 'false'
         uses: astral-sh/setup-uv@v10.0.1
 
-      - name: Regenerate architecture baseline
+      - name: Regenerate generated artifacts
+        id: regenerate
+        if: steps.fetch.outputs.behind != '0' && steps.merge.outputs.conflicted == 'false'
+        run: |
+          set -uo pipefail
+          uv sync --frozen --quiet
+          status=0
+          for script in \
+            scripts/architecture/baseline.py \
+            scripts/refresh_architecture_docs.py \
+            scripts/schema/exports.py \
+            scripts/generate_agent_api_mcp_schema.py \
+            scripts/generate_agent_skill_docs.py \
+            scripts/generate_system_settings_catalog.py
+          do
+            echo "== $script =="
+            uv run --frozen python "$script" || status=$?
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::部分生成脚本退出码 ${status}，请人工确认生成物是否需要手工修正"
+            echo "regenerated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "regenerated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit regenerated artifacts
         if: steps.fetch.outputs.behind != '0' && steps.merge.outputs.conflicted == 'false'
         run: |
           set -euo pipefail
-          uv sync --frozen --quiet
-          uv run --frozen python scripts/architecture/baseline.py --write-host
-          uv run --frozen python scripts/refresh_architecture_docs.py
           git add -A
           if git diff --cached --quiet; then
-            echo "架构基线无需更新"
+            echo "生成物无需更新"
           else
             git commit --amend --no-edit
-            echo "已把重新生成的架构基线并入合并提交"
+            echo "已把重新生成的产物并入合并提交"
           fi
 
       - name: Push merge

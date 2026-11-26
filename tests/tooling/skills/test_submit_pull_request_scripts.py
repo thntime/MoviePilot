@@ -148,7 +148,7 @@ def test_ensure_fork_reuses_existing_fork() -> None:
             return {
                 "fork": True,
                 "full_name": repo,
-                "parent": {"full_name": "jxxghp/MoviePilot"},
+                "parent": {"full_name": "thntime/MoviePilot"},
             }
 
         def create_fork(self, repo: str) -> dict:
@@ -159,7 +159,7 @@ def test_ensure_fork_reuses_existing_fork() -> None:
             return {}
 
     client = FakeClient()
-    fork_repo, created = common.ensure_fork(client, "jxxghp/MoviePilot", "bot")
+    fork_repo, created = common.ensure_fork(client, "thntime/MoviePilot", "bot")
     assert fork_repo == "bot/MoviePilot"
     assert created is False
     assert client.created is False
@@ -189,7 +189,7 @@ def test_ensure_fork_creates_after_not_found(monkeypatch) -> None:
             self.lookups += 1
             if self.lookups == 1:
                 raise common.GitHubApiError("github_api_error", "not found", status=404)
-            return {"fork": True, "parent": {"full_name": "jxxghp/MoviePilot"}}
+            return {"fork": True, "parent": {"full_name": "thntime/MoviePilot"}}
 
         def create_fork(self, repo: str) -> dict:
             """
@@ -200,7 +200,7 @@ def test_ensure_fork_creates_after_not_found(monkeypatch) -> None:
 
     monkeypatch.setattr(common.time, "sleep", lambda seconds: None)
     client = FakeClient()
-    fork_repo, created = common.ensure_fork(client, "jxxghp/MoviePilot", "bot")
+    fork_repo, created = common.ensure_fork(client, "thntime/MoviePilot", "bot")
     assert fork_repo == "bot/MoviePilot"
     assert created is True
     assert client.created == 1
@@ -238,7 +238,7 @@ def test_clone_repository_uses_upstream_base_and_writes_state(tmp_path: Path, mo
             """
             返回上游基线，工作分支模拟不存在。
             """
-            if repo == "jxxghp/MoviePilot":
+            if repo == "thntime/MoviePilot":
                 return {"object": {"sha": base_sha}}
             raise common.GitHubApiError("github_api_error", "not found", status=404)
 
@@ -268,7 +268,7 @@ def test_clone_repository_uses_upstream_base_and_writes_state(tmp_path: Path, mo
 
     monkeypatch.setattr(clone_script, "git_auth_environment", fake_git_auth)
     result = clone_script.clone_repository(
-        "jxxghp/MoviePilot",
+        "thntime/MoviePilot",
         destination=str(tmp_path / "clone"),
         state_file=str(tmp_path / "state.json"),
     )
@@ -292,7 +292,7 @@ def test_prepare_without_token_stops_before_api_write(tmp_path: Path, monkeypatc
     draft_file.write_text(
         json.dumps(
             {
-                "target_repo": "jxxghp/MoviePilot",
+                "target_repo": "thntime/MoviePilot",
                 "source_root": str(root),
                 "changes_file": collected["changes_file"],
                 "title": "[修复] 测试",
@@ -326,7 +326,7 @@ def test_submit_commits_pushes_and_creates_pr_with_fake_github(tmp_path: Path, m
     payload_file.write_text(
         json.dumps(
             {
-                "target_repo": "jxxghp/MoviePilot",
+                "target_repo": "thntime/MoviePilot",
                 "fork_repo": "bot/MoviePilot",
                 "source_root": str(root),
                 "changes_file": collected["changes_file"],
@@ -366,13 +366,13 @@ def test_submit_commits_pushes_and_creates_pr_with_fake_github(tmp_path: Path, m
             """
             返回目标 Fork parent。
             """
-            return {"fork": True, "parent": {"full_name": "jxxghp/MoviePilot"}}
+            return {"fork": True, "parent": {"full_name": "thntime/MoviePilot"}}
 
         def get_ref(self, repo: str, ref_branch: str) -> dict:
             """
             返回上游基线或模拟推送后的 Fork 分支。
             """
-            if repo == "jxxghp/MoviePilot":
+            if repo == "thntime/MoviePilot":
                 return {"object": {"sha": base_sha}}
             if self.remote_sha:
                 return {"object": {"sha": self.remote_sha}}
@@ -389,7 +389,7 @@ def test_submit_commits_pushes_and_creates_pr_with_fake_github(tmp_path: Path, m
             返回已验证的 PR 对象。
             """
             return {
-                "html_url": "https://github.com/jxxghp/MoviePilot/pull/1",
+                "html_url": "https://github.com/thntime/MoviePilot/pull/1",
                 "number": 1,
                 "draft": payload["draft"],
                 "head": {"ref": branch, "sha": self.remote_sha},

@@ -41,7 +41,7 @@ def _other_plugin_inventory() -> CandidateInventory:
             (
                 PluginMarketCandidate(
                     plugin_id="OtherPlugin",
-                    source_key="github:jxxghp/moviepilot-plugins",
+                    source_key="github:thntime/moviepilot-plugins",
                     source_type=TrustedPluginSourceType.OFFICIAL,
                     repo_url=REPO_URL,
                     package_generation="v3",
@@ -266,7 +266,7 @@ async def test_local_only_requires_explicit_online_binding() -> None:
     """
     online = PluginMarketCandidate(
         plugin_id="DemoPlugin",
-        source_key="github:jxxghp/moviepilot-plugins",
+        source_key="github:thntime/moviepilot-plugins",
         source_type=TrustedPluginSourceType.OFFICIAL,
         repo_url=REPO_URL,
         package_generation="v3",
@@ -368,7 +368,7 @@ async def test_explicit_local_sync_uses_local_candidate_and_execution_mode() -> 
     """
     online = PluginMarketCandidate(
         plugin_id="DemoPlugin",
-        source_key="github:jxxghp/moviepilot-plugins",
+        source_key="github:thntime/moviepilot-plugins",
         source_type=TrustedPluginSourceType.OFFICIAL,
         repo_url=REPO_URL,
         package_generation="v3",
@@ -386,10 +386,10 @@ async def test_explicit_local_sync_uses_local_candidate_and_execution_mode() -> 
         plugin_id="DemoPlugin",
         normalized_plugin_id="demoplugin",
         trusted_source_type=TrustedPluginSourceType.OFFICIAL,
-        trusted_source_key="github:jxxghp/moviepilot-plugins",
+        trusted_source_key="github:thntime/moviepilot-plugins",
         binding_basis=PluginBindingBasis.OFFICIAL_DEFAULT,
         payload_source_type=PluginPayloadSourceType.OFFICIAL,
-        payload_source_key="github:jxxghp/moviepilot-plugins",
+        payload_source_key="github:thntime/moviepilot-plugins",
         declared_version="9.0.0",
         package_generation="v3",
         declared_metadata=PluginDeclaredMetadata.from_package(
@@ -484,7 +484,7 @@ async def test_gateway_checks_compatibility_on_final_trusted_candidate() -> None
     """
     official = PluginMarketCandidate(
         plugin_id="DemoPlugin",
-        source_key="github:jxxghp/moviepilot-plugins",
+        source_key="github:thntime/moviepilot-plugins",
         source_type=TrustedPluginSourceType.OFFICIAL,
         repo_url=REPO_URL,
         package_generation="v3",
@@ -504,7 +504,7 @@ async def test_gateway_checks_compatibility_on_final_trusted_candidate() -> None
         plugin_id="DemoPlugin",
         normalized_plugin_id="demoplugin",
         trusted_source_type=TrustedPluginSourceType.OFFICIAL,
-        trusted_source_key="github:jxxghp/moviepilot-plugins",
+        trusted_source_key="github:thntime/moviepilot-plugins",
         binding_basis=PluginBindingBasis.OFFICIAL_DEFAULT,
         payload_source_type=PluginPayloadSourceType.LOCAL,
         payload_source_key=None,
@@ -559,7 +559,7 @@ async def test_gateway_source_inspection_preserves_sources_without_local_path() 
     official_v3 = _inventory().online_candidates[0]
     official_v2 = PluginMarketCandidate(
         plugin_id="DemoPlugin",
-        source_key="github:jxxghp/moviepilot-plugins",
+        source_key="github:thntime/moviepilot-plugins",
         source_type=TrustedPluginSourceType.OFFICIAL,
         repo_url=REPO_URL,
         package_generation="v2",
@@ -607,7 +607,7 @@ async def test_gateway_source_inspection_preserves_sources_without_local_path() 
     inspection = await gateway.inspect_source(plugin_id="DemoPlugin")
 
     assert [candidate.source_key for candidate in inspection.online_candidates] == [
-        "github:jxxghp/moviepilot-plugins",
+        "github:thntime/moviepilot-plugins",
         "github:example/moviepilot-plugins",
     ]
     assert inspection.online_candidates[0].package_generation == "v3"
@@ -626,10 +626,10 @@ async def test_gateway_forwards_explicit_source_change_revision() -> None:
         plugin_id="DemoPlugin",
         normalized_plugin_id="demoplugin",
         trusted_source_type=TrustedPluginSourceType.OFFICIAL,
-        trusted_source_key="github:jxxghp/moviepilot-plugins",
+        trusted_source_key="github:thntime/moviepilot-plugins",
         binding_basis=PluginBindingBasis.OFFICIAL_DEFAULT,
         payload_source_type=PluginPayloadSourceType.OFFICIAL,
-        payload_source_key="github:jxxghp/moviepilot-plugins",
+        payload_source_key="github:thntime/moviepilot-plugins",
         declared_version="1.0.0",
         package_generation="v3",
         declared_metadata=PluginDeclaredMetadata.from_package(
