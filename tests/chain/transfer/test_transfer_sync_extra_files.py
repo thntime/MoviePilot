@@ -855,3 +855,36 @@ def test_candidate_collection_checks_continue_callback(monkeypatch):
     assert state is False
     assert errmsg == f"{source_fileitem.name} 已取消"
     assert callback_calls == ["collect"]
+
+def test_unmatched_episode_format_skips_instead_of_failing(monkeypatch):
+    """
+    配了集数定位模板但文件名不匹配时按「跳过」结算，不报失败。
+
+    这类文件通常是同一目录下的花絮或样本，报失败会让整次整理显示红。
+    """
+    chain = make_transfer_chain()
+    source_fileitem = make_fileitem("/downloads/Test Show (2026)/extras.mkv")
+
+    monkeypatch.setattr(
+        chain,
+        "_TransferChain__get_trans_fileitems",
+        lambda fileitem, predicate: [(source_fileitem, False)],
+    )
+    monkeypatch.setattr(
+        "app.chain.transfer.workflow.get_configured_system_config",
+        lambda: SimpleNamespace(get=lambda key: None),
+    )
+    monkeypatch.setattr(
+        "app.chain.transfer.format.get_configured_system_config",
+        lambda: SimpleNamespace(get=lambda key: None),
+    )
+
+    state, errmsg = TransferChain.do_transfer(
+        chain,
+        fileitem=source_fileitem,
+        background=False,
+        epformat=EpisodeFormat(format="Show - {ep}.mkv"),
+    )
+
+    assert state is True
+    assert errmsg == ""
