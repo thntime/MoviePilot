@@ -146,7 +146,32 @@ jobs:
 
       - name: Push merge
         if: steps.fetch.outputs.behind != '0' && steps.merge.outputs.conflicted == 'false'
-        run: git push origin "HEAD:v3"
+        run: |
+          set -uo pipefail
+          # 镜像发布工作流会在同一分支上提交版本号，同步期间可能刚好有新提交，先对齐再推。
+          status=0
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:v3"; then
+              exit 0
+            fi
+            echo "第 ${attempt} 次推送失败，先合入远端新提交再重试"
+            git fetch origin v3 || status=1
+            if ! git merge --no-edit origin/v3 > /tmp/rebase.log 2>&1; then
+              # 版本号由镜像发布工作流负责，冲突时采用远端的版本号。
+              if git diff --name-only --diff-filter=U | grep -qx 'version.py'; then
+                git checkout --theirs -- version.py && git add -- version.py
+                git diff --name-only --diff-filter=U | grep -q . && { cat /tmp/rebase.log; git merge --abort; exit 1; }
+                git commit --no-edit || status=1
+              else
+                cat /tmp/rebase.log
+                git merge --abort
+                exit 1
+              fi
+            fi
+            [ "$status" -eq 0 ] || exit 1
+          done
+          echo "重试三次仍未推送成功"
+          exit 1
 
       - name: Report sync failure
         if: failure()
