@@ -523,7 +523,7 @@ def test_transfer_workflow_stops_on_reject(monkeypatch: pytest.MonkeyPatch) -> N
 
     chain = TransferChain()
     item = _item("启运丹田.mkv")
-    monkeypatch.setattr(chain, "_collect_transfer_candidates", lambda **kwargs: ([item], False))
+    monkeypatch.setattr(chain, "_collect_transfer_candidates", lambda **kwargs: ([(item, False)], False))
     monkeypatch.setattr(chain, "_filter_manual_transfer_history", lambda items, skip, record: items)
     monkeypatch.setattr(chain, "_filter_automatic_pending_transfers", lambda items, flag, record: items)
     monkeypatch.setattr(

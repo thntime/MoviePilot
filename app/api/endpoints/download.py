@@ -49,6 +49,7 @@ from app.schemas.context import SubtitleInfo as _SchemaSubtitleInfo
 from app.schemas.context import TorrentInfo as _SchemaTorrentInfo
 from app.schemas.download import DownloadAddedData as _SchemaDownloadAddedData
 from app.schemas.download import DownloadDirectory as _SchemaDownloadDirectory
+from app.schemas.download import DownloadMediaAlternative as _SchemaDownloadMediaAlternative
 from app.schemas.download import DownloadSourceClassificationData as _SchemaDownloadSourceClassificationData
 from app.schemas.download import DownloadSourceClassificationRequest as _SchemaDownloadSourceClassificationRequest
 from app.schemas.download import DownloadTaskUpdateData as _SchemaDownloadTaskUpdateData
@@ -198,7 +199,7 @@ def _same_title_alternatives(
     for candidate in candidates:
         if not isinstance(candidate, MediaInfo):
             continue
-        if _normalize_media_title(candidate.title) not in title_keys:
+        if _normalize_media_title(candidate.title or "") not in title_keys:
             continue
         key = f"{candidate.media_source}:{candidate.media_id}"
         same_title.setdefault(key, candidate)
@@ -211,7 +212,7 @@ def _same_title_alternatives(
     )
 
 
-def _alternatives_payload(alternatives: list[MediaInfo]) -> list[dict]:
+def _alternatives_payload(alternatives: list[MediaInfo]) -> List[_SchemaDownloadMediaAlternative]:
     """
     把同名版本列表投影成响应里的候选结构。
 
@@ -219,14 +220,14 @@ def _alternatives_payload(alternatives: list[MediaInfo]) -> list[dict]:
     :return: 候选字典列表
     """
     return [
-        {
-            "media_source": str(item.media_source or ""),
-            "media_id": str(item.media_id or ""),
-            "title": str(item.title or ""),
-            "year": str(item.year) if item.year is not None else None,
-            "type": str(getattr(item.type, "value", item.type) or "") or None,
-            "poster": str(item.poster_path or "") or None,
-        }
+        _SchemaDownloadMediaAlternative(
+            media_source=str(item.media_source or ""),
+            media_id=str(item.media_id or ""),
+            title=str(item.title or ""),
+            year=str(item.year) if item.year is not None else None,
+            type=str(getattr(item.type, "value", item.type) or "") or None,
+            poster=str(item.poster_path or "") or None,
+        )
         for item in alternatives
     ]
 def _is_tmdb_recognize_source() -> bool:
@@ -458,7 +459,7 @@ def _resolve_add_media(
         if mediainfo and not is_music and not allow_unrecognized:
             # 无身份下载按标题识别，同名多版本时必须让用户选，不许静默挑一个。
             # 用识别后的干净标题做广搜，避免「年番」等词或电视剧限定漏掉同名版本。
-            candidates = MediaChain().search_medias(MetaInfo(title=mediainfo.title))
+            candidates = MediaChain().search_medias(MetaInfo(title=mediainfo.title or ""))
             alternatives = _same_title_alternatives(mediainfo, candidates)
             if alternatives:
                 return (

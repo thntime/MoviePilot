@@ -576,7 +576,7 @@ def _render_prompt(
         "evidence_summary": f"本地得分 {score.score}/{content_verify.SCORE_TOTAL}，命中 {','.join(score.hits) or '无'}",
         "frame_count": len(list(frames)),
     }
-    return get_prompt_manager().render_system_task_message(SYSTEM_TASK, template_context=context)
+    return str(get_prompt_manager().render_system_task_message(SYSTEM_TASK, template_context=context))
 
 
 def _call_model_sync(prompt: str, frames: Sequence[str] = ()) -> str:
@@ -600,7 +600,7 @@ def _call_model_sync(prompt: str, frames: Sequence[str] = ()) -> str:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(asyncio.wait_for(_factory(), timeout=TIMEOUT_SECONDS))
+        return str(asyncio.run(asyncio.wait_for(_factory(), timeout=TIMEOUT_SECONDS)))
     holder: Dict[str, str] = {}
 
     def _runner() -> None:

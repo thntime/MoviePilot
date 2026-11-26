@@ -20,9 +20,9 @@ from app.application.subscription.facts import FreshFactLease
 from app.chain.media import MediaChain
 from app.chain.subscribe.contract import _SubscribeOwnerBase
 from app.chain.subscribe.identity import subscribe_recognize_kwargs
+from app.domain.aired import aired_episode_cap
 from app.domain.context import MediaInfo, MusicInfo
 from app.domain.meta.metabase import MetaBase
-from app.domain.projection.aired import aired_episode_cap
 from app.runtime.log import logger
 from app.schemas.media import resolve_media_identity
 from app.schemas.mediaserver import NotExistMediaInfo

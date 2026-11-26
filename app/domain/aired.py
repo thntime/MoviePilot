@@ -32,8 +32,12 @@ def last_aired_point(info: Any) -> Tuple[Optional[int], Optional[int]]:
     if not isinstance(last, dict):
         return None, None
     try:
-        season = int(last.get("season_number"))
-        episode = int(last.get("episode_number"))
+        season_value = last.get("season_number")
+        episode_value = last.get("episode_number")
+        if season_value is None or episode_value is None:
+            return None, None
+        season = int(season_value)
+        episode = int(episode_value)
     except (TypeError, ValueError):
         return None, None
     return season, episode

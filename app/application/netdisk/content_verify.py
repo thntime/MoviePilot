@@ -16,7 +16,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
 
 from app.domain.episode import episode_numbers
 from app.domain.netdisk import is_video_file_name
@@ -621,14 +621,14 @@ def _duration_close(
     return abs(median - expected) <= tolerance
 
 
-def _evidence_episodes(evidence: Sequence[FileEvidence]) -> set:
+def _evidence_episodes(evidence: Sequence[FileEvidence]) -> Set[int]:
     """
     收集文件证据里的集号。
 
     :param evidence: 文件证据
     :return: 集号集合
     """
-    numbers = set()
+    numbers: Set[int] = set()
     for item in evidence:
         numbers.update(episode_numbers(item.name))
     return numbers

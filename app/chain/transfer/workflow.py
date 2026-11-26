@@ -894,7 +894,7 @@ class TransferWorkflowOwner(_TransferOwnerBase):
             return submission.result(True, [], preview=bool(preview), preview_items=[])
         content_error = self._verify_downloaded_content(
             fileitem=fileitem,
-            file_items=file_items,
+            file_items=[item for item, _ in file_items],
             meta=meta,
             mediainfo=mediainfo,
             batch_mtype=batch_mtype,

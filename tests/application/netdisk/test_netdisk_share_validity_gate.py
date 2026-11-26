@@ -230,11 +230,17 @@ def test_pansou_filter_drops_dead_and_undecidable(
         "slow1": ({"alive": True, "unverified": True}, True),
     }
 
-    def fake_inspect(self: Any, torrent: TorrentInfo, cached_detail: Any = None) -> Any:
+    def fake_inspect(
+        self: Any,
+        torrent: TorrentInfo,
+        cached_detail: Any = None,
+        media_type: Any = None,
+        target_names: Any = (),
+    ) -> Any:
         """
         按分享码返回预设的校验结果。
         """
-        del self, cached_detail
+        del self, cached_detail, media_type, target_names
         code = str(torrent.enclosure or "").rsplit("/", 1)[-1]
         return details[code]
 
@@ -260,11 +266,17 @@ def test_pansou_filter_drops_blacklisted_share(
     torrents = [_torrent("bad1", "已拉黑资源"), _torrent("live1", "有效资源")]
     called: List[str] = []
 
-    def fake_inspect(self: Any, torrent: TorrentInfo, cached_detail: Any = None) -> Any:
+    def fake_inspect(
+        self: Any,
+        torrent: TorrentInfo,
+        cached_detail: Any = None,
+        media_type: Any = None,
+        target_names: Any = (),
+    ) -> Any:
         """
         记录被检查的分享码，并返回有效结果。
         """
-        del self, cached_detail
+        del self, cached_detail, media_type, target_names
         code = str(torrent.enclosure or "").rsplit("/", 1)[-1]
         called.append(code)
         return _quark_detail(), True
@@ -291,11 +303,17 @@ def test_cloudsaver_filter_drops_undecidable(
     del pansou_cache
     torrents = [_torrent("live1", "有效资源"), _torrent("slow1", "无法确认资源")]
 
-    def fake_inspect(self: Any, torrent: TorrentInfo, cached_detail: Any = None) -> Any:
+    def fake_inspect(
+        self: Any,
+        torrent: TorrentInfo,
+        cached_detail: Any = None,
+        media_type: Any = None,
+        target_names: Any = (),
+    ) -> Any:
         """
         按分享码返回预设的校验结果。
         """
-        del self, cached_detail
+        del self, cached_detail, media_type, target_names
         code = str(torrent.enclosure or "").rsplit("/", 1)[-1]
         if code == "slow1":
             return {"alive": True, "unverified": True}, True

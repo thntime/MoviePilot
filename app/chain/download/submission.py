@@ -1036,7 +1036,7 @@ class _DownloadResourceOwner(_DownloadOwnerBase):
             origin=source,
             downloader=downloader or prepared.site_downloader,
             save_path=prepared.download_uri,
-            folder_name=prepared.folder_name,
+            folder_name=prepared.folder_name or "",
             file_list=list(prepared.file_list),
             user_specified=user_specified,
             options={
@@ -1762,7 +1762,7 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             media=prepared.media,
             meta=prepared.meta,
             torrent=prepared.torrent,
-            folder_name=prepared.folder_name,
+            folder_name=prepared.folder_name or "",
             file_list=prepared.file_list,
             download_dir=download_dir,
             layout=layout,

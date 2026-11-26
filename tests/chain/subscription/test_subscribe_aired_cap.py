@@ -13,8 +13,8 @@ import pytest
 
 from app.application.subscription.contract import SubscriptionSnapshot
 from app.chain.subscribe.facade import SubscribeChain
+from app.domain.aired import aired_episode_cap
 from app.domain.context import MediaInfo
-from app.domain.projection.aired import aired_episode_cap
 from app.schemas.mediaserver import NotExistMediaInfo
 from app.schemas.types import MediaType
 

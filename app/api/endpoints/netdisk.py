@@ -36,9 +36,9 @@ from app.application.netdisk.login import NetdiskLoginService
 from app.application.netdisk.resolve import NetdiskResolveService
 from app.application.netdisk.share_blacklist import get_share_blacklist
 from app.chain.media import MediaChain
+from app.domain.aired import aired_seasons
 from app.domain.episode import parse_episode_selection
 from app.domain.netdisk import NetdiskError, NetdiskErrorCode, ShareFile
-from app.domain.projection.aired import aired_seasons
 from app.runtime.execution import run_in_threadpool
 from app.runtime.log import logger
 from app.schemas.netdisk import (

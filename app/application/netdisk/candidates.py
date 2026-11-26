@@ -512,8 +512,8 @@ def episode_form(torrent: TorrentInfo, groups: FileGroups) -> Optional[EpisodeFo
     season = _season_of_entries(features) or 1
     windows = episode_rules.declared_episode_window(str(torrent.title or ""))
     window: Set[int] = set()
-    for numbers in windows.values():
-        window.update(numbers)
+    for declared in windows.values():
+        window.update(declared)
     numbers = [_entry_episodes(entry, window) for entry in features]
     if features and all(_is_bluray(entry) for entry in features):
         # 蓝光原盘：文件全是 00001.m2ts 这类命名，不能按集数判断。

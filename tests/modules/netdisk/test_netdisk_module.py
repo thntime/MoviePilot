@@ -1362,11 +1362,14 @@ def test_filter_episodes_drops_unparseable_when_episodes_matched() -> None:
 def test_filter_episodes_keeps_unparseable_when_nothing_matches() -> None:
     """
     分享内文件名都无法解析集数时，保留原有兜底行为，避免漏集。
+
+    这里必须用真正解析不出集数的名字：中文数字（如「第一集」）现在能解析成集号，
+    与目标集不符时按设计丢弃，不再走兜底。
     """
     module = NetdiskModule()
     files = [
-        ShareFile(file_id="1", name="第一集.mkv", size=100),
-        ShareFile(file_id="2", name="第二集.mkv", size=100),
+        ShareFile(file_id="1", name="正片.mkv", size=100),
+        ShareFile(file_id="2", name="上集.mkv", size=100),
     ]
 
     kept = module._filter_episodes(files, {5})  # pylint: disable=protected-access

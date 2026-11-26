@@ -1030,13 +1030,13 @@ class _BatchDownloadRun:
                 submission["episodes"] = set().union(*targets.values())
             outcome = self._submit(context, **submission)
         else:
-            logger.info(f"开始下载 {context.torrent_info.title} ...")
+            logger.info(f"开始下载 {torrent.title} ...")
             outcome = self._submit(context, by_keyword=False)
         if outcome == "unconfirmed":
             for season in seasons:
                 self.unconfirmed_seasons.add((media_key, season))
             logger.warning(
-                f"{context.torrent_info.title} 已被下载器受理但暂未确认任务信息，"
+                f"{torrent.title} 已被下载器受理但暂未确认任务信息，"
                 f"本轮停止为 {media_key} 季 {seasons} 提交其他版本"
             )
             return False
