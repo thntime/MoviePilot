@@ -21,6 +21,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Optional,
     Tuple,
     Union,
@@ -149,6 +150,67 @@ def _validate_rust_accel(value: Any) -> Optional[str]:
     """
     if is_free_threaded_runtime() and value is not True:
         return "free-threaded 运行时必须启用 Rust 加速"
+    return None
+
+
+def _validate_site_user_agent(value: Any) -> Optional[str]:
+    """
+    校验通用站点默认 User-Agent 能否作为合法 HTTP 请求头发送。
+
+    :param value: 类型归一化后的配置值；留空时为 None
+    :return: 包含控制字符或非 Latin-1 字符时返回错误说明，合法时返回 None
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return "站点默认浏览器标识(UA)格式无效"
+    if value != value.strip() or any(
+        (ord(ch) < 0x20 and ch != "\t") or ord(ch) == 0x7F for ch in value
+    ):
+        return "站点默认浏览器标识(UA)包含非法字符，请检查配置"
+    try:
+        value.encode("latin-1")
+    except UnicodeEncodeError:
+        return "站点默认浏览器标识(UA)包含非法字符，请检查配置"
+    return None
+
+
+# 自动整理音乐专辑允许的曲目对齐策略集合。
+_AUTO_MUSIC_TRACK_MATCH_MODES = frozenset(
+    {"strict", "fallback_ignore_duration", "ignore_duration"}
+)
+
+
+def normalize_music_track_match_setting(
+    value: Any,
+) -> Literal["strict", "fallback_ignore_duration", "ignore_duration"]:
+    """
+    将部署配置中的自动整理音乐曲目对齐值归一化为合法策略，未知值安全回退为严格校验。
+    """
+    cleaned = str(value or "").strip().lower()
+    if cleaned == "ignore_duration":
+        return "ignore_duration"
+    if cleaned == "fallback_ignore_duration":
+        return "fallback_ignore_duration"
+    return "strict"
+
+
+def _normalize_music_track_match(value: Any) -> Any:
+    """
+    规范化自动整理音乐曲目对齐配置，去空白、转小写并将空值回退为严格校验。
+    """
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        return cleaned or "strict"
+    return value
+
+
+def _validate_music_track_match(value: Any) -> Optional[str]:
+    """
+    校验自动整理音乐曲目对齐配置，拒绝顺序盲套或未知策略。
+    """
+    if value not in _AUTO_MUSIC_TRACK_MATCH_MODES:
+        return "自动整理音乐曲目对齐方式仅支持 strict、fallback_ignore_duration 或 ignore_duration"
     return None
 
 
@@ -382,6 +444,16 @@ class ConfigModel(BaseModel):
         description='是否将写入 LRC/TXT 的歌词正文转为简体中文；保留时间轴、LRC 标签和来源 Lyricsfile',
     )
     MUSIC_CUE_ENABLE: bool = Field(default=True, description='是否读取关联 CUE；已分轨音频可关闭以忽略错误索引，整轨专辑应保持开启')
+    MUSIC_TRACK_MATCH: Annotated[
+        str,
+        SettingPolicy(
+            before_convert=_normalize_music_track_match,
+            validate=_validate_music_track_match,
+        ),
+    ] = Field(
+        default="strict",
+        description='自动整理音乐专辑时的曲目对齐方式：strict 严格校验、fallback_ignore_duration 严格校验失败时回落忽略时长、ignore_duration 忽略时长校验',
+    )
     MUSIC_RELEASE_REGION_PRIORITY: str = Field(
         default="CN,TW,HK",
         description='MusicBrainz 发行地区优先级，按 ISO 3166-1 两位代码从高到低排列',
@@ -525,6 +597,13 @@ class ConfigModel(BaseModel):
         default=5, ge=1, description="CloakBrowser 关闭宽限秒数，超时强制回收本次进程树，默认 5 秒",
     )
     FLARESOLVERR_URL: Optional[str] = Field(default=None, description='FlareSolverr 服务地址，例如 http://127.0.0.1:8191')
+    SITE_USER_AGENT: Annotated[
+        Optional[str],
+        SettingPolicy(validate=_validate_site_user_agent),
+    ] = Field(
+        default=None,
+        description='站点默认User-Agent，站点未单独配置时使用；留空则使用全局默认User-Agent',
+    )
 
     # 搜索配置
     SEARCH_MULTIPLE_NAME: bool = Field(default=False, description='搜索多个名称')
@@ -712,6 +791,7 @@ class ConfigModel(BaseModel):
                 "bangumi.lol",
                 "raw.githubusercontent.com",
                 "github.com",
+                "avatars.githubusercontent.com",
                 "thetvdb.com",
                 "cctvpic.com",
                 "iqiyipic.com",
@@ -734,6 +814,21 @@ class ConfigModel(BaseModel):
         default=False,
         description='是否开放 API 文档；开放 /docs、/redoc 与 /api/v1/openapi.json，文档首次生成后常驻约 20–30MB 内存，修改后立即生效',
     )
+    VAPID_PUBLIC_KEY: Optional[str] = Field(
+        default=None,
+        description='Web Push VAPID 公钥（base64url 编码的未压缩 P-256 公钥），留空时使用运行期内置默认值；需与 VAPID_PRIVATE_KEY 成对配置',
+    )
+    VAPID_PRIVATE_KEY: Annotated[
+        Optional[str],
+        SettingPolicy(sensitive=True),
+    ] = Field(
+        default=None,
+        description='Web Push VAPID 私钥（base64url 编码的 P-256 私钥），留空时使用运行期内置默认值；需与 VAPID_PUBLIC_KEY 成对配置',
+    )
+    VAPID_SUBJECT: Optional[str] = Field(
+        default=None,
+        description='Web Push VAPID 联系主体（mailto: 或 https:// 地址），留空时默认使用超级管理员邮箱地址',
+    )
 
     # 工作流配置
     WORKFLOW_STATISTIC_SHARE: bool = Field(default=True, description='工作流数据共享')
@@ -753,6 +848,7 @@ class ConfigModel(BaseModel):
 
     # AI智能体配置
     AI_AGENT_ENABLE: bool = Field(default=False, description='AI智能体开关')
+    AI_AGENT_KNOWLEDGE_ENABLE: bool = Field(default=True, description='是否允许 Agent 使用 MoviePilot Server 的中心知识工具')
     AGENT_INTERACTIVE_PRIORITY: bool = Field(default=True, description='为交互式智能助手隔离执行容量，并让新启动的非关键后台服务有限避让')
     AGENT_BACKGROUND_DEFER_SECONDS: int = Field(default=30, ge=0, description='交互活跃时非关键后台服务最多避让的秒数，0为不避让；不暂停已开始的任务')
     AGENT_LLM_TIMEOUT: int = Field(default=180, ge=0, description='Agent单次模型请求的总超时秒数，包含供应商重试；0为不限制')
@@ -761,7 +857,7 @@ class ConfigModel(BaseModel):
     AI_AGENT_HIDE_ENTRY: bool = Field(default=False, description='是否隐藏前端全局智能体入口')
     AI_AGENT_PET: str = Field(default="", description='默认助手形象，格式为 插件ID:形象key，留空使用内置机器人；用户个人选择优先')
     AI_AGENT_OUTPUT_LANGUAGE: str = Field(default="zh-CN", description='内置智能助手输出语言，默认使用简体中文')
-    LLM_PROVIDER: str = Field(default="deepseek", description='LLM提供商（支持内置 provider，以及从 models.dev 动态补充的平台）')
+    LLM_PROVIDER: str = Field(default="deepseek", description='LLM提供商（支持内置主流厂商及通用 OpenAI / Anthropic 兼容入口）')
     LLM_MODEL: str = Field(default="deepseek-v4-flash", description='LLM模型名称')
     LLM_THINKING_LEVEL: Optional[str] = Field(
         default="off",
@@ -900,6 +996,7 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
 
     :cvar model_config: 来源优先级为构造参数、环境变量、环境文件、secrets、默认值
     :ivar _secret_fields: 存在外部 secret 的字段名，包含被高优先级来源遮蔽或无效的文件
+    :ivar _runtime_defaults: 运行期注入的受保护默认键值，不参与持久化、环境变量导出或模型序列化
     """
 
     model_config = SettingsConfigDict(
@@ -909,6 +1006,7 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
         secrets_dir=_get_secrets_dir(),
     )
     _secret_fields: set[str] = PrivateAttr(default_factory=set)
+    _runtime_defaults: dict[str, Any] = PrivateAttr(default_factory=dict)
 
     @classmethod
     def settings_customise_sources(
@@ -1519,11 +1617,32 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
     def VAPID(self) -> dict[str, str]:
         """
         返回 Web Push 使用的 VAPID 配置。
+
+        优先使用显式成对配置的自定义密钥；均留空时回退到运行期注入的默认密钥对，
+        仅配置单边密钥时返回空密钥以避免公私钥错配。
         """
+        subject = (self.VAPID_SUBJECT or "").strip() or (
+            f"mailto:{self.SUPERUSER or 'moviepilot'}@movie-pilot.org"
+        )
+        custom_public = (self.VAPID_PUBLIC_KEY or "").strip()
+        custom_private = (self.VAPID_PRIVATE_KEY or "").strip()
+        if custom_public and custom_private:
+            return {
+                "subject": subject,
+                "publicKey": custom_public,
+                "privateKey": custom_private,
+            }
+        if custom_public or custom_private:
+            logger.warning("VAPID_PUBLIC_KEY 与 VAPID_PRIVATE_KEY 必须成对配置，当前仅配置了其中一项")
+            return {
+                "subject": subject,
+                "publicKey": "",
+                "privateKey": "",
+            }
         return {
-            "subject": f"mailto:{self.SUPERUSER or 'moviepilot'}@movie-pilot.org",
-            "publicKey": "BH3w49sZA6jXUnE-yt4jO6VKh73lsdsvwoJ6Hx7fmPIDKoqGiUl2GEoZzy-iJfn4SfQQcx7yQdHf9RknwrL_lSM",
-            "privateKey": "JTixnYY0vEw97t9uukfO3UWKfHKJdT5kCQDiv3gu894",
+            "subject": subject,
+            "publicKey": str(self._runtime_defaults.get("VAPID_PUBLIC_KEY") or "").strip(),
+            "privateKey": str(self._runtime_defaults.get("VAPID_PRIVATE_KEY") or "").strip(),
         }
 
     def MP_DOMAIN(self, url: Optional[str] = None) -> Optional[str]:

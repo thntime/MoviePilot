@@ -1,0 +1,145 @@
+"""
+Agent API 工具合同检查：Skill 分类文档、MCP schema 与固定路由注册表保持一致。
+"""
+
+import re
+from pathlib import Path
+
+from app.agent.policy.api import API_OPERATION_ROUTES
+from app.agent.skills.metadata import parse_skill_metadata
+from app.agent.tools.impl.api import MoviePilotApiTool
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+API_SKILL = PROJECT_ROOT / "skills/moviepilot-api/SKILL.md"
+NETDISK_SKILL = PROJECT_ROOT / "skills/netdisk-operation/SKILL.md"
+
+NETDISK_READ_ROUTES = {
+    "netdisk.platforms": ("GET", "/api/v1/netdisk/platforms"),
+    "netdisk.accounts": ("GET", "/api/v1/netdisk/accounts"),
+    "netdisk.files.capabilities": ("GET", "/api/v1/netdisk/files/{account_id}/capabilities"),
+    "netdisk.files.quota": ("GET", "/api/v1/netdisk/files/{account_id}/quota"),
+    "netdisk.files.list": ("GET", "/api/v1/netdisk/files/{account_id}/list"),
+}
+
+NETDISK_WRITE_ROUTES = {
+    "netdisk.files.share": ("POST", "/api/v1/netdisk/files/{account_id}/share"),
+    "netdisk.files.move": ("POST", "/api/v1/netdisk/files/{account_id}/move"),
+    "netdisk.files.rename": ("POST", "/api/v1/netdisk/files/{account_id}/rename"),
+    "netdisk.files.delete": ("POST", "/api/v1/netdisk/files/{account_id}/delete"),
+}
+
+
+def _read_api_skill_contract() -> str:
+    """
+    读取 API Skill 入口及全部分类契约文档。
+    """
+    skill_root = API_SKILL.parent
+    paths = [API_SKILL, *sorted((skill_root / "api").glob("*.md"))]
+    return "\n".join(path.read_text(encoding="utf-8") for path in paths)
+
+
+def test_moviepilot_api_skill_routes_contracts_to_category_files() -> None:
+    """
+    API Skill 通过分类文档索引全部 operation 及请求体合同。
+    """
+    entrypoint = API_SKILL.read_text(encoding="utf-8")
+    category_files = {
+        path.stem: path.read_text(encoding="utf-8")
+        for path in sorted((API_SKILL.parent / "api").glob("*.md"))
+    }
+
+    assert "### `" not in entrypoint
+    assert len(category_files) == 22
+    assert "models" not in category_files
+    assert all(
+        f"### `{operation_id}`" in category_files[operation_id.split(".", 1)[0]]
+        for operation_id in API_OPERATION_ROUTES
+    )
+    assert all("## Body Models" in content for content in category_files.values())
+
+
+def test_netdisk_read_operations_use_fixed_routes() -> None:
+    """
+    只读网盘操作必须注册为固定方法与方法模板，禁止调用方注入任意 URL。
+    """
+    for operation_id, (method, path) in NETDISK_READ_ROUTES.items():
+        route = API_OPERATION_ROUTES[operation_id]
+        assert route.method == method, operation_id
+        assert route.path == path, operation_id
+
+
+def test_netdisk_write_operations_use_fixed_routes() -> None:
+    """
+    网盘写操作必须注册为固定 POST 路由，禁止调用方注入任意 URL。
+    """
+    for operation_id, (method, path) in NETDISK_WRITE_ROUTES.items():
+        route = API_OPERATION_ROUTES[operation_id]
+        assert route.method == method, operation_id
+        assert route.path == path, operation_id
+
+
+def test_netdisk_operation_skill_declares_registered_operations() -> None:
+    """
+    网盘操作技能只声明已注册的九个操作，并说明宿主确认与删除边界。
+    """
+    content = NETDISK_SKILL.read_text(encoding="utf-8")
+    metadata = parse_skill_metadata(content, str(NETDISK_SKILL), "netdisk-operation")
+
+    assert metadata is not None
+    assert metadata["allowed_tools"] == ["moviepilot_api"]
+    declared = metadata["allowed_api_operations"]
+    expected = set(NETDISK_READ_ROUTES) | set(NETDISK_WRITE_ROUTES)
+    registered_netdisk = {
+        operation_id
+        for operation_id in API_OPERATION_ROUTES
+        if operation_id.startswith("netdisk.")
+    }
+    assert len(declared) == 9
+    assert set(declared) == expected
+    assert registered_netdisk == set(declared)
+
+    body = " ".join(content.lower().split())
+    assert "host" in body
+    assert "confirmation_required" in body
+    assert "fail closed" in body
+    assert "private reply" in body
+    assert "group" in body
+    assert "netdisk.files.delete" in body
+
+
+def test_every_gateway_operation_has_exact_skill_and_chinese_mcp_contract() -> None:
+    """
+    每个获准操作都必须有唯一的 Skill 契约及对应的中文 MCP 契约。
+    """
+    skill = _read_api_skill_contract()
+    schema = MoviePilotApiTool(session_id="audit", user_id="1").get_mcp_input_schema()
+    branches = {
+        branch["properties"]["operation_id"]["const"]: branch
+        for branch in schema["oneOf"]
+    }
+
+    assert set(branches) == set(API_OPERATION_ROUTES)
+    for operation_id, route in API_OPERATION_ROUTES.items():
+        assert skill.count(f"### `{operation_id}`") == 1
+        branch = branches[operation_id]
+        assert branch["description"].strip()
+        assert re.search(r"[\u3400-\u9fff]", branch["description"]), operation_id
+        assert route.method in skill.split(f"### `{operation_id}`", 1)[1].split("\n### `", 1)[0]
+        assert route.path in skill.split(f"### `{operation_id}`", 1)[1].split("\n### `", 1)[0]
+
+
+def test_every_gateway_path_placeholder_is_required_by_its_mcp_branch() -> None:
+    """
+    固定路由的每个路径占位符都必须在工具 schema 中以同名必填字段暴露。
+    """
+    schema = MoviePilotApiTool(session_id="audit", user_id="1").get_mcp_input_schema()
+    branches = {
+        branch["properties"]["operation_id"]["const"]: branch
+        for branch in schema["oneOf"]
+    }
+
+    for operation_id, route in API_OPERATION_ROUTES.items():
+        expected = set(re.findall(r"{([^}]+)}", route.path))
+        path_schema = branches[operation_id].get("properties", {}).get("path_params", {})
+        assert set(path_schema.get("properties", {})) == expected, operation_id
+        assert set(path_schema.get("required", [])) == expected, operation_id

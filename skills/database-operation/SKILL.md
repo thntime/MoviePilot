@@ -204,6 +204,12 @@ and pass the flag only for an explicitly authorized repair.
 - Write boundary: Consumed atomically by two-sided identity verification; never extend expiry, forge digests, or replace owners directly.
 - Columns: `id`, `user_id`, `user_identity`, `expires_at`
 
+### `contentverify`
+- Purpose: Stores content-verification records for netdisk downloads: verdict, tier, scores, evidence frames, and file references.
+- Useful queries: Reviewing pending audit items, tier counts, and verification evidence through the history verify API.
+- Write boundary: Written by the transfer content verification chain; delete rejected files only through the history verify delete endpoint.
+- Columns: `id`, `src`, `storage`, `title`, `media_type`, `season`, `episodes`, `score`, `confidence`, `reason`, `hits`, `frames`, `file_count`, `total_size`, `median_duration`, `platform`, `share_code`, `download_hash`, `decision`, `tier`, `created_at`, `updated_at`
+
 ### `downloadfailure`
 - Purpose: Stores stable fingerprints, media/torrent context, errors, and retry scheduling for failed downloads.
 - Useful queries: Analyzing failure causes, retry counts, next retry time, and affected media or sites.
@@ -221,6 +227,12 @@ and pass the flag only for an explicitly authorized repair.
 - Useful queries: Reviewing download history or tracing a media identity or hash back to its source.
 - Write boundary: Written by the download use case; delete or correct records through the download-history API.
 - Columns: `id`, `path`, `type`, `title`, `year`, `media_source`, `media_id`, `music_type`, `seasons`, `episodes`, `image`, `poster`, `downloader`, `download_hash`, `torrent_name`, `torrent_description`, `torrent_site`, `userid`, `username`, `channel`, `date`, `note`, `media_category_id`, `media_category`, `classification_rule_id`, `classification_policy_revision`, `classification_source`, `episode_group`, `custom_words`
+
+### `downloadpending`
+- Purpose: Stores recovery state for download submissions accepted by a downloader but not yet confirmed as a visible task.
+- Useful queries: Inspecting pending infohashes, target scopes, subscription links, expiry timestamps, and duplicate-submission locks.
+- Write boundary: Recovery state owned by download reconciliation; never delete or alter rows manually to bypass duplicate protection, and ordinary history retention does not purge it.
+- Columns: `id`, `pending_key`, `target_key`, `type`, `title`, `year`, `media_source`, `media_id`, `season`, `episodes`, `downloader`, `hashes`, `torrent_name`, `source`, `subscription_id`, `payload`, `submitted_at`, `last_checked_at`, `expires_at`
 
 ### `mediaserveritem`
 - Purpose: Stores the local index and canonical media identity projected from media-server libraries.

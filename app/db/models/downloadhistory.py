@@ -95,18 +95,28 @@ class DownloadHistory(Base):
     def get_by_hash(cls, db: Session, download_hash: str) -> Optional["DownloadHistory"]:
         """
         按下载任务哈希读取登记时间最新的下载历史。
+
+        登记时间只精确到秒，同一秒内对同一任务的多次登记（例如同一季包连续追加两集）以主键为准，
+        保证总能读到最后写入的一条；已有任务的"确认选中记录"依赖这一点（见下载链历史登记）。
         """
         history: Optional[DownloadHistory] = db.execute(
             select(DownloadHistory)
             .where(DownloadHistory.download_hash == download_hash)
-            .order_by(DownloadHistory.date.desc())
+            .order_by(DownloadHistory.date.desc(), DownloadHistory.id.desc())
         ).scalars().first()
         return history
 
     @classmethod
-    def get_by_hashes(cls, db: Session, download_hashes: List[str]) -> list["DownloadHistory"]:
+    def get_by_hashes(
+        cls, db: Session, download_hashes: List[str], *, downloader: Optional[str] = None,
+    ) -> list["DownloadHistory"]:
         """
         批量查询多个下载任务的最新历史记录，避免在上层形成 N+1 查询。
+
+        :param db: 调用方持有的同步数据库会话
+        :param download_hashes: 待批量查询的下载任务哈希标识
+        :param downloader: 选取最新记录前限定下载器实例名称；None 表示跨实例查询
+        :return: 按请求顺序返回的最新历史列表，每个哈希最多一条
         """
         normalized_hashes = []
         seen_hashes = set()
@@ -119,10 +129,12 @@ class DownloadHistory(Base):
         if not normalized_hashes:
             return []
 
+        statement = select(DownloadHistory).where(DownloadHistory.download_hash.in_(normalized_hashes))
+        if downloader is not None:
+            statement = statement.where(DownloadHistory.downloader == downloader)
         histories = db.execute(
-            select(DownloadHistory)
-            .where(DownloadHistory.download_hash.in_(normalized_hashes))
-            .order_by(DownloadHistory.download_hash, DownloadHistory.date.desc())
+            # 登记时间只精确到秒，同一秒内的多条记录以主键为准，与 get_by_hash 的"最新"口径一致。
+            statement.order_by(DownloadHistory.download_hash, DownloadHistory.date.desc(), DownloadHistory.id.desc())
         ).scalars().all()
         latest_histories = {}
         for history in histories:

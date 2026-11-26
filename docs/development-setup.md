@@ -49,6 +49,11 @@ UV_PROJECT_ENVIRONMENT="${MOVIEPILOT_WORKSPACE}/.venv-test" \
 同步共享环境。测试不加载运行用 `app.env`，由测试引导隔离临时 `CONFIG_DIR`；本地服务启动
 则遵循工作区的子进程环境加载约定。
 
+测试文件归属、增删与 fixture 生命周期按[单元测试规范](testing.md#测试归属与生命周期)维护。
+修改测试时运行 `uv run --locked --no-sync python scripts/testing/maintenance.py --base <pr-base>`；
+不传 `--base` 时清点并检查完整测试树，提供基准则附加文件增删摘要。
+基准历史不构成恢复旧平铺文件或旧导入的例外。工具不访问应用配置、数据库或网络，也不自动删除候选。
+
 ### 2. 依赖分层与事实源
 
 主程序只维护以下依赖事实源：
@@ -91,8 +96,12 @@ UV_PROJECT_ENVIRONMENT="${MOVIEPILOT_WORKSPACE}/.venv-test" \
 - `CLOAKBROWSER_OPERATION_TIMEOUT` 默认 `120` 秒，限制启动和单次原生浏览器操作；`CLOAKBROWSER_CLOSE_TIMEOUT` 默认 `5` 秒，限制关闭宽限。
 - 同一 Agent 浏览器会话的页面、标签及登录状态继续复用；实例未关闭时，包括等待模型响应期间，仍占用名额。
   网页任务完成后应调用 `close_session`；确需跨轮保留页面时，可等待用户继续操作，连续空闲 15 分钟后兜底回收。
-- 插件使用完成后必须在 `finally` 中关闭返回对象。关闭成功或底层 Browser 断开后归还名额；
+- 插件使用完成后必须在 `finally` 中关闭返回对象，或直接使用 `app.sdk.browser` 提供的 `browser_context` / `browser_context_async`
+  上下文管理器自动关闭并归还名额。关闭成功或底层 Browser 断开后归还名额；
   关闭失败继续保留真实占用，Agent 会保留原线程与句柄供任务回收或全局关闭重试。
+- 插件可通过 `app.sdk.browser` 的 `get_browser_queue_status()` 只读查看当前队列活跃数、排队深度与并发上限，
+  并通过 `browser_request(cancelled=..., queue_timeout=...)` 或 `browser_context` / `browser_context_async` 的
+  `cancelled` 与 `queue_timeout` 参数主动取消排队中的请求或收紧单次等待上限（取消时抛出 `BrowserQueueCancelledError`）。
 - 原生操作或关闭无响应时，owner 监控线程只回收本次 Playwright 驱动及带有本次唯一标记的后代进程；
   确认进程树退出后才归还名额。点击、提交或脚本在超时前可能已经执行时，工具返回 `execution_outcome=unknown`，应先核验页面再决定是否继续。
 - 队列协调当前宿主进程内的调用。多个独立 MoviePilot 进程或外部程序共用同一个 key 时，
@@ -361,17 +370,17 @@ Python 3.14 还会在平台支持时输出 C 栈；关闭 GIL 时只转储当前
 
 ### Agent 历史消息索引验证
 
-独立消息库位于 Agent 运行目录，不参与主库 Alembic。使用临时运行目录运行 `tests/test_agent_recall_persistence.py`，不得用真实用户的 `state.db` 做索引破坏或重建测试。CJK tokenizer 保留 Hermes 原版源码及许可证于 `native/fts5_cjk/`；Docker 构建与 CLI 依赖安装使用该目录的 `install.py`，按本机架构编译并用目标解释器实际验证两字中文查询，安装到 `<sys.prefix>/lib/moviepilot/libfts5_cjk.so`。旧配置目录内的手工扩展作为加载回退；编译器要求和补装/检查命令见该目录 README。测试有本地 C 编译器时在临时目录构建，无编译器时只跳过原生扩展用例，不能宣称该分词路径已验证。常规 FTS5 与 trigram、短中文回退无需该扩展，扩展缺失或失效时索引状态会明确降级。独立 schema 版本不等于产品版本；后续新增主库升级脚本从 3.1.0 命名。
+独立消息库位于 Agent 运行目录，不参与主库 Alembic。使用临时运行目录运行 `tests/agent/memory/test_agent_recall_persistence.py`，不得用真实用户的 `state.db` 做索引破坏或重建测试。CJK tokenizer 保留 Hermes 原版源码及许可证于 `native/fts5_cjk/`；Docker 构建与 CLI 依赖安装使用该目录的 `install.py`，按本机架构编译并用目标解释器实际验证两字中文查询，安装到 `<sys.prefix>/lib/moviepilot/libfts5_cjk.so`。旧配置目录内的手工扩展作为加载回退；编译器要求和补装/检查命令见该目录 README。测试有本地 C 编译器时在临时目录构建，无编译器时只跳过原生扩展用例，不能宣称该分词路径已验证。常规 FTS5 与 trigram、短中文回退无需该扩展，扩展缺失或失效时索引状态会明确降级。独立 schema 版本不等于产品版本；后续新增主库升级脚本从 3.1.0 命名。
 
 ### Agent 学习验证
 
 交互执行隔离、后台避让及超时配置见 [智能助手执行优先策略](agent-execution.md)。
 
-`tests/test_agent_learning_skills.py`、`tests/test_agent_learning_memory.py` 和
-`tests/test_agent_learning_review.py` 用临时目录与确定性模型核对 Hermes 学习契约，
+`tests/agent/memory/test_agent_learning_skills.py`、`tests/agent/memory/test_agent_learning_memory.py` 和
+`tests/agent/memory/test_agent_learning_review.py` 用临时目录与确定性模型核对 Hermes 学习契约，
 不访问实际 LLM 或个人记忆。匹配器、威胁模式和提示词的上游来源及 MIT 许可在
 `app/agent/learning/LICENSE.hermes`；不得以这些离线测试替代固定真实模型的效果评测。
 
-`tests/test_agent_guardrail_controller.py` 保留 Hermes 原始循环规则的纯行为回归，
-`tests/test_agent_guardrails.py` 使用真实 LangGraph 验证并行顺序、逐运行隔离、正常轮询、
+`tests/agent/security/test_agent_guardrail_controller.py` 保留 Hermes 原始循环规则的纯行为回归，
+`tests/agent/security/test_agent_guardrails.py` 使用真实 LangGraph 验证并行顺序、逐运行隔离、正常轮询、
 未知结果、尾部行动继续提示和流式停止交付。派生代码许可在 `app/agent/guardrails/LICENSE.hermes`。

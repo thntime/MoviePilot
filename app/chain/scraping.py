@@ -36,10 +36,11 @@ from app.domain.meta.metabase import MetaBase
 from app.domain.meta.metamusic import MetaMusic
 from app.domain.metainfo import MetaInfo, MetaInfoPath
 from app.domain.music import (
-    align_music_tracks,
+    align_music_tracks_by_policy,
     music_album_has_consistent_tracks,
     music_cover_priority,
     music_isrc_conflicts,
+    normalize_auto_music_track_match,
 )
 from app.foundation.singleton import Singleton
 from app.foundation.text import convert
@@ -401,7 +402,8 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
     MUSIC_LEGACY_LYRICS_EXTENSIONS = (".lyricsfile.yaml", ".txt")
     # 与音频元数据读取器对同目录 CUE 的数量上限保持一致
     MUSIC_MAX_CUE_FILES = 32
-    IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+    # SVG 作为矢量原图保存，并由实际内容校验后交给媒体服务器读取。
+    IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".svg"})
     _music_track_prefix_pattern = re.compile(
         r"^\s*(?:(?:cd|disc)\s*\d+\s*[-_. ]+)?(?:\d+\s*[-_. ]+)+",
         flags=re.IGNORECASE,
@@ -530,6 +532,7 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
 
         首个目标上传成功后，后续目标优先尝试同存储硬链接；不支持或链接失败时，
         从同一份下载临时文件复制后上传，避免重复请求远端地址。
+        图片格式按内容确认，受支持的 SVG 会保留矢量原图和 ``.svg`` 后缀。
 
         :param fileitem: 首个图片目标所在的目录项
         :param path: 首个图片目标路径
@@ -574,7 +577,10 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 else:
                     logger.warn(f"图片保存失败：{target_path}")
         except Exception as err:
-            logger.error(f"{url} 图片下载失败：{str(err)}！")
+            if isinstance(err, ValueError) and self._normalize_image_suffix(url) == ".svg":
+                logger.warn(f"跳过不支持的 SVG 图片：{url} - {err}")
+            else:
+                logger.error(f"{url} 图片下载失败：{str(err)}！")
         finally:
             self._cleanup_temp_file(downloaded_path)
 
@@ -680,7 +686,7 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         将图片地址或文件名的扩展名归一为受支持的小写后缀。
 
         :param value: 图片 URL 或来源文件名
-        :return: ``.jpg``、``.png`` 或 ``.webp`` 等归一后的后缀
+        :return: ``.jpg``、``.png``、``.webp`` 或 ``.svg`` 等归一后的后缀
         """
         suffix = Path(urlsplit(value or "").path).suffix.lower()
         if suffix == ".jpeg":
@@ -1817,10 +1823,14 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             if len(eligible) != len(items):
                 # 不完整的本地证据无法证明整批文件与线上曲目之间的双向唯一性。
                 continue
-            aligned = align_music_tracks(
+            track_match = normalize_auto_music_track_match(
+                getattr(get_chain_runtime_config_snapshot(), "music_track_match", "strict")
+            )
+            aligned = align_music_tracks_by_policy(
                 [meta for _, meta in eligible],
                 tracks,
                 allow_title_override=allow_title_override or bool(key[2]),
+                track_match=track_match,
             )
             for index, remote in aligned.items():
                 item, meta = eligible[index]
@@ -2183,16 +2193,16 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         return merged
 
     @classmethod
-    def _match_music_album_track(
+    def _rank_music_album_track(
             cls,
             local_meta: MetaMusic,
-            album_info: Optional[MusicAlbumInfo],
+            album_info: MusicAlbumInfo,
+            *,
+            ignore_duration: bool,
     ) -> Optional[MusicInfo]:
         """
-        按碟号、曲序、标题、艺术家和时长为本地文件匹配专辑中的单个音轨。
+        使用指定时长策略在专辑曲目表中寻找唯一高分音轨。
         """
-        if not album_info or not album_info.tracks:
-            return None
         local_title = cls._normalize_music_track_title(local_meta.title)
         local_artists = {
             cls._normalize_music_track_title(artist)
@@ -2221,7 +2231,7 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             }
             if local_artists and track_artists and local_artists.intersection(track_artists):
                 score += 3
-            if local_meta.duration and track.duration:
+            if not ignore_duration and local_meta.duration and track.duration:
                 duration_delta = abs(local_meta.duration - track.duration)
                 if duration_delta <= 2:
                     score += 4
@@ -2236,6 +2246,27 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             return None
         matched = deepcopy(ranked[0][1])
         matched.duration = matched.duration or local_meta.duration
+        return matched
+
+    @classmethod
+    def _match_music_album_track(
+            cls,
+            local_meta: MetaMusic,
+            album_info: Optional[MusicAlbumInfo],
+    ) -> Optional[MusicInfo]:
+        """
+        按碟号、曲序、标题、艺术家和配置的时长策略为本地文件匹配专辑中的单个音轨。
+        """
+        if not album_info or not album_info.tracks:
+            return None
+        policy = normalize_auto_music_track_match(
+            getattr(get_chain_runtime_config_snapshot(), "music_track_match", "strict")
+        )
+        if policy == "ignore_duration":
+            return cls._rank_music_album_track(local_meta, album_info, ignore_duration=True)
+        matched = cls._rank_music_album_track(local_meta, album_info, ignore_duration=False)
+        if matched is None and policy == "fallback_ignore_duration":
+            return cls._rank_music_album_track(local_meta, album_info, ignore_duration=True)
         return matched
 
     @classmethod

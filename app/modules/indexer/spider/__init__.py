@@ -13,10 +13,11 @@ from pyquery import PyQuery
 
 from app.adapters.network.http import AsyncRequestUtils, RequestUtils
 from app.adapters.system import rust as rust_accel
+from app.domain import site as site_rules
 from app.foundation import size as size_tools
 from app.foundation import temporal as time_tools
 from app.foundation import url as url_tools
-from app.foundation.url import UrlUtils
+from app.foundation.url import UrlUtils, mask_url_credentials
 from app.runtime.execution import run_in_threadpool
 from app.runtime.log import logger
 from app.runtime.settings import get_runtime_setting
@@ -205,7 +206,10 @@ class SiteSpider:
         self._result_offset = 0
         if self.domain and not str(self.domain).endswith("/"):
             self.domain = self.domain + "/"
-        self.ua = indexer.get('ua') or get_runtime_setting('USER_AGENT')
+        self.ua: Optional[str] = site_rules.resolve_site_user_agent_from_settings(
+            indexer.get('ua'),
+            get_runtime_setting,
+        )
         self.proxies = get_runtime_setting('PROXY') if indexer.get('proxy') else None
         self.proxy_server = get_runtime_setting('PROXY_SERVER') if indexer.get('proxy') else None
         self.cookie = indexer.get('cookie')
@@ -436,6 +440,8 @@ class SiteSpider:
         """
         同步请求站点搜索页面并解析种子或字幕结果。
 
+        完整请求地址只写入 DEBUG 日志，并先遮盖 URL 凭据。
+
         :return: 解析后的记录列表；不允许搜索或请求解析失败时为空，失败详情记录在实例中
         """
         if not self.__can_search():
@@ -443,7 +449,7 @@ class SiteSpider:
 
         searchurl = self.__get_search_url()
 
-        logger.info(f"开始请求：{searchurl}")
+        logger.debug(f"开始请求：{mask_url_credentials(searchurl)}")
 
         ret = RequestUtils(
             ua=self.ua,
@@ -461,6 +467,8 @@ class SiteSpider:
         """
         异步请求站点搜索页面，再在线程池中解析种子或字幕结果。
 
+        完整请求地址只写入 DEBUG 日志，并先遮盖 URL 凭据。
+
         :return: 解析后的记录列表；不允许搜索或请求解析失败时为空，失败详情记录在实例中
         """
         if not self.__can_search():
@@ -468,7 +476,7 @@ class SiteSpider:
 
         searchurl = self.__get_search_url()
 
-        logger.info(f"开始异步请求：{searchurl}")
+        logger.debug(f"开始异步请求：{mask_url_credentials(searchurl)}")
 
         ret = await AsyncRequestUtils(
             ua=self.ua,

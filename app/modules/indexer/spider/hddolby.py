@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from app.adapters.network.http import AsyncRequestUtils, RequestUtils
 from app.application.configuration import get_configured_system_config
 from app.domain import site as site_rules
+from app.foundation import text as text_tools
 from app.runtime.log import logger
 from app.runtime.settings import get_runtime_setting
 from app.schemas.types import MediaType
@@ -90,7 +91,7 @@ class HddolbySpider:
             if indexer.get('proxy'):
                 self._proxy = get_runtime_setting('PROXY')
             self._cookie = indexer.get('cookie')
-            self._ua = indexer.get('ua')
+            self._ua = site_rules.resolve_site_user_agent_from_settings(indexer.get('ua'), get_runtime_setting)
             self._apikey = indexer.get('apikey')
             self._timeout = indexer.get('timeout') or 15
             api_url = str(
@@ -196,6 +197,7 @@ class HddolbySpider:
                 'freedate': result.get('promotion_until'),
                 'page_url': self._pageurl % result.get('id') if self._pageurl else '',
                 'labels': torrentLabels,
+                'hit_and_run': text_tools.parse_bool(result.get('hr')),
                 'category': category
             }
             torrents.append(torrent)
@@ -327,7 +329,7 @@ class HddolbySpider:
         api_host = urlparse(self._api_url).hostname
         with RequestUtils(headers={
             "Content-Type": "application/json", "Accept": "application/json, text/plain, */*", "x-api-key": self._apikey,
-        }, ua=self._ua or get_runtime_setting("USER_AGENT"), proxies=self._proxy or {},
+        }, ua=site_rules.resolve_site_user_agent_from_settings(self._ua, get_runtime_setting), proxies=self._proxy or {},
             timeout=self._timeout).response_manager(
             method="GET", url=f"{self._api_url}/user/data", allow_redirects=False,
         ) as response:

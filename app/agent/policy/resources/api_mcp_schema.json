@@ -2746,7 +2746,6 @@
               "type": "null"
             }
           ],
-          "default": null,
           "description": "本次音乐最终目录。填写后只应用文件名模板，类型、分类及专辑目录层级由此路径确定",
           "title": "Music Target Path"
         },
@@ -2825,8 +2824,7 @@
               "type": "null"
             }
           ],
-          "default": false,
-          "description": "刮削",
+          "description": "刮削；为空时跟随目标目录的刮削设置",
           "title": "Scrape"
         },
         "season": {
@@ -3006,6 +3004,12 @@
           "default": "",
           "description": "父目录标识",
           "title": "Parent Id",
+          "type": "string"
+        },
+        "path": {
+          "default": "",
+          "description": "分享内相对路径；个人盘条目为空",
+          "title": "Path",
           "type": "string"
         },
         "size": {
@@ -8099,6 +8103,7 @@
             "count": {
               "anyOf": [
                 {
+                  "minimum": 1,
                   "type": "integer"
                 },
                 {
@@ -8112,6 +8117,7 @@
             "page": {
               "anyOf": [
                 {
+                  "minimum": 1,
                   "type": "integer"
                 },
                 {
@@ -8738,6 +8744,18 @@
               "default": 20,
               "description": "当前页最多返回的记录数。",
               "title": "Count"
+            },
+            "page": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "从 1 开始的结果页码。",
+              "title": "Page"
             },
             "server": {
               "description": "媒体服务器实例列表返回的精确实例名称。",
@@ -13497,7 +13515,7 @@
     },
     {
       "additionalProperties": false,
-      "description": "测试一个已配置站点的连通性和认证状态。请求方法：GET；路径：/api/v1/site/test/{site_id}。操作效果：safe_read；身份范围：bound_user。所需角色：user。",
+      "description": "测试站点连通性和适配器支持的登录状态；通用网页检测仅检查页面和 Cookie，不校验独立的用户认证接口，不能据此判断 UID、Passkey 等用户认证参数有效。请求方法：GET；路径：/api/v1/site/test/{site_id}。操作效果：safe_read；身份范围：bound_user。所需角色：user。",
       "properties": {
         "operation_id": {
           "const": "site.test",
@@ -13506,7 +13524,7 @@
         },
         "path_params": {
           "additionalProperties": false,
-          "description": "site.test 的资源标识参数。测试一个已配置站点的连通性和认证状态。仅使用下列已声明字段。",
+          "description": "site.test 的资源标识参数。测试站点连通性和适配器支持的登录状态；通用网页检测仅检查页面和 Cookie，不校验独立的用户认证接口，不能据此判断 UID、Passkey 等用户认证参数有效。仅使用下列已声明字段。",
           "properties": {
             "site_id": {
               "description": "site.list 返回的持久化站点标识。",
@@ -14682,6 +14700,7 @@
             "count": {
               "anyOf": [
                 {
+                  "minimum": 1,
                   "type": "integer"
                 },
                 {
@@ -14695,6 +14714,7 @@
             "page": {
               "anyOf": [
                 {
+                  "minimum": 1,
                   "type": "integer"
                 },
                 {
@@ -16387,6 +16407,7 @@
             "count": {
               "anyOf": [
                 {
+                  "minimum": 1,
                   "type": "integer"
                 },
                 {
@@ -16413,6 +16434,7 @@
             "page": {
               "anyOf": [
                 {
+                  "minimum": 1,
                   "type": "integer"
                 },
                 {

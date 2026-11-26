@@ -13,7 +13,6 @@ import pytest
 
 from app.api.endpoints import download as endpoint
 from app.domain.context import MediaInfo
-from app.domain.metainfo import MetaInfo
 from app.schemas.context import TorrentInfo as _SchemaTorrentInfo
 from app.schemas.types import MediaSource, MediaType
 

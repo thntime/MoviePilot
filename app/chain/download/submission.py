@@ -6,13 +6,17 @@ import base64
 import hashlib
 import json
 import re
-from copy import copy
+from collections.abc import Mapping, Sequence
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Set, Tuple, Union, cast
 from urllib.parse import urlparse
 
-from app.application.configuration import get_chain_runtime_config_snapshot
+from app.application.configuration import (
+    get_chain_runtime_config_snapshot,
+    get_runtime_settings,
+)
 from app.application.directory import (
     specified_download_save_path,
     validate_download_save_path,
@@ -33,6 +37,7 @@ from app.chain.download.ports import (
 )
 from app.chain.media import MediaChain
 from app.domain import episode as episode_rules
+from app.domain import site as site_rules
 from app.domain import torrent as torrent_rules
 from app.domain.context import (
     Context,
@@ -41,23 +46,444 @@ from app.domain.context import (
     TorrentInfo,
 )
 from app.domain.meta.metabase import MetaBase
+from app.domain.metainfo import MetaInfo
 from app.domain.netdisk import normalize_platform
 from app.foundation.url import UrlUtils, url_origin_for_log
 from app.runtime.cache import FileCache
 from app.runtime.events import eventmanager
+from app.runtime.locks import downloader_task_locks
 from app.runtime.log import logger
-from app.schemas.download import DOWNLOAD_TASK_ALREADY_EXISTS
-from app.schemas.event import ResourceDownloadEventData
+from app.schemas.common import JsonData
+from app.schemas.download import (
+    DownloadTaskAction,
+    ExistingTaskRejection,
+    is_unconfirmed_download_message,
+)
+from app.schemas.event import ResourceDownloadEventData, ResourceSubmitEventData
 from app.schemas.exception import RateLimitExceededException
 from app.schemas.file import FileURI
-from app.schemas.media import resolve_media_identity
+from app.schemas.media import normalize_media_source, resolve_media_identity
 from app.schemas.message import Message
 from app.schemas.types import (
     ChainEventType,
+    MediaSource,
     MediaType,
     MessageType,
+    ModuleType,
     NotificationChannel,
 )
+
+# 转换后可无损回填到 TMDB 媒体对象的非主来源外链字段，保持主身份不变。
+_AUXILIARY_EXTERNAL_ID_FIELDS = (
+    "douban_id",
+    "bangumi_id",
+    "anilist_id",
+    "imdb_id",
+    "tvdb_id",
+    "tvdb_slug",
+)
+
+
+def is_tmdb_recognize_source() -> bool:
+    """
+    判断当前系统影视识别源配置是否为 TMDB。
+
+    :return: 全局 RECOGNIZE_SOURCE 规范化为 TMDB 时返回 True，否则返回 False
+    """
+    return normalize_media_source(get_runtime_settings().get("RECOGNIZE_SOURCE")) == MediaSource.TMDB
+
+
+def _valid_season_number(value: object) -> Optional[int]:
+    """
+    提取有效的非负整数季号，排除布尔值和负数。
+
+    :param value: 来源或投影返回的原始季号字段
+    :return: 合法季号（含第 0 季特别篇）；无效时返回 None
+    """
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def explicit_meta_seasons(meta: MetaBase) -> list[int]:
+    """
+    从元数据提取显式解析出的季号列表，不把缺失季号的电视剧默认当成第 1 季。
+
+    ``MetaVideo`` 在标题仅含集号（如 ``E01-E05``）且未标季时会回填 ``begin_season=1``
+    但保持 ``total_season=0``；此类默认补齐不算显式季号，以便豆瓣或 Bangumi 季级条目
+    能正确带入真实季号。
+
+    :param meta: 种子标题解析出的元数据
+    :return: 按升序排列的显式季号列表；未解析出季号时返回空列表
+    """
+    begin = _valid_season_number(meta.begin_season)
+    if begin is None:
+        return []
+    end = _valid_season_number(meta.end_season)
+    if end is not None and end >= begin:
+        return list(range(begin, end + 1))
+    if begin == 1 and getattr(meta, "total_season", 0) == 0:
+        return []
+    return [begin]
+
+
+def _extract_source_media_season(source_media: Optional[MediaInfo]) -> Optional[int]:
+    """
+    从非 TMDB 媒体对象本身提取季号，兼容豆瓣和 Bangumi 等季级条目标题。
+
+    :param source_media: 转换前的原媒体对象
+    :return: 提取到的季号；无法确定时返回 None
+    """
+    if source_media is None:
+        return None
+    direct_season = _valid_season_number(source_media.season)
+    if direct_season is not None:
+        return direct_season
+    if not source_media.title:
+        return None
+    return _valid_season_number(MetaInfo(source_media.title).begin_season)
+
+
+def _resolve_conversion_query_season(
+    metainfo: MetaBase,
+    media_source: MediaSource,
+    source_media: Optional[MediaInfo],
+    expected_mtype: Optional[MediaType],
+) -> Optional[int]:
+    """
+    决定传给跨来源身份投影的查询季号，避免把电影或多季包误压成单季。
+
+    :param metainfo: 种子标题解析元数据
+    :param media_source: 待转换的非 TMDB 媒体来源
+    :param source_media: 已知的原媒体对象；无媒体上下文下载时为 None
+    :param expected_mtype: 已确认的影视类型；未确定时为 None
+    :return: 传给 ``convert_media_identity`` 的季号，未限定时返回 None
+    """
+    if expected_mtype == MediaType.MOVIE:
+        return None
+    explicit_seasons = explicit_meta_seasons(metainfo)
+    single_meta_season = explicit_seasons[0] if len(explicit_seasons) == 1 else None
+    if source_media is not None:
+        if single_meta_season is not None:
+            return single_meta_season
+        if not explicit_seasons:
+            return _extract_source_media_season(source_media)
+        return _valid_season_number(source_media.season)
+    if media_source == MediaSource.IMDb:
+        return single_meta_season if metainfo.type == MediaType.TV else None
+    return single_meta_season
+
+
+def _parse_tmdb_media_type(raw_type: object) -> Optional[MediaType]:
+    """
+    把投影返回的影视类型字段规范为电影或电视剧枚举。
+
+    :param raw_type: 投影结果中的 ``media_type`` 原始值
+    :return: 电影或电视剧枚举；无法识别或非影视类型时返回 None
+    """
+    parsed = (
+        raw_type
+        if isinstance(raw_type, MediaType)
+        else MediaType.from_agent(str(raw_type or ""))
+    )
+    return parsed if parsed in (MediaType.MOVIE, MediaType.TV) else None
+
+
+def available_tmdb_seasons(
+    converted: MediaInfo,
+    tmdbinfo: Optional[Mapping[str, Any]] = None,
+) -> set[int]:
+    """
+    收集 TMDB 识别结果中已列出的合法季号集合，用于校验目标季是否存在。
+
+    :param converted: TMDB 完整识别得到的媒体对象
+    :param tmdbinfo: 投影步骤返回的原始 TMDB 字典，可为 None
+    :return: 已确认存在的季号集合；结果未提供季清单时返回空集合
+    """
+    seasons: set[int] = {
+        season for season in (converted.seasons or {})
+        if _valid_season_number(season) is not None
+    }
+    for item in converted.season_info or ():
+        if isinstance(item, Mapping):
+            season_num = _valid_season_number(item.get("season_number"))
+            if season_num is not None:
+                seasons.add(season_num)
+    if seasons or not tmdbinfo:
+        return seasons
+    raw_seasons = tmdbinfo.get("seasons")
+    if not isinstance(raw_seasons, Sequence) or isinstance(raw_seasons, (str, bytes)):
+        return set()
+    for item in raw_seasons:
+        if isinstance(item, Mapping):
+            season_num = _valid_season_number(item.get("season_number"))
+            if season_num is not None:
+                seasons.add(season_num)
+    return seasons
+
+
+def _preserve_origin_media_fields(
+    converted: MediaInfo,
+    origin_source: MediaSource,
+    origin_id: str,
+    source_media: Optional[MediaInfo],
+) -> None:
+    """
+    在转换后的 TMDB 媒体对象上回填缺失的原来源外链标识，保持 TMDB 主身份不变。
+
+    :param converted: 转换并识别完成的 TMDB 媒体对象
+    :param origin_source: 转换前的原媒体来源
+    :param origin_id: 转换前的原来源原生标识
+    :param source_media: 转换前的原媒体对象，可为空
+    """
+    source_field_map: dict[MediaSource, tuple[str, bool]] = {
+        MediaSource.Douban: ("douban_id", False),
+        MediaSource.Bangumi: ("bangumi_id", True),
+        MediaSource.AniList: ("anilist_id", True),
+        MediaSource.IMDb: ("imdb_id", False),
+        MediaSource.TVDB: ("tvdb_id", True),
+    }
+    target = source_field_map.get(origin_source)
+    if target is not None:
+        field_name, is_numeric = target
+        if not getattr(converted, field_name, None):
+            if is_numeric:
+                if origin_id.isdigit():
+                    setattr(converted, field_name, int(origin_id))
+            else:
+                setattr(converted, field_name, origin_id)
+    if source_media is None:
+        return
+    for field_name in _AUXILIARY_EXTERNAL_ID_FIELDS:
+        if not getattr(converted, field_name, None):
+            value = getattr(source_media, field_name, None)
+            if value:
+                setattr(converted, field_name, value)
+
+
+def _validate_converted_tmdb_media(
+    converted: object,
+    *,
+    expected_tmdb_id: str,
+    expected_mtype: Optional[MediaType],
+    episode_group: Optional[str],
+    candidate_meta: MetaBase,
+    tmdbinfo: Mapping[str, Any],
+    origin_source: MediaSource,
+    origin_id: str,
+) -> Optional[MediaInfo]:
+    """
+    核验转换后的 TMDB 媒体对象与原目标在身份、类型、剧集组和电视剧季号上是否可靠一致。
+
+    :param converted: TMDB 完整识别返回的对象
+    :param expected_tmdb_id: 投影给出的目标 TMDB ID
+    :param expected_mtype: 原媒体确定的影视类型；未限定时为 None
+    :param episode_group: 请求保留的剧集组标识；未指定时为 None
+    :param candidate_meta: 已补齐缺失季号的候选元数据
+    :param tmdbinfo: 投影步骤返回的原始 TMDB 字典
+    :param origin_source: 原媒体来源，用于告警日志定位
+    :param origin_id: 原来源原生标识，用于告警日志定位
+    :return: 通过可靠性校验的 TMDB 媒体对象；任一条件不满足时返回 None
+    """
+    if not isinstance(converted, MediaInfo):
+        logger.warning(
+            f"手动下载未能识别转换后的 TMDB {expected_tmdb_id}，保留原身份 {origin_source.value}:{origin_id}"
+        )
+        return None
+    converted_source, converted_id = resolve_media_identity(media=converted)
+    if converted_source != MediaSource.TMDB or converted_id != expected_tmdb_id:
+        logger.warning(
+            f"手动下载识别结果与目标 TMDB {expected_tmdb_id} 不一致，保留原身份 {origin_source.value}:{origin_id}"
+        )
+        return None
+    if expected_mtype is not None and converted.type != expected_mtype:
+        logger.warning(
+            f"手动下载转换后的 TMDB {expected_tmdb_id} 类型（{converted.type}）与原目标（{expected_mtype}）冲突，"
+            f"保留原身份 {origin_source.value}:{origin_id}"
+        )
+        return None
+    if converted.type == MediaType.TV:
+        if episode_group and converted.episode_group != episode_group:
+            logger.warning(
+                f"手动下载转换后的 TMDB {expected_tmdb_id} 未能应用剧集组 {episode_group}，"
+                f"保留原身份 {origin_source.value}:{origin_id}"
+            )
+            return None
+        requested_seasons = explicit_meta_seasons(candidate_meta)
+        available_seasons = available_tmdb_seasons(converted, tmdbinfo)
+        if available_seasons and requested_seasons:
+            missing_seasons = [season for season in requested_seasons if season not in available_seasons]
+            if missing_seasons:
+                logger.warning(
+                    f"手动下载转换后的 TMDB {expected_tmdb_id} 季列表未包含目标季 {missing_seasons}，"
+                    f"保留原身份 {origin_source.value}:{origin_id}"
+                )
+                return None
+    return converted
+
+
+def _project_tmdb_payload(
+    media_chain: Any,
+    *,
+    media_source: MediaSource,
+    media_id: str,
+    expected_mtype: Optional[MediaType],
+    query_season: Optional[int],
+) -> Optional[tuple[Mapping[str, Any], str, Optional[MediaType]]]:
+    """
+    调用共享跨来源投影获取 TMDB 标识与类型，失败或类型冲突时记录告警并返回 None。
+
+    :param media_chain: 提供 ``convert_media_identity`` 的媒体链对象
+    :param media_source: 已规范化的非 TMDB 媒体来源
+    :param media_id: 已规范化的来源原生标识
+    :param expected_mtype: 已确认的影视类型；未限定时为 None
+    :param query_season: 传给投影接口的电视剧季号；电影或未指定时为 None
+    :return: ``(原始投影字典, TMDB ID, 最终识别类型)``；无法可靠投影时返回 None
+    """
+    convert_identity = getattr(media_chain, "convert_media_identity", None)
+    if not callable(convert_identity):
+        return None
+    convert_kwargs: dict[str, Any] = {
+        "target_source": MediaSource.TMDB,
+        "media_source": media_source,
+        "media_id": media_id,
+        "season": query_season,
+    }
+    if expected_mtype is not None:
+        convert_kwargs["mtype"] = expected_mtype
+    try:
+        tmdbinfo = convert_identity(**convert_kwargs)
+    except Exception as err:
+        logger.warning(
+            f"手动下载将 {media_source.value}:{media_id} 转换为 TMDB 主身份失败，保留原身份：{err}"
+        )
+        return None
+    if not isinstance(tmdbinfo, dict):
+        logger.warning(
+            f"手动下载未能将 {media_source.value}:{media_id} 映射到 TMDB 主身份，保留原身份"
+        )
+        return None
+    tmdb_id = tmdbinfo.get("id")
+    if not tmdb_id or isinstance(tmdb_id, bool):
+        logger.warning(
+            f"手动下载转换 {media_source.value}:{media_id} 未返回有效 TMDB ID，保留原身份"
+        )
+        return None
+    tmdb_mtype = _parse_tmdb_media_type(tmdbinfo.get("media_type"))
+    if expected_mtype is not None and tmdb_mtype is not None and tmdb_mtype != expected_mtype:
+        logger.warning(
+            f"手动下载转换 {media_source.value}:{media_id} 类型冲突（原：{expected_mtype.value}，"
+            f"映射：{tmdb_mtype.value}），保留原身份"
+        )
+        return None
+    return tmdbinfo, str(tmdb_id), expected_mtype or tmdb_mtype
+
+
+def convert_download_identity_to_tmdb(
+    media_chain: Any,
+    metainfo: MetaBase,
+    media_source: MediaSource,
+    media_id: str,
+    *,
+    source_media: Optional[MediaInfo] = None,
+    mtype: Optional[MediaType] = None,
+    episode_group: Optional[str] = None,
+) -> Optional[tuple[MetaBase, MediaInfo, dict[str, JsonData]]]:
+    """
+    复用订阅同款跨来源映射将非 TMDB 影视下载目标转换为完整 TMDB 主身份。
+
+    转换仅在命中有效 TMDB 映射、二次完整识别成功且通过类型、电视剧季号与剧集组核验时生效；
+    任一步骤失败均保持传入的 ``metainfo`` 与 ``source_media`` 不受污染并返回 None。
+    成功时会保留种子自身解析的季号与选集，并在返回对象与来源追溯字典中保留原来源信息。
+
+    :param media_chain: 媒体链实例，需提供 ``convert_media_identity`` 与 ``recognize_media``
+    :param metainfo: 种子标题解析出的元数据，转换失败时不会被修改
+    :param media_source: 原媒体来源
+    :param media_id: 原来源原生标识
+    :param source_media: 已知的原媒体对象；无媒体上下文入口为 None
+    :param mtype: 显式影视类型约束；省略时优先读取 ``source_media.type``
+    :param episode_group: 显式剧集组标识；省略时回退到原媒体或元数据中的剧集组
+    :return: ``(候选元数据, 完整 TMDB 媒体对象, 原来源追溯字典)``；不适用或不可靠时返回 None
+    """
+    normalized_source, normalized_id = resolve_media_identity(
+        media_source=media_source,
+        media_id=media_id,
+    )
+    if not normalized_source or not normalized_id or normalized_source == MediaSource.TMDB:
+        return None
+    expected_mtype = mtype or (
+        source_media.type
+        if source_media is not None and source_media.type in (MediaType.MOVIE, MediaType.TV)
+        else None
+    )
+    if source_media is not None and expected_mtype not in (MediaType.MOVIE, MediaType.TV):
+        return None
+    effective_episode_group = (
+        episode_group
+        or (source_media.episode_group if source_media is not None else None)
+        or getattr(metainfo, "episode_group", None)
+    )
+    query_season = _resolve_conversion_query_season(
+        metainfo, normalized_source, source_media, expected_mtype,
+    )
+    projected = _project_tmdb_payload(
+        media_chain,
+        media_source=normalized_source,
+        media_id=normalized_id,
+        expected_mtype=expected_mtype,
+        query_season=query_season,
+    )
+    if projected is None:
+        return None
+    tmdbinfo, tmdb_id, target_mtype = projected
+    candidate_meta = deepcopy(metainfo)
+    if target_mtype == MediaType.TV and not explicit_meta_seasons(candidate_meta):
+        projected_season = _valid_season_number(tmdbinfo.get("season"))
+        fallback_season = (
+            projected_season
+            if projected_season is not None
+            else _extract_source_media_season(source_media)
+        )
+        if fallback_season is not None:
+            candidate_meta.begin_season = fallback_season
+            if getattr(candidate_meta, "total_season", 0) == 0:
+                candidate_meta.total_season = 1
+    recognize_kwargs: dict[str, Any] = {
+        "meta": candidate_meta,
+        "mtype": target_mtype,
+        "media_source": MediaSource.TMDB,
+        "media_id": tmdb_id,
+    }
+    if effective_episode_group:
+        recognize_kwargs["episode_group"] = effective_episode_group
+    try:
+        raw_converted = media_chain.recognize_media(**recognize_kwargs)
+    except Exception as err:
+        logger.warning(
+            f"手动下载识别转换后的 TMDB {tmdb_id} 失败，保留原身份 {normalized_source.value}:{normalized_id}：{err}"
+        )
+        return None
+    converted = _validate_converted_tmdb_media(
+        raw_converted,
+        expected_tmdb_id=tmdb_id,
+        expected_mtype=expected_mtype,
+        episode_group=effective_episode_group,
+        candidate_meta=candidate_meta,
+        tmdbinfo=tmdbinfo,
+        origin_source=normalized_source,
+        origin_id=normalized_id,
+    )
+    if converted is None:
+        return None
+    _preserve_origin_media_fields(converted, normalized_source, normalized_id, source_media)
+    origin_media: dict[str, JsonData] = {
+        "media_source": normalized_source.value,
+        "media_id": normalized_id,
+    }
+    logger.info(
+        f"手动下载主身份已由 {normalized_source.value}:{normalized_id} 转换为 TMDB {tmdb_id}：{converted.title_year}"
+    )
+    return candidate_meta, converted, origin_media
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,17 +613,19 @@ class _DownloadResourceOwner(_DownloadOwnerBase):
             else None
         )
         http, _ = _download_ports_snapshot()
-        proxies = (
-            get_chain_runtime_config_snapshot().proxy
-            if request_params.get("proxy")
-            else None
-        )
+        config = get_chain_runtime_config_snapshot()
+        effective_ua = site_rules.resolve_site_user_agent(
+            ua,
+            getattr(config, "site_user_agent", None),
+            config.user_agent,
+        ) or None
+        proxies = config.proxy if request_params.get("proxy") else None
         site = site_request_config(request_url, site_id)
         wait_for_site_request(site)
         if request_params.get("method") == "get":
             response = http.get(
                 request_url,
-                ua=ua,
+                ua=effective_ua,
                 cookies=cookie,
                 headers=headers,
                 proxies=proxies,
@@ -208,7 +636,7 @@ class _DownloadResourceOwner(_DownloadOwnerBase):
                             (("json", "json_body"), ("allow_redirects", "allow_redirects")) if name in request_params}
             response = http.post(
                 request_url,
-                ua=ua,
+                ua=effective_ua,
                 cookies=cookie,
                 headers=headers,
                 proxies=proxies,
@@ -327,12 +755,21 @@ class _DownloadResourceOwner(_DownloadOwnerBase):
                          source: Optional[str] = None,
                          userid: Union[str, int, None] = None,
                          on_failure: Optional[Callable[[str], None]] = None,
+                         *,
+                         retry: bool = True,
+                         notify: bool = True,
                          ) -> Tuple[Optional[Union[str, bytes]], str, list[str]]:
         """
         下载种子文件，如果是磁力链，会返回磁力链接本身
         换票种子按站点资源和原始换票凭据复用本地内容，命中后不再请求临时链接。
 
+        :param torrent: 包含站点身份和种子地址的候选
+        :param channel: 下载失败通知的渠道
+        :param source: 下载请求来源，指定通知渠道时用于路由通知
+        :param userid: 接收下载失败通知的用户
         :param on_failure: 将本次具体失败原因交还准备流程，保持返回元组与并发调用隔离
+        :param retry: 是否对普通 GET 失败退避重试并缓存无效地址；仅核对集数时关闭
+        :param notify: 失败时是否推送下载失败告警；仅核对集数的读取应关闭
         :return: 种子内容，种子目录名，种子文件清单
         """
         enclosure = torrent.enclosure
@@ -347,7 +784,7 @@ class _DownloadResourceOwner(_DownloadOwnerBase):
             logger.info(f"{torrent.title} 命中下载失败黑名单，跳过下载")
             return None, "", []
         torrent = self._with_site_credentials(torrent)
-        result = self._get_torrent_content(torrent)
+        result = self._get_torrent_content(torrent, retry=retry)
         if result is None:
             reason = "换票失败：未获取到下载地址" if enclosure.startswith("[") else "无法获取下载地址"
             result = None, "", [], reason
@@ -359,16 +796,17 @@ class _DownloadResourceOwner(_DownloadOwnerBase):
         if not content:
             if on_failure:
                 on_failure(error_msg or "下载种子内容为空")
-            if not enclosure.startswith("[") and error_msg and "种子数据有误" in error_msg:
+            if retry and not enclosure.startswith("[") and "种子数据有误" in (error_msg or ""):
                 helper.add_invalid(enclosure)
             logger.error(f"下载种子文件失败：{torrent.title}，{error_msg}")
-            self.post_message(Message(
-                channel=channel,
-                source=source if channel else None,
-                mtype=MessageType.Manual,
-                title=f"{torrent.title} 种子下载失败！",
-                text=f"错误信息：{error_msg}\n站点：{torrent.site_name}",
-                userid=userid))
+            if notify:
+                self.post_message(Message(
+                    channel=channel,
+                    source=source if channel else None,
+                    mtype=MessageType.Manual,
+                    title=f"{torrent.title} 种子下载失败！",
+                    text=f"错误信息：{error_msg}\n站点：{torrent.site_name}",
+                    userid=userid))
             return None, "", []
 
         return content, download_folder or "", files or []
@@ -384,13 +822,14 @@ class _DownloadResourceOwner(_DownloadOwnerBase):
         scope = json.dumps((identity, torrent.enclosure, torrent.site_cookie))
         return f"resource-{hashlib.sha256(scope.encode('utf-8')).hexdigest()}.torrent"
 
-    def _get_torrent_content(self, torrent: TorrentInfo) -> Optional[Tuple[
+    def _get_torrent_content(self, torrent: TorrentInfo, *, retry: bool = True) -> Optional[Tuple[
         Optional[Union[str, bytes]], Optional[str], Optional[list[str]], Optional[str],
     ]]:
         """
         先读取已验证的换票种子内容；缓存损坏时重新换票，失败与磁力链不缓存。
 
         :param torrent: 含原始资源地址和站点认证上下文的候选
+        :param retry: 是否对普通 GET 瞬时失败退避重试
         :return: 内容、目录、文件列表及失败原因；换票失败不作为资源损坏处理
         """
         if not torrent.enclosure:
@@ -428,7 +867,7 @@ class _DownloadResourceOwner(_DownloadOwnerBase):
             reason = "换票失败：未获取到下载地址" if indirect_download else "无法获取下载地址"
             return None, "", [], reason
         _, content, download_folder, files, error_msg = self._download_torrent_content(
-            torrent, torrent_url, site_cookie, indirect_download
+            torrent, torrent_url, site_cookie, indirect_download, retry=retry
         )
         if indirect_download and not content and torrent_rules.rate_limit_cooldown(error_msg) is None:
             # 临时票据的错误页或失效不证明原种子损坏，下一次调用仍应重新换票。
@@ -445,9 +884,13 @@ class _DownloadResourceOwner(_DownloadOwnerBase):
             url: str,
             cookie: Optional[str],
             indirect_download: bool,
+            *,
+            retry: bool = True,
     ) -> Tuple[Optional[Path], Optional[Union[str, bytes]], Optional[str], Optional[list[str]], Optional[str]]:
         """
         短时签名失效时刷新同一资源并重试一次，最终失败再交由调用方冷却。
+
+        :param retry: 是否对普通 GET 瞬时失败退避重试；仅核对集数的读取应关闭
         """
         helper: TorrentHelper = cast(Any, TorrentHelper)()
         for attempt in range(2):
@@ -455,9 +898,13 @@ class _DownloadResourceOwner(_DownloadOwnerBase):
             result = helper.download_torrent(
                 url=url,
                 cookie=cookie,
-                ua=torrent.site_ua or self.runtime_config.user_agent,
+                ua=site_rules.resolve_site_user_agent(
+                    torrent.site_ua,
+                    getattr(self.runtime_config, "site_user_agent", None),
+                    self.runtime_config.user_agent,
+                ),
                 proxy=torrent.site_proxy,
-                cache_invalid=not (indirect_download or expiring),
+                cache_invalid=retry and not (indirect_download or expiring),
                 site_id=torrent.site,
             )
             if result[1] or attempt or indirect_download or not expiring:
@@ -550,6 +997,67 @@ class _DownloadResourceOwner(_DownloadOwnerBase):
             logger.warn(str(err))
             return save_path, str(err)
 
+    @staticmethod
+    def _apply_resource_submit_event(
+            *,
+            prepared: _PreparedDownload,
+            context: Context,
+            task_hashes: frozenset[str],
+            episodes: Optional[Set[int]],
+            channel: Optional[NotificationChannel],
+            source: Optional[str],
+            downloader: Optional[str],
+            userid: Union[str, int, None],
+            username: Optional[str],
+            label: Optional[str],
+            user_specified: bool,
+    ) -> Optional[str]:
+        """
+        在种子内容与真实哈希准备完成后、提交下载器之前触发链式取消检查。
+
+        :param prepared: 已解析出种子字节、文件清单与最终目录的本地提交事实
+        :param context: 本次下载的资源上下文
+        :param task_hashes: 从种子内容或磁力链接解析出的真实 info_hash 集合
+        :param episodes: 本次提交的目标集数
+        :param channel: 通知渠道
+        :param source: 下载来源标识
+        :param downloader: 调用方指定的下载器名称
+        :param userid: 触发下载的用户标识
+        :param username: 触发下载的用户名
+        :param label: 下载任务标签
+        :param user_specified: 是否为用户手动明确指定该种子
+        :return: 被事件取消时返回取消说明；允许提交时返回 None
+        """
+        event_data = ResourceSubmitEventData(
+            context=context,
+            hashes=sorted(task_hashes),
+            episodes=set(episodes or (prepared.meta.episode_list if prepared.meta else [])),
+            channel=channel,
+            origin=source,
+            downloader=downloader or prepared.site_downloader,
+            save_path=prepared.download_uri,
+            folder_name=prepared.folder_name,
+            file_list=list(prepared.file_list),
+            user_specified=user_specified,
+            options={
+                "userid": userid,
+                "username": username,
+                "media_category": prepared.media.category if prepared.media else None,
+                "label": label,
+            },
+        )
+        event = eventmanager.send_event(ChainEventType.ResourceSubmit, event_data)
+        if event and event.event_data:
+            event_data = cast(ResourceSubmitEventData, event.event_data)
+            if event_data.cancel:
+                logger.debug(
+                    "Resource submit canceled by event: %s, Reason: %s",
+                    event_data.source,
+                    event_data.reason,
+                )
+                return event_data.reason or "下载提交被事件取消"
+        return None
+
 
 class DownloadSubmissionOwner(_DownloadResourceOwner):
     """
@@ -580,11 +1088,17 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
                         return_detail: bool = False,
                         custom_words: Optional[str] = None,
                         governance: Optional[SubscriptionDownloadGovernance] = None,
+                        *,
+                        user_specified: bool = False,
                         ) -> Union[Optional[str], Tuple[Optional[str], Optional[str]]]:
         """
         下载单个资源并发送结果通知。
 
         保持下载链、消息入口和插件使用的公开签名，实际流程委托给内部执行阶段。
+
+        :param user_specified: 用户明确指定了这个种子（Web 界面、接口、智能助手，或消息交互中选中了具体资源）。
+            同一种子已在下载器中、本次目标文件之前被取消选择时，按用户这次的明确要求重新选中；
+            自动流程（订阅、工作流、插件）保持默认值 False，尊重之前的取消
         """
         return self._execute_download_single(
             context=context,
@@ -602,6 +1116,7 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             return_detail=return_detail,
             custom_words=custom_words,
             governance=governance,
+            user_specified=user_specified,
         )
 
     def _execute_download_single(
@@ -621,9 +1136,12 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
         return_detail: bool = False,
         custom_words: Optional[str] = None,
         governance: Optional[SubscriptionDownloadGovernance] = None,
+        user_specified: bool = False,
     ) -> Union[Optional[str], Tuple[Optional[str], Optional[str]]]:
         """
         准备下载事实，提交下载器并按订阅治理合同结算结果。
+
+        :param user_specified: 用户明确指定了这个种子，见 ``download_single``
         """
         prepared, error_msg = self._prepare_download_single(
             context=context,
@@ -647,6 +1165,24 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             if governance:
                 governance.report(context, "rejected", reason)
             return (None, reason) if return_detail else None
+        task_hashes = torrent_rules.download_hashes(prepared.torrent_content)
+        submit_error = self._apply_resource_submit_event(
+            prepared=prepared,
+            context=context,
+            task_hashes=task_hashes,
+            episodes=episodes,
+            channel=channel,
+            source=source,
+            downloader=downloader,
+            userid=userid,
+            username=username,
+            label=label,
+            user_specified=user_specified,
+        )
+        if submit_error:
+            if governance:
+                governance.report(context, "rejected", submit_error)
+            return (None, "下载被事件取消") if return_detail else None
         download_hash, error_msg = self._submit_prepared_download(
             prepared=prepared,
             context=context,
@@ -660,10 +1196,20 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             label=label,
             custom_words=custom_words,
             governance=governance,
+            user_specified=user_specified,
+            task_hashes=task_hashes,
         )
         if governance:
-            governance.report(context, "submitted" if download_hash else "failed",
-                              None if download_hash else "下载器未接受该资源，未提交成功")
+            if download_hash:
+                governance.report(context, "submitted", None)
+            elif is_unconfirmed_download_message(error_msg):
+                governance.report(
+                    context,
+                    "failed",
+                    "下载器已受理但暂未确认任务信息，已保留待确认状态并暂停同目标换源",
+                )
+            else:
+                governance.report(context, "failed", "下载器未接受该资源，未提交成功")
         return (download_hash, error_msg) if return_detail else download_hash
 
     def _has_completed_music_download(self, prepared: _PreparedDownload, source: Optional[str]) -> bool:
@@ -729,6 +1275,24 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
         return delivered
 
     @staticmethod
+    def _sync_context_after_download_event(
+        context: Context,
+        torrent: TorrentInfo,
+    ) -> Optional[tuple[TorrentInfo, Union[MediaInfo, MusicInfo], MetaBase]]:
+        """
+        在 ``ResourceDownload`` 事件返回后重新读取上下文，保证插件替换后的媒体与元数据生效。
+
+        :param context: 已派发过 ``ResourceDownload`` 事件的下载上下文
+        :param torrent: 事件派发前的种子对象，用作 ``context.torrent_info`` 未修改时的回退
+        :return: 同步后的 ``(种子, 媒体, 元数据)``；上下文缺失有效媒体或元数据时返回 None
+        """
+        media, meta = context.media_info, context.meta_info
+        if not isinstance(media, (MediaInfo, MusicInfo)) or meta is None:
+            return None
+        updated_torrent = context.torrent_info if context.torrent_info is not None else torrent
+        return updated_torrent, media, meta
+
+    @staticmethod
     def _netdisk_platform_rejection(torrent: Any) -> Optional[str]:
         """
         校验网盘候选的平台是否仍启用。
@@ -769,7 +1333,6 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
         rejection = self._netdisk_platform_rejection(torrent)
         if rejection:
             return None, rejection
-        site_downloader = torrent.site_downloader
         supplemented_media = MediaChain().supplement_tmdb_info(media, meta)
         if not isinstance(supplemented_media, (MediaInfo, MusicInfo)):
             return None, "媒体信息补全失败"
@@ -780,6 +1343,11 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
         )
         if event_error:
             return None, event_error
+        synced = self._sync_context_after_download_event(context, torrent)
+        if synced is None:
+            return None, "下载上下文缺少媒体或元数据信息"
+        torrent, media, meta = synced
+        site_downloader = torrent.site_downloader
         download_episodes = episode_rules.format_ranges(list(episodes)) if episodes else None
         if episodes is not None:
             context.selected_episodes = sorted(set(episodes))
@@ -873,9 +1441,18 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
         label: Optional[str],
         custom_words: Optional[str],
         governance: Optional[SubscriptionDownloadGovernance],
+        user_specified: bool = False,
+        task_hashes: Optional[frozenset[str]] = None,
     ) -> tuple[Optional[str], Optional[str]]:
         """
         在可取消边界后调用下载器，并分派成功或拒绝结算。
+
+        取消检查做两次：入口先检查一次，尽早退出；取得任务锁后、调用下载器前再检查一次，并在那里才标记
+        "开始产生下载副作用"。等锁期间（同一任务上的整理回写、rTorrent 新建任务的临时标签轮询等可能持锁
+        数十秒）订阅可能已被取消，只在入口检查的话，锁一释放仍会提交下载器并结算。
+
+        :param user_specified: 用户明确指定了这个种子，交给下载器：同一 hash 已存在时重新选中之前被取消的目标，
+            任务已暂停且目标未下完时恢复任务；拒绝时每次都通知，不做通知去重
         """
         if self._subscription_download_cancelled(governance):
             return None, "订阅下载在提交前已取消"
@@ -886,62 +1463,261 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
         submission_label = subscription_download_label(context.subscription_download)
         if submission_label:
             logger.info(f"开始下载【{submission_label}】{prepared.torrent.title} ...")
-        if governance and governance.mark_started:
-            governance.mark_started()
         category = prepared.media.category
         # 音乐尚无目录分类时仍提供稳定的下载器分类，不回写媒体的目录或元数据分类。
         if not category and prepared.media.type == MediaType.MUSIC:
             category = MediaType.MUSIC.value
-        result = self.download(
-            content=prepared.torrent_content,
-            cookie=prepared.torrent.site_cookie,
-            episodes=cast(Set[int], episodes),
-            episode_targets=episode_targets,
-            download_dir=prepared.download_dir,
-            category=category,
-            label=label,
-            downloader=downloader or prepared.site_downloader,
-            custom_words=custom_words,
-            episode_selection=torrent_rules.episode_selection_for_context(context) if episodes else None,
-            download_type=str(getattr(prepared.torrent, "download_type", "torrent") or "torrent"),
-            netdisk_platform=getattr(prepared.torrent, "netdisk_platform", None),
-            share_password=getattr(prepared.torrent, "share_password", None),
-            netdisk_share_token=getattr(prepared.torrent, "netdisk_share_token", None),
-            season=getattr(getattr(prepared, "meta", None), "season_list", None),
-            source=source,
-            media_runtime=getattr(prepared.media, "runtime", None),
+        resolved_hashes = (
+            task_hashes
+            if task_hashes is not None
+            else torrent_rules.download_hashes(prepared.torrent_content)
         )
-        actual_downloader, download_hash, layout, error_msg = (
-            result if result else (None, None, None, "未找到下载器")
-        )
-        if download_hash:
-            self._settle_accepted_download(
-                prepared=prepared,
-                context=context,
-                episodes=episodes,
-                channel=channel,
-                source=source,
-                userid=userid,
-                username=username,
-                custom_words=custom_words,
-                actual_downloader=actual_downloader,
-                download_hash=download_hash,
-                layout=layout,
-                already_exists=error_msg == DOWNLOAD_TASK_ALREADY_EXISTS,
+        # 读取确认记录 → 下载器受理 → 写入下载历史整段持有任务锁，见 downloader_task_locks：
+        # 已有任务上的追加与整理链回写、删除、暂停开始互斥，确认记录的读取、合并与写回也不会被并发提交打断。
+        result: Optional[Tuple[Optional[str], Optional[str], Optional[str], str]]
+        with downloader_task_locks.hold(resolved_hashes):
+            try:
+                previous_selection = self._existing_task_confirmed_selection(resolved_hashes)
+            except Exception as err:
+                # 读不到历史时不能当成"没有历史"继续：受理后写回的确认记录只会剩下本次的文件，之前被取消的
+                # 文件从此不再受保护。数据库读不了时写历史同样会失败，直接按瞬时失败稍后重试，不调用下载器。
+                logger.warning(f"读取下载历史中的已确认选集失败：{err}")
+                previous_selection, result = None, (
+                    None, None, None, f"读取下载历史失败，未提交下载器，稍后重试：{err}",
+                )
+            else:
+                if self._subscription_download_cancelled(governance):
+                    return None, "订阅下载在提交前已取消"
+                if governance and governance.mark_started:
+                    governance.mark_started()
+                result = self.download(
+                    content=prepared.torrent_content,
+                    cookie=prepared.torrent.site_cookie,
+                    episodes=cast(Set[int], episodes),
+                    episode_targets=episode_targets,
+                    download_dir=prepared.download_dir,
+                    category=category,
+                    label=label,
+                    downloader=downloader or prepared.site_downloader,
+                    custom_words=custom_words,
+                    episode_selection=torrent_rules.episode_selection_for_context(context) if episodes else None,
+                    confirmed_selection=previous_selection,
+                    user_specified=user_specified,
+                    download_type=str(getattr(prepared.torrent, "download_type", "torrent") or "torrent"),
+                    netdisk_platform=getattr(prepared.torrent, "netdisk_platform", None),
+                    share_password=getattr(prepared.torrent, "share_password", None),
+                    netdisk_share_token=getattr(prepared.torrent, "netdisk_share_token", None),
+                    season=getattr(getattr(prepared, "meta", None), "season_list", None),
+                    source=source,
+                    media_runtime=getattr(prepared.media, "runtime", None),
+                )
+            missing_downloader = not result
+            actual_downloader, download_hash, layout, error_msg = (
+                result
+                if result
+                else (
+                    None,
+                    None,
+                    None,
+                    self._missing_downloader_error(
+                        downloader,
+                        prepared,
+                        user_specified=user_specified,
+                        diagnostic=self._missing_downloader_diagnostic(
+                            downloader,
+                            prepared,
+                        ),
+                    ),
+                )
             )
-        else:
-            self._record_rejected_download(
-                prepared=prepared,
-                context=context,
-                episodes=episodes,
-                channel=channel,
-                source=source,
-                downloader=downloader,
-                userid=userid,
-                actual_downloader=actual_downloader,
-                error_msg=error_msg,
-            )
+            if download_hash:
+                self._settle_accepted_download(
+                    prepared=prepared,
+                    context=context,
+                    episodes=episodes,
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    custom_words=custom_words,
+                    actual_downloader=actual_downloader,
+                    download_hash=download_hash,
+                    layout=layout,
+                    task_action=DownloadTaskAction.from_downloader_message(error_msg),
+                    previous_selection=previous_selection,
+                    accepted_files=self._accepted_task_files(download_hash, actual_downloader),
+                    downloader_scope=self._download_scope(downloader, prepared.torrent),
+                )
+        if not download_hash:
+            if is_unconfirmed_download_message(error_msg):
+                self._record_unconfirmed_download(
+                    prepared=prepared,
+                    context=context,
+                    episodes=episodes,
+                    channel=channel,
+                    source=source,
+                    downloader=downloader,
+                    userid=userid,
+                    username=username,
+                    custom_words=custom_words,
+                    actual_downloader=actual_downloader,
+                    error_msg=error_msg,
+                    user_specified=user_specified,
+                )
+            else:
+                self._record_rejected_download(
+                    prepared=prepared,
+                    context=context,
+                    episodes=episodes,
+                    channel=channel,
+                    source=source,
+                    downloader=downloader,
+                    userid=userid,
+                    actual_downloader=actual_downloader,
+                    error_msg=error_msg,
+                    user_specified=user_specified,
+                    record_failure=not missing_downloader,
+                )
         return download_hash, error_msg
+
+    def _missing_downloader_diagnostic(
+        self,
+        downloader: Optional[str],
+        prepared: _PreparedDownload,
+    ) -> Optional[str]:
+        """
+        读取本地下载器模块健康快照，为实例缺失错误补充初始化或热重载失败线索。
+
+        仅读取运行态缓存，不触发下载器网络请求或模块物化。
+
+        :param downloader: 调用方或订阅显式传入的下载器名称
+        :param prepared: 提交前已规范化的下载事实
+        :return: 可附加到错误提示后的诊断说明；模块状态正常或未装配管理器时返回 None
+        """
+        manager = getattr(self, "modulemanager", None)
+        get_issues = getattr(manager, "get_unhealthy_module_issues", None)
+        if not callable(get_issues):
+            return None
+        issues = get_issues(ModuleType.Downloader)
+        if not isinstance(issues, list) or not issues:
+            return None
+        target = downloader or prepared.site_downloader
+        if target:
+            for issue in issues:
+                init_errors = issue.get("init_errors")
+                if isinstance(init_errors, Mapping) and target in init_errors:
+                    return f"实例初始化失败：{init_errors[target]}"
+        unavailable = [
+            f"{issue.get('name') or issue.get('id')}（{issue.get('error') or issue.get('lifecycle')}）"
+            for issue in issues
+            if issue.get("lifecycle") != "degraded"
+        ]
+        if unavailable:
+            return f"下载器模块未就绪：{'；'.join(unavailable)}"
+        if not target:
+            degraded = [
+                str(issue.get("error"))
+                for issue in issues
+                if issue.get("error")
+            ]
+            if degraded:
+                return f"部分下载器实例初始化失败：{'；'.join(degraded)}"
+        return None
+
+    @staticmethod
+    def _missing_downloader_error(
+        downloader: Optional[str],
+        prepared: _PreparedDownload,
+        *,
+        user_specified: bool = False,
+        diagnostic: Optional[str] = None,
+    ) -> str:
+        """
+        生成所有下载器模块均未匹配到可用实例时的诊断说明。
+
+        区分调用方指定、站点绑定和默认下载器三种目标来源，避免只提示“未找到下载器”掩盖配置线索；
+        不会静默回退到其他下载器，以免破坏用户的下载器隔离与路径映射。
+
+        :param downloader: 调用方或订阅显式传入的下载器名称
+        :param prepared: 提交前已规范化的下载事实，用于读取站点绑定下载器与站点名
+        :param user_specified: 是否为用户手动提交；手动下载接口会把用户选择的下载器写入 ``site_downloader``
+        :param diagnostic: 可选的运行态模块或实例初始化失败说明
+        :return: 供日志与失败通知展示的具体错误说明
+        """
+        suffix = f"（{diagnostic}）" if diagnostic else ""
+        if downloader or (prepared.site_downloader and user_specified):
+            target = downloader or prepared.site_downloader
+            return (
+                f"未找到可用下载器实例：{target}，"
+                f"请检查下载器是否已启用、改名或删除，以及订阅或下载配置中的下载器设置{suffix}"
+            )
+        if prepared.site_downloader:
+            site_name = prepared.torrent.site_name or "当前站点"
+            return (
+                f"未找到站点 {site_name} 指定的下载器实例：{prepared.site_downloader}，"
+                f"请检查下载器是否已启用、改名或删除，以及站点下载器配置{suffix}"
+            )
+        return f"未找到可用的默认下载器实例，请检查下载器配置中是否存在已启用的下载器{suffix}"
+
+    def _existing_task_confirmed_selection(
+        self, task_hashes: frozenset[str],
+    ) -> Optional[torrent_rules.ConfirmedSelection]:
+        """
+        读取 MP 此前在同一种子上确认选中过的文件（按下载器分开），供下载器识别被别人取消的文件。
+
+        下载器只在同一 hash 已存在时使用这份记录，并只取自己那台下载器的部分，新建任务时忽略。记录随每次
+        受理累积写在该 hash 最新一条下载历史的 note 中（各台下载器的记录都在同一份里，见
+        ``DownloadHistoryOwner._confirmed_task_selection``），这里只需读取最新一条。
+        下载器返回的 hash 大小写不一（rTorrent 为大写），因此大小写两种写法都查询。
+
+        :param task_hashes: 由种子内容计算出的 v1/v2 hash；无法解析时为空
+        :return: 确认记录；MP 没有该 hash 的任何下载历史（外部添加或从未下载过）时返回 None，
+            只有升级前的历史时返回空记录
+        :raises Exception: 读取下载历史失败时原样抛出，调用方按失败处理，不能当成"没有历史"
+        """
+        candidates = sorted({variant for item in task_hashes for variant in (item.lower(), item.upper())})
+        if not candidates:
+            return None
+        histories = self.download_history_repository.get_by_hashes(candidates)
+        if not histories:
+            return None
+        # 大小写两种写法各返回一条时取最新的；登记时间只精确到秒，同一秒内以主键为准。
+        latest = max(
+            histories.values(),
+            key=lambda item: (str(getattr(item, "date", "") or ""), getattr(item, "id", None) or 0),
+        )
+        return torrent_rules.ConfirmedSelection.from_note(latest.note)
+
+    def _accepted_task_files(
+        self, download_hash: str, downloader: Optional[str],
+    ) -> Optional[list[tuple[int, str]]]:
+        """
+        受理后读取下载器里该任务的文件索引与相对路径，用于写入"MP 确认选中过的文件"。
+
+        必须在下载链持有任务锁期间读取：之后的受理决策读到的是同一套下载器索引，不受种子文件顺序（BEP 47
+        填充文件）或文件改名影响，磁力链接取得元数据后也能记录。读不到时返回 None，本次不记录确认文件，
+        宁可之后把被取消的文件重新选中，也不误拒正常请求。
+
+        :param download_hash: 下载器返回的任务 hash
+        :param downloader: 下载器返回的实际下载器名称
+        :return: 文件索引与相对路径；读取失败、没有文件或索引不是整数时返回 None
+        """
+        try:
+            files = self.torrent_files(download_hash, downloader)
+        except Exception as err:
+            logger.warning(f"读取下载任务 {download_hash} 的文件列表失败，本次不记录已确认选集：{err}")
+            return None
+        entries: list[tuple[int, str]] = []
+        for item in files or []:
+            file_id = getattr(item, "id", None)
+            if isinstance(file_id, bool) or not isinstance(file_id, (int, str)) or not str(file_id).isdigit():
+                logger.warning(f"下载任务 {download_hash} 的文件索引无法识别，本次不记录已确认选集")
+                return None
+            entries.append((int(file_id), str(getattr(item, "name", "") or "")))
+        if not entries:
+            logger.warning(f"未读取到下载任务 {download_hash} 的文件列表，本次不记录已确认选集")
+            return None
+        return entries
 
     def _settle_accepted_download(
         self,
@@ -957,15 +1733,24 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
         actual_downloader: Optional[str],
         download_hash: str,
         layout: Optional[str],
-        already_exists: bool = False,
+        task_action: DownloadTaskAction = DownloadTaskAction.CREATED,
+        previous_selection: Optional[torrent_rules.ConfirmedSelection] = None,
+        accepted_files: Optional[list[tuple[int, str]]] = None,
+        downloader_scope: str = "",
     ) -> None:
         """
         按普通下载合同结算下载器明确返回的成功结果。
 
-        :param already_exists: 下载器中已存在同一任务时为 True，结算时复用现有任务而不重复通知
+        下载器只有在本次目标确认受理后才返回 hash（已有任务会先追加目标文件），
+        因此这里沿用请求集数结算订阅进度是安全的。
+
+        :param task_action: 下载器对任务的实际动作，决定通知、文件明细去重与重复退避
+        :param previous_selection: 提交前在同一把任务锁内读到的确认记录，受理后与本次确认的文件合并写回
+        :param accepted_files: 受理后在同一把任务锁内读到的下载器文件索引与路径，见 ``_accepted_task_files``
+        :param downloader_scope: 请求指向的下载器范围，重复提交退避按它记录
         """
-        if already_exists:
-            logger.info(f"{prepared.torrent.title} 下载器中已存在同一任务，沿用现有下载进度")
+        if task_action.is_existing_task:
+            logger.info(f"{prepared.torrent.title} 下载器中已存在同一任务（{task_action.value}），沿用该任务")
         # 下载器中已存在相同 Hash 时下载器会沿用原保存目录，须以实际目录记录
         download_dir = self._resolve_actual_download_dir(
             downloader=actual_downloader,
@@ -991,7 +1776,10 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
             username=username,
             torrent_content=prepared.torrent_content,
             custom_words=custom_words,
-            already_exists=already_exists,
+            task_action=task_action,
+            previous_selection=previous_selection,
+            accepted_files=accepted_files,
+            downloader_scope=downloader_scope,
         )
 
     def _resolve_actual_download_dir(
@@ -1050,21 +1838,44 @@ class DownloadSubmissionOwner(_DownloadResourceOwner):
         userid: Union[str, int, None],
         actual_downloader: Optional[str],
         error_msg: str,
+        user_specified: bool = False,
+        record_failure: bool = True,
     ) -> None:
         """
         按普通失败合同记录下载器明确拒绝并通知原调用渠道。
+
+        已有任务的拒绝不会让订阅跳过候选，每一轮都交给下载器按实时状态重新判断（用户在下载器里恢复任务、
+        重新勾选文件后下一轮就能接着用）。自动流程（订阅、工作流、插件）在同一原因的通知静默期内重复遇到时
+        只记日志，不再通知、不顺延记录，见 ``_existing_task_rejection_noted``；用户手动指定种子时每次都通知。
+        当失败源于下载器实例缺失而非资源本身问题时，调用方传入 ``record_failure=False``，避免把正常种子
+        写入资源级冷却台账，修正配置后即可立即重试。
+
+        :param user_specified: 用户明确指定了这个种子
+        :param record_failure: 是否写入资源级失败冷却台账；下载器实例缺失等配置问题时为 False
         """
+        rejection = ExistingTaskRejection.from_message(error_msg)
+        downloader_scope = self._download_scope(downloader, prepared.torrent)
+        if rejection is not None and not user_specified and self._existing_task_rejection_noted(
+                context, rejection=rejection, downloader_scope=downloader_scope, episodes=episodes,
+        ):
+            logger.info(
+                f"{prepared.media.title_year} 下载器中的同一任务仍不能受理（与上次原因相同，不重复通知）："
+                f"{prepared.torrent.title}，{error_msg}"
+            )
+            return
         logger.error(
             f"{prepared.media.title_year} 添加下载任务失败："
             f"{prepared.torrent.title} - {prepared.torrent.enclosure}，{error_msg}"
         )
-        self._record_download_failure(
-            context=context,
-            error_msg=error_msg,
-            downloader=actual_downloader or downloader or prepared.site_downloader,
-            source=source,
-            episodes=episodes,
-        )
+        if record_failure:
+            self._record_download_failure(
+                context=context,
+                error_msg=error_msg,
+                downloader=actual_downloader or downloader or prepared.site_downloader,
+                source=source,
+                episodes=episodes,
+                downloader_scope=downloader_scope,
+            )
         self.post_message(
             Message(
                 channel=channel,

@@ -11,9 +11,11 @@ import threading
 import time
 import types
 import weakref
+from collections.abc import Mapping
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Iterator, Literal, Optional, Tuple, Union, cast, overload
+from urllib.parse import urlsplit
 
 import chardet
 import httpx
@@ -77,6 +79,74 @@ def _proxy_configured(proxies: Any) -> bool:
     if isinstance(proxies, dict):
         return any(isinstance(value, str) and value.strip() for value in proxies.values())
     return bool(proxies)
+
+
+def _url_origin(url: str) -> str:
+    """
+    提取仅含协议与主机端口的目标来源，避免在请求异常日志中泄露路径或查询凭据。
+    """
+    try:
+        parts = urlsplit(url)
+        port = f":{parts.port}" if parts.port is not None else ""
+    except ValueError:
+        return "<invalid-url>"
+    if not parts.scheme or not parts.hostname:
+        return "<invalid-url>"
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    return f"{parts.scheme}://{host}{port}"
+
+
+def _is_valid_header_part(part: Any, *, is_name: bool) -> bool:
+    """
+    按 HTTP 请求头规范校验单个字段名或值，避免调用传输库内部工具改变 egress 指纹。
+    """
+    if isinstance(part, bytes):
+        text = part.decode("latin-1")
+    elif isinstance(part, str):
+        try:
+            part.encode("latin-1")
+        except UnicodeEncodeError:
+            return False
+        text = part
+    else:
+        return False
+    if is_name:
+        return bool(text) and not text[0].isspace() and ":" not in text and "\r" not in text and "\n" not in text
+    if not text:
+        return True
+    if text != text.strip():
+        return False
+    return not any((ord(ch) < 0x20 and ch != "\t") or ord(ch) == 0x7F for ch in text)
+
+
+def _find_invalid_header_names(headers: Any) -> list[str]:
+    """
+    识别触发请求头校验失败的字段名称，不输出可能包含凭据的字段值。
+    """
+    if not isinstance(headers, Mapping):
+        return []
+    invalid_names: list[str] = []
+    for key, value in headers.items():
+        if value is None:
+            continue
+        if not _is_valid_header_part(key, is_name=True) or not _is_valid_header_part(value, is_name=False):
+            invalid_names.append(str(key))
+    return invalid_names
+
+
+def _log_invalid_header_error(error: Exception, headers: Any, url: str) -> None:
+    """
+    记录请求头构造失败的异常类型与出错字段，避免静默返回 None 误导为网络故障。
+    """
+    invalid_names = _find_invalid_header_names(headers)
+    origin = _url_origin(url)
+    if invalid_names:
+        logger.warning(
+            f"HTTP 请求头无效（{type(error).__name__}），"
+            f"异常字段：{', '.join(invalid_names)}，目标：{origin}"
+        )
+        return
+    logger.warning(f"HTTP 请求头无效（{type(error).__name__}），目标：{origin}")
 
 
 def _can_retry_proxy_tls12(url: str, proxies: Any, method: str) -> bool:
@@ -436,6 +506,88 @@ def _record_shared_pool_timeout(
             return
 
 
+# 共享 transport 看门任务的登记 owner：每个使用共享 transport 的事件循环
+# 挂一个同 owner 的看门任务，任务名即 owner。须与
+# _ensure_shared_async_transport_watchdog 中 TaskRegistry.create 的 owner
+# 字面量保持一致（任务归属门禁要求该处使用字符串字面量）。
+_SHARED_TRANSPORT_WATCHDOG_OWNER = "http.transport.watchdog"
+
+
+async def _watch_shared_async_transports() -> None:
+    """
+    看门任务：等待被取消，退出时关闭本循环的共享 transport。
+
+    asyncio.run / asyncio.Runner 在关闭循环前会取消全部剩余任务，看门任务
+    借此机会调用 aclose_shared_async_transports()，在循环仍在运行时关闭
+    连接池；常驻循环不受影响（任务一直挂起，直到宿主显式关闭时才被取消）。
+    weakref.finalize 无法替代：桶的值链（transport→连接→循环）让循环对象
+    始终可达，finalize 在桶被弹出前永远不会触发。
+    """
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        await aclose_shared_async_transports()
+        raise
+
+
+def _find_shared_async_transport_watchdog(
+    loop: asyncio.AbstractEventLoop,
+) -> Optional[asyncio.Task[Any]]:
+    """
+    在给定循环的任务中查找共享 transport 看门任务。
+
+    :param loop: 待查找的事件循环
+    :return: 看门任务，未找到时返回 None
+    """
+    for task in asyncio.all_tasks(loop):
+        if task.get_name() == _SHARED_TRANSPORT_WATCHDOG_OWNER:
+            return task
+    return None
+
+
+def _ensure_shared_async_transport_watchdog(
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """
+    首次在循环上创建共享 transport 桶时挂看门任务；已存在则不重复创建。
+
+    看门任务经任务登记器创建并按 owner 归属，便于关停阶段统一收口，与本
+    文件退役池关闭共用同一登记路径。须在循环所属线程调用
+    （_get_shared_async_transport 的调用方保证）。登记器已停止时只记警告，
+    不阻断本次请求（退化为修复前的行为）。
+
+    :param loop: 待挂接看门任务的事件循环
+    """
+    if _find_shared_async_transport_watchdog(loop) is not None:
+        return
+    try:
+        get_task_registry().create(
+            _watch_shared_async_transports(),
+            owner="http.transport.watchdog",
+            cancel_on_shutdown=True,
+        )
+    except RuntimeError:  # pragma: no cover - 登记器已停止的防御性分支
+        logger.warning("后台任务登记器已停止，共享 HTTP 连接池看门任务未创建，临时循环退出时连接池可能残留")
+
+
+def _cancel_shared_async_transport_watchdog(
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """
+    取消给定循环的看门任务，避免池关闭后循环关闭时残留 pending task。
+
+    调用方就是看门任务本身（临时循环退出时）则跳过，由它在 aclose 返回后
+    自行以 CancelledError 退出。
+
+    :param loop: 待取消看门任务的事件循环
+    """
+    task = _find_shared_async_transport_watchdog(loop)
+    if task is None or task.done():
+        return
+    if task is not asyncio.current_task():
+        task.cancel()
+
+
 def _get_shared_async_transport(
     proxy: Optional[str],
     verify: _VerifySetting,
@@ -468,6 +620,13 @@ def _get_shared_async_transport(
         if per_loop is None:
             per_loop = collections.OrderedDict()
             _shared_async_transports[loop] = per_loop
+            new_loop_bucket = True
+        else:
+            new_loop_bucket = False
+    if new_loop_bucket:
+        # 首次在该循环上建桶时挂看门任务：临时循环退出取消全部任务时由它
+        # 关闭本循环的共享池，避免连接随循环退出而泄漏。
+        _ensure_shared_async_transport_watchdog(loop)
 
     key: _SharedTransportKey = (
         proxy,
@@ -528,6 +687,9 @@ async def aclose_shared_async_transports() -> None:
         ]
         for transport in retiring:
             _shared_transport_recovery[transport].closing = True
+    # 池已弹出：取消本循环的看门任务，避免循环关闭时残留 pending task。
+    # 调用方就是看门任务本身（临时循环退出）时跳过，由它自行退出。
+    _cancel_shared_async_transport_watchdog(loop)
     transports = list(per_loop.values()) if per_loop else []
     if per_loop:
         per_loop.clear()
@@ -656,6 +818,8 @@ class RequestUtils:
         if headers:
             self._headers = headers
         else:
+            if isinstance(ua, str):
+                ua = ua.strip()
             if ua and ua == _default_user_agent:
                 caller_name = get_caller()
                 if caller_name:
@@ -835,6 +999,11 @@ class RequestUtils:
                     return None
             if raise_exception:
                 raise
+            return None
+        except requests.exceptions.InvalidHeader as error:
+            if raise_exception:
+                raise
+            _log_invalid_header_error(error, kwargs.get("headers"), url)
             return None
         except requests.exceptions.RequestException:
             if raise_exception:
@@ -1435,6 +1604,8 @@ class AsyncRequestUtils:
             # 过滤掉None值的headers
             self._headers = {k: v for k, v in headers.items() if v is not None}
         else:
+            if isinstance(ua, str):
+                ua = ua.strip()
             if ua and ua == _default_user_agent:
                 caller_name = get_caller()
                 if caller_name:
@@ -1615,30 +1786,16 @@ class AsyncRequestUtils:
             return await self._dispatch_request(
                 True, cookies_dict, method, url, True, **kwargs
             )
-        except _H2_TUNNEL_BREAK_ERRORS:
-            _trip_h2_proxy_breaker(self._proxies, url)
-            try:
-                return await self._dispatch_request(
-                    False,
-                    cookies_dict,
-                    method,
-                    url,
-                    True if proxy_tls_fallback else raise_exception,
-                    **kwargs,
-                )
-            except httpx2.RequestError as error:
-                if proxy_tls_fallback and isinstance(error, _ASYNC_PROXY_TLS_FALLBACK_ERRORS):
-                    return await self._dispatch_with_tls12(
-                        False,
-                        cookies_dict,
-                        method,
-                        url,
-                        raise_exception,
-                        **kwargs,
-                    )
-                if raise_exception:
-                    raise
-                return None
+        except _H2_TUNNEL_BREAK_ERRORS as error:
+            return await self._handle_h2_proxy_tunnel_error(
+                error,
+                cookies_dict,
+                method,
+                url,
+                proxy_tls_fallback,
+                raise_exception,
+                **kwargs,
+            )
         except _ASYNC_PROXY_TLS_FALLBACK_ERRORS:
             if proxy_tls_fallback:
                 return await self._dispatch_with_tls12(
@@ -1655,6 +1812,53 @@ class AsyncRequestUtils:
         except httpx2.RequestError:
             # 与 h2 隧道无关的失败（超时、连接失败等）：不熔断也不重试，
             # 恢复调用方原本的 raise_exception 语义
+            if raise_exception:
+                raise
+            return None
+
+    async def _handle_h2_proxy_tunnel_error(
+        self,
+        error: Exception,
+        cookies_dict: Optional[dict[str, Any]],
+        method: str,
+        url: str,
+        proxy_tls_fallback: bool,
+        raise_exception: bool,
+        **kwargs: Any,
+    ) -> Optional[httpx2.Response]:
+        """
+        处理代理 HTTP/2 协议异常：本地非法请求头直接告警返回，真实隧道中断再熔断并回落 HTTP/1.1。
+        """
+        if isinstance(error, httpx2.LocalProtocolError):
+            request_headers = kwargs.get("headers", self._headers)
+            if _find_invalid_header_names(request_headers):
+                if raise_exception:
+                    raise error
+                _log_invalid_header_error(error, request_headers, url)
+                return None
+        if self._proxies:
+            _trip_h2_proxy_breaker(self._proxies, url)
+        try:
+            return await self._dispatch_request(
+                False,
+                cookies_dict,
+                method,
+                url,
+                True if proxy_tls_fallback else raise_exception,
+                **kwargs,
+            )
+        except httpx2.RequestError as fallback_error:
+            if proxy_tls_fallback and isinstance(
+                fallback_error, _ASYNC_PROXY_TLS_FALLBACK_ERRORS
+            ):
+                return await self._dispatch_with_tls12(
+                    False,
+                    cookies_dict,
+                    method,
+                    url,
+                    raise_exception,
+                    **kwargs,
+                )
             if raise_exception:
                 raise
             return None
@@ -1772,6 +1976,12 @@ class AsyncRequestUtils:
             # 直接恢复调用方原本的 raise_exception 语义。
             if raise_exception:
                 raise
+            return None
+        except httpx2.LocalProtocolError as error:
+            if raise_exception:
+                raise
+            if _find_invalid_header_names(kwargs.get("headers")):
+                _log_invalid_header_error(error, kwargs.get("headers"), url)
             return None
         except httpx2.RequestError:
             if raise_exception:

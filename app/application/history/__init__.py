@@ -123,7 +123,8 @@ class DownloadHistorySnapshot:
     :param username: 触发下载的本地用户名
     :param channel: 触发下载的消息渠道名称
     :param date: 历史记录的时间文本
-    :param note: 冻结的附加 JSON 信息，包含恢复音乐上下文所需的扩展数据
+    :param note: 冻结的附加 JSON 信息：恢复音乐上下文所需的扩展数据；下载链写入的 ``confirmed_selection``（按下载器
+        记录已确认需要下载的文件索引区间，同一任务再次受理时读取，见 ``app.domain.torrent.ConfirmedSelection``）
     :param media_category_id: 媒体类别的稳定标识
     :param media_category: 下载时保存的媒体类别路径快照
     :param classification_rule_id: 当次分类命中的规则标识
@@ -220,7 +221,8 @@ class DownloadHistoryWrite:
     :param username: 触发下载的本地用户名
     :param channel: 触发下载的消息渠道名称
     :param date: 历史记录的时间文本
-    :param note: 冻结的附加 JSON 信息，包含恢复音乐上下文所需的扩展数据
+    :param note: 冻结的附加 JSON 信息：恢复音乐上下文所需的扩展数据；下载链写入的 ``confirmed_selection``（按下载器
+        记录已确认需要下载的文件索引区间，同一任务再次受理时读取，见 ``app.domain.torrent.ConfirmedSelection``）
     :param media_category_id: 媒体类别的稳定标识
     :param media_category: 下载时保存的媒体类别路径快照
     :param classification_rule_id: 当次分类命中的规则标识
@@ -320,11 +322,14 @@ class DownloadHistoryQueryPort(Protocol):
     def get_by_hashes(
         self,
         download_hashes: list[str],
+        *,
+        downloader: Optional[str] = None,
     ) -> dict[str, DownloadHistorySnapshot]:
         """
         批量返回以下载任务 Hash 为键的最新历史快照。
 
         :param download_hashes: 待批量查询的下载任务哈希标识
+        :param downloader: 限定为该名称的下载器实例；None 表示跨实例查询
         :return: 以任务哈希为键的最新历史映射；未找到的哈希不写入映射
         """
         ...

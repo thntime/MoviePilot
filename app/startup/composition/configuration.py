@@ -37,7 +37,7 @@ from app.db.adapters.classification import (
 from app.db.adapters.configuration import TransactionalUserConfigurationRepository
 from app.db.oper.systemconfig import SystemConfigOper
 from app.db.session import SessionFactory
-from app.runtime.config import Settings
+from app.runtime.config import Settings, normalize_music_track_match_setting
 from app.runtime.settings import (
     configure_runtime_setting_provider,
     configure_runtime_setting_updater,
@@ -154,6 +154,7 @@ def build_api_runtime_config(settings: Settings) -> ApiRuntimeConfig:
     """
     从可热更新的部署设置构建一次 API 请求配置快照。
     """
+    vapid = settings.VAPID
     return ApiRuntimeConfig(
         access_token_expire_minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES,
         btrfs_fsid_dedup=settings.BTRFS_FSID_DEDUP,
@@ -170,8 +171,9 @@ def build_api_runtime_config(settings: Settings) -> ApiRuntimeConfig:
         movie_rename_format=settings.RENAME_FORMAT(MediaType.MOVIE),
         television_rename_format=settings.RENAME_FORMAT(MediaType.TV),
         music_rename_format=settings.RENAME_FORMAT(MediaType.MUSIC),
-        vapid_private_key=settings.VAPID.get("privateKey", ""),
-        vapid_subject=settings.VAPID.get("subject", ""),
+        vapid_public_key=vapid.get("publicKey", ""),
+        vapid_private_key=vapid.get("privateKey", ""),
+        vapid_subject=vapid.get("subject", ""),
         cookiecloud_enable_local=bool(settings.COOKIECLOUD_ENABLE_LOCAL),
         cookiecloud_auth_header=settings.COOKIECLOUD_AUTH_HEADER,
         cookie_path=settings.COOKIE_PATH,
@@ -285,6 +287,7 @@ def build_chain_runtime_config(settings: Settings) -> ChainRuntimeConfig:
         music_metadata_to_simplified=settings.MUSIC_METADATA_TO_SIMPLIFIED,
         music_lyrics_to_simplified=settings.MUSIC_LYRICS_TO_SIMPLIFIED,
         music_cue_enable=settings.MUSIC_CUE_ENABLE,
+        music_track_match=normalize_music_track_match_setting(settings.MUSIC_TRACK_MATCH),
         music_release_region_priority=tuple(
             item.strip().upper() for item in settings.MUSIC_RELEASE_REGION_PRIORITY.split(",") if item.strip()
         ),
@@ -323,6 +326,7 @@ def build_chain_runtime_config(settings: Settings) -> ChainRuntimeConfig:
         television_subscribe_url=settings.MP_DOMAIN("#/subscribe/tv?tab=mysub"),
         music_subscribe_url=settings.MP_DOMAIN("#/subscribe/music?tab=mysub"),
         user_agent=settings.USER_AGENT,
+        site_user_agent=settings.SITE_USER_AGENT,
         normal_user_agent=settings.NORMAL_USER_AGENT,
         proxy=settings.PROXY,
         proxy_server=settings.PROXY_SERVER,

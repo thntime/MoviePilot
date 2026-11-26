@@ -13,11 +13,9 @@ import pytest
 
 from app.application.netdisk.audit import (
     EPISODE_MISSING,
-    EPISODE_PRESENT,
     EPISODE_UNCONFIRMED,
     LIBRARY_PRESENT,
     LIBRARY_UNKNOWN,
-    AuditedMedia,
     RecognizedMedia,
     ShareAuditService,
     ShareFileGroup,

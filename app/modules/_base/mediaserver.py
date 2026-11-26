@@ -5,9 +5,9 @@
 定时重连与连接测试。服务器差异（认证 API、存在性检查端点、连接探测方式）
 通过类属性与钩子方法保留在各模块。
 """
-from typing import TYPE_CHECKING, Any, Generator, Iterable, Mapping, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, Generator, Iterable, Mapping, Optional, Tuple, Union, cast
 
-from app.application.mediaserver import MusicMediaServerHelper
+from app.application.mediaserver import MediaServerQueryError, MusicMediaServerHelper
 from app.domain.context import MediaInfo, MusicInfo
 from app.modules import TService, _MediaServerBase, _ModuleBase
 from app.runtime.events import eventmanager
@@ -15,7 +15,11 @@ from app.runtime.log import logger
 from app.schemas.event import AuthCredentials as _SchemaAuthCredentials
 from app.schemas.event import AuthInterceptCredentials as _SchemaAuthInterceptCredentials
 from app.schemas.mediaserver import ExistMediaInfo as _SchemaExistMediaInfo
+from app.schemas.mediaserver import MediaServerBrowseItem as _SchemaMediaServerBrowseItem
+from app.schemas.mediaserver import MediaServerBrowsePage as _SchemaMediaServerBrowsePage
 from app.schemas.mediaserver import MediaServerField, MediaServerQueryOptions
+from app.schemas.mediaserver import MediaServerFilterOptions as _SchemaMediaServerFilterOptions
+from app.schemas.mediaserver import MediaServerItemDetail as _SchemaMediaServerItemDetail
 from app.schemas.types import ChainEventType, MediaType
 
 if TYPE_CHECKING:
@@ -25,6 +29,32 @@ if TYPE_CHECKING:
 _EMBY_ITEMS_PAGE_SIZE = 200
 # 单个合并文件可覆盖的最大集数；异常的 IndexNumberEnd 展开为千万级列表会耗尽内存。
 _EMBY_EPISODE_RANGE_MAX_SPAN = 1000
+
+
+def read_emby_query_items(
+    request: "RequestUtils", url: str, params: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    读取存在性查询的条目列表，区分成功空列表与不可确认的响应。
+
+    :param request: 保留当前媒体服务器认证配置的 HTTP 工具
+    :param url: 标题搜索或分集查询地址
+    :param params: 当前请求的查询条件与内容投影
+    :return: 已验证的原始条目列表，成功查询无条目时为空列表
+    :raises MediaServerQueryError: 无响应、非 200 状态或条目结构无效
+    """
+    response = request.get_res(url, params)
+    if response is None:
+        raise MediaServerQueryError("媒体库查询失败：未收到响应")
+    try:
+        if response.status_code != 200:
+            raise MediaServerQueryError(f"媒体库查询失败：HTTP {response.status_code}")
+        items = response.json().get("Items")
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise MediaServerQueryError("媒体库查询失败：条目列表格式无效")
+        return items
+    finally:
+        response.close()
 
 
 def _read_emby_item_page(
@@ -158,6 +188,370 @@ class _MediaServerModuleBase(_ModuleBase, _MediaServerBase[TService]):
     # 仅已实现查询投影的适配器向原生客户端透传新参数。
     _query_options_supported: bool = False
 
+    def mediaserver_stream_url(
+        self,
+        server: str,
+        item_id: Union[str, int],
+        item_type: Optional[str],
+        media_source_id: Optional[str] = None,
+        play_session_id: Optional[str] = None,
+        user_token: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        委托客户端获取支持 Range 的原始媒体流地址；未实现时返回 None。
+
+        :param server: 媒体服务器配置名称
+        :param item_id: 媒体服务器条目标识
+        :param item_type: 媒体服务器返回的条目类型
+        :param media_source_id: 可选指定的多版本媒体源标识
+        :param play_session_id: 可选本次播放会话标识，用于与实时会话关联
+        :param user_token: 可选用户级访问令牌
+        :return: 上游媒体流地址；当前适配器不支持时返回 None
+        """
+        server_obj = self.get_instance(server)
+        getter = getattr(server_obj, "get_stream_url", None)
+        if not callable(getter):
+            return None
+        extra: dict[str, Any] = {}
+        if media_source_id:
+            extra["media_source_id"] = media_source_id
+        if play_session_id:
+            extra["play_session_id"] = play_session_id
+        if user_token:
+            extra["user_token"] = user_token
+        try:
+            return cast(Optional[str], getter(str(item_id), item_type, **extra))
+        except TypeError:
+            if media_source_id:
+                try:
+                    return cast(Optional[str], getter(str(item_id), item_type, media_source_id=media_source_id))
+                except TypeError:
+                    pass
+            return cast(Optional[str], getter(str(item_id), item_type))
+
+    def mediaserver_playback_session(
+        self,
+        server: str,
+        item_id: Union[str, int],
+        media_source_id: Optional[str] = None,
+        username: Optional[str] = None,
+        user_token: Optional[str] = None,
+        client_id: Optional[str] = None,
+        device_name: Optional[str] = None,
+        platform: Optional[str] = None,
+        app_version: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """
+        委托媒体服务器客户端准备播放会话上下文（官方 PlaySessionId 与同源流会话头）。
+
+        :param server: 媒体服务器配置名称
+        :param item_id: 媒体条目标识
+        :param media_source_id: 可选多版本媒体源标识
+        :param username: 可选 MoviePilot 用户名
+        :param user_token: 可选当前用户绑定的访问令牌
+        :param client_id: 客户端匿名稳定设备标识
+        :param device_name: 客户端设备展示名
+        :param platform: 客户端平台标识
+        :param app_version: 客户端版本号
+        :return: 包含 `play_session_id`、`media_source_id`、`stream_headers` 与 `sync_mode` 的字典；不支持时返回 None
+        """
+        server_obj = self.get_instance(server)
+        preparer = getattr(server_obj, "prepare_playback_session", None)
+        if not callable(preparer):
+            return None
+        return cast(
+            Optional[dict[str, Any]],
+            preparer(
+                str(item_id),
+                media_source_id=media_source_id,
+                username=username,
+                user_token=user_token,
+                client_id=client_id,
+                device_name=device_name,
+                platform=platform,
+                app_version=app_version,
+            ),
+        )
+
+    def mediaserver_subtitle_url(
+        self, server: str, item_id: Union[str, int], subtitle_id: str
+    ) -> Optional[str]:
+        """
+        委托客户端解析服务端托管字幕的原始下载流地址。
+
+        :param server: 媒体服务器配置名称
+        :param item_id: 媒体服务器条目标识
+        :param subtitle_id: 代理字幕标识
+        :return: 上游字幕流地址；不支持或未匹配时返回 None
+        """
+        server_obj = self.get_instance(server)
+        getter = getattr(server_obj, "get_subtitle_url", None)
+        if not callable(getter):
+            return None
+        return cast(Optional[str], getter(str(item_id), subtitle_id))
+
+    def mediaserver_browse_items(
+        self,
+        server: str,
+        library_id: Optional[str] = None,
+        parent_id: Optional[str] = None,
+        item_type: Optional[str] = None,
+        genre: Optional[str] = None,
+        year: Optional[int] = None,
+        played_filter: Optional[str] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        keyword: Optional[str] = None,
+        start_index: int = 0,
+        limit: int = 30,
+        username: Optional[str] = None,
+    ) -> Optional[_SchemaMediaServerBrowsePage]:
+        """
+        分页浏览指定媒体服务器的媒体库内容并支持筛选、排序和搜索。
+
+        :param server: 媒体服务器配置名称
+        :param library_id: 可选媒体库标识
+        :param parent_id: 可选父目录标识
+        :param item_type: 可选条目类型过滤
+        :param genre: 可选风格过滤
+        :param year: 可选年份过滤
+        :param played_filter: 可选观看状态过滤
+        :param sort_by: 可选排序键
+        :param sort_order: 可选排序方向
+        :param keyword: 可选关键词搜索
+        :param start_index: 零基分页偏移
+        :param limit: 单页数量上限
+        :param username: 可选用户名
+        :return: 分页浏览模型；实例不存在或不支持时返回 None
+        """
+        server_obj = self.get_instance(server)
+        browser = getattr(server_obj, "browse_items", None)
+        if not callable(browser):
+            return None
+        page = cast(
+            Optional[_SchemaMediaServerBrowsePage],
+            browser(
+                library_id=library_id,
+                parent_id=parent_id,
+                item_type=item_type,
+                genre=genre,
+                year=year,
+                played_filter=played_filter,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                keyword=keyword,
+                start_index=start_index,
+                limit=limit,
+                username=username,
+            ),
+        )
+        if page:
+            for item in page.items:
+                item.server = server
+        return page
+
+    def mediaserver_filter_options(
+        self,
+        server: str,
+        library_id: Optional[str] = None,
+        username: Optional[str] = None,
+    ) -> Optional[_SchemaMediaServerFilterOptions]:
+        """
+        读取指定媒体库可用的风格、年份与排序筛选选项。
+
+        :param server: 媒体服务器配置名称
+        :param library_id: 可选媒体库标识
+        :param username: 可选用户名
+        :return: 筛选项模型；实例不存在或不支持时返回 None
+        """
+        server_obj = self.get_instance(server)
+        getter = getattr(server_obj, "get_filter_options", None)
+        if not callable(getter):
+            return None
+        return cast(
+            Optional[_SchemaMediaServerFilterOptions],
+            getter(library_id=library_id, username=username),
+        )
+
+    def mediaserver_item_detail(
+        self,
+        server: str,
+        item_id: Union[str, int],
+        username: Optional[str] = None,
+    ) -> Optional[_SchemaMediaServerItemDetail]:
+        """
+        读取媒体服务器单个条目的完整详情（含多版本及音轨字幕轨道）。
+
+        :param server: 媒体服务器配置名称
+        :param item_id: 媒体服务器条目标识
+        :param username: 可选用户名
+        :return: 详情模型；实例或条目不存在时返回 None
+        """
+        server_obj = self.get_instance(server)
+        getter = getattr(server_obj, "get_item_detail", None)
+        if not callable(getter):
+            return None
+        detail = cast(
+            Optional[_SchemaMediaServerItemDetail],
+            getter(str(item_id), username=username),
+        )
+        if detail:
+            detail.server = server
+        return detail
+
+    def mediaserver_seasons(
+        self,
+        server: str,
+        item_id: Union[str, int],
+        username: Optional[str] = None,
+    ) -> Optional[list[_SchemaMediaServerBrowseItem]]:
+        """
+        读取电视剧的全部季卡片信息。
+
+        :param server: 媒体服务器配置名称
+        :param item_id: 电视剧条目标识
+        :param username: 可选用户名
+        :return: 季卡片列表；实例不存在或不支持时返回 None
+        """
+        server_obj = self.get_instance(server)
+        getter = getattr(server_obj, "get_seasons", None)
+        if not callable(getter):
+            return None
+        seasons = cast(
+            Optional[list[_SchemaMediaServerBrowseItem]],
+            getter(str(item_id), username=username),
+        )
+        if seasons is not None:
+            for season_item in seasons:
+                season_item.server = server
+        return seasons
+
+    def mediaserver_season_episodes(
+        self,
+        server: str,
+        item_id: Union[str, int],
+        season_id: Optional[str] = None,
+        season: Optional[int] = None,
+        username: Optional[str] = None,
+    ) -> Optional[list[_SchemaMediaServerBrowseItem]]:
+        """
+        读取电视剧指定季的全部单集详情卡片。
+
+        :param server: 媒体服务器配置名称
+        :param item_id: 电视剧条目标识
+        :param season_id: 可选季条目标识
+        :param season: 可选季号
+        :param username: 可选用户名
+        :return: 单集卡片列表；实例不存在或不支持时返回 None
+        """
+        server_obj = self.get_instance(server)
+        getter = getattr(server_obj, "get_season_episodes", None)
+        if not callable(getter):
+            return None
+        episodes = cast(
+            Optional[list[_SchemaMediaServerBrowseItem]],
+            getter(str(item_id), season_id=season_id, season=season, username=username),
+        )
+        if episodes is not None:
+            for ep in episodes:
+                ep.server = server
+        return episodes
+
+    def mediaserver_report_progress(
+        self,
+        server: str,
+        item_id: Union[str, int],
+        position_ms: int,
+        media_source_id: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        is_paused: bool = False,
+        state: str = "playing",
+        username: Optional[str] = None,
+        play_session_id: Optional[str] = None,
+        event_name: Optional[str] = None,
+        client_id: Optional[str] = None,
+        device_name: Optional[str] = None,
+        platform: Optional[str] = None,
+        app_version: Optional[str] = None,
+        play_method: str = "DirectPlay",
+        playback_time_ms: Optional[int] = None,
+        audio_stream_index: Optional[int] = None,
+        subtitle_stream_index: Optional[int] = None,
+        user_token: Optional[str] = None,
+        started_reported: bool = False,
+        allow_userdata_write: bool = True,
+        scrobbled: bool = False,
+    ) -> Optional[Union[bool, dict[str, Any]]]:
+        """
+        向媒体服务器回传客户端的播放进度与实时会话状态。
+
+        :param server: 媒体服务器配置名称
+        :param item_id: 条目标识
+        :param position_ms: 当前播放位置（毫秒）
+        :param media_source_id: 可选媒体源标识
+        :param duration_ms: 可选总时长（毫秒）
+        :param is_paused: 是否暂停
+        :param state: 事件状态：started / playing / paused / stopped
+        :param username: 可选用户名
+        :param play_session_id: 可选本次播放会话标识
+        :param event_name: 可选细分播放事件名
+        :param client_id: 客户端匿名安装标识
+        :param device_name: 客户端设备展示名
+        :param platform: 客户端平台标识
+        :param app_version: 客户端版本号
+        :param play_method: 播放方式
+        :param playback_time_ms: 本次会话累计有效播放耗时（毫秒）
+        :param audio_stream_index: 当前选中服务端音轨序号
+        :param subtitle_stream_index: 当前选中服务端字幕序号
+        :param user_token: 可选当前用户绑定的访问令牌
+        :param started_reported: 后端会话表记录的是否已发送过起播事件
+        :param allow_userdata_write: 是否允许本轮执行 API Key 兜底 UserData 写入
+        :param scrobbled: 是否已向目标服务器提交完播记录
+        :return: 结构化同步回执字典或布尔值；适配器不支持时返回 None
+        """
+        server_obj = self.get_instance(server)
+        reporter = getattr(server_obj, "report_progress", None)
+        if not callable(reporter):
+            return None
+        kwargs: dict[str, Any] = {
+            "position_ms": position_ms,
+            "media_source_id": media_source_id,
+            "duration_ms": duration_ms,
+            "is_paused": is_paused,
+            "state": state,
+            "username": username,
+            "play_session_id": play_session_id,
+            "event_name": event_name,
+            "client_id": client_id,
+            "device_name": device_name,
+            "platform": platform,
+            "app_version": app_version,
+            "play_method": play_method,
+            "playback_time_ms": playback_time_ms,
+            "audio_stream_index": audio_stream_index,
+            "subtitle_stream_index": subtitle_stream_index,
+            "user_token": user_token,
+            "started_reported": started_reported,
+            "allow_userdata_write": allow_userdata_write,
+            "scrobbled": scrobbled,
+        }
+        try:
+            return cast(Union[bool, dict[str, Any]], reporter(str(item_id), **kwargs))
+        except TypeError:
+            # 兼容只接受基础参数的旧版或插件媒体服务器客户端
+            return cast(
+                Union[bool, dict[str, Any]],
+                reporter(
+                    str(item_id),
+                    position_ms=position_ms,
+                    media_source_id=media_source_id,
+                    duration_ms=duration_ms,
+                    is_paused=is_paused,
+                    state=state,
+                    username=username,
+                ),
+            )
+
     def user_authenticate(
             self,
             credentials: _SchemaAuthCredentials,
@@ -221,6 +615,7 @@ class _MediaServerModuleBase(_ModuleBase, _MediaServerBase[TService]):
         server: Optional[str] = None,
         *,
         query: Optional[MediaServerQueryOptions] = None,
+        raise_on_query_failure: bool = False,
     ) -> Optional[_SchemaExistMediaInfo]:
         """
         判断媒体文件是否存在。
@@ -229,7 +624,13 @@ class _MediaServerModuleBase(_ModuleBase, _MediaServerBase[TService]):
         :param itemid:  媒体服务器ItemID
         :param server:  媒体服务器名称
         :param query: 可选查询内容投影，省略时保留原有请求和返回内容
+        :param raise_on_query_failure: 剧集查询失败时抛 MediaServerQueryError 而不是返回 None；
+            默认 False 保持既有行为。仅电视剧分支区分失败与未找到：各剧集服务约定查询失败
+            返回两项 None，未找到返回 None 和空映射；电影/音乐服务无法区分两种情况，
+            不受该参数影响
         :return: 如不存在返回None，存在时返回信息，包括每季已存在所有集{type: movie/tv, seasons: {season: [episodes]}}
+        :raises MediaServerQueryError: 剧集查询失败且 raise_on_query_failure 为 True，
+            且没有服务器确认媒体存在时
         """
         if not self._query_options_supported:
             query = None
@@ -238,6 +639,8 @@ class _MediaServerModuleBase(_ModuleBase, _MediaServerBase[TService]):
             servers = [(server, self.get_instance(server))]
         else:
             servers = self.get_instances().items()
+        query_failed = False
+        failed_servers: list[str] = []
         for name, s in servers:
             if not s:
                 continue
@@ -291,6 +694,13 @@ class _MediaServerModuleBase(_ModuleBase, _MediaServerBase[TService]):
                     item_id=itemid,
                     **({"query": query} if query is not None else {}),
                 )
+                if tvs is None:
+                    # 查询失败（返回两项 None）与未找到（返回 None 和空映射）必须区分：
+                    # 前者不得被当作缺失，否则一次读取失败会触发整季重复下载。
+                    query_failed = True
+                    failed_servers.append(str(name))
+                    logger.warning(f"{mediainfo.title_year} 查询媒体库 {name} 失败，无法确认是否已入库")
+                    continue
                 if not tvs:
                     logger.info(f"{mediainfo.title_year} 没有在媒体库 {name} 中")
                     continue
@@ -299,6 +709,10 @@ class _MediaServerModuleBase(_ModuleBase, _MediaServerBase[TService]):
                     return _SchemaExistMediaInfo(
                         type=MediaType.TV, seasons=tvs, server_type=self._server_type_value, server=name, itemid=itemid
                     )
+        if query_failed and raise_on_query_failure:
+            raise MediaServerQueryError(
+                f"媒体库查询失败，未能确认 {mediainfo.title_year} 是否已入库：{', '.join(failed_servers)}"
+            )
         return None
 
     def scheduler_job(self) -> None:
@@ -323,8 +737,14 @@ class _MediaServerModuleBase(_ModuleBase, _MediaServerBase[TService]):
         """
         检查已配置媒体服务器，遇到首个不可用实例即返回失败。
 
-        :return: 是否就绪与失败说明；没有实例时返回 None
+        存在初始化失败的服务器配置时优先返回具体错误，避免其余实例可用时掩盖故障。
+
+        :return: 是否就绪与失败说明；没有实例且无初始化错误时返回 None
         """
+        init_errors = self.get_init_errors()
+        if init_errors:
+            init_name, init_error = next(iter(init_errors.items()))
+            return False, f"初始化{self.get_name()}服务器失败：{init_name or '未命名'}（{init_error}）"
         if not self.get_instances():
             return None
         for name, server in self.get_instances().items():

@@ -21,7 +21,7 @@ from app.runtime.event.binding import (
     HandlerInstanceResolver,
 )
 from app.runtime.event.contracts import normalize_event_type, validate_event_payload
-from app.runtime.event.dispatch import EventDispatcher
+from app.runtime.event.dispatch import EventDispatcher, is_handling_system_error
 from app.runtime.event.errors import EventErrorNotifier, EventErrorPolicy
 from app.runtime.event.registry import EventRegistry
 from app.runtime.log import logger
@@ -656,15 +656,25 @@ class EventManager(metaclass=Singleton):
         etype: EventType,
         data: Optional[Union[dict[str, object], BaseEventData]] = None,
         priority: Optional[int] = DEFAULT_EVENT_PRIORITY,
+        *,
+        handler_id: Optional[str] = None,
     ) -> Event:
         """
-        异步发送广播事件并等待全部处理器完成，保证配置写入返回时已完成重载。
+        异步发送广播事件并等待指定或全部处理器完成，保证配置写入返回时已完成重载。
+
+        :param etype: 广播事件类型
+        :param data: 可选事件载荷
+        :param priority: 事件优先级
+        :param handler_id: 可选的目标处理器稳定标识；为 None 时派发给全部已启用处理器
         """
         event = Event(etype, data, priority)
         with self.__lifecycle_lock:
             if self.__lifecycle_state != "running":
                 raise RuntimeError(f"事件处理处于 {self.__lifecycle_state} 状态")
-        await self.__dispatcher.dispatch_broadcast_async_strict(event)
+        await self.__dispatcher.dispatch_broadcast_async_strict(
+            event,
+            handler_id=handler_id,
+        )
         return event
 
     @staticmethod
@@ -797,9 +807,17 @@ class EventManager(metaclass=Singleton):
         """
         触发广播事件，将事件插入到优先级队列中。
 
+        SystemError 处理器调用栈内再次产生的 SystemError 只记录日志：错误通知渠道
+        自身失败时继续广播会让通知插件反复投递同一渠道，形成错误通知循环。
+
         :param event: 要处理的事件对象
         """
         logger.debug(f"Triggering broadcast event: {event}")
+        if event.event_type == EventType.SystemError and is_handling_system_error():
+            payload = event.event_data
+            error = payload.get("error") if isinstance(payload, dict) else getattr(payload, "error", None)
+            logger.warning(f"SystemError 处理期间再次产生系统错误，仅记录日志并停止递归广播：{error}")
+            return None
         with self.__lifecycle_lock:
             if self.__lifecycle_state in {"sealed", "stopping", "stopped"}:
                 logger.warning(

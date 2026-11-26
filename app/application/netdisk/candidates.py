@@ -9,7 +9,7 @@ CD 站点与 PanSou 站点共用同一套规则：平台是否可用、文件类
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 

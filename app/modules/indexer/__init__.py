@@ -28,6 +28,7 @@ from app.foundation.url import split_netloc
 from app.modules import _ModuleBase
 from app.modules.indexer.parser import SiteParserBase, SiteSchema
 from app.modules.indexer.spider import JsonList, SiteSpider
+from app.modules.indexer.spider.colapt import ColaPTSpider
 from app.modules.indexer.spider.fluxtorrent import FluxTorrentSpider
 from app.modules.indexer.spider.haidan import HaiDanSpider
 from app.modules.indexer.spider.hdarea import HDAreaSpider
@@ -35,7 +36,7 @@ from app.modules.indexer.spider.hddolby import HddolbySpider
 from app.modules.indexer.spider.hdwing import HDWingPromotionMixin
 from app.modules.indexer.spider.milkie import MilkieSpider
 from app.modules.indexer.spider.mtorrent import MTorrentSpider
-from app.modules.indexer.spider.piggo import PiggoSpider
+from app.modules.indexer.spider.piggo import PiggoSpider, media_search_params
 from app.modules.indexer.spider.rousi import RousiSpider
 from app.modules.indexer.spider.sunnypt import SunnyPTSpider
 from app.modules.indexer.spider.tnode import TNodeSpider
@@ -203,6 +204,7 @@ SPIDER_PARSER_CLASSES: dict[str, type[_PagedSpider]] = {
     "Haidan": HaiDanSpider,
     "HDDolby": HddolbySpider,
     "HDArea": HDAreaSpider,
+    "ColaPT": ColaPTSpider,
     "HDWing": HDWingSpider,
     "RousiPro": RousiSpider,
     "SunnyPT": SunnyPTSpider,
@@ -221,7 +223,7 @@ _DOMAIN_CONNECTION_PARSERS = {
 _DOMAIN_CONNECTION_SETTINGS = {"yemapt.org": {"legacy_cookie_test": True}}
 _CONNECTION_PROTOCOL_NAMES = frozenset(_DOMAIN_CONNECTION_PARSERS.values())
 _SPECIAL_SITE_DOMAINS = ("u2.dmhy.org", "pt.ecust.pp.ua", "pt.gtkpw.xyz", "pt.gtk.pw")
-_TORRENT_PATH_ADAPTERS = (MTorrentSpider, TTGDownloadAdapter)
+_TORRENT_PATH_ADAPTERS = (MTorrentSpider, TTGDownloadAdapter, ColaPTSpider)
 
 # 仅传递各专站搜索入口支持的参数，避免同步与异步调用契约分叉。
 _SPECIALIZED_SEARCH_ARGUMENTS = {
@@ -234,6 +236,7 @@ _SPECIALIZED_SEARCH_ARGUMENTS = {
     "Haidan": ("keyword", "mtype"),
     "HDDolby": ("keyword", "mtype", "cat", "page"),
     "HDArea": ("keyword", "mtype", "cat", "page"),
+    "ColaPT": ("keyword", "mtype", "cat", "page"),
     "HDWing": ("keyword", "mtype", "cat", "page"),
     "RousiPro": ("keyword", "mtype", "cat", "page"),
     "Milkie": ("keyword", "mtype", "page"),
@@ -483,16 +486,18 @@ class IndexerModule(_ModuleBase):
     @staticmethod
     def __site_user_agent(site: dict[str, Any]) -> Optional[str]:
         """
-        使用适配器声明的 User-Agent 规则构造下载上下文。
+        使用适配器声明的 User-Agent 规则或通用站点回退策略构造下载上下文。
 
         :param site: 包含搜索协议和当前用户配置的站点上下文
-        :return: 专站规则处理后的 User-Agent，普通站点保留当前配置值
+        :return: 专站规则或三级优先级解析后的 User-Agent；均为空时返回 None
         """
+        raw_ua = site.get("ua")
+        normalized_ua = raw_ua.strip() if isinstance(raw_ua, str) else raw_ua
         parser_class = SPIDER_PARSER_CLASSES.get(str(site.get("parser") or ""))
         get_user_agent = getattr(parser_class, "get_user_agent", None)
         if callable(get_user_agent):
-            return cast(str, get_user_agent(site.get("ua")))
-        return cast(Optional[str], site.get("ua"))
+            return cast(str, get_user_agent(normalized_ua))
+        return site_rules.resolve_site_user_agent_from_settings(normalized_ua, get_runtime_setting) or None
 
     @staticmethod
     def __parse_result(site: dict[str, Any], result_array: list[dict[str, Any]], seconds: int) -> List[TorrentInfo]:
@@ -541,7 +546,7 @@ class IndexerModule(_ModuleBase):
         return [SubtitleInfo(site=site.get("id"),
                              site_name=site.get("name"),
                              site_cookie=site.get("cookie"),
-                             site_ua=site.get("ua"),
+                             site_ua=IndexerModule.__site_user_agent(site),
                              site_proxy=bool(site.get("proxy")),
                              site_order=int(site.get("pri") or 0),
                              **result) for result in result_array if
@@ -821,8 +826,10 @@ class IndexerModule(_ModuleBase):
         if not IndexerModule.__search_check(site, keyword):
             return None
 
-        search_word = IndexerModule.__clear_search_text(keyword)
         parser_name = str(site.get("parser") or "")
+        # 精确作品链接依赖原始标点，其他站点及猪猪普通关键词继续原有清洗。
+        keep_keyword = parser_name == "Piggo" and search_type == "torrents" and media_search_params(keyword)
+        search_word = keyword if keep_keyword else IndexerModule.__clear_search_text(keyword)
         parser_class = SPIDER_PARSER_CLASSES.get(parser_name)
         if search_type == "subtitles":
             subtitle_argument_names = _SPECIALIZED_SUBTITLE_SEARCH_ARGUMENTS.get(parser_name)
@@ -1316,13 +1323,14 @@ class IndexerModule(_ModuleBase):
                                 f"{str(site_url).rstrip('/')}/",
                                 userdata_path.lstrip("/"),
                             )
+                    raw_ua = site.get("ua")
                     return site_schema(
                         site_name=site.get("name"),
                         url=site_url,
                         site_cookie=site.get("cookie"),
                         apikey=site.get("apikey"),
                         token=site.get("token"),
-                        ua=site.get("ua") or get_runtime_setting("USER_AGENT"),
+                        ua=site_rules.resolve_site_user_agent_from_settings(raw_ua, get_runtime_setting),
                         proxy=site.get("proxy"),
                         api_url=site.get("api_url"))
             return None

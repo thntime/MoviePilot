@@ -1,0 +1,1057 @@
+"""
+保护批量下载各阶段之间的状态传递与副作用顺序。
+"""
+
+from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+import app.application.netdisk.share_blacklist as share_blacklist_module
+import app.chain.download.batch as download_batch
+import app.chain.download.selection as download_selection
+from app.application.netdisk.resolve import NetdiskResolveService, ResolvedShare
+from app.application.netdisk.share_blacklist import ShareBlacklistStore
+from app.application.torrent.download import TorrentHelper
+from app.chain.download import DownloadChain
+from app.domain.context import Context, MediaInfo, TorrentInfo
+from app.domain.metainfo import MetaInfo
+from app.domain.netdisk import NetdiskPlatform, ShareDetail, ShareFile, ShareRef
+from app.schemas.download import ExistingTaskRejection
+from app.schemas.mediaserver import NotExistMediaInfo
+from app.schemas.types import MediaSource, MediaType, NotificationChannel
+
+
+def _context(
+        name: str,
+        media_id: str = "1",
+        episodes: tuple[int, ...] = (),
+        season: int = 1,
+        media_type: MediaType = MediaType.TV,
+) -> Context:
+    """
+    构造指定媒体身份、季和集号的批量下载候选。
+    """
+    meta = MetaInfo(f"{name} S{season:02d}")
+    if episodes:
+        meta.set_episodes(begin=min(episodes), end=max(episodes))
+    return Context(
+        meta_info=meta,
+        media_info=MediaInfo(
+            title=name, type=media_type, media_source=MediaSource.TMDB, media_id=media_id,
+        ),
+        torrent_info=TorrentInfo(title=name, site_name="test", site=1),
+    )
+
+
+def _missing(
+        episodes: tuple[int, ...] = (),
+        total: int = 4,
+        season: int = 1,
+        complete: bool = False,
+) -> NotExistMediaInfo:
+    """
+    构造单季缺集或完整覆盖要求。
+    """
+    return NotExistMediaInfo(
+        season=season, episodes=list(episodes), total_episode=total,
+        start_episode=1, require_complete_coverage=complete,
+    )
+
+
+@pytest.fixture
+def batch(monkeypatch):
+    """
+    只替换事件、排序、持久化及下载边界，保留真实阶段选择和失败指纹。
+    """
+    chain = object.__new__(DownloadChain)
+    chain.eventmanager = SimpleNamespace(send_event=MagicMock(return_value=None))
+    chain._active_download_failure_fingerprints = MagicMock(return_value={})
+    chain._record_download_failure = MagicMock()
+    chain._log_download_failure_cooldown = MagicMock()
+    chain.download_single = MagicMock(return_value="download-id")
+    chain.download_torrent = MagicMock(return_value=(b"torrent", None, [1, 2, 3, 4]))
+    helper = SimpleNamespace(
+        sort_torrents=MagicMock(side_effect=lambda contexts: contexts),
+        get_torrent_episodes=MagicMock(side_effect=lambda files, **_kwargs: files),
+    )
+    stop = SimpleNamespace(is_system_stopped=False)
+    monkeypatch.setattr(download_batch, "TorrentHelper", lambda: helper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", lambda: helper)
+    monkeypatch.setattr(download_batch, "runtime_stop_state", stop)
+    monkeypatch.setattr(download_selection, "runtime_stop_state", stop)
+    return SimpleNamespace(chain=chain, helper=helper, stop=stop)
+
+
+def _submitted(chain) -> list[Context]:
+    """
+    按调用顺序提取批量下载提交的候选。
+    """
+    return [
+        call.args[0] if call.args else call.kwargs["context"]
+        for call in chain.download_single.call_args_list
+    ]
+
+
+def _batch_run(chain, contexts=(), missing=None, governance=None):
+    """
+    构造单次批量状态，便于直接核对阶段内部判定。
+    """
+    options = {
+        "save_path": None, "channel": None, "source": None, "userid": None,
+        "username": None, "downloader": None, "custom_words": None,
+        "governance": governance,
+    }
+    return download_batch._BatchDownloadRun(chain, list(contexts), missing or {}, options, None)
+
+
+def _patch_netdisk_paths(monkeypatch, paths):
+    """
+    让网盘取链服务返回带相对路径的文件清单。
+    """
+    files = tuple(
+        ShareFile(file_id=f"f{index}", name=Path(path).name, size=100, path=path)
+        for index, path in enumerate(paths)
+    )
+
+    def fake_walk(self, url, password=None, platform=None, account_id=None, **kwargs):
+        return ResolvedShare(
+            ref=ShareRef(platform=NetdiskPlatform.QUARK, share_id="abc123", url=url),
+            detail=ShareDetail(title="multiseason", size=len(files) * 100, files=files),
+            files=files,
+        )
+
+    monkeypatch.setattr(NetdiskResolveService, "walk", fake_walk)
+
+
+def test_partial_pack_maps_file_episodes_before_missing_intersection(batch):
+    """
+    拆包候选检查也须先映射，避免目标 E05 在累计编号包中被提前丢弃。
+    """
+    context = _context("Show", episodes=tuple(range(1, 13)), season=2)
+    context.torrent_info.title = "Show.S01E13-E24"
+    batch.chain.download_torrent.return_value = (
+        b"torrent", None, [f"Show.S01E{episode:02}.mkv" for episode in range(13, 25)],
+    )
+    batch.helper.get_torrent_episodes = TorrentHelper.get_torrent_episodes
+    missing = {"tmdb:1": {2: _missing((5,), total=12, season=2)}}
+
+    downloaded, remaining = batch.chain.batch_download([context], missing)
+
+    assert downloaded == [context]
+    assert remaining == {}
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {5}
+
+
+def test_batch_preserves_phase_order_and_submission_options(batch):
+    """
+    批量下载保持各媒体阶段顺序，并完整传递提交选项。
+    """
+    partial = _context("partial", media_id="3")
+    labelled = _context("labelled", media_id="2", episodes=(2,))
+    whole = _context("whole")
+    movie = _context("movie", media_type=MediaType.MOVIE)
+    music = _context("music", media_type=MediaType.MUSIC)
+    missing = {
+        "tmdb:3": {1: _missing((3,))},
+        "tmdb:2": {1: _missing((2,))},
+        "tmdb:1": {1: _missing()},
+    }
+    options = {
+        "save_path": "smb:/server/media",
+        "channel": NotificationChannel.Telegram,
+        "source": "Subscribe|42",
+        "userid": "user-id",
+        "username": "plugin-name",
+        "downloader": "test-downloader",
+        "custom_words": "first\nsecond",
+        "governance": object(),
+    }
+    result, remaining = batch.chain.batch_download(
+        [partial, labelled, whole, movie, music], missing, **options,
+    )
+
+    assert result == [movie, music, whole, labelled, partial]
+    assert _submitted(batch.chain) == result
+    assert remaining is missing
+    assert remaining == {}
+    assert batch.chain.eventmanager.send_event.call_count == 1
+    assert batch.helper.sort_torrents.call_count == 1
+    assert batch.chain._active_download_failure_fingerprints.call_count == 1
+    for call in batch.chain.download_single.call_args_list:
+        assert {key: call.kwargs[key] for key in options} == options
+    calls = batch.chain.download_single.call_args_list
+    assert "torrent_content" not in calls[0].kwargs
+    assert calls[2].kwargs["torrent_content"] == b"torrent"
+    assert "torrent_content" not in calls[3].kwargs
+    assert calls[4].kwargs["episodes"] == {3}
+    assert all(
+        call.kwargs["custom_words"] == ["first", "second"]
+        for call in batch.helper.get_torrent_episodes.call_args_list
+    )
+
+
+def test_incomplete_season_becomes_labelled_candidate_after_file_inspection(batch):
+    """
+    整季候选内容不足时按解析出的剧集转入带集数候选阶段。
+    """
+    candidate = _context("incomplete")
+    missing = {"tmdb:1": {1: _missing()}}
+    batch.chain.download_torrent.return_value = (b"torrent", None, [1, 2])
+
+    result, remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == [candidate]
+    assert remaining is missing
+    assert remaining["tmdb:1"][1].episodes == [3, 4]
+    assert candidate.meta_info.episode_list == [1, 2]
+    batch.chain.download_torrent.assert_called_once()
+    batch.chain.download_single.assert_called_once()
+    assert "torrent_content" not in batch.chain.download_single.call_args.kwargs
+    batch.chain._record_download_failure.assert_not_called()
+
+
+def test_whole_season_download_preserves_other_seasons_with_explicit_missing_episodes(batch):
+    """
+    整季下载成功只清除该季，其他季的缺集仍能在本轮获得提交。
+    """
+    whole = _context("show", season=2)
+    partial = _context("show", season=1, episodes=(1,))
+    missing = {"tmdb:1": {1: _missing((1, 2)), 2: _missing(season=2)}}
+
+    result, remaining = batch.chain.batch_download([whole, partial], missing)
+
+    assert result == [whole, partial]
+    assert set(remaining["tmdb:1"]) == {1}
+    assert remaining["tmdb:1"][1].episodes == [2]
+
+
+def test_failed_season_submission_stays_in_cooldown_after_metadata_changes(batch):
+    """
+    整季下载失败后，即使剧集元数据变化也继续受到失败冷却约束。
+    """
+    whole = _context("whole")
+    fallback = _context("fallback", episodes=(1,))
+    missing = {"tmdb:1": {1: _missing(total=3)}}
+    batch.chain.download_torrent.return_value = (b"torrent", None, [1, 2, 3])
+    batch.chain.download_single.side_effect = [None, "fallback-id"]
+
+    result, remaining = batch.chain.batch_download([whole, fallback], missing)
+
+    assert result == [fallback]
+    assert _submitted(batch.chain) == [whole, fallback]
+    assert remaining["tmdb:1"][1].episodes == [2, 3]
+    assert whole.meta_info.episode_list == [1, 2, 3]
+    batch.chain.download_torrent.assert_called_once()
+    assert batch.chain._log_download_failure_cooldown.call_count == 2
+
+
+def test_empty_torrent_is_recorded_once_and_not_retried_in_later_phases(batch):
+    """
+    空种子失败只记录一次，后续阶段不重复尝试。
+    """
+    whole = _context("empty")
+    fallback = _context("fallback", episodes=(1,))
+    missing = {"tmdb:1": {1: _missing(total=3)}}
+    batch.chain.download_torrent.return_value = (None, "failed", [])
+
+    result, remaining = batch.chain.batch_download(
+        [whole, fallback], missing, source="Subscribe|42", downloader="test",
+    )
+
+    assert result == [fallback]
+    assert remaining["tmdb:1"][1].episodes == [2, 3]
+    batch.chain.download_torrent.assert_called_once()
+    batch.chain._record_download_failure.assert_called_once_with(
+        context=whole, error_msg="下载种子内容为空", downloader="test", source="Subscribe|42",
+        ttl_seconds=3600,
+    )
+
+
+def test_uninspectable_magnet_is_not_cooled_down_as_a_download_failure(batch):
+    """
+    无法检查文件的磁力链接不被误判为下载失败冷却。
+    """
+    whole = _context("magnet")
+    fallback = _context("fallback", episodes=(1,))
+    missing = {"tmdb:1": {1: _missing(total=3)}}
+    batch.chain.download_torrent.return_value = ("magnet:?xt=test", None, [])
+
+    result, remaining = batch.chain.batch_download([whole, fallback], missing)
+
+    assert result == [fallback]
+    assert remaining["tmdb:1"][1].episodes == [2, 3]
+    assert batch.chain.download_torrent.call_count == 2
+    batch.chain._record_download_failure.assert_not_called()
+    batch.chain._log_download_failure_cooldown.assert_not_called()
+    batch.helper.get_torrent_episodes.assert_not_called()
+
+
+def test_netdisk_share_skips_whole_season_file_inspection(batch):
+    """
+    网盘分享不是种子，整季阶段直接跳过文件检查，不触发种子下载与集数解析。
+    """
+    netdisk = _context("netdisk")
+    netdisk.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing()}}
+
+    result, remaining = batch.chain.batch_download([netdisk], missing)
+
+    assert result == []
+    assert remaining is missing
+    assert remaining == missing
+    batch.chain.download_torrent.assert_not_called()
+    batch.helper.get_torrent_episodes.assert_not_called()
+    batch.chain._record_download_failure.assert_not_called()
+
+
+def test_partial_packs_only_settle_successful_allowed_episode_selections(batch):
+    """
+    分集包仅结算成功提交且在允许范围内的剧集。
+    """
+    failed = _context("failed", episodes=(1, 4))
+    first = _context("first")
+    first.allowed_episodes = {1, 3}
+    second = _context("second")
+    missing = {"tmdb:1": {1: _missing((1, 2, 3))}}
+    batch.chain.download_torrent.side_effect = [
+        (b"failed", None, [1, 2, 4]),
+        (b"first", None, [1, 3, 4]),
+        (b"second", None, [2, 4]),
+    ]
+    needs_at_submission = []
+
+    def submit(**kwargs):
+        needs_at_submission.append(list(missing["tmdb:1"][1].episodes))
+        return None if kwargs["context"] is failed else "id"
+
+    batch.chain.download_single.side_effect = submit
+    result, remaining = batch.chain.batch_download([failed, first, second], missing)
+
+    assert result == [first, second]
+    assert remaining is missing
+    assert remaining == {}
+    assert needs_at_submission == [[1, 2, 3], [1, 2, 3], [2]]
+    assert [
+        call.kwargs["episodes"] for call in batch.chain.download_single.call_args_list
+    ] == [{1, 2}, {1, 3}, {2}]
+    assert first.meta_info.episode_list == [1, 3, 4]
+    assert second.meta_info.episode_list == [2, 4]
+    assert failed.meta_info.episode_list == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("rejection,retried", [
+    (ExistingTaskRejection.FILES_CANCELLED, True),
+    (ExistingTaskRejection.EPISODES_NOT_FOUND, True),
+    (ExistingTaskRejection.PAUSED, False),
+])
+def test_target_specific_rejection_only_blocks_those_episodes_in_the_batch(batch, rejection, retried):
+    """
+    原包提交 E03-E04 时，下载器因 E03 在已有任务上被取消而拒绝；备用种子补上 E03 后，拆包阶段只要 E04，
+    同一批次内仍应从原包追加 E04。只有"只针对这几集"的拒绝才这样处理，任务暂停等针对整个任务的拒绝
+    照旧让本批不再提交这个候选。
+    """
+    original = _context("original", episodes=(3, 4))
+    backup = _context("backup", episodes=(3,))
+    missing = {"tmdb:1": {1: _missing((3, 4))}}
+
+    def submit(*args, **kwargs):
+        """
+        原包提交 E03-E04 时被拒，其余提交都受理。
+        """
+        context = args[0] if args else kwargs["context"]
+        if context is original and kwargs.get("episodes") == {3, 4}:
+            return None, rejection.describe("abc", "原因")
+        return "download-id", "添加下载成功"
+
+    batch.chain.download_single.side_effect = submit
+
+    result, remaining = batch.chain.batch_download([original, backup], missing)
+
+    submitted = [
+        (call.args[0] if call.args else call.kwargs["context"], call.kwargs.get("episodes"))
+        for call in batch.chain.download_single.call_args_list
+    ]
+    if retried:
+        assert submitted == [(original, {3, 4}), (backup, {3}), (original, {4})]
+        assert result == [backup, original]
+        assert remaining == {}
+    else:
+        assert submitted == [(original, {3, 4}), (backup, {3})]
+        assert result == [backup]
+
+
+def test_same_target_rejected_once_is_not_resubmitted_in_later_phases(batch):
+    """
+    下载器以"只针对这几集"的原因拒绝某个候选的 E03-E04 后，本批后续阶段遇到同一候选、同一目标时直接跳过，
+    不再向下载器重复提交；缺集原样保留，交给下一轮或别的种子。
+    """
+    original = _context("original", episodes=(3, 4))
+    missing = {"tmdb:1": {1: _missing((3, 4))}}
+    batch.chain.download_single.side_effect = lambda *_args, **_kwargs: (
+        None, ExistingTaskRejection.FILES_CANCELLED.describe("abc", "原因"),
+    )
+
+    result, remaining = batch.chain.batch_download([original], missing)
+
+    assert [call.kwargs.get("episodes") for call in batch.chain.download_single.call_args_list] == [{3, 4}]
+    assert result == []
+    assert remaining["tmdb:1"][1].episodes == [3, 4]
+
+
+def test_plugin_download_entry_with_legacy_signature_is_not_passed_return_detail(batch):
+    """
+    插件替换的单资源下载入口可能是不接受 ``return_detail`` 的旧签名：批量下载不能因为传了它而抛 TypeError，按旧方式
+    只取任务 ID，失败时按整个候选记入本批失败。
+    """
+    submitted = []
+
+    def legacy_download_single(context, episodes=None, torrent_content=None, save_path=None, channel=None,
+                               source=None, userid=None, username=None, downloader=None, custom_words=None,
+                               governance=None):
+        """
+        旧签名的插件下载入口：只返回任务 ID，第一次提交失败。
+        """
+        submitted.append(episodes)
+        return None if len(submitted) == 1 else "download-id"
+
+    batch.chain.download_single = legacy_download_single
+    original = _context("original", episodes=(3, 4))
+
+    result, _remaining = batch.chain.batch_download([original], {"tmdb:1": {1: _missing((3, 4))}})
+
+    assert submitted == [{3, 4}]
+    assert result == []
+
+
+def test_keyword_support_follows_entry_point_signature():
+    """
+    只在下载入口的签名里有该参数或 ``**kwargs`` 时才传；读不到签名时按旧签名处理，不传。
+    """
+    class Unreadable:
+        """
+        签名属性非法、读取签名会失败的可调用对象。
+        """
+
+        __signature__ = "invalid"
+
+        def __call__(self, *args, **kwargs):
+            """
+            不会被调用。
+            """
+
+    def legacy(context, episodes=None):
+        """
+        旧签名入口。
+        """
+
+    def detailed(context, *, return_detail=False):
+        """
+        支持详细结果的入口。
+        """
+
+    def flexible(context, **kwargs):
+        """
+        接受任意关键字参数的入口。
+        """
+
+    assert download_batch._accepts_keyword(legacy, "return_detail") is False
+    assert download_batch._accepts_keyword(detailed, "return_detail") is True
+    assert download_batch._accepts_keyword(flexible, "return_detail") is True
+    assert download_batch._accepts_keyword(Unreadable(), "return_detail") is False
+
+
+@pytest.mark.parametrize("missing", [None, {}])
+def test_batch_preserves_optional_missing_result_and_resets_per_call_state(batch, missing):
+    """
+    批量调用保留可选缺集结果的对象语义，并重置每次调用状态。
+    """
+    candidate = _context("movie", media_type=MediaType.MOVIE)
+    batch.chain.download_single.side_effect = [None, "retry-id"]
+
+    first, first_remaining = batch.chain.batch_download([candidate], missing)
+    second, second_remaining = batch.chain.batch_download([candidate], missing)
+
+    assert first == []
+    assert second == [candidate]
+    assert first_remaining is missing
+    assert second_remaining is missing
+    assert batch.chain.download_single.call_count == 2
+
+
+def test_reentrant_batch_call_keeps_outer_candidates_and_accounting(batch):
+    """
+    下载回调触发另一批次时，两次调用不能共用候选、结果或缺集状态。
+    """
+    movie = _context("outer-movie", media_type=MediaType.MOVIE)
+    nested = _context("nested-movie", media_type=MediaType.MOVIE)
+    whole = _context("whole")
+    missing = {"tmdb:1": {1: _missing()}}
+    nested_results = []
+
+    def submit(*args, **kwargs):
+        context = args[0] if args else kwargs["context"]
+        if context is movie:
+            nested_results.append(batch.chain.batch_download([nested]))
+        return "id"
+
+    batch.chain.download_single.side_effect = submit
+    result, remaining = batch.chain.batch_download([whole, movie], missing)
+
+    assert result == [movie, whole]
+    assert nested_results == [([nested], None)]
+    assert remaining is missing
+    assert remaining == {}
+    assert _submitted(batch.chain) == [movie, nested, whole]
+
+
+def test_stop_during_movie_submission_prevents_later_phase_side_effects(batch):
+    """
+    电影提交期间收到停止信号后，不再执行后续阶段的副作用。
+    """
+    movie = _context("movie", media_type=MediaType.MOVIE)
+    whole = _context("whole")
+    missing = {"tmdb:1": {1: _missing()}}
+
+    def submit(*_args, **_kwargs):
+        batch.stop.is_system_stopped = True
+        return "movie-id"
+
+    batch.chain.download_single.side_effect = submit
+    result, remaining = batch.chain.batch_download([whole, movie], missing)
+
+    assert result == [movie]
+    assert remaining == {"tmdb:1": {1: _missing()}}
+    batch.chain.download_single.assert_called_once()
+    batch.chain.download_torrent.assert_not_called()
+
+
+def test_multiseason_pack_submits_without_reading_torrent_files(batch):
+    """
+    多季合集直接提交，不额外读取种子文件确认覆盖范围。
+    """
+    candidate = _context("multiseason", season=0)
+    candidate.meta_info.end_season = 1
+    missing = {"tmdb:1": {0: _missing(season=0), 1: _missing()}}
+
+    result, remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == [candidate]
+    assert remaining is missing
+    assert remaining == {}
+    batch.chain.download_torrent.assert_not_called()
+    assert batch.chain.download_single.call_args.args == (candidate,)
+    assert candidate.confirmed_full_coverage is False
+
+
+def test_partial_failure_does_not_rewrite_candidate_episode_range(batch):
+    """
+    分集提交失败不得改写候选的原始剧集范围。
+    """
+    candidate = _context("partial")
+    missing = {"tmdb:1": {1: _missing((2,))}}
+    batch.chain.download_single.return_value = None
+    batch.chain.download_torrent.return_value = (b"torrent", None, [1, 2, 3])
+
+    result, remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == []
+    assert remaining["tmdb:1"][1].episodes == [2]
+    assert candidate.meta_info.episode_list == []
+    batch.chain.download_single.assert_called_once()
+
+
+def test_failed_complete_coverage_submission_does_not_confirm_or_settle(batch):
+    """
+    要求完整覆盖的提交失败时，不确认覆盖完成或结算缺集。
+    """
+    candidate = _context("complete")
+    missing = {"tmdb:1": {1: _missing(complete=True)}}
+    batch.chain.download_single.return_value = None
+
+    result, remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == []
+    assert remaining["tmdb:1"][1].require_complete_coverage is True
+    assert remaining["tmdb:1"][1].episodes == []
+    assert candidate.confirmed_full_coverage is False
+    batch.chain.download_single.assert_called_once()
+
+
+def test_higher_priority_labelled_full_pack_wins_whole_season_phase(batch):
+    """
+    标注完整集数的高优先级包与无集数整季包同轮竞争，不被后者抢先清空缺季。
+    """
+    labelled = _context("labelled", episodes=(1, 2, 3, 4))
+    whole = _context("whole")
+    missing = {"tmdb:1": {1: _missing(complete=True)}}
+
+    result, remaining = batch.chain.batch_download([labelled, whole], missing)
+
+    assert result == [labelled]
+    assert remaining == {}
+    batch.chain.download_torrent.assert_called_once()
+    assert batch.chain.download_single.call_args.kwargs["torrent_content"] == b"torrent"
+    assert labelled.confirmed_full_coverage is True
+
+
+@pytest.mark.parametrize(
+    ("episodes", "total"),
+    [((1, 2), 4), ((1, 2, 3, 4), 0)],
+    ids=["partial-range", "unknown-total"],
+)
+def test_labelled_pack_without_full_coverage_stays_out_of_whole_season_phase(batch, episodes, total):
+    """
+    未覆盖整季的带集数候选不得进入整季优先阶段。
+    """
+    labelled = _context("labelled", episodes=episodes)
+    whole = _context("whole")
+    missing = {"tmdb:1": {1: _missing(total=total)}}
+
+    result, _remaining = batch.chain.batch_download([labelled, whole], missing)
+
+    assert result == [whole]
+    batch.chain.download_torrent.assert_called_once()
+    assert batch.chain.download_single.call_args.kwargs["context"] is whole
+
+
+def test_labelled_full_pack_respects_candidate_allowed_episodes(batch):
+    """
+    带集数完整合集仍必须遵守候选允许下载的剧集范围。
+    """
+    labelled = _context("labelled", episodes=(1, 2, 3, 4))
+    labelled.allowed_episodes = {1, 2}
+    missing = {"tmdb:1": {1: _missing()}}
+
+    result, remaining = batch.chain.batch_download([labelled], missing)
+
+    assert result == []
+    assert remaining["tmdb:1"][1].episodes == []
+    batch.chain.download_torrent.assert_not_called()
+    batch.chain.download_single.assert_not_called()
+
+
+def test_labelled_full_pack_magnet_falls_back_to_episode_pack_phase(batch):
+    """
+    无法检查内容的完整合集磁力链接回退到分集包阶段提交。
+    """
+    labelled = _context("labelled", episodes=(1, 2, 3, 4))
+    missing = {"tmdb:1": {1: _missing(complete=True)}}
+    batch.chain.download_torrent.return_value = ("magnet:?xt=test", None, [])
+
+    result, remaining = batch.chain.batch_download([labelled], missing)
+
+    assert result == [labelled]
+    assert remaining == {}
+    batch.chain.download_torrent.assert_called_once()
+    assert "torrent_content" not in batch.chain.download_single.call_args.kwargs
+    batch.chain._record_download_failure.assert_not_called()
+
+
+def test_gapped_season_pack_keeps_missing_middle_episode(batch):
+    """
+    整季种子文件断档时不得把中间缺失集记入已覆盖范围。
+
+    回归：合集实际只有 E26/E28/E29 时，若按起止集连续填成 E26-E29，
+    订阅会把 E27 记为已下载，后续补搜与 RSS 都不再寻找该集。
+    """
+    candidate = _context("gapped")
+    missing = {"tmdb:1": {1: _missing((26, 27, 28, 29), total=29)}}
+    batch.chain.download_torrent.return_value = (b"torrent", None, [26, 28, 29])
+
+    result, remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == [candidate]
+    assert remaining["tmdb:1"][1].episodes == [27]
+    assert candidate.meta_info.episode_list == [26, 28, 29]
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {26, 28, 29}
+
+
+def test_whole_season_inspection_uses_only_target_season_episodes(batch, monkeypatch):
+    """
+    整季核对只统计目标季的文件，其他季的集号不能补齐目标季缺集。
+    """
+    candidate = _context("multiseason")
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing(total=2, complete=True)}}
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S02/02.mp4"])
+    run = _batch_run(batch.chain, [candidate], missing)
+
+    assert run._inspect_whole_season(candidate, "tmdb:1", 1) is None
+
+
+def test_multiseason_netdisk_pack_submits_target_season_episodes(batch, monkeypatch):
+    """
+    缺 S01 时允许包含 S02 的网盘整包，只按 S01 目标集提交。
+    """
+    candidate = _context("multiseason")
+    candidate.meta_info.end_season = 2
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing(total=1)}}
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S02/05.mp4"])
+
+    result, remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == [candidate]
+    assert remaining == {}
+    assert batch.chain.download_single.call_args.kwargs["episode_targets"] == {1: {1}}
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {1}
+    assert candidate.meta_info.episode_list == []
+    batch.chain.download_torrent.assert_not_called()
+
+
+def test_multiseason_netdisk_pack_keeps_same_number_across_seasons(batch, monkeypatch):
+    """
+    目标季与其他季存在同集号时，提交的季级目标不能把其他季集号并进来。
+    """
+    candidate = _context("multiseason")
+    candidate.meta_info.end_season = 2
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing(total=2, complete=True)}}
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S01/02.mp4", "S02/02.mp4"])
+
+    result, _remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == [candidate]
+    assert batch.chain.download_single.call_args.kwargs["episode_targets"] == {1: {1, 2}}
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {1, 2}
+    # 多季整包不得用跨季并集 min/max 改写候选原始识别范围。
+    assert candidate.meta_info.episode_list == []
+
+
+def test_single_season_netdisk_pack_submits_season_targets(batch, monkeypatch):
+    """
+    单季候选即使分享里混有其他季，也按目标季提交季级目标。
+    """
+    candidate = _context("multiseason")
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing(total=1)}}
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S02/01.mp4"])
+
+    result, _remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == [candidate]
+    assert batch.chain.download_single.call_args.kwargs["episode_targets"] == {1: {1}}
+
+
+def test_whole_season_candidate_allows_netdisk_extra_season(batch):
+    """
+    网盘候选只要覆盖任一缺失季即可进入整季阶段。
+    """
+    candidate = _context("multiseason")
+    candidate.meta_info.end_season = 2
+    candidate.torrent_info.download_type = "netdisk"
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing()}})
+
+    assert run._whole_season_candidate(candidate, "tmdb:1", [1]) == [1, 2]
+
+
+def test_whole_season_candidate_keeps_non_netdisk_subset_requirement(batch):
+    """
+    非网盘候选仍要求全部季都在缺失范围内。
+    """
+    candidate = _context("multiseason")
+    candidate.meta_info.end_season = 2
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing()}})
+
+    assert run._whole_season_candidate(candidate, "tmdb:1", [1]) == []
+
+
+def test_multiseason_netdisk_pack_keeps_partial_season_accounting(batch, monkeypatch):
+    """
+    整季阶段只结算整缺季，候选附带的部分缺集季必须保留原缺集记录。
+    """
+    candidate = _context("multiseason")
+    candidate.meta_info.end_season = 2
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {
+        "tmdb:1": {
+            1: _missing(total=1),
+            2: _missing((5,), total=10),
+        },
+    }
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S02/05.mp4"])
+
+    result, remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == [candidate]
+    assert batch.chain.download_single.call_args.kwargs["episode_targets"] == {1: {1}}
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {1}
+    assert 1 not in remaining["tmdb:1"]
+    assert remaining["tmdb:1"][2].episodes == [5]
+
+
+def test_single_season_netdisk_pack_without_season_markers_submits(batch, monkeypatch):
+    """
+    根目录平铺、无季标记的分享仍按目标季提交，不能因季号为 None 被整季阶段拒绝。
+    """
+    candidate = _context("flat")
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing(total=2)}}
+    _patch_netdisk_paths(monkeypatch, ["第01集.mp4", "第02集.mp4"])
+
+    result, _remaining = batch.chain.batch_download([candidate], missing)
+
+    assert result == [candidate]
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {1, 2}
+    assert batch.chain.download_single.call_args.kwargs["episode_targets"] == {1: {1, 2}}
+
+
+def test_netdisk_partial_pack_without_season_markers_submits(batch, monkeypatch):
+    """
+    无季标记分享的缺失集走拆包阶段时，仍能按目标季兜底提交。
+    """
+    candidate = _context("flat")
+    candidate.torrent_info.download_type = "netdisk"
+    missing = {"tmdb:1": {1: _missing((27, 28, 29), total=29)}}
+    _patch_netdisk_paths(monkeypatch, ["第27集.mp4", "第28集.mp4", "第29集.mp4"])
+    run = _batch_run(batch.chain, [candidate], missing)
+
+    run._download_season_partial_packs("tmdb:1", 1, [27, 28, 29])  # pylint: disable=protected-access
+
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {27, 28, 29}
+
+
+def test_episode_pack_candidate_falls_back_for_flat_share(batch, monkeypatch):
+    """
+    无季标记分享在完整集阶段同样按目标季兜底取集，不再返回空集。
+    """
+    candidate = _context("flat")
+    candidate.torrent_info.download_type = "netdisk"
+    info = _missing((27, 28, 29), total=29)
+    _patch_netdisk_paths(monkeypatch, ["第27集.mp4", "第28集.mp4", "第29集.mp4"])
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: info}})
+
+    assert run._episode_pack_candidate(  # pylint: disable=protected-access
+        candidate, "tmdb:1", 1, [27, 28, 29], info,
+    ) == {27, 28, 29}
+
+
+def test_episode_pack_candidate_only_counts_target_season_episodes(batch, monkeypatch):
+    """
+    多季分享中的完整集包只按目标季集号结算，其他季同集号不计入。
+    """
+    candidate = _context("multiseason")
+    candidate.torrent_info.download_type = "netdisk"
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S02/02.mp4"])
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing((2,), total=2)}})
+
+    assert run._episode_pack_candidate(  # pylint: disable=protected-access
+        candidate, "tmdb:1", 1, [2], _missing((2,), total=2),
+    ) == set()
+
+
+def test_partial_pack_does_not_submit_other_season_episode(batch, monkeypatch):
+    """
+    拆包阶段只按目标季核对集号，其他季同集号不能触发提交。
+    """
+    candidate = _context("multiseason")
+    candidate.torrent_info.download_type = "netdisk"
+    _patch_netdisk_paths(monkeypatch, ["S01/01.mp4", "S02/02.mp4"])
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing((2,), total=2)}})
+
+    run._download_season_partial_packs("tmdb:1", 1, [2])  # pylint: disable=protected-access
+
+    batch.chain.download_single.assert_not_called()
+
+
+def _governance_stub() -> tuple[SimpleNamespace, list[tuple[str, str | None]]]:
+    """
+    记录治理回调的替身，便于断言跳过原因。
+    """
+    calls: list[tuple[str, str | None]] = []
+
+    def report(_context, decision, reason=None):
+        calls.append((decision, reason))
+
+    return SimpleNamespace(report=report), calls
+
+
+def test_episode_pack_candidate_reports_season_mismatch(batch):
+    """
+    候选季号与订阅目标不一致时，必须把原因写进治理记录。
+    """
+    candidate = _context("other-season", season=2)
+    candidate.torrent_info.download_type = "netdisk"
+    governance, calls = _governance_stub()
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing((1,), total=1)}}, governance)
+
+    assert run._episode_pack_candidate(  # pylint: disable=protected-access
+        candidate, "tmdb:1", 1, [1], _missing((1,), total=1),
+    ) == set()
+    assert calls and calls[0][0] == "rejected"
+    assert "季号" in (calls[0][1] or "")
+
+
+def test_episode_pack_candidate_reports_share_without_target_episodes(batch, monkeypatch):
+    """
+    分享内没有目标集数时，治理记录要给出具体原因而不是静默跳过。
+    """
+    candidate = _context("perfect-world")
+    candidate.torrent_info.download_type = "netdisk"
+    _patch_netdisk_paths(monkeypatch, ["S01/05.mp4"])
+    governance, calls = _governance_stub()
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing((1,), total=5)}}, governance)
+
+    assert run._episode_pack_candidate(  # pylint: disable=protected-access
+        candidate, "tmdb:1", 1, [1], _missing((1,), total=5),
+    ) == set()
+    assert calls and calls[0][0] == "rejected"
+    assert "目标集数" in (calls[0][1] or "")
+
+
+def test_partial_pack_reports_mismatch(batch):
+    """
+    拆包阶段的候选被跳过时同样要记录原因。
+    """
+    candidate = _context("other-season", season=2)
+    candidate.torrent_info.download_type = "netdisk"
+    governance, calls = _governance_stub()
+    run = _batch_run(batch.chain, [candidate], {"tmdb:1": {1: _missing((1,), total=1)}}, governance)
+
+    run._download_season_partial_packs("tmdb:1", 1, [1])  # pylint: disable=protected-access
+
+    assert batch.chain.download_single.call_count == 0
+    assert calls and calls[0][0] == "rejected"
+    assert "季号" in (calls[0][1] or "")
+
+
+def _target_missing(start: int, total: int) -> NotExistMediaInfo:
+    """
+    构造订阅起止集限定的完整覆盖缺失范围，与首次整包优先和洗版入口一致。
+    """
+    return NotExistMediaInfo(
+        season=1, episodes=[], total_episode=total, start_episode=start,
+        require_complete_coverage=True,
+    )
+
+
+def test_whole_season_pack_only_selects_subscribed_episodes(batch):
+    """
+    只订阅单集时，整季包覆盖目标也只选择目标集，不下载订阅范围外的剧集。
+    """
+    pack = _context("pack")
+    single = _context("single", episodes=(5,))
+    missing = {"tmdb:1": {1: _target_missing(5, 5)}}
+    batch.chain.download_torrent.return_value = (b"torrent", None, list(range(1, 11)))
+
+    result, remaining = batch.chain.batch_download([pack, single], missing)
+
+    assert result == [pack]
+    assert remaining == {}
+    batch.chain.download_single.assert_called_once()
+    call = batch.chain.download_single.call_args
+    assert call.kwargs["context"] is pack
+    assert call.kwargs["torrent_content"] == b"torrent"
+    assert call.kwargs["episodes"] == {5}
+    assert pack.confirmed_full_coverage is True
+
+
+def test_whole_season_pack_matching_target_keeps_whole_submission(batch):
+    """
+    种子集数与目标范围一致时仍整包提交，保留字幕、花絮等无集号文件。
+    """
+    pack = _context("pack")
+    missing = {"tmdb:1": {1: _target_missing(1, 4)}}
+
+    result, remaining = batch.chain.batch_download([pack], missing)
+
+    assert result == [pack]
+    assert remaining == {}
+    assert batch.chain.download_single.call_args.kwargs.get("episodes") is None
+    assert pack.confirmed_full_coverage is True
+
+
+def test_labelled_pack_magnet_only_selects_subscribed_episodes(batch):
+    """
+    无法读取文件的带集数完整包回退分集包阶段时，同样只提交订阅范围内的集。
+    """
+    labelled = _context("labelled", episodes=tuple(range(1, 11)))
+    missing = {"tmdb:1": {1: _target_missing(5, 6)}}
+    batch.chain.download_torrent.return_value = ("magnet:?xt=test", None, [])
+
+    result, remaining = batch.chain.batch_download([labelled], missing)
+
+    assert result == [labelled]
+    assert remaining == {}
+    assert batch.chain.download_single.call_args.kwargs["episodes"] == {5, 6}
+    assert labelled.confirmed_full_coverage is True
+
+def _counting_walk(monkeypatch, paths):
+    """
+    让网盘取链返回固定文件清单，并记录真实读目录的次数。
+    """
+    files = tuple(
+        ShareFile(file_id=f"f{index}", name=Path(path).name, size=100, path=path)
+        for index, path in enumerate(paths)
+    )
+    urls: list[str] = []
+
+    def fake_walk(self, url, password=None, platform=None, account_id=None, **kwargs):
+        urls.append(url)
+        return ResolvedShare(
+            ref=ShareRef(platform=NetdiskPlatform.UC, share_id="b442f632b23c4", url=url),
+            detail=ShareDetail(title="xianni", size=len(files) * 100, files=files),
+            files=files,
+        )
+
+    monkeypatch.setattr(NetdiskResolveService, "walk", fake_walk)
+    return urls
+
+
+def _netdisk_candidate() -> Context:
+    """
+    构造带真实 UC 分享链接的网盘候选，供黑名单写入断言使用。
+    """
+    candidate = _context("xianni")
+    candidate.torrent_info.download_type = "netdisk"
+    candidate.torrent_info.netdisk_platform = "uc"
+    candidate.torrent_info.enclosure = "https://drive.uc.cn/s/b442f632b23c4"
+    return candidate
+
+
+def _isolate_blacklist(monkeypatch, tmp_path) -> ShareBlacklistStore:
+    """
+    把分享黑名单单例指到临时文件，避免测试写进真实配置目录。
+    """
+    store = ShareBlacklistStore(tmp_path / "blacklist.json")
+    monkeypatch.setattr(share_blacklist_module, "_store", store)
+    return store
+
+
+def test_no_target_episodes_blacklists_share_for_one_day(batch, monkeypatch, tmp_path):
+    """
+    分享内没有目标集时按 24 小时写进分享黑名单，下一轮搜索才会跳过它。
+    """
+    store = _isolate_blacklist(monkeypatch, tmp_path)
+    candidate = _netdisk_candidate()
+    _counting_walk(monkeypatch, ["S01/第167集.mp4"])
+    missing = {"tmdb:1": {1: _missing((182,), total=200)}}
+
+    batch.chain.batch_download([candidate], missing)
+
+    entry = store.is_blacklisted("uc", "b442f632b23c4")
+    assert entry is not None
+    assert entry.reason.startswith("分享内没有目标集数")
+    assert "167" in entry.reason
+    assert "182" in entry.reason
+    created = datetime.fromisoformat(entry.created_at)
+    expires = datetime.fromisoformat(entry.expires_at)
+    assert expires - created == timedelta(days=1)
+    batch.chain.download_single.assert_not_called()
+
+
+def test_netdisk_share_directory_is_read_once_per_batch(batch, monkeypatch, tmp_path):
+    """
+    整季阶段与拆包阶段核对同一分享时，只真读一次分享目录。
+    """
+    _isolate_blacklist(monkeypatch, tmp_path)
+    candidate = _netdisk_candidate()
+    urls = _counting_walk(monkeypatch, ["S01/第167集.mp4"])
+    missing = {"tmdb:1": {1: _missing((182,), total=200)}}
+
+    batch.chain.batch_download([candidate], missing)
+
+    assert urls == ["https://drive.uc.cn/s/b442f632b23c4"]

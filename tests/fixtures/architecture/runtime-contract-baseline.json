@@ -1192,6 +1192,11 @@
           "replacement": "app.application.transfer.workflow.TransferTask",
           "target_module": "app.sdk._legacy.transfer",
           "target_name": "TransferTask"
+        },
+        "WebMessageItem": {
+          "replacement": "app.schemas.message.MessageHistoryItem",
+          "target_module": "app.schemas.message",
+          "target_name": "MessageHistoryItem"
         }
       },
       "app.schemas.agent": {
@@ -1261,6 +1266,11 @@
           "replacement": "app.schemas.types.MessageType",
           "target_module": "app.schemas.types",
           "target_name": "MessageType"
+        },
+        "WebMessageItem": {
+          "replacement": "app.schemas.message.MessageHistoryItem",
+          "target_module": "app.schemas.message",
+          "target_name": "MessageHistoryItem"
         }
       },
       "app.schemas.transfer": {
@@ -1670,7 +1680,7 @@
     ],
     "dynamic_consumer_count": 1,
     "dynamic_producer_count": 2,
-    "event_count": 53,
+    "event_count": 54,
     "event_index": {
       "ChainEventType.AgentLLMProvider": {
         "consumer_fingerprints": [],
@@ -1764,6 +1774,12 @@
         "consumer_fingerprints": [],
         "producer_fingerprints": [
           "8121a37b3badc8940c2f1c5bbc563845cf342bc073c20af63113c6989aa01255"
+        ]
+      },
+      "ChainEventType.ResourceSubmit": {
+        "consumer_fingerprints": [],
+        "producer_fingerprints": [
+          "7d564f9e9178c7d4d8b10604b35ee34617b75c952f30aa03f6f2dcbce6c7923a"
         ]
       },
       "ChainEventType.StorageOperSelection": {
@@ -2021,7 +2037,7 @@
       "EventType.UserMessage": {
         "consumer_fingerprints": [],
         "producer_fingerprints": [
-          "6e4d8de098b200f04c1089fc9a5a67e1064a5fac50a1c0ce0a13ea0f6cece32f"
+          "9934766390c1470e31c1c04239785b21af3fcdba636898b752c920bee8143e11"
         ]
       },
       "EventType.WebhookMessage": {
@@ -2039,11 +2055,11 @@
         ]
       }
     },
-    "fact_count": 95,
+    "fact_count": 96,
     "invalid_consumer_count": 0,
     "invalid_producer_count": 0,
-    "producer_call_count": 76,
-    "producer_event_reference_count": 76,
+    "producer_call_count": 77,
+    "producer_event_reference_count": 77,
     "producers": [
       {
         "caller": "app.agent.orchestrator",
@@ -2324,6 +2340,18 @@
         "receiver_kind": "canonical_singleton"
       },
       {
+        "caller": "app.chain.download.submission",
+        "dynamic": false,
+        "events": [
+          "ChainEventType.ResourceSubmit"
+        ],
+        "fingerprint": "7d564f9e9178c7d4d8b10604b35ee34617b75c952f30aa03f6f2dcbce6c7923a",
+        "invalid": false,
+        "method": "send_event",
+        "qualname": "_DownloadResourceOwner._apply_resource_submit_event",
+        "receiver_kind": "canonical_singleton"
+      },
+      {
         "caller": "app.chain.download.tasks",
         "dynamic": false,
         "events": [
@@ -2411,18 +2439,6 @@
         "caller": "app.chain.message",
         "dynamic": false,
         "events": [
-          "EventType.UserMessage"
-        ],
-        "fingerprint": "6e4d8de098b200f04c1089fc9a5a67e1064a5fac50a1c0ce0a13ea0f6cece32f",
-        "invalid": false,
-        "method": "send_event",
-        "qualname": "MessageChain._handle_message_core",
-        "receiver_kind": "injected_event_manager"
-      },
-      {
-        "caller": "app.chain.message",
-        "dynamic": false,
-        "events": [
           "EventType.CommandExcute"
         ],
         "fingerprint": "f022ca0218b956cfd193695721ddc60343030bf15baa2d7bb0a2e9ccacce6bba",
@@ -2441,6 +2457,18 @@
         "invalid": false,
         "method": "send_event",
         "qualname": "MessageChain._interaction_router._dispatch_plugin_callback",
+        "receiver_kind": "injected_event_manager"
+      },
+      {
+        "caller": "app.chain.message",
+        "dynamic": false,
+        "events": [
+          "EventType.UserMessage"
+        ],
+        "fingerprint": "9934766390c1470e31c1c04239785b21af3fcdba636898b752c920bee8143e11",
+        "invalid": false,
+        "method": "send_event",
+        "qualname": "MessageChain._publish_user_message",
         "receiver_kind": "injected_event_manager"
       },
       {
@@ -2957,7 +2985,7 @@
       }
     ],
     "static_consumer_count": 18,
-    "static_producer_call_count": 74
+    "static_producer_call_count": 75
   },
   "event_specs": {
     "ChainEventType.AgentLLMProvider": {
@@ -3172,6 +3200,21 @@
       "ordering": "priority_serial",
       "output_contract": "ResourceSelectionOutputContractData",
       "payload_contract": "ResourceSelectionContractData",
+      "payload_mode": "snapshot",
+      "schema_version": 1,
+      "sensitive_fields": [],
+      "validation_mode": "diagnostic",
+      "visibility": "plugin_public"
+    },
+    "ChainEventType.ResourceSubmit": {
+      "delivery": "ephemeral",
+      "error_behavior": "stop_chain",
+      "input_contract": "ResourceSubmitInputContractData",
+      "legacy_reason": null,
+      "mode": "chain",
+      "ordering": "priority_serial",
+      "output_contract": "ResourceSubmitOutputContractData",
+      "payload_contract": "ResourceSubmitContractData",
       "payload_mode": "snapshot",
       "schema_version": 1,
       "sensitive_fields": [],
@@ -4564,7 +4607,9 @@
       "execution": "sync_or_async",
       "family": "media-recognition",
       "input_contract": "TmdbMatchRequest",
-      "optional_parameters": [],
+      "optional_parameters": [
+        "imdbid"
+      ],
       "plugin_short_circuit": true,
       "public_to_plugins": true,
       "required_parameters": [
@@ -5423,6 +5468,32 @@
       "timeout_policy": "caller_budget",
       "version": 1
     },
+    "confirm_pending_download": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "downloader",
+      "input_contract": "PendingDownloadConfirmRequest",
+      "optional_parameters": [
+        "confirmed_selection",
+        "custom_words",
+        "downloader",
+        "episode_selection",
+        "episodes",
+        "user_specified"
+      ],
+      "plugin_short_circuit": true,
+      "public_to_plugins": true,
+      "required_parameters": [
+        "hashes"
+      ],
+      "result_contract": "PendingDownloadCheckResult | None",
+      "result_shape": "model",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
     "create_folder": {
       "aggregation": "first_non_empty",
       "error_policy": "isolate_provider",
@@ -5734,6 +5805,7 @@
       "family": "downloader",
       "input_contract": "DownloadTaskRequest",
       "optional_parameters": [
+        "confirmed_selection",
         "custom_words",
         "download_type",
         "episode_selection",
@@ -5743,7 +5815,8 @@
         "netdisk_share_token",
         "season",
         "share_password",
-        "source"
+        "source",
+        "user_specified"
       ],
       "plugin_short_circuit": true,
       "public_to_plugins": true,
@@ -6261,6 +6334,25 @@
       "timeout_policy": "caller_budget",
       "version": 1
     },
+    "get_file_stream_url": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "storage",
+      "input_contract": "StorageStreamUrlRequest",
+      "optional_parameters": [],
+      "plugin_short_circuit": true,
+      "public_to_plugins": true,
+      "required_parameters": [
+        "fileitem"
+      ],
+      "result_contract": "tuple[str, dict[str, str]] | None",
+      "result_shape": "any",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
     "get_folder": {
       "aggregation": "first_non_empty",
       "error_policy": "isolate_provider",
@@ -6695,7 +6787,9 @@
       "execution": "sync_or_async",
       "family": "media-recognition",
       "input_contract": "TmdbMatchRequest",
-      "optional_parameters": [],
+      "optional_parameters": [
+        "imdbid"
+      ],
       "plugin_short_circuit": true,
       "public_to_plugins": true,
       "required_parameters": [
@@ -6718,7 +6812,8 @@
       "family": "media-server",
       "input_contract": "MediaExistsRequest",
       "optional_parameters": [
-        "query"
+        "query",
+        "raise_on_query_failure"
       ],
       "plugin_short_circuit": true,
       "public_to_plugins": true,
@@ -6772,6 +6867,60 @@
       "timeout_policy": "caller_budget",
       "version": 1
     },
+    "mediaserver_browse_items": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "media-server",
+      "input_contract": "MediaServerBrowseRequest",
+      "optional_parameters": [
+        "genre",
+        "item_type",
+        "keyword",
+        "library_id",
+        "limit",
+        "parent_id",
+        "played_filter",
+        "sort_by",
+        "sort_order",
+        "start_index",
+        "username",
+        "year"
+      ],
+      "plugin_short_circuit": true,
+      "public_to_plugins": true,
+      "required_parameters": [
+        "server"
+      ],
+      "result_contract": "MediaServerBrowsePage | None",
+      "result_shape": "model",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
+    "mediaserver_filter_options": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "media-server",
+      "input_contract": "MediaServerFilterOptionsRequest",
+      "optional_parameters": [
+        "library_id",
+        "username"
+      ],
+      "plugin_short_circuit": true,
+      "public_to_plugins": true,
+      "required_parameters": [
+        "server"
+      ],
+      "result_contract": "MediaServerFilterOptions | None",
+      "result_shape": "model",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
     "mediaserver_image_cookies": {
       "aggregation": "first_non_empty",
       "error_policy": "isolate_provider",
@@ -6787,6 +6936,28 @@
       ],
       "result_contract": "str | dict | None",
       "result_shape": "any",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
+    "mediaserver_item_detail": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "media-server",
+      "input_contract": "MediaServerItemDetailRequest",
+      "optional_parameters": [
+        "username"
+      ],
+      "plugin_short_circuit": true,
+      "public_to_plugins": true,
+      "required_parameters": [
+        "item_id",
+        "server"
+      ],
+      "result_contract": "MediaServerItemDetail | None",
+      "result_shape": "model",
       "supports_async": true,
       "supports_sync": true,
       "timeout_policy": "caller_budget",
@@ -6948,6 +7119,34 @@
       "timeout_policy": "caller_budget",
       "version": 1
     },
+    "mediaserver_playback_session": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "media-server",
+      "input_contract": "MediaServerPlaybackSessionRequest",
+      "optional_parameters": [
+        "app_version",
+        "client_id",
+        "device_name",
+        "media_source_id",
+        "platform",
+        "user_token",
+        "username"
+      ],
+      "plugin_short_circuit": true,
+      "public_to_plugins": false,
+      "required_parameters": [
+        "item_id",
+        "server"
+      ],
+      "result_contract": "dict[str, Any] | None",
+      "result_shape": "mapping",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
     "mediaserver_playing": {
       "aggregation": "ordered_list_merge",
       "error_policy": "isolate_provider",
@@ -6971,13 +7170,57 @@
       "timeout_policy": "caller_budget",
       "version": 1
     },
+    "mediaserver_report_progress": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "media-server",
+      "input_contract": "MediaServerProgressReportRequest",
+      "optional_parameters": [
+        "allow_userdata_write",
+        "app_version",
+        "audio_stream_index",
+        "client_id",
+        "device_name",
+        "duration_ms",
+        "event_name",
+        "is_paused",
+        "media_source_id",
+        "platform",
+        "play_method",
+        "play_session_id",
+        "playback_time_ms",
+        "scrobbled",
+        "started_reported",
+        "state",
+        "subtitle_stream_index",
+        "user_token",
+        "username"
+      ],
+      "plugin_short_circuit": true,
+      "public_to_plugins": false,
+      "required_parameters": [
+        "item_id",
+        "position_ms",
+        "server"
+      ],
+      "result_contract": "dict[str, Any] | bool | None",
+      "result_shape": "any",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
     "mediaserver_search": {
       "aggregation": "ordered_list_merge",
       "error_policy": "isolate_provider",
       "execution": "sync_or_async",
       "family": "media-server",
       "input_contract": "MediaServerLibrarySearchRequest",
-      "optional_parameters": [],
+      "optional_parameters": [
+        "library_id",
+        "server"
+      ],
       "plugin_short_circuit": true,
       "public_to_plugins": true,
       "required_parameters": [
@@ -7010,6 +7253,98 @@
       ],
       "result_contract": "dict[int, str] | None",
       "result_shape": "mapping",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
+    "mediaserver_season_episodes": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "media-server",
+      "input_contract": "MediaServerSeasonEpisodeListRequest",
+      "optional_parameters": [
+        "season",
+        "season_id",
+        "username"
+      ],
+      "plugin_short_circuit": true,
+      "public_to_plugins": true,
+      "required_parameters": [
+        "item_id",
+        "server"
+      ],
+      "result_contract": "list[MediaServerBrowseItem] | None",
+      "result_shape": "list",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
+    "mediaserver_seasons": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "media-server",
+      "input_contract": "MediaServerSeasonsRequest",
+      "optional_parameters": [
+        "username"
+      ],
+      "plugin_short_circuit": true,
+      "public_to_plugins": true,
+      "required_parameters": [
+        "item_id",
+        "server"
+      ],
+      "result_contract": "list[MediaServerBrowseItem] | None",
+      "result_shape": "list",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
+    "mediaserver_stream_url": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "media-server",
+      "input_contract": "MediaServerStreamRequest",
+      "optional_parameters": [
+        "media_source_id",
+        "play_session_id",
+        "user_token"
+      ],
+      "plugin_short_circuit": true,
+      "public_to_plugins": false,
+      "required_parameters": [
+        "item_id",
+        "item_type",
+        "server"
+      ],
+      "result_contract": "str | None",
+      "result_shape": "string",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
+    "mediaserver_subtitle_url": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "media-server",
+      "input_contract": "MediaServerSubtitleUrlRequest",
+      "optional_parameters": [],
+      "plugin_short_circuit": true,
+      "public_to_plugins": false,
+      "required_parameters": [
+        "item_id",
+        "server",
+        "subtitle_id"
+      ],
+      "result_contract": "str | None",
+      "result_shape": "string",
       "supports_async": true,
       "supports_sync": true,
       "timeout_policy": "caller_budget",
@@ -7467,6 +7802,25 @@
       ],
       "result_contract": "str | None",
       "result_shape": "string",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
+    "open_file_stream": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "storage",
+      "input_contract": "StorageOpenStreamRequest",
+      "optional_parameters": [],
+      "plugin_short_circuit": true,
+      "public_to_plugins": true,
+      "required_parameters": [
+        "fileitem"
+      ],
+      "result_contract": "tuple[BinaryIO, int] | None",
+      "result_shape": "any",
       "supports_async": true,
       "supports_sync": true,
       "timeout_policy": "caller_budget",
@@ -8070,6 +8424,25 @@
       ],
       "result_contract": "StorageProviderResult",
       "result_shape": "any",
+      "supports_async": true,
+      "supports_sync": true,
+      "timeout_policy": "caller_budget",
+      "version": 1
+    },
+    "supports_file_stream": {
+      "aggregation": "first_non_empty",
+      "error_policy": "isolate_provider",
+      "execution": "sync_or_async",
+      "family": "storage",
+      "input_contract": "StorageStreamSupportRequest",
+      "optional_parameters": [],
+      "plugin_short_circuit": true,
+      "public_to_plugins": true,
+      "required_parameters": [
+        "storage"
+      ],
+      "result_contract": "bool | None",
+      "result_shape": "boolean",
       "supports_async": true,
       "supports_sync": true,
       "timeout_policy": "caller_budget",
@@ -8752,7 +9125,9 @@
       "execution": "sync_or_async",
       "family": "authentication",
       "input_contract": "UserAuthenticationRequest",
-      "optional_parameters": [],
+      "optional_parameters": [
+        "service_name"
+      ],
       "plugin_short_circuit": true,
       "public_to_plugins": true,
       "required_parameters": [
@@ -8788,10 +9163,10 @@
     }
   },
   "run_module": {
-    "call_count": 289,
+    "call_count": 303,
     "dynamic_call_count": 0,
     "dynamic_calls": [],
-    "method_count": 229,
+    "method_count": 242,
     "methods": {
       "anilist_credits": [
         {
@@ -9452,6 +9827,13 @@
           "mode": "sync"
         }
       ],
+      "confirm_pending_download": [
+        {
+          "caller": "app.chain.base",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
       "create_folder": [
         {
           "caller": "app.chain.storage",
@@ -9723,6 +10105,13 @@
           "mode": "sync"
         }
       ],
+      "get_file_stream_url": [
+        {
+          "caller": "app.chain.storage",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
       "get_folder": [
         {
           "caller": "app.chain.storage",
@@ -9854,7 +10243,28 @@
           "mode": "sync"
         }
       ],
+      "mediaserver_browse_items": [
+        {
+          "caller": "app.chain.mediaserver",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
+      "mediaserver_filter_options": [
+        {
+          "caller": "app.chain.mediaserver",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
       "mediaserver_image_cookies": [
+        {
+          "caller": "app.chain.mediaserver",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
+      "mediaserver_item_detail": [
         {
           "caller": "app.chain.mediaserver",
           "count": 1,
@@ -9910,7 +10320,21 @@
           "mode": "sync"
         }
       ],
+      "mediaserver_playback_session": [
+        {
+          "caller": "app.chain.mediaserver",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
       "mediaserver_playing": [
+        {
+          "caller": "app.chain.mediaserver",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
+      "mediaserver_report_progress": [
         {
           "caller": "app.chain.mediaserver",
           "count": 1,
@@ -9925,6 +10349,34 @@
         }
       ],
       "mediaserver_season_episode_ids": [
+        {
+          "caller": "app.chain.mediaserver",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
+      "mediaserver_season_episodes": [
+        {
+          "caller": "app.chain.mediaserver",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
+      "mediaserver_seasons": [
+        {
+          "caller": "app.chain.mediaserver",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
+      "mediaserver_stream_url": [
+        {
+          "caller": "app.chain.mediaserver",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
+      "mediaserver_subtitle_url": [
         {
           "caller": "app.chain.mediaserver",
           "count": 1,
@@ -10135,6 +10587,13 @@
           "mode": "sync"
         }
       ],
+      "open_file_stream": [
+        {
+          "caller": "app.chain.storage",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
       "parse_torrent_download_response": [
         {
           "caller": "app.chain.download.submission",
@@ -10334,6 +10793,13 @@
         }
       ],
       "storage_manage": [
+        {
+          "caller": "app.chain.storage",
+          "count": 1,
+          "mode": "sync"
+        }
+      ],
+      "supports_file_stream": [
         {
           "caller": "app.chain.storage",
           "count": 1,
@@ -10574,6 +11040,11 @@
       ],
       "user_authenticate": [
         {
+          "caller": "app.chain.mediaserver",
+          "count": 1,
+          "mode": "sync"
+        },
+        {
           "caller": "app.chain.user",
           "count": 1,
           "mode": "sync"
@@ -10601,6 +11072,41 @@
   "sdk_exports": {
     "app.sdk": [],
     "app.sdk.browser": [
+      {
+        "kind": "import",
+        "name": "BrowserOperationTimeoutError",
+        "target": "app.runtime.browser.BrowserOperationTimeoutError"
+      },
+      {
+        "kind": "import",
+        "name": "BrowserQueueCancelledError",
+        "target": "app.runtime.browser.BrowserQueueCancelledError"
+      },
+      {
+        "kind": "import",
+        "name": "BrowserQueueStatus",
+        "target": "app.runtime.browser.BrowserQueueStatus"
+      },
+      {
+        "kind": "FunctionDef",
+        "name": "browser_context",
+        "target": ""
+      },
+      {
+        "kind": "AsyncFunctionDef",
+        "name": "browser_context_async",
+        "target": ""
+      },
+      {
+        "kind": "import",
+        "name": "browser_request",
+        "target": "app.runtime.browser.browser_request"
+      },
+      {
+        "kind": "import",
+        "name": "get_browser_queue_status",
+        "target": "app.runtime.browser.get_browser_queue_status"
+      },
       {
         "kind": "FunctionDef",
         "name": "launch_browser_context",
@@ -10875,6 +11381,21 @@
       },
       {
         "kind": "import",
+        "name": "ResourceSubmitContractData",
+        "target": "app.schemas.event.ResourceSubmitContractData"
+      },
+      {
+        "kind": "import",
+        "name": "ResourceSubmitInputContractData",
+        "target": "app.schemas.event.ResourceSubmitInputContractData"
+      },
+      {
+        "kind": "import",
+        "name": "ResourceSubmitOutputContractData",
+        "target": "app.schemas.event.ResourceSubmitOutputContractData"
+      },
+      {
+        "kind": "import",
         "name": "SubscribeCompletionCheckContractData",
         "target": "app.schemas.event.SubscribeCompletionCheckContractData"
       },
@@ -11108,6 +11629,11 @@
         "kind": "import",
         "name": "set_custom_separator",
         "target": "app.domain.meta.customization.set_custom_separator"
+      },
+      {
+        "kind": "import",
+        "name": "torrent_resource_identity",
+        "target": "app.application.site.protocol.torrent_resource_identity"
       }
     ],
     "app.sdk.network": [

@@ -299,13 +299,13 @@
       "reason": "async-tool-run"
     },
     {
-      "path": "app/agent/tools/impl/recognize_captcha.py",
-      "owner": "RecognizeCaptchaTool.run",
+"path": "app/agent/tools/impl/read_log.py",
+      "owner": "ReadLogTool.run",
       "codes": [
         "override"
       ],
-      "fingerprint": "6475ed9eea3e63c5692b594a98eba7940c24f56c5ec715703194b7a07312e989",
-      "statement": "async def run(self, image_url: Optional[str]=None, cookie: Optional[str]=None, user_agent: Optional[str]=None, allow_private_network: bool=False, image_data: Optional[bytes]=None, **kwargs: object) -> str:",
+      "fingerprint": "1a3f5f74c120c3e5e7983e4dfc750377144ea683eac03eaebe22055554150792",
+      "statement": "async def run(self, logfile: str, tail: Optional[int]=DEFAULT_LOG_TAIL, level: Optional[str]=None, keyword: Optional[str]=None, **kwargs: object) -> str:",
       "reason": "async-tool-run"
     },
     {
@@ -509,16 +509,6 @@
       "reason": "runtime-mro"
     },
     {
-      "path": "app/api/endpoints/history.py",
-      "owner": "download_history",
-      "codes": [
-        "assignment"
-      ],
-      "fingerprint": "e7327c23ed2dd984fc664c9d0dc8341d955337c6472d02702665ac5e5ecdbad7",
-      "statement": "@router.get('/download', summary='查询下载历史记录', response_model=List[_SchemaDownloadHistory], openapi_extra={COLLECTION_TOTAL_OPENAPI_KEY: True})\nasync def download_history(page: Optional[int]=1, count: Optional[int]=30, query: HistoryQueryService=Depends(get_history_query_service), _: _SchemaTokenPayload=Depends(verify_token), response: Response=None) -> Any:",
-      "reason": "fastapi-response-default"
-    },
-    {
       "path": "app/api/endpoints/mfa.py",
       "owner": "passkey_list",
       "codes": [
@@ -526,16 +516,6 @@
       ],
       "fingerprint": "654f847b3b762dc8acb465d48dc8eb3ae4b4c5cc2d58b6462dcbea5d125c6dca",
       "statement": "@router.get('/passkey/list', summary='获取当前用户的 PassKey 列表', response_model=_SchemaResponse[list[_SchemaPasskeyInfo]], openapi_extra={COLLECTION_TOTAL_OPENAPI_KEY: True})\ndef passkey_list(current_user: Annotated[ApiPrincipal, Depends(get_current_active_user)], response: Response=None, service: PasskeyService=Depends(get_passkey_service), page: CompatiblePageParam=None, count: CompatibleCountParam=None) -> Any:",
-      "reason": "fastapi-response-default"
-    },
-    {
-      "path": "app/api/endpoints/plugin.py",
-      "owner": "all_plugins",
-      "codes": [
-        "assignment"
-      ],
-      "fingerprint": "5f6a039d011683394079e360301c9a5ea1b5f5aa09ee4e4826c56fdaff1aaf4f",
-      "statement": "@router.get('/', summary='所有插件', response_model=List[_SchemaPlugin], openapi_extra={COLLECTION_TOTAL_OPENAPI_KEY: True})\nasync def all_plugins(_: ApiPrincipal=Depends(get_current_active_superuser_async), state: Optional[str]='all', force: bool=False, query: Optional[str]=None, max_results: Annotated[Optional[int], Query(ge=1, le=200)]=None, page: CompatiblePageParam=None, count: CompatibleCountParam=None, response: Response=None) -> List[_SchemaPlugin]:",
       "reason": "fastapi-response-default"
     },
     {
@@ -626,16 +606,6 @@
       ],
       "fingerprint": "ed2e2a56d57aabca69b5a5778313547b43d081b1d98757758797c34aa5fb9f42",
       "statement": "@router.get('/', summary='查询所有订阅', response_model=List[_SchemaSubscribe], openapi_extra={COLLECTION_TOTAL_OPENAPI_KEY: True})\nasync def read_subscribes(response: Response=None, query: SubscriptionQueryService=Depends(get_subscription_query_service), status_service: SubscriptionExecutionStatusService=Depends(get_subscription_execution_status_service), current_user: ApiPrincipal=Depends(get_current_active_user_async), page: CompatiblePageParam=None, count: CompatibleCountParam=None) -> Any:",
-      "reason": "fastapi-response-default"
-    },
-    {
-      "path": "app/api/endpoints/subscribe.py",
-      "owner": "subscribe_history",
-      "codes": [
-        "assignment"
-      ],
-      "fingerprint": "ac30ef74741b93c556c16d34d74aa02334a761c24300522c16830145b72775de",
-      "statement": "@router.get('/history/{mtype}', summary='查询订阅历史', response_model=List[_SchemaSubscribe], openapi_extra={COLLECTION_TOTAL_OPENAPI_KEY: True})\nasync def subscribe_history(mtype: str, page: Optional[int]=1, count: Optional[int]=30, query: SubscriptionQueryService=Depends(get_subscription_query_service), current_user: ApiPrincipal=Depends(get_current_active_user_async), response: Response=None) -> Any:",
       "reason": "fastapi-response-default"
     },
     {

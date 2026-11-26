@@ -17,6 +17,7 @@ _MODEL_EXPORTS = {
     "DownloadFailure": ("app.db.models.downloadfailure", "DownloadFailure"),
     "DownloadFiles": ("app.db.models.downloadhistory", "DownloadFiles"),
     "DownloadHistory": ("app.db.models.downloadhistory", "DownloadHistory"),
+    "DownloadPending": ("app.db.models.downloadpending", "DownloadPending"),
     "MediaServerItem": ("app.db.models.mediaserver", "MediaServerItem"),
     "Message": ("app.db.models.message", "Message"),
     "NetdiskAccount": ("app.db.models.netdiskaccount", "NetdiskAccount"),

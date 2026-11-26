@@ -17,7 +17,7 @@ from app.domain.meta.infopath import (
     should_use_parent_title_for_file_stem,
 )
 from app.domain.meta.metaanime import MetaAnime
-from app.domain.meta.metabase import MetaBase
+from app.domain.meta.metabase import MetaBase, refine_subtitle_period_episode
 from app.domain.meta.metamusic import MetaMusic, infer_audio_lossless, normalize_audio_format
 from app.domain.meta.metavideo import MetaVideo
 from app.domain.meta.releasegroup import ReleaseGroupsMatcher
@@ -26,7 +26,12 @@ from app.domain.meta.runtime import (
     get_media_extensions,
     get_metainfo_accelerator,
 )
-from app.domain.meta.words import WordsMatcher, get_custom_words
+from app.domain.meta.words import (
+    WordsMatcher,
+    get_custom_words,
+    normalize_global_custom_words,
+    resolve_custom_words,
+)
 from app.schemas.media import normalize_media_source, resolve_media_identity
 from app.schemas.types import MediaSource, MediaType
 
@@ -82,6 +87,13 @@ _EXTENDED_MEDIA_ID_TAG_RE = re.compile(
     re.IGNORECASE,
 )
 _GENERIC_MEDIA_ID_TAG_RE = re.compile(r'(?:^|[;\[])media_(?:source|id)=', re.IGNORECASE)
+# 季目录全名带年份（如 Season 5 (2026)，重命名规则会生成此类目录名）：
+# Rust 加速器（moviepilot-rust 0.3.13）仍把拼写出的季名误读为剧集名，
+# 必须由 Python 参考解析器处理；待 Rust 侧修复后可移除该分流（issue #7514）。
+_SEASON_DIR_WITH_YEAR_RE = re.compile(
+    r"^(?:Season\s+|S)(\d{1,3})\s*\(\d{4}\)$",
+    re.IGNORECASE,
+)
 _RUST_PARSE_OPTIONS_CACHE_KEY = "_cache_key"
 logger = logging.getLogger(__name__)
 
@@ -405,7 +417,7 @@ def _rust_default_parse_options() -> dict[str, Any]:
         get_customization()
     )
     options = {
-        "custom_words": get_custom_words() or [],
+        "custom_words": normalize_global_custom_words(get_custom_words()),
         # PyO3 当前按 Python list 提取 Vec<String>，不能传 tuple。
         "media_exts": list(get_media_extensions()),
         "release_groups": release_groups,
@@ -431,11 +443,19 @@ def _rust_parse_options(custom_words: Optional[List[str]] = None) -> dict[str, A
     """
     收集 Rust Meta 解析所需的运行时配置，避免 Rust 层直接访问数据库和 settings。
 
-    与 Python 识别词匹配器保持一致：None 或空列表沿用全局规则，非空列表覆盖全局规则。
+    与 Python 识别词匹配器保持一致：None 或空列表沿用全局规则，非空列表默认覆盖全局规则并支持 ``@global`` 展开全局规则。
+
+    :param custom_words: 临时或订阅自定义识别词列表
+    :return: 供 Rust 解析器消费的配置字典
     """
+    default_options = _rust_default_parse_options()
     if not custom_words:
-        return _rust_default_parse_options()
-    return _rust_custom_parse_options(tuple(custom_words))
+        return default_options
+    resolved_words = resolve_custom_words(
+        custom_words,
+        global_words=default_options["custom_words"],
+    )
+    return _rust_custom_parse_options(tuple(resolved_words))
 
 
 def clear_rust_parse_options_cache() -> None:
@@ -494,24 +514,43 @@ def _meta_from_rust(parsed: Optional[dict[str, Any]]) -> Optional[MetaBase]:
     }
     for key, value in fields.items():
         setattr(meta, key, value)
+    refine_subtitle_period_episode(meta)
     return meta
 
 
 def _requires_python_metainfo(
     title: str,
     custom_words: Optional[List[str]] = None,
+    path_parts: Optional[Tuple[str, ...]] = None,
 ) -> bool:
     """
-    判断标题或临时识别词是否必须由 Python 解析器处理媒体身份标签。
+    判断标题或临时识别词是否必须由 Python 解析器处理。
 
-    :param title: 原始标题
+    除媒体身份标签外，季目录全名带年份（如 Season 5 (2026)）也必须由
+    Python 参考解析器处理：Rust 加速器仍把拼写出的季名误读为剧集名。
+
+    :param title: 原始标题或路径上下文
     :param custom_words: 临时识别词
+    :param path_parts: 路径各段名称，仅路径入口传入，用于逐段识别季目录
     :return: 是否必须使用Python解析器
     """
-    candidates = [title or "", *(custom_words or [])]
+    resolved_words = (
+        resolve_custom_words(
+            custom_words,
+            global_words=_rust_default_parse_options()["custom_words"],
+        )
+        if custom_words
+        else []
+    )
+    candidates = [title or "", *resolved_words]
     if any(_GENERIC_MEDIA_ID_TAG_RE.search(candidate) for candidate in candidates):
         return True
     if any(_PARENTHESIZED_TMDB_RE.search(candidate) for candidate in candidates):
+        return True
+    if any(
+        _SEASON_DIR_WITH_YEAR_RE.match(candidate)
+        for candidate in [*candidates, *(path_parts or ())]
+    ):
         return True
     contains_extended_id = any(
         _EXTENDED_MEDIA_ID_TAG_RE.search(candidate) for candidate in candidates
@@ -592,7 +631,11 @@ def MetaInfoPath(path: Path, custom_words: Optional[List[str]] = None, force_vid
     )
     rust_meta = None
     accelerator = get_metainfo_accelerator()
-    if accelerator and not _requires_python_metainfo(path_context, custom_words):
+    if accelerator and not _requires_python_metainfo(
+        path_context,
+        custom_words,
+        path_parts=(path.name, path.parent.name, path.parent.parent.name),
+    ):
         rust_meta = _meta_from_rust(
             accelerator.parse_metainfo_path(
                 str(path),

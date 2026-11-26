@@ -5,7 +5,6 @@
 """
 
 import json
-from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import pytest

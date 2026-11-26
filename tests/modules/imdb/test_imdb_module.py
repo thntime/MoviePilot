@@ -1,0 +1,765 @@
+"""
+IMDb 原生媒体数据源 Module 测试。
+"""
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+
+from app.api.endpoints import download as download_endpoint
+from app.domain.context import MediaInfo
+from app.domain.meta.metabase import MetaBase
+from app.domain.metainfo import MetaInfo
+from app.modules.imdb import ImdbModule
+from app.modules.imdb.api import (
+    ImdbAka,
+    ImdbApi,
+    ImdbCredit,
+    ImdbDate,
+    ImdbEpisode,
+    ImdbImage,
+    ImdbPerson,
+    ImdbSeason,
+    ImdbTitle,
+)
+from app.runtime.config import settings
+from app.runtime.tasks import TaskRegistry
+from app.schemas.context import TorrentInfo
+from app.schemas.types import MediaRecognizeType, MediaSource, MediaType
+
+
+@pytest.fixture
+def imdb_title() -> ImdbTitle:
+    """
+    构造一条包含完整基础字段的 IMDb 电视剧条目。
+    """
+    return ImdbTitle(
+        id="tt0903747",
+        type="tvSeries",
+        primaryTitle="Breaking Bad",
+        originalTitle="Breaking Bad",
+        primaryImage={"url": "https://image.example/poster.jpg", "type": "poster"},
+        startYear=2008,
+        runtimeSeconds=2820,
+        genres=["Crime", "Drama"],
+        rating={"aggregateRating": 9.5, "voteCount": 2200000},
+        plot="A chemistry teacher becomes a methamphetamine producer.",
+        originCountries=[{"code": "US", "name": "United States"}],
+        spokenLanguages=[{"code": "eng", "name": "English"}],
+    )
+
+
+@pytest.fixture
+def imdb_api(imdb_title: ImdbTitle) -> Mock:
+    """
+    构造同步和异步方法行为一致的 IMDb API 替身。
+    """
+    api = Mock(spec=ImdbApi)
+    api.search_titles.return_value = [imdb_title]
+    api.get_title.return_value = imdb_title
+    api.list_akas.return_value = [ImdbAka(text="绝命毒师")]
+    api.list_credits.return_value = [
+        ImdbCredit(
+            name=ImdbPerson(
+                id="nm0533713",
+                displayName="Vince Gilligan",
+                primaryImage=ImdbImage(url="https://image.example/director.jpg"),
+            ),
+            category="DIRECTOR",
+        ),
+        ImdbCredit(
+            name=ImdbPerson(
+                id="nm0186505",
+                displayName="Bryan Cranston",
+                primaryImage=ImdbImage(url="https://image.example/actor.jpg"),
+            ),
+            category="ACTOR",
+            characters=["Walter White"],
+        ),
+    ]
+    api.list_images.return_value = [
+        ImdbImage(url="https://image.example/backdrop.jpg", type="still_frame")
+    ]
+    api.list_episodes.return_value = [
+        ImdbEpisode(
+            id="tt0959621",
+            season="1",
+            episodeNumber=1,
+            releaseDate=ImdbDate(year=2008, month=1, day=20),
+        )
+    ]
+    api.list_seasons.return_value = [ImdbSeason(season="1", episodeCount=7)]
+    api.async_search_titles = AsyncMock(return_value=[imdb_title])
+    api.async_get_title = AsyncMock(return_value=imdb_title)
+    api.async_list_akas = AsyncMock(return_value=api.list_akas.return_value)
+    api.async_list_credits = AsyncMock(return_value=api.list_credits.return_value)
+    api.async_list_images = AsyncMock(return_value=api.list_images.return_value)
+    api.async_list_episodes = AsyncMock(return_value=api.list_episodes.return_value)
+    api.async_list_seasons = AsyncMock(return_value=api.list_seasons.return_value)
+    return api
+
+
+@pytest.fixture
+def imdb_module(imdb_api: Mock) -> ImdbModule:
+    """
+    构造注入离线 API 替身的 IMDb Module。
+    """
+    module = ImdbModule()
+    module.imdb_api = imdb_api
+    module.scraper = Mock()
+    return module
+
+
+def test_imdb_module_declares_independent_media_recognizer() -> None:
+    """
+    IMDb 应作为独立宿主媒体识别 Module 暴露稳定元数据。
+    """
+    assert ImdbModule.get_name() == "IMDb"
+    assert ImdbModule.get_subtype() == MediaRecognizeType.IMDb
+    assert ImdbModule.get_priority() == 4
+
+
+def test_imdb_api_search_uses_keyless_imdb_suggestion_endpoint() -> None:
+    """
+    IMDb 标题搜索应直接调用 IMDb 免 Key 建议接口并缓存响应。
+    """
+    api = ImdbApi()
+    api.clear_cache()
+    api._request = Mock()
+    api._request.get_json.return_value = {
+        "d": [
+            {
+                "id": "tt0111161",
+                "qid": "movie",
+                "l": "The Shawshank Redemption",
+                "y": 1994,
+            }
+        ]
+    }
+
+    results = api.search_titles("The Shawshank Redemption", limit=1)
+    cached_results = api.search_titles("The Shawshank Redemption", limit=1)
+
+    assert [item.id for item in results] == ["tt0111161"]
+    assert [item.id for item in cached_results] == ["tt0111161"]
+    api._request.get_json.assert_called_once_with(
+        "https://v2.sg.media-imdb.com/suggestion/x/"
+        "The%20Shawshank%20Redemption.json",
+        params={},
+    )
+
+    api.clear_cache()
+    api.search_titles("The Shawshank Redemption", limit=1)
+    assert api._request.get_json.call_count == 2
+
+
+def test_imdb_graphql_error_is_not_cached() -> None:
+    """
+    GraphQL 错误响应不应污染缓存，后续成功详情仍应正常写入缓存。
+    """
+    api = ImdbApi()
+    api.clear_cache()
+    api._request = Mock()
+    api._request.post_json.side_effect = [
+        {"errors": [{"message": "temporary failure"}]},
+        {
+            "data": {
+                "titles": [
+                    {
+                        "id": "tt0111161",
+                        "titleText": {"text": "The Shawshank Redemption"},
+                        "titleType": {"id": "movie"},
+                        "releaseYear": {"year": 1994},
+                    }
+                ]
+            }
+        },
+    ]
+
+    assert api.get_title("tt0111161") is None
+    detail = api.get_title("tt0111161")
+    cached_detail = api.get_title("tt0111161")
+
+    assert detail and detail.primary_title == "The Shawshank Redemption"
+    assert cached_detail and cached_detail.id == "tt0111161"
+    assert api._request.post_json.call_count == 2
+
+
+def test_imdb_title_parser_accepts_null_optional_objects() -> None:
+    """
+    GraphQL 可选对象为 null 时应保留可用详情并归一为空值。
+    """
+    detail = ImdbApi._parse_title(
+        {
+            "titles": [
+                {
+                    "id": "tt30836097",
+                    "titleType": {"id": "tvSeries"},
+                    "titleText": {"text": "19th Floor"},
+                    "originalTitleText": None,
+                    "releaseYear": None,
+                    "runtime": None,
+                    "titleGenres": None,
+                    "countriesOfOrigin": None,
+                    "spokenLanguages": None,
+                    "plot": None,
+                }
+            ]
+        }
+    )
+
+    assert detail is not None
+    assert detail.id == "tt30836097"
+    assert detail.primary_title == "19th Floor"
+    assert detail.original_title is None
+    assert detail.start_year is None
+    assert detail.runtime_seconds is None
+    assert detail.genres == []
+    assert detail.origin_countries == []
+    assert detail.spoken_languages == []
+    assert detail.plot is None
+
+
+def test_imdb_episode_parser_accepts_null_optional_objects() -> None:
+    """
+    剧集 GraphQL 可选对象为 null 时应保留单集并归一为空值。
+    """
+    episodes, next_cursor = ImdbApi._parse_episode_page(
+        {
+            "titles": [
+                {
+                    "episodes": {
+                        "episodes": {
+                            "edges": [
+                                {
+                                    "node": {
+                                        "id": "tt-episode",
+                                        "titleText": None,
+                                        "series": None,
+                                        "runtime": None,
+                                        "plot": {"plotText": None},
+                                    }
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": False,
+                                "endCursor": None,
+                            },
+                        }
+                    }
+                }
+            ]
+        }
+    )
+
+    assert next_cursor is None
+    assert len(episodes) == 1
+    assert episodes[0].id == "tt-episode"
+    assert episodes[0].title is None
+    assert episodes[0].season is None
+    assert episodes[0].episode_number is None
+    assert episodes[0].runtime_seconds is None
+    assert episodes[0].plot is None
+
+
+def test_imdb_season_parser_accepts_null_episodes() -> None:
+    """
+    季列表 GraphQL 的 episodes 为 null 时应按空列表处理。
+    """
+    seasons = ImdbApi._parse_seasons(
+        {
+            "titles": [
+                {
+                    "episodes": None,
+                }
+            ]
+        }
+    )
+
+    assert seasons == []
+
+
+def test_imdb_clear_cache_registers_async_cleanup_in_running_loop() -> None:
+    """
+    同步清缓存入口在异步宿主中应登记任务，并保留原同步调用约定。
+    """
+
+    async def scenario() -> None:
+        """
+        验证异步缓存清理直到完成前都由宿主登记器持有。
+        """
+        api = ImdbApi()
+        registry = TaskRegistry()
+        release = asyncio.Event()
+
+        async def clear_async_cache() -> None:
+            """
+            等待测试释放，确保可以观察登记中的任务。
+            """
+            await release.wait()
+
+        with (
+            patch("app.modules.imdb.api.get_task_registry", return_value=registry),
+            patch.object(api, "async_clear_cache", side_effect=clear_async_cache),
+        ):
+            assert api.clear_cache() is None
+            assert [record.owner for record in registry.records] == [
+                "module.imdb.cache_clear"
+            ]
+
+            release.set()
+            await registry.records[0].task
+            await asyncio.sleep(0)
+
+        assert registry.records == ()
+        api.close()
+
+    asyncio.run(scenario())
+
+
+def test_async_imdb_api_merges_paginated_episodes() -> None:
+    """
+    IMDb 异步剧集查询应使用 GraphQL 游标合并并缓存所有分页。
+    """
+    api = ImdbApi()
+    asyncio.run(api.async_clear_cache())
+    api._async_request = Mock()
+    api._async_request.post_json = AsyncMock(
+        side_effect=[
+            {
+                "data": {
+                    "titles": [
+                        {
+                            "episodes": {
+                                "episodes": {
+                                    "edges": [
+                                        {
+                                            "node": {
+                                                "id": "tt-first",
+                                                "series": {
+                                                    "episodeNumber": {
+                                                        "seasonNumber": 1,
+                                                        "episodeNumber": 1,
+                                                    }
+                                                },
+                                            }
+                                        }
+                                    ],
+                                    "pageInfo": {
+                                        "hasNextPage": True,
+                                        "endCursor": "next-page",
+                                    },
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "data": {
+                    "titles": [
+                        {
+                            "episodes": {
+                                "episodes": {
+                                    "edges": [
+                                        {
+                                            "node": {
+                                                "id": "tt-second",
+                                                "series": {
+                                                    "episodeNumber": {
+                                                        "seasonNumber": 1,
+                                                        "episodeNumber": 2,
+                                                    }
+                                                },
+                                            }
+                                        }
+                                    ],
+                                    "pageInfo": {
+                                        "hasNextPage": False,
+                                        "endCursor": None,
+                                    },
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "data": {
+                    "titles": [
+                        {
+                            "episodes": {
+                                "episodes": {
+                                    "edges": [
+                                        {
+                                            "node": {
+                                                "id": "tt-first",
+                                                "series": {
+                                                    "episodeNumber": {
+                                                        "seasonNumber": 1,
+                                                        "episodeNumber": 1,
+                                                    }
+                                                },
+                                            }
+                                        }
+                                    ],
+                                    "pageInfo": {
+                                        "hasNextPage": True,
+                                        "endCursor": "next-page",
+                                    },
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "data": {
+                    "titles": [
+                        {
+                            "episodes": {
+                                "episodes": {
+                                    "edges": [
+                                        {
+                                            "node": {
+                                                "id": "tt-second",
+                                                "series": {
+                                                    "episodeNumber": {
+                                                        "seasonNumber": 1,
+                                                        "episodeNumber": 2,
+                                                    }
+                                                },
+                                            }
+                                        }
+                                    ],
+                                    "pageInfo": {
+                                        "hasNextPage": False,
+                                        "endCursor": None,
+                                    },
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+        ]
+    )
+
+    results = asyncio.run(api.async_list_episodes("tt-series"))
+    cached_results = asyncio.run(api.async_list_episodes("tt-series"))
+
+    assert [item.id for item in results] == ["tt-first", "tt-second"]
+    assert [item.id for item in cached_results] == ["tt-first", "tt-second"]
+    assert api._async_request.post_json.await_count == 2
+    assert api._async_request.post_json.await_args_list[0].kwargs["json"][
+        "variables"
+    ] == {"after": None, "first": 100, "titles": ("tt-series",)}
+    assert api._async_request.post_json.await_args_list[1].kwargs["json"][
+        "variables"
+    ] == {"after": "next-page", "first": 100, "titles": ("tt-series",)}
+
+    asyncio.run(api.async_clear_cache())
+    refreshed_results = asyncio.run(api.async_list_episodes("tt-series"))
+    assert [item.id for item in refreshed_results] == ["tt-first", "tt-second"]
+    assert api._async_request.post_json.await_count == 4
+
+
+def test_imdb_proxy_snapshot_reloads_client_and_closes_old_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    代理变更应关闭旧 IMDb 客户端并按新代理快照重建。
+    """
+    module = ImdbModule()
+    old_client = Mock()
+    new_client = Mock()
+    monkeypatch.setattr(settings, "PROXY_HOST", "http://old-proxy:7890")
+
+    with patch("app.modules.imdb.ImdbApi", side_effect=[old_client, new_client]) as api_type:
+        module.init_module()
+        old_proxy = settings.PROXY
+        monkeypatch.setattr(settings, "PROXY_HOST", "http://new-proxy:7890")
+        new_proxy = settings.PROXY
+        module.on_config_changed()
+
+    assert api_type.call_args_list[0].kwargs["proxies"] == old_proxy
+    assert api_type.call_args_list[1].kwargs["proxies"] == new_proxy
+    old_client.close.assert_called_once_with()
+    assert module.imdb_api is new_client
+
+
+def test_imdb_module_clear_cache_delegates_to_api(
+    imdb_module: ImdbModule,
+) -> None:
+    """
+    系统统一清缓存动作应清理 IMDb HTTP 缓存区。
+    """
+    imdb_module.clear_cache()
+
+    imdb_module.imdb_api.clear_cache.assert_called_once_with()
+
+
+def test_imdb_search_respects_source_and_returns_generic_identity(
+    imdb_module: ImdbModule,
+) -> None:
+    """
+    IMDb 搜索只响应选中的来源，并返回来源与原生 ID 对。
+    """
+    meta = MetaBase("Breaking Bad")
+    meta.name = "Breaking Bad"
+    meta.type = MediaType.TV
+
+    assert imdb_module.search_medias(meta, media_source=MediaSource.Douban) is None
+
+    results = imdb_module.search_medias(meta, media_source=MediaSource.IMDb)
+
+    assert results and len(results) == 1
+    assert results[0].media_source == MediaSource.IMDb
+    assert results[0].media_id == "tt0903747"
+    assert results[0].imdb_id == "tt0903747"
+    assert results[0].type == MediaType.TV
+
+
+def test_imdb_summary_keeps_unknown_adult_state_missing() -> None:
+    """
+    IMDb 搜索摘要缺少成人标记时不能把未知值误写为否。
+    """
+    result = ImdbModule._to_media_info(
+        ImdbTitle(
+            id="tt0000001",
+            type="movie",
+            primaryTitle="Summary Movie",
+            startYear=2024,
+        )
+    )
+
+    assert result.adult is None
+
+
+def test_imdb_explicit_identity_recognition_enriches_media_info(
+    imdb_module: ImdbModule,
+) -> None:
+    """
+    显式 IMDb ID 识别应补齐别名、演职员、剧集和图片。
+    """
+    result = imdb_module.recognize_media(
+        media_source=MediaSource.IMDb,
+        media_id="TT0903747",
+    )
+
+    assert isinstance(result, MediaInfo)
+    assert result.media_source == MediaSource.IMDb
+    assert result.media_id == "tt0903747"
+    assert result.title == "Breaking Bad"
+    assert result.names == ["Breaking Bad", "绝命毒师"]
+    assert result.backdrop_path == "https://image.example/backdrop.jpg"
+    assert result.directors[0]["name"] == "Vince Gilligan"
+    assert result.actors[0]["character"] == "Walter White"
+    assert result.seasons == {1: [1]}
+    assert result.season_years == {1: "2008"}
+    assert result.number_of_episodes == 1
+    assert result.runtime == 47
+    assert result.category == ""
+    assert result.library_category == ""
+
+
+def test_imdb_name_recognition_requires_imdb_selection(
+    imdb_module: ImdbModule, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    名称识别仅在请求级或全局来源选中 IMDb 时执行。
+    """
+    meta = MetaBase("绝命毒师")
+    meta.name = "绝命毒师"
+    meta.cn_name = "绝命毒师"
+    meta.type = MediaType.TV
+    monkeypatch.setattr(settings, "RECOGNIZE_SOURCE", MediaSource.TMDB.value)
+
+    assert imdb_module.recognize_media(meta=meta) is None
+
+    result = imdb_module.recognize_media(
+        meta=meta,
+        media_source=MediaSource.IMDb,
+    )
+
+    assert result and result.media_id == "tt0903747"
+    imdb_module.imdb_api.search_titles.assert_called_with("绝命毒师")
+
+
+def test_imdb_recognition_rejects_invalid_or_music_identity(
+    imdb_module: ImdbModule,
+) -> None:
+    """
+    IMDb Module 不应接管非法 ID 或音乐识别请求。
+    """
+    assert (
+        imdb_module.recognize_media(
+            media_source=MediaSource.IMDb,
+            media_id="0903747",
+        )
+        is None
+    )
+    assert (
+        imdb_module.recognize_media(
+            mtype=MediaType.MUSIC,
+            media_source=MediaSource.IMDb,
+            media_id="tt0903747",
+        )
+        is None
+    )
+
+
+def test_async_imdb_recognition_uses_async_detail_pipeline(
+    imdb_module: ImdbModule,
+) -> None:
+    """
+    异步显式识别应使用异步详情管线并保持统一身份。
+    """
+    result = asyncio.run(
+        imdb_module.async_recognize_media(
+            media_source=MediaSource.IMDb,
+            media_id="tt0903747",
+        )
+    )
+
+    assert result and result.media_source == MediaSource.IMDb
+    assert result.media_id == "tt0903747"
+    assert result.backdrop_path == "https://image.example/backdrop.jpg"
+    imdb_module.imdb_api.async_get_title.assert_awaited()
+    imdb_module.imdb_api.async_list_credits.assert_awaited_once_with("tt0903747")
+
+
+@pytest.fixture
+def imdb_episode_title(imdb_api: Mock, imdb_title: ImdbTitle) -> ImdbTitle:
+    """
+    在同步和异步标题接口中提供同一单集及其父剧集详情。
+    """
+    episode = ImdbApi._parse_title({
+        "titles": [{
+            "id": "tt0959621",
+            "titleType": {"id": "tvEpisode"},
+            "titleText": {"text": "Pilot"},
+            "series": {
+                "series": {"id": imdb_title.id},
+                "episodeNumber": {"seasonNumber": 1, "episodeNumber": 1},
+            },
+        }],
+    })
+    assert episode is not None
+    titles = {episode.id: episode, imdb_title.id: imdb_title}
+    imdb_api.get_title.side_effect = titles.get
+    imdb_api.async_get_title.side_effect = titles.get
+    return episode
+
+
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_imdb_episode_recognition_uses_parent_identity_and_resource_range(
+    imdb_module: ImdbModule, imdb_episode_title: ImdbTitle, async_mode: bool,
+) -> None:
+    """
+    从单集识别所属剧集，保留资源本身的季集范围。
+    """
+    meta = MetaInfo("Breaking.Bad.S02E02-E07.1080p.WEB-DL")
+    query = {"meta": meta, "media_source": MediaSource.IMDb, "media_id": imdb_episode_title.id}
+    if async_mode:
+        result = asyncio.run(imdb_module.async_recognize_media(**query))
+    else:
+        result = imdb_module.recognize_media(**query)
+
+    assert result is not None
+    assert (result.media_source, result.media_id, result.imdb_id) == (
+        MediaSource.IMDb, "tt0903747", "tt0903747",
+    )
+    assert (result.type, result.title, result.season) == (MediaType.TV, "Breaking Bad", 2)
+    assert meta.season_list == [2]
+    assert meta.episode_list == [2, 3, 4, 5, 6, 7]
+
+
+@pytest.mark.parametrize("parent_problem", ["no_link", "no_title", "movie", "different_id"])
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_imdb_episode_without_verified_parent_is_unrecognized(
+    imdb_module: ImdbModule, imdb_api: Mock, imdb_episode_title: ImdbTitle,
+    parent_problem: str, async_mode: bool,
+) -> None:
+    """
+    父剧集缺失或返回身份冲突时，单集不能作为可用媒体身份。
+    """
+    titles = {imdb_episode_title.id: imdb_episode_title}
+    if parent_problem == "no_link":
+        titles[imdb_episode_title.id] = ImdbTitle(id=imdb_episode_title.id, type="tvEpisode")
+    elif parent_problem == "movie":
+        titles["tt0903747"] = ImdbTitle(id="tt0903747", type="movie")
+    elif parent_problem == "different_id":
+        titles["tt0903747"] = ImdbTitle(id="tt0000001", type="tvSeries")
+    imdb_api.get_title.side_effect = titles.get
+    imdb_api.async_get_title.side_effect = titles.get
+
+    if async_mode:
+        result = asyncio.run(imdb_module.async_recognize_media(
+            media_source=MediaSource.IMDb, media_id=imdb_episode_title.id,
+        ))
+    else:
+        result = imdb_module.recognize_media(
+            media_source=MediaSource.IMDb, media_id=imdb_episode_title.id,
+        )
+
+    assert result is None
+    imdb_api.list_episodes.assert_not_called()
+    imdb_api.async_list_episodes.assert_not_awaited()
+
+
+@pytest.mark.parametrize("parent_found", [True, False], ids=["parent-found", "parent-missing"])
+def test_download_add_resolves_imdb_episode_for_season_pack(
+    imdb_module: ImdbModule, imdb_api: Mock, imdb_episode_title: ImdbTitle,
+    parent_found: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    整季下载仅使用已核实的父剧集身份，查不到时要求确认。
+    """
+    if not parent_found:
+        imdb_api.get_title.side_effect = {imdb_episode_title.id: imdb_episode_title}.get
+    downloader = Mock()
+    downloader.download_single.return_value = "download-1"
+    monkeypatch.setattr(download_endpoint, "MediaChain", lambda: imdb_module)
+    monkeypatch.setattr(download_endpoint, "DownloadChain", lambda: downloader)
+
+    response = download_endpoint.add(
+        torrent_in=TorrentInfo(title="Breaking Bad S02 Complete 1080p WEB-DL"),
+        media_source=MediaSource.IMDb,
+        media_id=imdb_episode_title.id,
+        current_user=SimpleNamespace(name="tester"),
+    )
+
+    if not parent_found:
+        assert response.success is False
+        assert response.data.requires_confirmation is True
+        downloader.download_single.assert_not_called()
+        return
+    assert response.success is True
+    downloader.download_single.assert_called_once()
+    context = downloader.download_single.call_args.kwargs["context"]
+    assert context.media_info.media_id == "tt0903747"
+    assert context.media_info.type == MediaType.TV
+    assert context.meta_info.season_list == [2]
+    assert context.meta_info.episode_list == []
+
+
+def test_imdb_scraping_only_handles_imdb_source(
+    imdb_module: ImdbModule,
+) -> None:
+    """
+    IMDb NFO 和图片刮削只响应显式 IMDb 刮削来源。
+    """
+    media_info = MediaInfo()
+    media_info.scrape_source = MediaSource.Douban.value
+    assert imdb_module.metadata_nfo(media_info) is None
+    assert imdb_module.metadata_img(media_info) is None
+
+    media_info.scrape_source = MediaSource.IMDb.value
+    imdb_module.scraper.get_metadata_nfo.return_value = "<movie />"
+    imdb_module.scraper.get_metadata_img.return_value = {"poster.jpg": "url"}
+
+    assert imdb_module.metadata_nfo(media_info) == "<movie />"
+    assert imdb_module.metadata_img(media_info) == {"poster.jpg": "url"}

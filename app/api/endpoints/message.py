@@ -15,9 +15,13 @@ from app.adapters.external.wechat import WXBizMsgCrypt
 from app.adapters.web.security.access import verify_apitoken, verify_token
 from app.api.context import get_background_task_registry, resolve_background_task_registry
 from app.api.dependencies.agent import get_message_query_service
-from app.api.dependencies.auth import get_current_active_superuser
+from app.api.dependencies.auth import get_current_active_superuser, get_current_active_user
 from app.api.principal import ApiPrincipal
-from app.api.response import ResponseAPIRouter
+from app.api.response import (
+    PositiveCountParam,
+    PositivePageParam,
+    ResponseAPIRouter,
+)
 from app.application.configuration import (
     get_api_runtime_config_snapshot,
     get_configured_system_config,
@@ -34,7 +38,7 @@ from app.schemas.message import MessageClearScope as _SchemaMessageClearScope
 from app.schemas.message import MessageHistoryItem as _SchemaMessageHistoryItem
 from app.schemas.message import Subscription as _SchemaSubscription
 from app.schemas.message import SubscriptionMessage as _SchemaSubscriptionMessage
-from app.schemas.message import WebMessageItem as _SchemaWebMessageItem
+from app.schemas.message import WebPushPublicKeyData as _SchemaWebPushPublicKeyData
 from app.schemas.response import Response as _SchemaResponse
 from app.schemas.token import TokenPayload as _SchemaTokenPayload
 from app.schemas.types import NotificationChannel, SystemConfigKey
@@ -177,10 +181,10 @@ async def user_message(
 async def web_message(
     request: Request,
     text: Optional[str] = None,
-    current_user: ApiPrincipal = Depends(get_current_active_superuser),
+    current_user: ApiPrincipal = Depends(get_current_active_user),
 ) -> _SchemaResponse[None]:
     """
-    WEB消息响应
+    接收并处理当前登录用户的 WEB 消息，按真实登录用户身份绑定权限。
     """
     images = None
     content_type = request.headers.get("content-type") or ""
@@ -204,39 +208,65 @@ async def web_message(
     MessageChain().handle_message(
         channel=NotificationChannel.Web,
         source=current_user.name,
-        userid=current_user.name,
+        userid=str(current_user.id),
         username=current_user.name,
         text=text or "",
         images=images,
+        is_channel_admin=bool(current_user.is_superuser),
     )
     return _SchemaResponse(success=True)
 
 
-@router.get("/web", summary="获取WEB消息", response_model=List[_SchemaWebMessageItem])
-async def get_web_message(
+@router.get(
+    "/web",
+    summary="获取消息历史（兼容入口）",
+    response_model=List[_SchemaMessageHistoryItem],
+    deprecated=True,
+)
+@router.get(
+    "/history",
+    summary="获取消息历史",
+    response_model=List[_SchemaMessageHistoryItem],
+)
+async def get_message_history(
     _: _SchemaTokenPayload = Depends(verify_token),
     service: MessageQueryService = Depends(get_message_query_service),
-    page: Optional[int] = 1,
-    count: Optional[int] = 20,
-) -> List[dict[str, Any]]:
+    page: PositivePageParam = 1,
+    count: PositiveCountParam = 20,
+) -> List[_SchemaMessageHistoryItem]:
     """
-    获取WEB消息列表
+    分页获取消息表中的全部历史记录，包含接收消息与发送通知。
+
+    旧路径 GET /api/v1/message/web 作为兼容入口保留相同行为；仅查询系统已发送通知时使用 GET /api/v1/message/notification。
+
+    :param _: 已验证的访问令牌载荷
+    :param service: 消息历史查询服务
+    :param page: 页码，从 1 开始，最小为 1；直接调用传入 None 时默认第 1 页
+    :param count: 每页最多返回条数，最小为 1；直接调用传入 None 时默认 20 条
+    :return: 按登记时间和主键倒序排列的消息历史列表
     """
-    return await service.list_web(
+    messages = await service.list_history(
         page=page if page is not None else 1,
         count=count if count is not None else 20,
     )
+    return [_SchemaMessageHistoryItem(**message) for message in messages]
 
 
 @router.get("/notification", summary="获取通知消息", response_model=List[_SchemaMessageHistoryItem])
 async def get_notification_message(
     _: _SchemaTokenPayload = Depends(verify_token),
     service: MessageQueryService = Depends(get_message_query_service),
-    page: Optional[int] = 1,
-    count: Optional[int] = 20,
+    page: PositivePageParam = 1,
+    count: PositiveCountParam = 20,
 ) -> List[_SchemaMessageHistoryItem]:
     """
-    获取系统发送的通知消息列表。
+    获取清理水位之后系统发送的通知消息列表，仅包含发送方向（action=1）记录。
+
+    :param _: 已验证的访问令牌载荷
+    :param service: 消息历史查询服务
+    :param page: 页码，从 1 开始，最小为 1；直接调用传入 None 时默认第 1 页
+    :param count: 每页最多返回条数，最小为 1；直接调用传入 None 时默认 20 条
+    :return: 按登记时间和主键倒序排列的系统通知消息列表
     """
     clear_before = _get_notification_clear_before()
     messages = await service.list_notifications(
@@ -364,6 +394,29 @@ def incoming_verify(
     return vocechat_verify()
 
 
+@router.get(
+    "/webpush/public-key",
+    summary="获取客户端webpush公钥",
+    response_model=_SchemaResponse[_SchemaWebPushPublicKeyData],
+)
+def get_webpush_public_key(
+    _: _SchemaTokenPayload = Depends(verify_token),
+) -> _SchemaResponse[_SchemaWebPushPublicKeyData]:
+    """
+    返回当前实例用于浏览器 Web Push 订阅的 VAPID 公钥
+    """
+    public_key = get_api_runtime_config_snapshot().vapid_public_key
+    if not public_key:
+        return _SchemaResponse(
+            success=False,
+            message="未配置有效的 WebPush VAPID 公钥",
+        )
+    return _SchemaResponse(
+        success=True,
+        data=_SchemaWebPushPublicKeyData(public_key=public_key),
+    )
+
+
 @router.post(
     "/webpush/subscribe",
     summary="客户端webpush通知订阅",
@@ -397,6 +450,7 @@ def send_notification(
     if not subscriptions:
         return _SchemaResponse(success=True, message="没有可发送的浏览器通知")
 
+    api_config = get_api_runtime_config_snapshot()
     success_count = 0
     failure_count = 0
     for sub in subscriptions:
@@ -404,8 +458,8 @@ def send_notification(
             send_webpush(
                 subscription=sub,
                 data=json.dumps(payload.model_dump()),
-                vapid_private_key=get_api_runtime_config_snapshot().vapid_private_key,
-                vapid_subject=get_api_runtime_config_snapshot().vapid_subject,
+                vapid_private_key=api_config.vapid_private_key,
+                vapid_subject=api_config.vapid_subject,
                 **webpush_options_for_endpoint(sub.get("endpoint")),
             )
             success_count += 1

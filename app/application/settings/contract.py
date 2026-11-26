@@ -290,6 +290,15 @@ SYSTEMCONFIG_CONTRACTS: dict[SystemConfigKey, _SystemConfigContract] = {
         operations=_LIST_OBJECT_OPERATIONS,
         match_field="name",
     ),
+    SystemConfigKey.MediaServerUserCredentials: _internal_contract(
+        "media_servers", Optional[dict[str, JsonData]], sensitive=True
+    ),
+    SystemConfigKey.DanmakuConfig: _internal_contract(
+        "media_servers", Optional[dict[str, JsonData]], sensitive=True
+    ),
+    SystemConfigKey.DanmakuBindings: _internal_contract(
+        "media_servers", Optional[dict[str, JsonData]]
+    ),
     SystemConfigKey.Notifications: _contract(
         "notifications",
         Optional[list[NotificationConf]],
@@ -634,7 +643,9 @@ _RESTART_REQUIRED_GROUPS = {
     "system_update",
 }
 # 所在分组需要重启，但由调用方逐次读取、修改后立即生效的例外项。
-_IMMEDIATE_SETTINGS_IN_RESTART_GROUPS = frozenset({"API_DOCS_ENABLE"})
+_IMMEDIATE_SETTINGS_IN_RESTART_GROUPS = frozenset(
+    {"API_DOCS_ENABLE", "VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY", "VAPID_SUBJECT"}
+)
 
 
 def _load_source_catalog() -> dict[str, Any]:

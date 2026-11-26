@@ -8,6 +8,7 @@ import json
 import mimetypes
 import re
 import threading
+import unicodedata
 import uuid
 from collections.abc import Mapping
 from concurrent.futures import CancelledError as FutureCancelledError
@@ -15,7 +16,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Tuple, Union, cast
 from urllib.parse import unquote, urlparse
 
 from app.application.agent import (
@@ -50,6 +51,9 @@ from app.runtime.tasks import get_task_registry
 from app.schemas.message import IncomingMessage, Message
 from app.schemas.notification import ChannelCapabilityManager
 from app.schemas.types import EventType, MessageType, NotificationChannel
+
+if TYPE_CHECKING:
+    from app.application.security.user import UserSnapshot
 
 
 class MessageResponsePort(Protocol):
@@ -324,11 +328,22 @@ class MessageChain(ChainBase):
             callback_data: Optional[str] = None,
     ) -> None:
         """
-        识别消息内容，执行操作
+        识别消息内容并执行对应操作。
+
+        外部渠道中以标点或符号开头的纯文本优先交给插件，避免验证码等插件输入被
+        智能体拦截或写入普通消息历史；斜杠命令和 Web 聊天仍按原路由处理。
         """
         text = text or ""
         images = IncomingMessage.MessageImage.normalize_list(images)
-        if self._handle_channel_authorization(channel, source, userid, username, text, callback_data):
+        is_special_plugin_text = (
+            channel not in {NotificationChannel.Web, NotificationChannel.WebAgent}
+            and not (images or audio_refs or files or callback_data)
+            and self._is_special_plugin_text(text)
+        )
+        if self._handle_channel_authorization(
+                channel, source, userid, username, text, callback_data,
+                allow_plugin_input=is_special_plugin_text,
+        ):
             return
 
         # 兼容归一化：结构化回调优先，CALLBACK: 文本前缀作为旧渠道和插件直接调用的兼容入口
@@ -395,6 +410,17 @@ class MessageChain(ChainBase):
                 original_chat_id=original_chat_id,
                 is_channel_admin=is_channel_admin,
             )
+
+            is_non_admin_web = (
+                channel in {NotificationChannel.Web, NotificationChannel.WebAgent}
+                and is_channel_admin is False
+            )
+
+            if is_special_plugin_text and not is_non_admin_web:
+                # 插件验证码等专用输入不进入 Agent、普通历史或传统命令路由。
+                self._dispatch_plugin_text(interaction_context, text, reply_to_message_id)
+                return
+
             member_result = self._handle_channel_member_message(
                 interaction_context, text, normalized_callback, images, files, has_audio_input,
             ) if channel_managed else None
@@ -402,7 +428,7 @@ class MessageChain(ChainBase):
                 processing_finish_deferred = member_result
                 return
 
-            if (not channel_managed or is_channel_admin) and self._plugin_input_interaction_handler().handle_text(
+            if (not channel_managed or is_channel_admin) and not is_non_admin_web and self._plugin_input_interaction_handler().handle_text(
                     context=interaction_context,
                     text=text,
                     reply_to_message_id=reply_to_message_id,
@@ -470,24 +496,251 @@ class MessageChain(ChainBase):
                     original_chat_id=original_chat_id,
                 )
 
+    def _dispatch_plugin_text(
+        self, context: InteractionContext, text: str, reply_to_message_id: Optional[Union[str, int]],
+    ) -> None:
+        """
+        将插件专用文本优先投递给活动输入会话，无会话时广播原有用户消息事件。
+
+        :param context: 本次消息的渠道、发送者及会话信息
+        :param text: 已确认以标点或符号开头的原始纯文本
+        :param reply_to_message_id: 回复目标，用于匹配插件输入会话
+        """
+        if self._plugin_input_interaction_handler().handle_text(
+                context=context, text=text, reply_to_message_id=reply_to_message_id,
+        ):
+            return
+        self._publish_user_message(context, text, reply_to_message_id)
+
+    def _publish_user_message(
+        self, context: InteractionContext, text: str, reply_to_message_id: Optional[Union[str, int]],
+    ) -> None:
+        """
+        按原有事件契约向插件发布用户文本，供普通路由和专用输入共用。
+
+        :param context: 本次消息的渠道、发送者及会话信息
+        :param text: 发给插件处理的原始用户文本
+        :param reply_to_message_id: 保留的回复目标消息标识
+        """
+        self.eventmanager.send_event(
+            EventType.UserMessage,
+            {
+                "text": text,
+                "userid": context.user_id,
+                "channel": context.channel,
+                "source": context.source,
+                "chat_id": context.original_chat_id,
+                "reply_to_message_id": reply_to_message_id,
+            },
+        )
+
+    def _resolve_approved_channel_member(
+        self, context: InteractionContext,
+    ) -> Tuple[bool, Optional["UserSnapshot"]]:
+        """
+        实时解析已批准普通成员的能力与归属，区分未批准成员和失效授权。
+
+        :param context: 本次渠道消息上下文
+        :return: (是否允许继续, 已批准成员快照)；未申请或待审批返回 (True, None)，授权失效已回复错误时返回 (False, None)
+        """
+        authorization = get_channel_authorization()
+        if authorization is None:
+            return False, None
+        try:
+            member = authorization.find(context.channel.value, context.source or "", str(context.user_id))
+            if member is None or member.status == "pending":
+                return True, None
+            return True, authorization.principal(member.id)
+        except (PermissionError, ValueError) as error:
+            self.post_message(Message(
+                channel=context.channel, source=context.source, userid=context.user_id,
+                title=str(error), save_history=False,
+            ))
+            return False, None
+
+    def _dispatch_member_media_text(
+        self, context: InteractionContext, text: str, principal: "UserSnapshot",
+    ) -> bool:
+        """
+        仅在传统媒体交互范围内处理已批准普通成员的文本输入，不进入旧管理会话。
+
+        :param context: 本次渠道消息上下文
+        :param text: 去除 /noai 等控制前缀后的交互文本
+        :param principal: 实时复核后的普通成员权限与归属快照
+        :return: 已被传统媒体交互消费时返回 True
+        """
+        if not text:
+            return False
+        status = self._mark_message_processing_started(
+            channel=context.channel, source=context.source or "", userid=context.user_id,
+            original_message_id=context.original_message_id, original_chat_id=context.original_chat_id, text=text,
+        )
+        try:
+            return _MediaInteractionChain().handle_text_interaction(
+                channel=context.channel,
+                source=context.source or "",
+                userid=context.user_id,
+                username=context.username or str(context.user_id),
+                text=text,
+                allowed_scopes=principal.permissions,
+                owner_username=principal.name,
+            )
+        finally:
+            self._mark_message_processing_finished(
+                channel=context.channel, source=context.source or "", userid=context.user_id, status=status,
+                original_message_id=context.original_message_id, original_chat_id=context.original_chat_id,
+            )
+
+    def _dispatch_member_media_callback(
+        self, context: InteractionContext, callback_data: str, principal: "UserSnapshot",
+    ) -> bool:
+        """
+        在成员实时能力范围内处理传统媒体交互按钮回调。
+
+        :param context: 本次渠道消息上下文
+        :param callback_data: 已归一化的媒体交互回调载荷
+        :param principal: 实时复核后的普通成员权限与归属快照
+        :return: 回调不延后结束状态，固定返回 False
+        """
+        if not ChannelCapabilityManager.supports_callbacks(context.channel):
+            logger.warning("渠道 %s 不支持回调，但收到了回调消息：%s", context.channel.value, callback_data)
+            return False
+        status = self._mark_message_processing_started(
+            channel=context.channel, source=context.source or "", userid=context.user_id,
+            original_message_id=context.original_message_id, original_chat_id=context.original_chat_id,
+            text=callback_data,
+        )
+        try:
+            _MediaInteractionChain().handle_callback_interaction(
+                callback_data=callback_data,
+                channel=context.channel,
+                source=context.source or "",
+                userid=context.user_id,
+                username=context.username or str(context.user_id),
+                original_message_id=context.original_message_id,
+                original_chat_id=context.original_chat_id,
+                allowed_scopes=principal.permissions,
+                owner_username=principal.name,
+            )
+        finally:
+            self._mark_message_processing_finished(
+                channel=context.channel, source=context.source or "", userid=context.user_id, status=status,
+                original_message_id=context.original_message_id, original_chat_id=context.original_chat_id,
+            )
+        return False
+
+    def _handle_approved_channel_member_text(
+        self, context: InteractionContext, text: str, principal: "UserSnapshot",
+        images: Optional[List[IncomingMessage.MessageImage]], files: Optional[List[IncomingMessage.MessageAttachment]],
+        has_audio_input: bool,
+    ) -> bool:
+        """
+        路由已批准普通成员的文本消息：优先按配置分流受控 Agent 与受控传统媒体交互。
+
+        :param context: 平台消息上下文
+        :param text: 转写后的用户输入文本
+        :param principal: 实时复核后的普通成员权限与归属快照
+        :param images: 归一化图片附件
+        :param files: 文件附件
+        :param has_audio_input: 是否已有语音输入
+        :return: 是否延后结束处理中状态
+        """
+        no_ai_requested, no_ai_text = self._strip_no_ai_prefix(text)
+        if no_ai_requested:
+            if not no_ai_text:
+                self.post_message(Message(
+                    channel=context.channel, source=context.source, userid=context.user_id,
+                    title="请输入要使用传统交互处理的内容", save_history=False,
+                ))
+                return False
+            self._dispatch_member_media_text(context, no_ai_text, principal)
+            return False
+
+        if self._has_ai_prefix(text) or is_agent_learning_command(text):
+            if not self.runtime_config.ai_agent_enable:
+                self.post_message(Message(
+                    channel=context.channel, source=context.source, userid=context.user_id,
+                    title="AI Agent 未启用，请联系管理员。", save_history=False,
+                ))
+                return False
+            return self._handle_ai_message(
+                text=text, channel=context.channel, source=context.source or "", userid=context.user_id,
+                username=context.username or "", is_channel_admin=False,
+                original_message_id=context.original_message_id, original_chat_id=context.original_chat_id,
+                images=images, files=files, has_audio_input=has_audio_input,
+            )
+
+        media_attempted = False
+        if media_interaction_manager.get_by_user(context.user_id) is not None:
+            media_attempted = True
+            if self._dispatch_member_media_text(context, text, principal):
+                return False
+
+        if self.runtime_config.ai_agent_enable and (
+            self.runtime_config.ai_agent_global or images or files or has_audio_input
+        ):
+            return self._handle_ai_message(
+                text=text, channel=context.channel, source=context.source or "", userid=context.user_id,
+                username=context.username or "", is_channel_admin=False,
+                original_message_id=context.original_message_id, original_chat_id=context.original_chat_id,
+                images=images, files=files, has_audio_input=has_audio_input,
+            )
+
+        if text and not media_attempted and self._dispatch_member_media_text(context, text, principal):
+            return False
+
+        if self.runtime_config.ai_agent_enable:
+            self.post_message(Message(
+                channel=context.channel, source=context.source, userid=context.user_id,
+                title="请使用 /ai 加上要执行的操作。", save_history=False,
+            ))
+        elif images or files or has_audio_input:
+            self.post_message(Message(
+                channel=context.channel, source=context.source, userid=context.user_id,
+                title="AI Agent 未启用，请联系管理员。", save_history=False,
+            ))
+        return False
+
     def _handle_channel_member_message(
         self, context: InteractionContext, text: str, callback_data: Optional[str],
         images: Optional[List[IncomingMessage.MessageImage]], files: Optional[List[IncomingMessage.MessageAttachment]],
         has_audio_input: bool,
     ) -> Optional[bool]:
         """
-        普通及待审批成员只进入受控 Agent，旧管理会话不能在撤权后消费文本。
+        受控处理普通及待审批成员消息，隔离旧管理会话并按配置分流 Agent 与传统媒体交互。
 
         :param context: 平台消息上下文及刚复核的管理员标记
         :param text: 转写后的本次输入
-        :param callback_data: 仅批准的 Agent 选项回调交给后续路由
+        :param callback_data: 仅批准的 Agent 选项回调交给后续路由，媒体回调按成员能力执行
         :param images: 归一化图片附件
         :param files: 文件附件
         :param has_audio_input: 是否已有语音输入
         :return: None 表示继续原路由；布尔值表示本次已处理及是否延后结束状态
         """
-        if context.is_channel_admin or callback_data is not None:
+        if context.is_channel_admin:
             return None
+        if callback_data is not None:
+            if parse_agent_choice_callback(callback_data) is not None:
+                return None
+            if _MediaInteractionChain.parse_callback(callback_data) is None:
+                self.post_message(Message(
+                    channel=context.channel, source=context.source, userid=context.user_id,
+                    title="此命令需要管理员授权。", save_history=False,
+                ))
+                return False
+            ok, principal = self._resolve_approved_channel_member(context)
+            if not ok or principal is None:
+                return False
+            return self._dispatch_member_media_callback(context, callback_data, principal)
+
+        ok, principal = self._resolve_approved_channel_member(context)
+        if not ok:
+            return False
+        if principal is not None:
+            return self._handle_approved_channel_member_text(
+                context, text, principal, images, files, has_audio_input,
+            )
+
         if not self.runtime_config.ai_agent_enable:
             self.post_message(Message(channel=context.channel, source=context.source, userid=context.user_id,
                                       title="AI Agent 未启用，请联系管理员。", save_history=False))
@@ -506,11 +759,16 @@ class MessageChain(ChainBase):
     def _handle_channel_authorization(
         self, channel: NotificationChannel, source: str, userid: Union[str, int],
         username: str, text: str, callback_data: Optional[str],
+        *, allow_plugin_input: bool = False,
     ) -> bool:
         """
         在语音、传统交互和 Agent 执行前处理申请并统一检查渠道成员状态。
 
-        未授权身份只收到申请入口，不自动执行原业务请求。已授权普通成员不能执行传统管理命令。
+        缺失或待审批成员的标点/符号开头纯文本可继续交给插件消息入口；其它未授权消息
+        仍只收到申请入口。已授权普通成员不能执行传统管理命令。
+
+        :param allow_plugin_input: 调用方已排除回调、附件及 Web 聊天的插件专用纯文本标记
+        :return: 已处理授权控制或拒绝本次消息时返回 True
         """
         service = get_channel_authorization()
         if service is None or channel in {NotificationChannel.Web, NotificationChannel.WebAgent}:
@@ -520,6 +778,10 @@ class MessageChain(ChainBase):
             value = value[9:].strip()
         try:
             member = service.find(channel.value, source, str(userid))
+            if (
+                member is None or member.status == "pending"
+            ) and allow_plugin_input:
+                return False
             if value.startswith("绑定账号 "):
                 member = service.bind(channel.value, source, str(userid), username, value[5:].strip())
                 self.post_message(Message(channel=channel, source=source, userid=userid,
@@ -552,8 +814,18 @@ class MessageChain(ChainBase):
                 ))
                 return True
             principal = service.principal(member.id)
-            traditional_command = value.startswith("/") and not self._has_ai_prefix(value) and not is_agent_learning_command(value)
-            traditional_callback = bool(callback_data or text.startswith("CALLBACK:")) and parse_agent_choice_callback(value) is None
+            no_ai_requested, _ = self._strip_no_ai_prefix(value)
+            traditional_command = (
+                value.startswith("/")
+                and not self._has_ai_prefix(value)
+                and not is_agent_learning_command(value)
+                and not no_ai_requested
+            )
+            traditional_callback = (
+                bool(callback_data or text.startswith("CALLBACK:"))
+                and parse_agent_choice_callback(value) is None
+                and _MediaInteractionChain.parse_callback(value) is None
+            )
             if (traditional_command or traditional_callback) and not principal.is_superuser:
                 self.post_message(Message(channel=channel, source=source, userid=userid, title="此命令需要管理员授权。", save_history=False))
                 return True
@@ -661,7 +933,12 @@ class MessageChain(ChainBase):
                 )
             return False
 
-        if self._plugin_input_interaction_handler().handle_text(
+        is_non_admin_web = (
+            channel in {NotificationChannel.Web, NotificationChannel.WebAgent}
+            and is_channel_admin is False
+        )
+
+        if not is_non_admin_web and self._plugin_input_interaction_handler().handle_text(
                 context=context,
                 text=text,
                 reply_to_message_id=reply_to_message_id,
@@ -689,6 +966,18 @@ class MessageChain(ChainBase):
                 return False
 
         if text.startswith("/") and not self._has_ai_prefix(text) and not is_agent_learning_command(text):
+            if is_non_admin_web:
+                self.post_message(
+                    Message(
+                        channel=channel,
+                        source=source,
+                        userid=userid,
+                        username=username,
+                        title="只有管理员才有权限执行此命令",
+                        save_history=False,
+                    )
+                )
+                return False
             self.eventmanager.send_event(
                 EventType.CommandExcute,
                 {
@@ -756,17 +1045,7 @@ class MessageChain(ChainBase):
         ):
             return False
 
-        self.eventmanager.send_event(
-            EventType.UserMessage,
-            {
-                "text": text,
-                "userid": userid,
-                "channel": channel,
-                "source": source,
-                "chat_id": original_chat_id,
-                "reply_to_message_id": reply_to_message_id,
-            },
-        )
+        self._publish_user_message(context, text, reply_to_message_id)
         return False
 
     @classmethod
@@ -787,6 +1066,21 @@ class MessageChain(ChainBase):
         判断消息是否使用显式 AI 前缀。
         """
         return (text or "").lower().startswith(cls._ai_prefix)
+
+    @staticmethod
+    def _is_special_plugin_text(text: Optional[str]) -> bool:
+        """
+        判断纯文本是否以标点或符号开头，可作为插件消息输入。
+
+        斜杠命令保留宿主路由；调用方负责排除回调、附件及 Web 聊天。
+
+        :param text: 渠道收到的原始文本
+        :return: 首个非空白字符为标点或符号且不是斜杠时返回 True
+        """
+        normalized = (text or "").lstrip()
+        if not normalized or normalized.startswith("/"):
+            return False
+        return unicodedata.category(normalized[0])[0] in {"P", "S"}
 
     def _is_agent_message(
             self,

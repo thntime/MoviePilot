@@ -37,6 +37,13 @@ _SECRET_SETTING_NAMES = frozenset(
         "cookiecloud_key",
         # 自动推送接入是内部凭据状态，默认查询应整体脱敏，不能只根据嵌套字段名判断。
         "app_push_credentials",
+        # 媒体服务器用户播放令牌是内部加密凭据，默认查询应整体脱敏。
+        "media_server_user_credentials",
+        "mediaserver_user_credentials",
+        # 弹幕上游服务地址与加密凭据整体受保护，禁止在普通设置快照与日志中泄露。
+        "danmaku_config",
+        # 中心知识的源地址与独立令牌整体受保护，Agent 不能通过设置读取凭据。
+        "ai_agent_knowledge",
     }
 )
 _SECRET_SETTING_ENDINGS = ("_encrypt_key",)

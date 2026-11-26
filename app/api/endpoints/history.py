@@ -36,6 +36,8 @@ from app.api.dependencies.history import (
 from app.api.response import (
     COLLECTION_TOTAL_HEADER,
     COLLECTION_TOTAL_OPENAPI_KEY,
+    PositiveCountParam,
+    PositivePageParam,
     ResponseAPIRouter,
 )
 from app.application.agent import get_running_agent_manager
@@ -265,6 +267,42 @@ def _submit_batch_ai_redo(
     )
 
 
+def _resolve_download_history_username(token: _SchemaTokenPayload) -> Optional[str]:
+    """
+    解析下载历史查询应限定的用户名；管理员和下载管理权限用户返回 None 以查看全局记录。
+
+    :param token: 已校验的访问令牌载荷
+    :return: 限定查询的用户名；允许全局查询时返回 None
+    """
+    if token.agent_authorization_id:
+        from app.application.security.authorization import get_channel_authorization
+
+        authorization = get_channel_authorization()
+        if authorization is None:
+            raise HTTPException(status_code=503, detail="渠道授权服务不可用")
+        user = authorization.authorize_operation(token.agent_authorization_id, token.agent_operation or "")
+        return None if user.is_superuser else user.name
+    if token.super_user:
+        return None
+    if token.sub is not None:
+        from app.application.security.user import get_configured_user_id_lookup
+        from app.domain.authorization import has_web_permission
+
+        web_user = get_configured_user_id_lookup()(int(token.sub))
+        if web_user is None or not web_user.is_active:
+            raise HTTPException(status_code=401, detail="用户未激活")
+        if web_user.is_superuser or has_web_permission(False, web_user.permissions, "manage", "manage.downloading"):
+            return None
+        if has_web_permission(False, web_user.permissions, "search", "search.resource") or has_web_permission(
+            False, web_user.permissions, "subscribe"
+        ):
+            return web_user.name
+        raise HTTPException(status_code=403, detail="用户权限不足")
+    if token.username:
+        return token.username
+    raise HTTPException(status_code=403, detail="用户权限不足")
+
+
 @router.get(
     "/download",
     summary="查询下载历史记录",
@@ -272,26 +310,28 @@ def _submit_batch_ai_redo(
     openapi_extra={COLLECTION_TOTAL_OPENAPI_KEY: True},
 )
 async def download_history(
-    page: Optional[int] = 1,
-    count: Optional[int] = 30,
+    response: Response,
+    page: PositivePageParam = 1,
+    count: PositiveCountParam = 30,
     query: HistoryQueryService = Depends(get_history_query_service),
     _: _SchemaTokenPayload = Depends(verify_token),
-    response: Response = None,  # type: ignore[assignment]
 ) -> Any:
     """
-    按下载时间倒序查询下载历史记录
+    按下载时间倒序分页查询下载历史记录，并通过响应头写入精确总数。
+
+    :param response: 由 FastAPI 注入的响应对象，用于设置集合总数响应头
+    :param page: 页码，从 1 开始，最小为 1；直接调用传入 None 时默认第 1 页
+    :param count: 每页最多返回条数，最小为 1；直接调用传入 None 时默认 30 条
+    :param query: 下载与整理历史查询服务
+    :param _: 已验证的访问令牌载荷
+    :return: 当前分页窗口内的下载历史记录列表
     """
     page = page if page is not None else 1
     count = count if count is not None else 30
-    if isinstance(_, _SchemaTokenPayload) and _.agent_authorization_id:
-        from app.application.security.authorization import get_channel_authorization
+    if isinstance(_, _SchemaTokenPayload) and (_.agent_authorization_id or not _.super_user):
         from app.runtime.execution import run_in_threadpool
 
-        authorization = get_channel_authorization()
-        if authorization is None:
-            raise HTTPException(status_code=503, detail="渠道授权服务不可用")
-        user = await run_in_threadpool(authorization.authorize_operation, _.agent_authorization_id, _.agent_operation or "")
-        username = None if user.is_superuser else user.name
+        username = await run_in_threadpool(_resolve_download_history_username, _)
         results = await query.list_download(page=page, count=count, username=username)
         if response is not None:
             response.headers[COLLECTION_TOTAL_HEADER] = str(await query.count_download(username=username))
@@ -326,15 +366,24 @@ def delete_download_history(
 )
 async def transfer_history(
     title: Optional[str] = None,
-    page: Optional[int] = 1,
-    count: Optional[int] = 30,
+    page: PositivePageParam = 1,
+    count: PositiveCountParam = 30,
     status: Optional[bool] = None,
     origin: Optional[Literal["external"]] = None,
     query: HistoryQueryService = Depends(get_history_query_service),
     _: _SchemaTokenPayload = Depends(verify_token),
 ) -> Any:
     """
-    查询整理记录，title 支持通配符 * 和 ?（如 *.mkv、*2024*）
+    按条件分页查询整理记录，title 支持通配符 * 和 ?（如 *.mkv、*2024*）。
+
+    :param title: 可选标题或路径匹配条件，支持通配符与分词模糊检索
+    :param page: 页码，从 1 开始，最小为 1；直接调用传入 None 时默认第 1 页
+    :param count: 每页最多返回条数，最小为 1；直接调用传入 None 时默认 30 条
+    :param status: 可选整理成功状态筛选，None 表示不限制
+    :param origin: 可选来源筛选，external 仅返回外部登记历史
+    :param query: 下载与整理历史查询服务
+    :param _: 已验证的访问令牌载荷
+    :return: 包含当前页整理记录与精确总数的统一响应
     """
     page = page if page is not None else 1
     count = count if count is not None else 30
@@ -716,8 +765,8 @@ def _remove_local_path(target: Path) -> bool:
     response_model=_SchemaContentVerifyPage,
 )
 async def content_verify_list(
-    page: Optional[int] = 1,
-    count: Optional[int] = 30,
+    page: PositivePageParam = 1,
+    count: PositiveCountParam = 30,
     status: Optional[str] = "all",
     tier: Optional[str] = "all",
     _: _SchemaTokenPayload = Depends(verify_token),

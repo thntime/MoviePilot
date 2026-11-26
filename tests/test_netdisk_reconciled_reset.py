@@ -9,8 +9,8 @@ from typing import Any, Dict
 
 import pytest
 
-from app.modules.netdisk import store as netdisk_store
 from app.modules.netdisk import NetdiskModule
+from app.modules.netdisk import store as netdisk_store
 
 _TASK = "2db84ae7bcec6a2b"
 

@@ -7,7 +7,7 @@ TMDB 会把还没播出的集也列进季清单（`episode_count` 200，实际�
 """
 
 import dataclasses
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import pytest
 
@@ -120,7 +120,7 @@ def test_resolve_subscribe_missing_keeps_series_open(monkeypatch: pytest.MonkeyP
     class _FakeDownloadChain:
         """替换下载链，返回「只缺未播出集」的结果。"""
 
-        def get_no_exists_info(self, meta, mediainfo, totals, totals_are_episode_numbers=False):
+        def get_no_exists_info(self, meta, mediainfo, totals, totals_are_episode_numbers=False, raise_on_query_failure=False):
             """返回整季目标下的缺失集。"""
             captured["totals"] = dict(totals)
             missing = list(range(_AIRED + 1, _TOTAL + 1))
@@ -157,7 +157,7 @@ def test_clip_does_not_mark_series_complete(monkeypatch: pytest.MonkeyPatch) -> 
     class _FakeDownloadChain:
         """返回「媒体库缺两集 + 未播出的集」的缺集结果。"""
 
-        def get_no_exists_info(self, meta, mediainfo, totals, totals_are_episode_numbers=False):
+        def get_no_exists_info(self, meta, mediainfo, totals, totals_are_episode_numbers=False, raise_on_query_failure=False):
             """返回未裁剪的缺集。"""
             return False, {
                 "203483": {

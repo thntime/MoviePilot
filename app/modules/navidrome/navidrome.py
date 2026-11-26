@@ -5,15 +5,29 @@ Navidrome Subsonic/OpenSubsonic API 客户端。
 import hashlib
 import re
 import secrets
+import time
 from typing import Any, Dict, Generator, List, Optional
 from urllib.parse import urlencode
+from uuid import uuid4
 
 from app.adapters.network.http import RequestUtils
 from app.foundation.url import UrlUtils
 from app.runtime.log import logger
 from app.schemas.dashboard import Statistic as _SchemaStatistic
+from app.schemas.mediaserver import (
+    MediaServerBrowseItem as _SchemaMediaServerBrowseItem,
+)
+from app.schemas.mediaserver import (
+    MediaServerBrowsePage as _SchemaMediaServerBrowsePage,
+)
 from app.schemas.mediaserver import MediaServerField, MediaServerQueryOptions
+from app.schemas.mediaserver import (
+    MediaServerFilterOptions as _SchemaMediaServerFilterOptions,
+)
 from app.schemas.mediaserver import MediaServerItem as _SchemaMediaServerItem
+from app.schemas.mediaserver import (
+    MediaServerItemDetail as _SchemaMediaServerItemDetail,
+)
 from app.schemas.mediaserver import MediaServerLibrary as _SchemaMediaServerLibrary
 from app.schemas.mediaserver import MediaServerPlayItem as _SchemaMediaServerPlayItem
 from app.schemas.types import MediaType
@@ -369,8 +383,177 @@ class Navidrome:
         album = (payload or {}).get("album") or {}
         return self._album_to_item(album) if album else None
 
-    def search_library(self, keyword: str, limit: int) -> List[_SchemaMediaServerPlayItem]:
+    def _album_to_browse_item(self, album: dict[str, Any]) -> _SchemaMediaServerBrowseItem:
+        """将 Subsonic 专辑转换为统一浏览卡片模型。"""
+        album_id = str(album.get("id") or "")
+        cover = self._album_cover(album)
+        duration_sec = album.get("duration")
+        return _SchemaMediaServerBrowseItem(
+            item_id=album_id,
+            server_type="navidrome",
+            item_type="MusicAlbum",
+            media_type=MediaType.MUSIC.value,
+            title=self._album_name(album) or album_id,
+            subtitle=album.get("artist") or album.get("albumArtist"),
+            year=album.get("year"),
+            duration_ms=int(duration_sec * 1000) if isinstance(duration_sec, (int, float)) and duration_sec > 0 else None,
+            poster=cover,
+            backdrop=cover,
+            thumb=cover,
+            child_count=album.get("songCount") if isinstance(album.get("songCount"), int) else None,
+        )
+
+    def _song_to_browse_item(self, song: dict[str, Any]) -> _SchemaMediaServerBrowseItem:
+        """将 Subsonic 单曲转换为统一浏览卡片模型。"""
+        song_id = str(song.get("id") or "")
+        cover = self._album_cover(song)
+        duration_sec = song.get("duration")
+        parts = [str(p) for p in (song.get("artist"), song.get("album")) if p]
+        return _SchemaMediaServerBrowseItem(
+            item_id=song_id,
+            server_type="navidrome",
+            item_type="Audio",
+            media_type=MediaType.MUSIC.value,
+            title=str(song.get("title") or song.get("name") or song_id),
+            subtitle=" · ".join(parts) if parts else None,
+            year=song.get("year"),
+            duration_ms=int(duration_sec * 1000) if isinstance(duration_sec, (int, float)) and duration_sec > 0 else None,
+            poster=cover,
+            backdrop=cover,
+            thumb=cover,
+            episode_number=song.get("track") if isinstance(song.get("track"), int) else None,
+            season_number=song.get("discNumber") if isinstance(song.get("discNumber"), int) else 1,
+        )
+
+    def browse_items(
+        self,
+        *,
+        library_id: Optional[str] = None,
+        parent_id: Optional[str] = None,
+        item_type: Optional[str] = None,
+        genre: Optional[str] = None,
+        year: Optional[int] = None,
+        played_filter: Optional[str] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        keyword: Optional[str] = None,
+        start_index: int = 0,
+        limit: int = 30,
+        username: Optional[str] = None,
+    ) -> Optional[_SchemaMediaServerBrowsePage]:
+        """分页浏览 Navidrome 音乐库（支持专辑列表、风格/年份筛选与关键词搜索）。"""
+        _ = library_id, parent_id, item_type, played_filter, sort_order, username
+        if not self.user:
+            return None
+        safe_start = max(0, int(start_index))
+        safe_limit = max(1, min(int(limit), 100))
+        if keyword and keyword.strip():
+            payload = self._call(
+                "search3", query=keyword.strip(), artistCount=0, albumCount=safe_limit, songCount=safe_limit
+            )
+            result = (payload or {}).get("searchResult3") or {}
+            albums = [self._album_to_browse_item(a) for a in (result.get("album") or []) if isinstance(a, dict)]
+            songs = [self._song_to_browse_item(s) for s in (result.get("song") or []) if isinstance(s, dict)]
+            combined = albums + songs
+            page_items = combined[safe_start : safe_start + safe_limit]
+            return _SchemaMediaServerBrowsePage(
+                items=page_items,
+                total_count=len(combined),
+                start_index=safe_start,
+                limit=safe_limit,
+                has_more=(safe_start + len(page_items)) < len(combined),
+            )
+        list_type = {
+            "date_created": "newest",
+            "premiere_date": "byYear",
+            "name": "alphabeticalByName",
+            "random": "random",
+        }.get((sort_by or "date_created").casefold(), "newest")
+        call_kwargs: dict[str, Any] = {"type": list_type, "size": safe_limit, "offset": safe_start}
+        if genre:
+            call_kwargs.update({"type": "byGenre", "genre": genre})
+        elif year:
+            call_kwargs.update({"type": "byYear", "fromYear": int(year), "toYear": int(year)})
+        payload = self._call("getAlbumList2", **call_kwargs)
+        raw_albums = ((payload or {}).get("albumList2") or {}).get("album") or []
+        items = [self._album_to_browse_item(a) for a in raw_albums if isinstance(a, dict)]
+        has_more = len(items) == safe_limit
+        return _SchemaMediaServerBrowsePage(
+            items=items,
+            total_count=safe_start + len(items) + (1 if has_more else 0),
+            start_index=safe_start,
+            limit=safe_limit,
+            has_more=has_more,
+        )
+
+    def get_filter_options(
+        self, library_id: Optional[str] = None, username: Optional[str] = None
+    ) -> _SchemaMediaServerFilterOptions:
+        """读取 Navidrome 音乐风格列表。"""
+        _ = library_id, username
+        genres: list[str] = []
+        if self.user:
+            payload = self._call("getGenres")
+            raw_genres = ((payload or {}).get("genres") or {}).get("genre") or []
+            genres = [str(g.get("value")) for g in raw_genres if isinstance(g, dict) and g.get("value")]
+        return _SchemaMediaServerFilterOptions(
+            genres=genres,
+            years=[],
+            item_types=["MusicAlbum", "Audio"],
+            sort_options=["date_created", "name", "random"],
+        )
+
+    def get_item_detail(
+        self, item_id: str, username: Optional[str] = None
+    ) -> Optional[_SchemaMediaServerItemDetail]:
+        """获取 Navidrome 单曲或专辑的完整详情。"""
+        _ = username
+        if not self.user or not item_id:
+            return None
+        song_payload = self._call("getSong", id=item_id)
+        song = (song_payload or {}).get("song")
+        if isinstance(song, dict) and song:
+            base = self._song_to_browse_item(song)
+            return _SchemaMediaServerItemDetail(
+                **base.model_dump(),
+                genres=[str(song["genre"])] if song.get("genre") else [],
+                play_url=self.get_play_url(item_id),
+                can_play=True,
+            )
+        album_payload = self._call("getAlbum", id=item_id)
+        album = (album_payload or {}).get("album")
+        if isinstance(album, dict) and album:
+            base = self._album_to_browse_item(album)
+            return _SchemaMediaServerItemDetail(
+                **base.model_dump(),
+                genres=[str(album["genre"])] if album.get("genre") else [],
+                episode_count=album.get("songCount") if isinstance(album.get("songCount"), int) else None,
+                play_url=self._play_host,
+                can_play=False,
+            )
+        return None
+
+    def get_season_episodes(
+        self,
+        series_id: str,
+        *,
+        season_id: Optional[str] = None,
+        season: Optional[int] = None,
+        username: Optional[str] = None,
+    ) -> Optional[List[_SchemaMediaServerBrowseItem]]:
+        """获取 Navidrome 专辑内的全部曲目列表（复用分集端点便于统一展示与连播）。"""
+        _ = season_id, season, username
+        if not self.user or not series_id:
+            return None
+        album_payload = self._call("getAlbum", id=series_id)
+        songs = ((album_payload or {}).get("album") or {}).get("song") or []
+        return [self._song_to_browse_item(s) for s in songs if isinstance(s, dict)]
+
+    def search_library(
+        self, keyword: str, limit: int, library_id: Optional[str] = None
+    ) -> List[_SchemaMediaServerPlayItem]:
         """调用 Subsonic 搜索接口并返回可流式播放的单曲结果。"""
+        _ = library_id
         if not keyword.strip() or not self.user:
             return []
         payload = self._call(
@@ -507,6 +690,114 @@ class Navidrome:
         if not url:
             return None
         return f"{url}/stream?{urlencode(self._params(id=item_id))}"
+
+    def prepare_playback_session(
+        self,
+        item_id: str,
+        *,
+        media_source_id: Optional[str] = None,
+        username: Optional[str] = None,
+        user_token: Optional[str] = None,
+        client_id: Optional[str] = None,
+        device_name: Optional[str] = None,
+        platform: Optional[str] = None,
+        app_version: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        为 Navidrome 音乐播放生成本地会话上下文并声明 Subsonic scrobble 模式。
+        """
+        _ = item_id, username, user_token, client_id, device_name, platform, app_version
+        if not self.user:
+            return None
+        return {
+            "play_session_id": uuid4().hex,
+            "media_source_id": media_source_id,
+            "stream_headers": {},
+            "sync_mode": "scrobble",
+        }
+
+    def report_progress(
+        self,
+        item_id: str,
+        *,
+        position_ms: int,
+        media_source_id: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        is_paused: bool = False,
+        state: str = "playing",
+        username: Optional[str] = None,
+        play_session_id: Optional[str] = None,
+        event_name: Optional[str] = None,
+        client_id: Optional[str] = None,
+        device_name: Optional[str] = None,
+        platform: Optional[str] = None,
+        app_version: Optional[str] = None,
+        play_method: str = "DirectPlay",
+        playback_time_ms: Optional[int] = None,
+        audio_stream_index: Optional[int] = None,
+        subtitle_stream_index: Optional[int] = None,
+        user_token: Optional[str] = None,
+        started_reported: bool = False,
+        allow_userdata_write: bool = True,
+        scrobbled: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        通过 Subsonic `scrobble` 接口同步 Navidrome 正在播放状态与完播计数。
+
+        起播时上报 `submission=false` 激活正在播放列表。停止时优先按客户端上报的累计
+        收听时长判断，达到曲目时长的 50% 或 4 分钟且尚未计次时，提交 `submission=true`。
+
+        :param item_id: Navidrome 曲目标识
+        :param position_ms: 播放位置（毫秒）；仅在未上报累计时长时用于估算
+        :param duration_ms: 曲目总时长（毫秒）；缺失时只按 4 分钟判断
+        :param state: 播放会话事件状态
+        :param playback_time_ms: 本次播放累计收听时长（毫秒）；None 表示客户端未提供
+        :param started_reported: 是否已经上报过起播
+        :param scrobbled: 是否已经提交过本次播放计数
+        :return: 上报结果及本次播放是否已计次
+        """
+        _ = (
+            media_source_id,
+            is_paused,
+            username,
+            play_session_id,
+            event_name,
+            client_id,
+            device_name,
+            platform,
+            app_version,
+            play_method,
+            audio_stream_index,
+            subtitle_stream_index,
+            user_token,
+            allow_userdata_write,
+        )
+        if not self.user or not item_id:
+            return {"reported": False, "mode": "unsupported", "started_sent": started_reported, "scrobbled": scrobbled}
+        if state == "started" or (state == "playing" and not started_reported):
+            ok = self._call("scrobble", id=item_id, submission="false") is not None
+            return {
+                "reported": ok,
+                "mode": "scrobble",
+                "started_sent": ok or started_reported,
+                "scrobbled": scrobbled,
+            }
+        if state == "stopped":
+            if scrobbled:
+                return {"reported": True, "mode": "scrobble", "started_sent": started_reported, "scrobbled": True}
+            listened_ms = position_ms if playback_time_ms is None else playback_time_ms
+            reached_half = bool(duration_ms and duration_ms > 0 and listened_ms * 2 >= duration_ms)
+            if reached_half or listened_ms >= 240_000:
+                ok = self._call("scrobble", id=item_id, submission="true", time=int(time.time() * 1000)) is not None
+                return {
+                    "reported": ok,
+                    "mode": "scrobble",
+                    "started_sent": started_reported,
+                    "scrobbled": ok,
+                }
+            return {"reported": True, "mode": "scrobble", "started_sent": started_reported, "scrobbled": False}
+        # Subsonic 协议无中途秒级进度上报接口，避免在心跳期无意义重复刷写
+        return {"reported": True, "mode": "scrobble", "started_sent": started_reported, "scrobbled": scrobbled}
 
     def refresh_root_library(self) -> bool:
         """

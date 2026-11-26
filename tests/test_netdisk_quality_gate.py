@@ -292,7 +292,7 @@ def test_declared_episode_count_rescues_unnumbered_files() -> None:
 def test_unnumbered_files_without_declared_count_still_dropped() -> None:
     """标题没声明集数时，无法解析的文件仍按集数不清晰丢弃。"""
     entries = [_entry(f"凡人修仙传 S04E{index:02d}.mkv") for index in range(1, 3)]
-    entries += [_entry(f"凡人修仙传 慕兰之战 4K.mkv") for _ in range(8)]
+    entries += [_entry("凡人修仙传 慕兰之战 4K.mkv") for _ in range(8)]
 
     assert _passed("凡人修仙传 年番4", entries) is False
 

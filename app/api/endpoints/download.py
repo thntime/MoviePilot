@@ -20,7 +20,10 @@ from app.api.response import (
     CompatiblePageParam,
     ResponseAPIRouter,
 )
-from app.application.configuration import get_configured_system_config
+from app.application.configuration import (
+    get_configured_system_config,
+    get_runtime_settings,
+)
 from app.application.directory import DirectoryHelper
 from app.application.download.organization import organize_existing_source
 from app.application.download.tasks import DownloadTaskMutationService
@@ -30,13 +33,16 @@ from app.application.site.query import (
     get_configured_site_query_service,
 )
 from app.chain.download import DownloadChain
+from app.chain.download.submission import convert_download_identity_to_tmdb
 from app.chain.media import MediaChain
+from app.domain.authorization import has_web_permission
 from app.domain.context import Context, MediaInfo, MusicInfo, SubtitleInfo, TorrentInfo
 from app.domain.episode import parse_episode_selection
 from app.domain.media import is_music_media_source, normalize_music_type
 from app.domain.meta.metabase import MetaBase
 from app.domain.metainfo import MetaInfo
 from app.foundation.url import UrlUtils
+from app.schemas.common import JsonData
 from app.schemas.common import ServiceClientInfo as _SchemaServiceClientInfo
 from app.schemas.context import MediaInfo as _SchemaMediaInfo
 from app.schemas.context import SubtitleInfo as _SchemaSubtitleInfo
@@ -49,6 +55,7 @@ from app.schemas.download import DownloadTaskUpdateData as _SchemaDownloadTaskUp
 from app.schemas.download import DownloadTaskUpdateRequest as _SchemaDownloadTaskUpdateRequest
 from app.schemas.download import SubtitleDownloadData as _SchemaSubtitleDownloadData
 from app.schemas.file import FileURI as _SchemaFileURI
+from app.schemas.media import normalize_media_source, resolve_media_identity
 from app.schemas.music import MusicInfo as _SchemaMusicInfo
 from app.schemas.response import Response as _SchemaResponse
 from app.schemas.token import TokenPayload as _SchemaTokenPayload
@@ -222,6 +229,165 @@ def _alternatives_payload(alternatives: list[MediaInfo]) -> list[dict]:
         }
         for item in alternatives
     ]
+def _is_tmdb_recognize_source() -> bool:
+    """
+    判断当前系统影视识别源配置是否为 TMDB。
+    """
+    return normalize_media_source(get_runtime_settings().get("RECOGNIZE_SOURCE")) == MediaSource.TMDB
+
+
+def _should_convert_download_identity_to_tmdb(
+    torrent_in: _SchemaTorrentInfo,
+    media_source: MediaSource,
+    media_id: str,
+) -> bool:
+    """
+    判断下载请求携带的非 TMDB 影视身份是否应转换为 TMDB 主身份。
+
+    当系统识别源为 TMDB 时，IMDb 标识以及种子自身携带的非 TMDB 线索（如站点资源附带的
+    IMDb 或豆瓣 ID）优先投影为 TMDB 身份，以避免后续下载记录和整理锁死为外部来源标题或季级身份；
+    用户在高级选项中主动切换的其他非 TMDB 来源则保持原来源。
+    """
+    if media_source == MediaSource.TMDB or not _is_tmdb_recognize_source():
+        return False
+    if media_source == MediaSource.IMDb:
+        return True
+    return resolve_media_identity(media=torrent_in) == (media_source, media_id)
+
+
+def _resolve_converted_tmdb_media(
+    media_chain: MediaChain,
+    metainfo: MetaBase,
+    media_source: MediaSource,
+    media_id: str,
+    *,
+    source_media: Optional[MediaInfo] = None,
+) -> tuple[MetaBase, MediaInfo, dict[str, JsonData]] | None:
+    """
+    复用统一下载身份转换规则，将非 TMDB 影视身份投影并核验为完整 TMDB 媒体信息。
+    """
+    return convert_download_identity_to_tmdb(
+        media_chain,
+        metainfo,
+        media_source,
+        media_id,
+        source_media=source_media,
+    )
+
+
+def _convert_manual_download_media(
+    metainfo: MetaBase,
+    mediainfo: MediaInfo | MusicInfo,
+) -> tuple[MetaBase, MediaInfo | MusicInfo, Optional[dict[str, JsonData]]]:
+    """
+    在全局识别源为 TMDB 时，将手动下载携带的非 TMDB 影视媒体对象转换为 TMDB 主身份。
+
+    仅对电影和电视剧生效；已有 TMDB 身份、音乐、非 TMDB 识别源以及无法可靠转换或核验的目标
+    均保持原媒体与元数据对象不变。
+
+    :param metainfo: 种子标题解析出的元数据
+    :param mediainfo: 请求传入的影视或音乐媒体对象
+    :return: ``(最终元数据, 最终媒体对象, 原来源追溯字典)``；未转换时追溯字典为 None
+    """
+    if (
+        not isinstance(mediainfo, MediaInfo)
+        or mediainfo.type not in (MediaType.MOVIE, MediaType.TV)
+        or not _is_tmdb_recognize_source()
+    ):
+        return metainfo, mediainfo, None
+    source, media_id = resolve_media_identity(media=mediainfo)
+    if not source or not media_id or source == MediaSource.TMDB:
+        return metainfo, mediainfo, None
+    converted = _resolve_converted_tmdb_media(
+        MediaChain(),
+        metainfo,
+        source,
+        media_id,
+        source_media=mediainfo,
+    )
+    if converted is None:
+        return metainfo, mediainfo, None
+    return converted
+
+
+def _origin_media_for_converted_add(
+    media_source: MediaSource | None,
+    media_id: str | None,
+    mediainfo: MediaInfo | MusicInfo,
+) -> Optional[dict[str, JsonData]]:
+    """
+    判断无媒体信息下载是否发生了非 TMDB 到 TMDB 的主身份转换，并返回原来源追溯记录。
+
+    :param media_source: 请求提交的原媒体来源
+    :param media_id: 请求提交的原来源原生标识
+    :param mediainfo: 最终用于提交下载的媒体对象
+    :return: 发生跨来源转换时返回 ``{"media_source": ..., "media_id": ...}``，否则返回 None
+    """
+    if not isinstance(mediainfo, MediaInfo) or media_source is None or media_id is None:
+        return None
+    origin_source, origin_id = resolve_media_identity(
+        media_source=media_source,
+        media_id=media_id,
+    )
+    final_source, final_id = resolve_media_identity(media=mediainfo)
+    if (
+        origin_source
+        and origin_id
+        and origin_source != MediaSource.TMDB
+        and final_source == MediaSource.TMDB
+        and final_id
+    ):
+        return {
+            "media_source": origin_source.value,
+            "media_id": origin_id,
+        }
+    return None
+
+
+def _resolve_explicit_download_media(
+    torrent_in: _SchemaTorrentInfo,
+    metainfo: MetaBase,
+    media_source: MediaSource,
+    media_id: str,
+    *,
+    is_music: bool,
+    music_type: Optional[str],
+) -> tuple[MetaBase, MediaInfo | MusicInfo | None]:
+    """
+    使用显式来源身份识别下载媒体，适用时优先按 TMDB 识别源转换主身份并保留失败回退。
+    """
+    media_chain = MediaChain()
+    normalized_source, normalized_id = resolve_media_identity(
+        media_source=media_source,
+        media_id=media_id,
+    )
+    if (
+        not is_music
+        and normalized_source
+        and normalized_id
+        and _should_convert_download_identity_to_tmdb(
+            torrent_in,
+            normalized_source,
+            normalized_id,
+        )
+    ):
+        converted = _resolve_converted_tmdb_media(
+            media_chain,
+            metainfo,
+            normalized_source,
+            normalized_id,
+        )
+        if converted is not None:
+            converted_meta, converted_media, _origin_media = converted
+            return converted_meta, converted_media
+    mediainfo = media_chain.recognize_media(
+        meta=metainfo,
+        media_source=media_source,
+        media_id=media_id,
+        mtype=MediaType.MUSIC if is_music else None,
+        music_type=music_type,
+    )
+    return metainfo, mediainfo
 
 
 def _resolve_add_media(
@@ -273,11 +439,12 @@ def _resolve_add_media(
     metainfo = MetaInfo(title=torrent_in.title or "", subtitle=torrent_in.description,
                         mtype=MediaType.MUSIC if is_music else None)
     if media_source and media_id:
-        mediainfo = MediaChain().recognize_media(
-            meta=metainfo,
-            media_source=media_source,
-            media_id=media_id,
-            mtype=MediaType.MUSIC if is_music else None,
+        metainfo, mediainfo = _resolve_explicit_download_media(
+            torrent_in,
+            metainfo,
+            media_source,
+            media_id,
+            is_music=is_music,
             music_type=normalized_music_type,
         )
     else:
@@ -333,10 +500,17 @@ def _resolve_add_media(
 @router.get("/", summary="正在下载", response_model=List[_SchemaDownloaderTorrent])
 def current(name: Optional[str] = None, _: ApiPrincipal = Depends(get_current_download_viewer), page: CompatiblePageParam = None, count: CompatibleCountParam = None) -> Any:
     """
-    管理员查询全局下载任务，获授权渠道成员仅查询自己发起的任务。
+    管理员及下载管理权限用户查询全局下载任务，其余已授权用户仅查询自己发起的任务。
     """
     tasks = DownloadChain().downloading(name)
-    if getattr(_, "authorization_id", None) and not _.is_superuser:
+    can_view_all = bool(
+        _.is_superuser
+        or (
+            not getattr(_, "authorization_id", None)
+            and has_web_permission(False, getattr(_, "permissions", None), "manage", "manage.downloading")
+        )
+    )
+    if not can_view_all:
         return [task for task in tasks if task.username == _.name]
     return tasks
 
@@ -367,13 +541,19 @@ def download(
         mediainfo = MediaInfo()
         mediainfo.from_dict(media_in.model_dump())
     metainfo = MetaInfo(title=torrent_in.title or "", subtitle=torrent_in.description, mtype=mediainfo.type)
+    metainfo, mediainfo, origin_media = _convert_manual_download_media(metainfo, mediainfo)
     # 种子信息
     torrentinfo = TorrentInfo()
     torrentinfo.from_dict(torrent_in.model_dump())
     # 手动下载始终使用选择的下载器
     torrentinfo.site_downloader = downloader
     # 上下文
-    context = Context(meta_info=metainfo, media_info=mediainfo, torrent_info=torrentinfo)
+    context = Context(
+        meta_info=metainfo,
+        media_info=mediainfo,
+        torrent_info=torrentinfo,
+        origin_media=origin_media,
+    )
     episodes = set(parse_episode_selection(episode_selection or "")) or None
     did = DownloadChain().download_single(
         context=context,
@@ -381,6 +561,7 @@ def download(
         save_path=save_path,
         episodes=episodes,
         source="Manual",
+        user_specified=True,
     )
     if not did:
         return _SchemaResponse(success=False, message="任务添加失败")
@@ -446,6 +627,7 @@ def download_artist_collection(
         username=current_user.name,
         save_path=save_path,
         source="Manual",
+        user_specified=True,
     )
     if not did:
         return _SchemaResponse(success=False, message="艺术家合集任务添加失败")
@@ -490,7 +672,12 @@ def add(
     torrentinfo = TorrentInfo()
     torrentinfo.from_dict(torrent_in.model_dump())
     # 上下文
-    context = Context(meta_info=metainfo, media_info=mediainfo, torrent_info=torrentinfo)
+    context = Context(
+        meta_info=metainfo,
+        media_info=mediainfo,
+        torrent_info=torrentinfo,
+        origin_media=_origin_media_for_converted_add(media_source, media_id, mediainfo),
+    )
 
     episodes = set(parse_episode_selection(episode_selection or "")) or None
     did = DownloadChain().download_single(
@@ -500,6 +687,7 @@ def add(
         save_path=save_path,
         episodes=episodes,
         source="Manual",
+        user_specified=True,
     )
     if not did:
         return _SchemaResponse(success=False, message="任务添加失败")

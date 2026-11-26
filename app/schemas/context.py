@@ -308,6 +308,7 @@ class MediaInfo(OptionalMediaIdentityMixin, BaseModel):
     backdrop_path: Optional[str] = Field(default=None, description="背景图片")
     poster_path: Optional[str] = Field(default=None, description="海报图片")
     logo_path: Optional[str] = Field(default=None, description="标题 LOGO")
+    logo_language: Optional[str] = Field(default=None, description="标题 LOGO 语言代码")
     vote_average: Optional[float] = Field(default=0.0, description="评分")
     overview: Optional[str] = Field(default=None, description="描述")
     library_category: Optional[str] = Field(default="", description="媒体库目录分类；category 是过渡期兼容字段")
@@ -461,6 +462,7 @@ class Context(BaseModel):
     match_reason: Optional[str] = Field(default=None, description="资源匹配或未匹配的原因")
     confirmed_full_coverage: Optional[bool] = Field(default=False, description="下载层确认候选资源覆盖完整目标范围，供订阅事实写入判断整包资源")
     subscription_download: Optional[Dict[str, JsonData]] = Field(default=None, description="本次订阅提交类型、全集洗版模式及新增和升级集数；旧记录或非订阅下载为空")
+    origin_media: Optional[Dict[str, JsonData]] = Field(default=None, description="主身份转换为 TMDB 前保留的原媒体来源与原生标识；未转换时为空")
     music_track_keys: Optional[List[str]] = Field(default=None, description="下载层从种子文件清单提取的稳定音轨键，供专辑订阅跨轮次累计下载进度")
 
 

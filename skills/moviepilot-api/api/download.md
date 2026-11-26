@@ -11,7 +11,6 @@ Identity scope: `bound_user`; required role: `user`.
 - `path_params`: none
 - `query`: none
 - `body`: `allow_unrecognized` (boolean; default `False`): 无法解析规范媒体身份时，是否仍允许下载。; `downloader` (string|null): 已配置下载器的实例名称。; `episode_selection` (string|null): 仅网盘下载器使用的集数选择文本，例如 153-162 或 164；其他下载器忽略。; `media_id` (string|null): 来源原生媒体标识，始终与搜索返回的精确 media_source 配对。; `media_source` (MediaSource|null): 元数据来源标识，保留与 media_id 一同返回的精确值。; `music_type` (string(recording,album)|null): 音乐身份层级：按操作支持范围选择 recording、album 或 artist。; `save_path` (string|null): 下载或订阅使用的下载器端配置保存路径，或已配置下载目录的精确名称别名。; `torrent_in*` (TorrentInfo): search.results 或 search.torrents 返回的完整候选种子。
-- `response`: 未提供 media_source/media_id 且标题命中多个同名版本时，不创建下载任务；`success=false`、`data.requires_confirmation=true`，`data.alternatives` 返回候选版本（media_source、media_id、title、year、type、poster）。调用方必须让用户选择后，携带选定版本的 media_source 与 media_id 重新提交；`allow_unrecognized=true` 时保留原确认放行行为。
 
 ### `download.artist_collection`
 `POST /api/v1/download/artist-collection`; policy effect: `external_side_effect`.

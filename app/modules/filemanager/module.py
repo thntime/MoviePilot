@@ -258,12 +258,20 @@ class FileManagerModule(_ModuleBase):
         """
         handler = TransHandler()
         rename_format = get_runtime_setting('RENAME_FORMAT')(mediainfo.type)
+        # 仅保留受支持的媒体/音频/字幕/歌词扩展名，避免把种子名中的点分标签误作文件后缀。
+        raw_suffix = Path(meta.title or "").suffix
+        supported_exts = {
+            ext.lower()
+            for key in ("RMT_MEDIAEXT", "RMT_AUDIOEXT", "RMT_SUBEXT", "RMT_LYRICSEXT")
+            for ext in (get_runtime_setting(key) or ())
+        }
+        file_ext = raw_suffix if raw_suffix and raw_suffix.lower() in supported_exts else ""
         path = handler.get_rename_path(
             template_string=rename_format,
             rename_dict=handler.get_naming_dict(meta=meta,
                                                 mediainfo=mediainfo,
                                                 episodes_info=episodes_info,
-                                                file_ext=Path(meta.title or "").suffix)
+                                                file_ext=file_ext)
         )
         return path.as_posix() if path else ""
 
@@ -425,6 +433,45 @@ class FileManagerModule(_ModuleBase):
             logger.error(f"不支持 {fileitem.storage} 的下载处理")
             return None
         return storage_oper.download(fileitem, path=path)
+
+    def supports_file_stream(self, storage: str) -> bool:
+        """
+        检查指定存储实现是否支持按需 HTTP Range 流式读取（无需整文件落盘）。
+        """
+        if storage == "local":
+            return True
+        if storage not in self._support_storages:
+            return False
+        storage_oper = self.__get_storage_oper(storage)
+        if not storage_oper:
+            return False
+        storage_cls = type(storage_oper)
+        return (
+            storage_cls.get_stream_url is not StorageBase.get_stream_url
+            or storage_cls.open_file_stream is not StorageBase.open_file_stream
+        )
+
+    def get_file_stream_url(self, fileitem: FileItem) -> Optional[tuple[str, dict[str, str]]]:
+        """
+        委托远端存储解析可 Range 代理的 HTTP(S) 直链与上游请求头。
+        """
+        if fileitem.storage not in self._support_storages:
+            return None
+        storage_oper = self.__get_storage_oper(fileitem.storage)
+        if not storage_oper:
+            return None
+        return storage_oper.get_stream_url(fileitem)
+
+    def open_file_stream(self, fileitem: FileItem) -> Optional[tuple[Any, int]]:
+        """
+        委托远端存储以可 seek 二进制流打开文件用于 HTTP Range 渐进传输。
+        """
+        if fileitem.storage not in self._support_storages:
+            return None
+        storage_oper = self.__get_storage_oper(fileitem.storage)
+        if not storage_oper:
+            return None
+        return storage_oper.open_file_stream(fileitem)
 
     def upload_file(self, fileitem: FileItem, path: Path, new_name: Optional[str] = None) -> Optional[FileItem]:
         """

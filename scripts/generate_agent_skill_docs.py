@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # 与对应 SKILL.md 同步维护，重新生成不能回退用户同步所需的版本。
-MOVIEPILOT_API_SKILL_VERSION = "77"
+MOVIEPILOT_API_SKILL_VERSION = "79"
 DATABASE_OPERATION_SKILL_VERSION = "20"
 
 
@@ -77,6 +77,11 @@ DATABASE_TABLE_GUIDES: dict[str, tuple[str, str, str]] = {
         "Stores media identity, torrent, downloader, user, and recognition context for submitted downloads.",
         "Reviewing download history or tracing a media identity or hash back to its source.",
         "Written by the download use case; delete or correct records through the download-history API.",
+    ),
+    "downloadpending": (
+        "Stores recovery state for download submissions accepted by a downloader but not yet confirmed as a visible task.",
+        "Inspecting pending infohashes, target scopes, subscription links, expiry timestamps, and duplicate-submission locks.",
+        "Recovery state owned by download reconciliation; never delete or alter rows manually to bypass duplicate protection, and ordinary history retention does not purge it.",
     ),
     "mediaserveritem": (
         "Stores the local index and canonical media identity projected from media-server libraries.",
@@ -237,6 +242,11 @@ DATABASE_TABLE_GUIDES: dict[str, tuple[str, str, str]] = {
         "Inspecting scheduled/event workflows, pause state, current action, run count, and failures.",
         "Create, modify, run, pause, or reset through the workflow API.",
     ),
+    "contentverify": (
+        "Stores content-verification records for netdisk downloads: verdict, tier, scores, evidence frames, and file references.",
+        "Reviewing pending audit items, tier counts, and verification evidence through the history verify API.",
+        "Written by the transfer content verification chain; delete rejected files only through the history verify delete endpoint.",
+    ),
 }
 
 
@@ -349,6 +359,11 @@ _OPERATION_NOTES: dict[str, list[str]] = {
         "It never stops a plugin or deletes plugin data, databases, or files. Rows with settings, "
         "clones, missing rows, or mixed scopes are rejected.",
     ],
+    "plugin.market": [
+        "- If the market view has no online candidates and one or more configured index reads fail, "
+        "the endpoint returns HTTP `424` with a retryable index-read error instead of an empty list. "
+        "A confirmed empty index or an absent package generation remains a successful read.",
+    ],
     "library.exists": [
         "- **Agent note:** The media-type field name is `mtype` (placed inside `query`). "
         "Do **not** reuse the `type` field from the recognition result — `type` is not a "
@@ -384,6 +399,11 @@ _OPERATION_NOTES: dict[str, list[str]] = {
         "`*`-marked path parameter across this document set (`media_type`, `site_id`, …).",
         "",
         "#### Candidate Selection and Empty-Result Retries",
+        "",
+        "With `include_candidates=true`, manually reviewable music candidates also include resources "
+        "rejected by automatic identity matching. `match_status` is `candidate`, `match_reason` "
+        "retains the rejection reason (for example `title_mismatch`), and `media_info` is null. "
+        "Do not treat them as confirmed matches or download them automatically; existing search filters still apply.",
         "",
         "- When `media.search` returns multiple candidates, select based on "
         "**title matching the user's request AND `type` (movie/series) matching**; do not "

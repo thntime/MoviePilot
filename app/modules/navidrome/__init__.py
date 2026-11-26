@@ -13,8 +13,20 @@ from app.runtime.log import logger
 from app.schemas.dashboard import Statistic as _SchemaStatistic
 from app.schemas.event import AuthCredentials, AuthInterceptCredentials
 from app.schemas.mediaserver import ExistMediaInfo as _SchemaExistMediaInfo
+from app.schemas.mediaserver import (
+    MediaServerBrowseItem as _SchemaMediaServerBrowseItem,
+)
+from app.schemas.mediaserver import (
+    MediaServerBrowsePage as _SchemaMediaServerBrowsePage,
+)
 from app.schemas.mediaserver import MediaServerField, MediaServerQueryOptions
+from app.schemas.mediaserver import (
+    MediaServerFilterOptions as _SchemaMediaServerFilterOptions,
+)
 from app.schemas.mediaserver import MediaServerItem as _SchemaMediaServerItem
+from app.schemas.mediaserver import (
+    MediaServerItemDetail as _SchemaMediaServerItemDetail,
+)
 from app.schemas.mediaserver import MediaServerLibrary as _SchemaMediaServerLibrary
 from app.schemas.mediaserver import MediaServerPlayItem as _SchemaMediaServerPlayItem
 from app.schemas.mediaserver import MediaServerSeasonInfo as _SchemaMediaServerSeasonInfo
@@ -153,6 +165,7 @@ class NavidromeModule(_ModuleBase, _MediaServerBase[Navidrome]):
         server: Optional[str] = None,
         *,
         query: Optional[MediaServerQueryOptions] = None,
+        raise_on_query_failure: bool = False,
     ) -> Optional[_SchemaExistMediaInfo]:
         """
         按条目标识或音乐名称检查媒体是否已入库。
@@ -161,6 +174,8 @@ class NavidromeModule(_ModuleBase, _MediaServerBase[Navidrome]):
         :param itemid: 可选专辑标识，优先查询；不匹配时继续按名称搜索
         :param server: 媒体服务器配置名称；省略时汇总本类型全部实例
         :param query: 可选查询内容投影，省略时保留原有请求和返回内容
+        :param raise_on_query_failure: 仅为兼容链路严格口径保留，本方法只处理音乐，
+            严格口径仅用于电视剧，故该参数不改变本方法的行为
         :return: 首个匹配项的服务器和条目标识；非音乐或未找到匹配项时返回 None
         """
         if mediainfo.type != MediaType.MUSIC or not isinstance(mediainfo, MusicInfo):
@@ -296,15 +311,104 @@ class NavidromeModule(_ModuleBase, _MediaServerBase[Navidrome]):
         service = self.get_instance(server)
         return service.get_iteminfo(item_id, **({"query": query} if query is not None else {})) if service else None
 
+    def mediaserver_browse_items(
+        self,
+        server: str,
+        library_id: Optional[str] = None,
+        parent_id: Optional[str] = None,
+        item_type: Optional[str] = None,
+        genre: Optional[str] = None,
+        year: Optional[int] = None,
+        played_filter: Optional[str] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        keyword: Optional[str] = None,
+        start_index: int = 0,
+        limit: int = 30,
+        username: Optional[str] = None,
+    ) -> Optional[_SchemaMediaServerBrowsePage]:
+        """分页浏览 Navidrome 音乐库。"""
+        service = self.get_instance(server)
+        if not service:
+            return None
+        page = service.browse_items(
+            library_id=library_id,
+            parent_id=parent_id,
+            item_type=item_type,
+            genre=genre,
+            year=year,
+            played_filter=played_filter,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            keyword=keyword,
+            start_index=start_index,
+            limit=limit,
+            username=username,
+        )
+        if page:
+            for item in page.items:
+                item.server = server
+        return page
+
+    def mediaserver_filter_options(
+        self,
+        server: str,
+        library_id: Optional[str] = None,
+        username: Optional[str] = None,
+    ) -> Optional[_SchemaMediaServerFilterOptions]:
+        """获取 Navidrome 可用风格筛选项。"""
+        service = self.get_instance(server)
+        return service.get_filter_options(library_id=library_id, username=username) if service else None
+
+    def mediaserver_item_detail(
+        self, server: str, item_id: Union[str, int], username: Optional[str] = None
+    ) -> Optional[_SchemaMediaServerItemDetail]:
+        """获取 Navidrome 单曲或专辑详情。"""
+        service = self.get_instance(server)
+        if not service:
+            return None
+        detail = service.get_item_detail(str(item_id), username=username)
+        if detail:
+            detail.server = server
+        return detail
+
+    def mediaserver_season_episodes(
+        self,
+        server: str,
+        item_id: Union[str, int],
+        season_id: Optional[str] = None,
+        season: Optional[int] = None,
+        username: Optional[str] = None,
+    ) -> Optional[List[_SchemaMediaServerBrowseItem]]:
+        """获取 Navidrome 专辑内曲目列表。"""
+        service = self.get_instance(server)
+        if not service:
+            return None
+        tracks = service.get_season_episodes(str(item_id), season_id=season_id, season=season, username=username)
+        if tracks is not None:
+            for track in tracks:
+                track.server = server
+        return tracks
+
     def mediaserver_search(
-        self, keyword: str, types: List[str], limit: int
+        self,
+        keyword: str,
+        types: List[str],
+        limit: int,
+        server: Optional[str] = None,
+        library_id: Optional[str] = None,
     ) -> List[_SchemaMediaServerPlayItem]:
-        """搜索所有已启用 Navidrome 实例的可播放音乐单曲。"""
+        """搜索指定或所有已启用 Navidrome 实例的可播放音乐单曲。"""
         if MediaType.MUSIC.value not in types:
             return []
         items: List[_SchemaMediaServerPlayItem] = []
-        for server_name, service in self.get_instances().items():
-            for item in service.search_library(keyword, limit):
+        target_instances = (
+            {server: inst}
+            if server and (inst := self.get_instance(server))
+            else ({} if server else self.get_instances())
+        )
+        for server_name, service in target_instances.items():
+            for item in service.search_library(keyword, limit, library_id=library_id):
                 item.server = server_name
                 items.append(item)
         return items
@@ -355,6 +459,116 @@ class NavidromeModule(_ModuleBase, _MediaServerBase[Navidrome]):
         """
         service = self.get_instance(server)
         return service.get_play_url(str(item_id)) if service else None
+
+    def mediaserver_stream_url(
+        self,
+        server: str,
+        item_id: Union[str, int],
+        item_type: Optional[str],
+        media_source_id: Optional[str] = None,
+        play_session_id: Optional[str] = None,
+        user_token: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        返回 Navidrome 已签名的原始音频流地址。
+
+        :param server: Navidrome 配置名称
+        :param item_id: Navidrome 曲目标识
+        :param item_type: 媒体服务器返回的类型，本适配器只服务音频条目
+        :param media_source_id: 兼容统一流接口的可选媒体源标识
+        :param play_session_id: 兼容统一流接口的可选会话标识
+        :param user_token: 兼容统一流接口的可选用户令牌
+        :return: 上游音频流地址；条目不是音频或实例不可用时返回 None
+        """
+        _ = media_source_id, play_session_id, user_token
+        if (item_type or "").casefold() not in {"audio", "music", "track", MediaType.MUSIC.value.casefold()}:
+            return None
+        service = self.get_instance(server)
+        return service.get_play_url(str(item_id)) if service else None
+
+    def mediaserver_playback_session(
+        self,
+        server: str,
+        item_id: Union[str, int],
+        media_source_id: Optional[str] = None,
+        username: Optional[str] = None,
+        user_token: Optional[str] = None,
+        client_id: Optional[str] = None,
+        device_name: Optional[str] = None,
+        platform: Optional[str] = None,
+        app_version: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        准备 Navidrome 播放会话上下文，声明 Subsonic scrobble 同步模式。
+        """
+        service = self.get_instance(server)
+        if not service:
+            return None
+        return service.prepare_playback_session(
+            str(item_id),
+            media_source_id=media_source_id,
+            username=username,
+            user_token=user_token,
+            client_id=client_id,
+            device_name=device_name,
+            platform=platform,
+            app_version=app_version,
+        )
+
+    def mediaserver_report_progress(
+        self,
+        server: str,
+        item_id: Union[str, int],
+        position_ms: int,
+        media_source_id: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        is_paused: bool = False,
+        state: str = "playing",
+        username: Optional[str] = None,
+        play_session_id: Optional[str] = None,
+        event_name: Optional[str] = None,
+        client_id: Optional[str] = None,
+        device_name: Optional[str] = None,
+        platform: Optional[str] = None,
+        app_version: Optional[str] = None,
+        play_method: str = "DirectPlay",
+        playback_time_ms: Optional[int] = None,
+        audio_stream_index: Optional[int] = None,
+        subtitle_stream_index: Optional[int] = None,
+        user_token: Optional[str] = None,
+        started_reported: bool = False,
+        allow_userdata_write: bool = True,
+        scrobbled: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        向 Navidrome 回传 Subsonic 正在播放和完播记录。
+        """
+        service = self.get_instance(server)
+        if not service:
+            return None
+        return service.report_progress(
+            str(item_id),
+            position_ms=position_ms,
+            media_source_id=media_source_id,
+            duration_ms=duration_ms,
+            is_paused=is_paused,
+            state=state,
+            username=username,
+            play_session_id=play_session_id,
+            event_name=event_name,
+            client_id=client_id,
+            device_name=device_name,
+            platform=platform,
+            app_version=app_version,
+            play_method=play_method,
+            playback_time_ms=playback_time_ms,
+            audio_stream_index=audio_stream_index,
+            subtitle_stream_index=subtitle_stream_index,
+            user_token=user_token,
+            started_reported=started_reported,
+            allow_userdata_write=allow_userdata_write,
+            scrobbled=scrobbled,
+        )
 
     def mediaserver_latest(
         self,

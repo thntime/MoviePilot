@@ -427,7 +427,10 @@ def configure_plugin_system_services():
         TransactionalAgentTaskRepository,
         TransactionalPluginDataRepository,
     )
-    from app.db.adapters.download import TransactionalDownloadFailureRepository
+    from app.db.adapters.download import (
+        TransactionalDownloadFailureRepository,
+        TransactionalDownloadPendingRepository,
+    )
     from app.db.adapters.history.download import TransactionalDownloadHistoryRepository
     from app.db.adapters.history.transfer import TransactionalTransferHistoryRepository
     from app.db.adapters.mediaserver import TransactionalMediaServerRepository
@@ -573,6 +576,7 @@ def configure_plugin_system_services():
             transfer_execution_repository=TransactionalTransferExecutionRepository(SessionFactory),
             media_server_repository=TransactionalMediaServerRepository(SessionFactory),
             download_failure_repository=TransactionalDownloadFailureRepository(SessionFactory),
+            download_pending_repository=TransactionalDownloadPendingRepository(SessionFactory),
             user_repository=user_repository(),
             configuration=build_chain_runtime_config(settings),
         )
@@ -584,8 +588,10 @@ def configure_plugin_system_services():
     )
 
     init_chain_ports()
-    # 共享关系是新增的外部端口；普通单元测试保持未装配，由专项测试注入受控实现。
+    # 共享关系与详情页查找会访问外部服务；普通单元测试保持未装配，由专项测试注入受控实现。
+    from app.application.server.lookup import configure_media_mapping_lookup
     from app.application.server.mapping import configure_media_mapping_port
+    configure_media_mapping_lookup(None)
     configure_media_mapping_port(None)
     init_chain_network_ports()
     configure_site_query_service(SiteQueryService(repository=site_repository()))

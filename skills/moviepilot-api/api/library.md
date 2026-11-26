@@ -19,7 +19,7 @@ Purpose: 为当前用户列出指定媒体服务器实例最近入库的项目�
 Identity scope: `bound_user`; required role: `user`.
 - `response`: `data` remains a list and `collection.result_count` reports the returned items. `collection.total_count` is omitted because this endpoint or its upstream source does not expose a total.
 - `path_params`: none
-- `query`: `count` (integer|null; default `20`): 当前页最多返回的记录数。; `server*` (string): 媒体服务器实例列表返回的精确实例名称。
+- `query`: `count` (integer|null; default `20`): 当前页最多返回的记录数。; `page` (integer|null): 从 1 开始的结果页码。; `server*` (string): 媒体服务器实例列表返回的精确实例名称。
 - `body`: none
 
 ## Body Models

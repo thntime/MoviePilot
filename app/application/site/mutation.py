@@ -222,6 +222,8 @@ class SiteMutationCommand:
         """
         values = dict(payload)
         raw_url = values.get("url")
+        if isinstance(raw_url, str):
+            raw_url = raw_url.strip()
         if not isinstance(raw_url, str) or not raw_url:
             return SiteMutationResult(False, "站点地址不能为空")
         kind, auth_type, error = _resolve_site_kind_auth(values)
@@ -330,7 +332,9 @@ class SiteMutationCommand:
             values.pop("password", None)
 
         raw_url = values.get("url")
-        normalized_url = self._url_normalizer(raw_url if isinstance(raw_url, str) else "")
+        normalized_url = self._url_normalizer(
+            raw_url.strip() if isinstance(raw_url, str) else ""
+        )
         normalized_domain = self._domain_extractor(normalized_url)
         values["url"] = normalized_url
         values["domain"] = normalized_domain

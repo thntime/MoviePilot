@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -37,6 +38,8 @@ class _ProjectionRule(Enum):
     BANGUMI_TO_TMDB = auto()
     # 根据 AniList 的多语言标题、年份和季信息匹配 TMDB 身份。
     ANILIST_TO_TMDB = auto()
+    # 根据 IMDb 标识直接通过 TMDB 外部标识接口精确匹配 TMDB 身份。
+    IMDB_TO_TMDB = auto()
     # 根据 TMDB 详情匹配豆瓣身份。
     TMDB_TO_DOUBAN = auto()
     # 根据 Bangumi 详情匹配豆瓣身份。
@@ -49,6 +52,7 @@ _PROJECTION_RULES: Final = {
     (MediaSource.Douban, MediaSource.TMDB): _ProjectionRule.DOUBAN_TO_TMDB,
     (MediaSource.Bangumi, MediaSource.TMDB): _ProjectionRule.BANGUMI_TO_TMDB,
     (MediaSource.AniList, MediaSource.TMDB): _ProjectionRule.ANILIST_TO_TMDB,
+    (MediaSource.IMDb, MediaSource.TMDB): _ProjectionRule.IMDB_TO_TMDB,
     (MediaSource.TMDB, MediaSource.Douban): _ProjectionRule.TMDB_TO_DOUBAN,
     (MediaSource.Bangumi, MediaSource.Douban): _ProjectionRule.BANGUMI_TO_DOUBAN,
 }
@@ -58,6 +62,8 @@ _NUMERIC_SOURCE_RULES: Final = {
     _ProjectionRule.TMDB_TO_DOUBAN,
     _ProjectionRule.BANGUMI_TO_DOUBAN,
 }
+# IMDb 原生条目标识必须为 tt 加数字，统一转小写后再用于查询与共享缓存键。
+_IMDB_ID_PATTERN: Final = re.compile(r"^tt\d+$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -167,6 +173,10 @@ def _build_projection_plan(
     rule = _PROJECTION_RULES.get((source, target), _ProjectionRule.EVENT)
     if rule in _NUMERIC_SOURCE_RULES and not normalized_id.isdigit():
         return None
+    if rule == _ProjectionRule.IMDB_TO_TMDB:
+        if not _IMDB_ID_PATTERN.fullmatch(normalized_id):
+            return None
+        normalized_id = normalized_id.lower()
     return _ProjectionPlan(
         rule=rule,
         source=source,
@@ -425,8 +435,15 @@ def _convert_builtin_projection(
     plan: _ProjectionPlan,
 ) -> Optional[_ProjectionPayload]:
     """
-    同步执行来源读取、纯投影和目标匹配三阶段流程。
+    同步执行来源读取、纯投影和目标匹配流程；IMDb 直连 TMDB 外部标识匹配。
     """
+    if plan.rule == _ProjectionRule.IMDB_TO_TMDB:
+        return owner.match_tmdbinfo(
+            name="",
+            mtype=plan.media_type,
+            season=plan.season,
+            imdbid=plan.media_id,
+        )
     source_info = _load_projection_source(owner, plan)
     match = _build_projection_match(plan, source_info) if source_info else None
     return _apply_projection_match(owner, match) if match else None
@@ -437,8 +454,15 @@ async def _async_convert_builtin_projection(
     plan: _ProjectionPlan,
 ) -> Optional[_ProjectionPayload]:
     """
-    异步执行来源读取、纯投影和目标匹配三阶段流程。
+    异步执行来源读取、纯投影和目标匹配流程；IMDb 直连 TMDB 外部标识匹配。
     """
+    if plan.rule == _ProjectionRule.IMDB_TO_TMDB:
+        return await owner.async_match_tmdbinfo(
+            name="",
+            mtype=plan.media_type,
+            season=plan.season,
+            imdbid=plan.media_id,
+        )
     source_info = await _async_load_projection_source(owner, plan)
     match = _build_projection_match(plan, source_info) if source_info else None
     return await _async_apply_projection_match(owner, match) if match else None
@@ -463,32 +487,72 @@ def _mapping_query(plan: _ProjectionPlan) -> MediaMappingQuery | None:
         return None
 
 
+def _season_unlisted(result: _ProjectionPayload, season: object) -> bool:
+    """
+    判断 TMDB 详情是否给出了季列表却没有转换附带的季号。
+
+    TMDB 季匹配未命中时会按整剧名称回退，转换仍附带请求的季号；只有详情带季列表时才能核实，
+    缺少季列表的插件结果保持原有处理。
+
+    :param result: 转换得到的完整 TMDB 详情
+    :param season: 转换附带的 TMDB 季号，None 表示未指定
+    :return: 详情给出季列表但其中没有该季时为 True
+    """
+    seasons = result.get("seasons")
+    if season is None or not isinstance(seasons, Sequence) or isinstance(seasons, (str, bytes)):
+        return False
+    return not any(isinstance(item, Mapping) and item.get("season_number") == season for item in seasons)
+
+
+def _extract_mapping(
+    plan: _ProjectionPlan,
+    query: MediaMappingQuery,
+    result: _ProjectionPayload | None,
+) -> MediaMapping | None:
+    """
+    从转换得到的 TMDB 原始详情提取单向关系，共享上报和详情页查找共用同一规则。
+
+    :param plan: 原来源身份及转换上下文，结果未声明类型时回退到调用方类型
+    :param query: 由同一转换计划生成的共享查询
+    :param result: 转换得到的完整 TMDB 详情，失败为 None
+    :return: 可共享的关系；结果缺少有效 TMDB 类型或 ID，或 TMDB 详情未列出附带的季时为 None
+    """
+    if not result:
+        return None
+    try:
+        raw_type = result.get("media_type")
+        media_type = raw_type if isinstance(raw_type, MediaType) else MediaType.from_agent(str(raw_type or ""))
+        media_type = media_type or plan.media_type
+        if media_type not in (MediaType.MOVIE, MediaType.TV):
+            return None
+        target_type: Literal["movie", "tv"] = "movie" if media_type == MediaType.MOVIE else "tv"
+        tmdb_season = result.get("season") if target_type == "tv" else None
+        if _season_unlisted(result, tmdb_season):
+            # 整剧回退命中的季号未经核实，不能写成不存在的季链接；订阅转换结果本身不受影响。
+            return None
+        return MediaMapping.model_validate({
+            **query.model_dump(), "type": query.type or target_type,
+            "tmdb_id": result.get("id"), "tmdb_type": target_type, "tmdb_season": tmdb_season,
+        })
+    except (ValidationError, TypeError, ValueError):
+        # 未提供有效 TMDB 身份的旧插件结果继续返回业务调用方，但不能污染公共关系表。
+        return None
+
+
 def _share_mapping(plan: _ProjectionPlan, result: _ProjectionPayload | None) -> None:
     """
-    从成功的 TMDB 原始详情提取关系；不影响原转换结果与插件兼容合同。
+    从成功的 TMDB 原始详情提取关系并后台共享；不影响原转换结果与插件兼容合同。
 
     :param plan: 原来源身份及转换上下文
     :param result: 成功转换的完整 TMDB 详情，失败为 None
     """
     port = get_media_mapping_port()
     query = _mapping_query(plan)
-    if port is None or query is None or not result:
+    if port is None or query is None:
         return
-    try:
-        raw_type = result.get("media_type")
-        media_type = raw_type if isinstance(raw_type, MediaType) else MediaType.from_agent(str(raw_type or ""))
-        media_type = media_type or plan.media_type
-        if media_type not in (MediaType.MOVIE, MediaType.TV):
-            return
-        target_type: Literal["movie", "tv"] = "movie" if media_type == MediaType.MOVIE else "tv"
-        port.share(MediaMapping.model_validate({
-            **query.model_dump(), "type": query.type or target_type,
-            "tmdb_id": result.get("id"), "tmdb_type": target_type,
-            "tmdb_season": result.get("season") if target_type == "tv" else None,
-        }))
-    except (ValidationError, TypeError, ValueError):
-        # 未提供有效 TMDB 身份的旧插件结果继续返回业务调用方，但不能污染公共关系表。
-        return
+    mapping = _extract_mapping(plan, query, result)
+    if mapping is not None:
+        port.share(mapping)
 
 
 class MediaProjectionOwner(_MediaOwnerBase):
@@ -677,3 +741,31 @@ class MediaProjectionOwner(_MediaOwnerBase):
             result = await _async_convert_builtin_projection(self, plan)
         _share_mapping(plan, result)
         return result
+
+    async def async_match_media_mapping(
+        self,
+        query: MediaMappingQuery,
+    ) -> MediaMapping | None:
+        """
+        用订阅同款转换为非 TMDB 影视来源查找 TMDB 关系，成功结果由转换流程尽力写回共享表。
+
+        只复用 `async_convert_media_identity`，不另写匹配流程；返回值与本次上报的关系
+        使用同一提取规则，因此逐字段一致。共享关系已由调用方先行查询。
+
+        :param query: 已校验的原来源身份、影视类型和季号
+        :return: 本次转换得到的关系；来源不受支持、未匹配或结果无效时为 None
+        """
+        mtype = MediaType.MOVIE if query.type == "movie" else MediaType.TV if query.type == "tv" else None
+        plan = _build_projection_plan(MediaSource.TMDB, query.media_source, query.media_id, mtype, query.season)
+        mapping_query = _mapping_query(plan) if plan else None
+        if plan is None or mapping_query is None:
+            return None
+        result = await MediaProjectionOwner.async_convert_media_identity(
+            self,
+            target_source=MediaSource.TMDB,
+            media_source=query.media_source,
+            media_id=query.media_id,
+            mtype=mtype,
+            season=query.season,
+        )
+        return _extract_mapping(plan, mapping_query, result)
