@@ -700,7 +700,11 @@
     "请使用 MoviePilot 系统管理员账号管理渠道授权": "Use a MoviePilot system administrator account to manage channel authorization",
     "目标渠道不存在或尚未启用": "The target channel does not exist or is disabled",
     "渠道授权服务不可用": "The channel authorization service is unavailable",
-    "用户未激活": "User is inactive"
+    "用户未激活": "User is inactive",
+    "网盘站点不支持该能力": "Netdisk sites do not support this capability",
+    "只支持删除本地文件": "Only local files can be deleted",
+    "路径不在下载目录内，已拒绝删除": "The path is not inside the download directory, so deletion was rejected",
+    "文件不存在或删除失败": "The file does not exist or could not be deleted"
   },
   "message_patterns": [
     {
@@ -1794,6 +1798,18 @@
     {
       "source": "{seconds}秒",
       "target": "{seconds}s"
+    },
+    {
+      "source": "《{title}》有多个同名版本，请选择要下载的版本",
+      "target": "Multiple versions of \"{title}\" share the same name. Choose the version to download"
+    },
+    {
+      "source": "不支持的内容校验状态：{status}",
+      "target": "Unsupported content verification status: {status}"
+    },
+    {
+      "source": "不支持的内容审核档位：{tier}",
+      "target": "Unsupported content verification tier: {tier}"
     }
   ]
 }
