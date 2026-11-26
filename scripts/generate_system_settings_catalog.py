@@ -79,6 +79,15 @@ def _load_module(path: Path) -> tuple[ast.Module, list[str]]:
     return ast.parse(text), text.splitlines()
 
 
+def _source_file(path: Path) -> str:
+    """
+    返回稳定的来源文件标识。
+
+    用 POSIX 分隔符输出，避免在 Windows 上生成带反斜杠的目录，让产物与平台无关。
+    """
+    return path.relative_to(PROJECT_ROOT).as_posix()
+
+
 def _find_class(module: ast.Module, class_name: str) -> ast.ClassDef:
     """
     按名称查找一个顶层类定义。
@@ -185,7 +194,7 @@ def _extract_model_fields(
         results[field_name] = {
             "description": description,
             "group": group,
-            "source_file": str(path.relative_to(PROJECT_ROOT)),
+            "source_file": _source_file(path),
         }
     return results
 
@@ -205,7 +214,7 @@ def _extract_systemconfig_fields(path: Path) -> dict[str, dict[str, Any]]:
         results[str(value)] = {
             "enum_name": field_name,
             "description": " ".join(_preceding_comments(lines, node.lineno, exclude_sections=False)).strip(),
-            "source_file": str(path.relative_to(PROJECT_ROOT)),
+            "source_file": _source_file(path),
         }
     return results
 
