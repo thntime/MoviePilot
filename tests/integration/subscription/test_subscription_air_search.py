@@ -281,6 +281,53 @@ def test_schema_treats_empty_string_as_disabled() -> None:
     assert schema.air_search_weekdays is None
 
 
+def test_schema_treats_whitespace_only_as_disabled() -> None:
+    """
+    只含空白的播出配置同样等价于关闭，覆盖空字符串被前置规范化拦不到的情形。
+    """
+    schema = SubscribeSchema.model_validate({
+        "name": "空白配置",
+        "air_search_time": "   ",
+        "air_search_weekdays": "  ",
+    })
+
+    assert schema.air_search_time is None
+    assert schema.air_search_weekdays is None
+
+
+def test_schema_accepts_weekday_list_and_skips_blank_items() -> None:
+    """
+    兜底周几接受列表输入，空项被跳过并按去重升序输出。
+    """
+    schema = SubscribeSchema.model_validate({
+        "name": "列表配置",
+        "air_search_weekdays": ["7", " 6 ", ""],
+    })
+
+    assert schema.air_search_weekdays == "6,7"
+
+
+def test_schema_weekdays_with_only_blank_items_is_disabled() -> None:
+    """
+    列表里全是空项时视为未配置兜底周几。
+    """
+    schema = SubscribeSchema.model_validate({"name": "空项配置", "air_search_weekdays": " , "})
+
+    assert schema.air_search_weekdays is None
+
+
+@pytest.mark.parametrize("payload", [
+    {"air_search_time": 1100},
+    {"air_search_weekdays": 6},
+])
+def test_schema_rejects_non_text_air_search_fields(payload) -> None:
+    """
+    非文本输入直接拒绝，不做隐式转换。
+    """
+    with pytest.raises(ValidationError):
+        SubscribeSchema.model_validate({"name": "非文本配置", **payload})
+
+
 @pytest.mark.parametrize("air_time,weekdays,expected", [
     ("11:00", None, False),
     (None, None, True),
