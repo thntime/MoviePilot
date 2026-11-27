@@ -15,6 +15,7 @@ from app.application.subscription.contract import (
     SubscriptionSnapshot,
 )
 from app.application.subscription.lookup import SubscriptionIdentityLookup
+from app.domain.airwindow import AIR_SEARCH_RETRY_MINUTES
 from app.domain.context import MediaInfo
 from app.domain.meta.metabase import MetaBase
 from app.schemas.common import JsonData
@@ -363,6 +364,9 @@ def subscription_search_due(
 ) -> bool:
     """
     按最近一次主动搜索计算定时搜索到期；旧记录以本地创建时间起算。
+
+    启用播出窗口的订阅按分钟级间隔重试：窗口只有 48 小时，小时间隔会把窗口
+    耗在等下一次到期上；未启用窗口的订阅仍按订阅或系统的小时间隔判定。
     """
     if subscribe.state not in {"R", "P"}:
         return False
@@ -376,5 +380,8 @@ def subscription_search_due(
     # 旧创建时间没有时区，保持其本地时间语义；新搜索时间始终携带 UTC 时区。
     if started.tzinfo is None:
         started = started.astimezone()
+    if subscribe.air_search_time:
+        minutes = subscribe.air_search_interval_minutes or AIR_SEARCH_RETRY_MINUTES
+        return now >= started + timedelta(minutes=minutes)
     interval = subscribe.search_interval or default_interval
     return now >= started + timedelta(hours=interval)

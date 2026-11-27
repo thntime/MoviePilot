@@ -13,6 +13,10 @@ from typing import Any, Optional, Sequence
 # 又明显短于周更周期，避免整周空转
 AIR_SEARCH_WINDOW_HOURS = 48
 
+# 窗口内的默认重试间隔（分钟）：窗口只有 48 小时，按小时级间隔会把窗口耗在等下一次到期上，
+# 取 15 分钟与调度器 5 分钟的扫描粒度对齐
+AIR_SEARCH_RETRY_MINUTES = 15
+
 # 播出时刻的合法形态：24 小时制两位数字
 _AIR_TIME_SEPARATOR = ":"
 

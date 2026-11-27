@@ -198,7 +198,7 @@ class Subscribe(OptionalMediaIdentityMixin, BaseModel):
         "custom_words", "keyword", "save_path", "episode_group", "downloader",
         "min_bitrate", "min_bit_depth", "min_sample_rate",
         "media_category_id", "media_category",
-        "air_search_time", "air_search_weekdays",
+        "air_search_time", "air_search_weekdays", "air_search_interval_minutes",
     })
 
     PUBLIC_WRITE_EXCLUDED_FIELDS: ClassVar[frozenset[str]] = frozenset({
@@ -216,6 +216,7 @@ class Subscribe(OptionalMediaIdentityMixin, BaseModel):
     search_interval: Optional[int] = Field(default=None, ge=1, le=8760, description="定时搜索间隔（小时）；空值跟随系统设置")
     air_search_time: Optional[str] = Field(default=None, description="播出日当天的更新时刻 HH:MM；空值不按播出窗口限制定时搜索")
     air_search_weekdays: Optional[str] = Field(default=None, description="播出日期缺失时兜底触发的周几，逗号分隔的 ISO 周号 1-7；空值表示没有兜底")
+    air_search_interval_minutes: Optional[int] = Field(default=None, ge=1, le=1440, description="播出窗口内的重试间隔（分钟）；空值按 15 分钟默认")
     last_search: Optional[str] = Field(default=None, description="最近一次主动搜索开始时间，仅供读取")
     keyword: Optional[str] = Field(default=None, description="搜索关键字")
     media_source: Optional[MediaSource] = Field(default=None, description="媒体数据源")

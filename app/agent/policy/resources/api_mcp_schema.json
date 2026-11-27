@@ -4028,6 +4028,20 @@
     "Subscribe": {
       "description": "电影、电视剧或音乐订阅输入模型。",
       "properties": {
+        "air_search_interval_minutes": {
+          "anyOf": [
+            {
+              "maximum": 1440.0,
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "播出窗口内的重试间隔（分钟）；空值按 15 分钟默认",
+          "title": "Air Search Interval Minutes"
+        },
         "air_search_time": {
           "anyOf": [
             {

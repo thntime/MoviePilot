@@ -28,7 +28,7 @@ RULE_FIELDS = (
 )
 EDIT_FIELDS = RULE_FIELDS + (
     "keyword", "search_interval", "state", "downloader", "save_path", "episode_group",
-    "air_search_time", "air_search_weekdays",
+    "air_search_time", "air_search_weekdays", "air_search_interval_minutes",
 )
 DETAIL_LIMIT = 100
 DECISION_RANKS = {"related": 0, "rejected": 1, "qualified": 2, "failed": 3, "submitted": 4}

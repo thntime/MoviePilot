@@ -90,6 +90,7 @@ def _project_subscription(record: Subscribe) -> SubscriptionSnapshot:
         search_interval=record.search_interval,
         air_search_time=record.air_search_time,
         air_search_weekdays=record.air_search_weekdays,
+        air_search_interval_minutes=record.air_search_interval_minutes,
         media_source=_media_source(record.media_source),
         media_id=record.media_id,
         music_type=record.music_type,

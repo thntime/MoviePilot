@@ -33,6 +33,7 @@ _SUBSCRIPTION_FIELDS = frozenset(
         "search_interval",
         "air_search_time",
         "air_search_weekdays",
+        "air_search_interval_minutes",
         "last_search",
         "media_source",
         "media_id",
@@ -104,6 +105,7 @@ _SUBSCRIPTION_HISTORY_FIELDS = (_SUBSCRIPTION_FIELDS - {
     # 播出窗口只影响活动订阅的定时搜索，历史表没有对应列，也不参与完成判定
     "air_search_time",
     "air_search_weekdays",
+    "air_search_interval_minutes",
 }) | _CLASSIFICATION_HISTORY_FIELDS | {"activity_key"}
 
 
@@ -188,6 +190,7 @@ class SubscriptionSnapshot:
     :param search_interval: 定时搜索间隔（小时）；空值跟随系统设置
     :param air_search_time: 播出日当天的更新时刻 HH:MM；空值不按播出窗口限制定时搜索
     :param air_search_weekdays: 播出日期缺失时兜底触发的周几，逗号分隔的 ISO 周号 1-7
+    :param air_search_interval_minutes: 播出窗口内的重试间隔（分钟）；空值按 15 分钟默认
     :param media_source: 订阅媒体的标准数据来源，与 media_id 配对使用
     :param media_id: 数据来源中的原生媒体标识
     :param music_type: 音乐实体类型：recording 单曲、album 专辑
@@ -247,6 +250,7 @@ class SubscriptionSnapshot:
     search_interval: Optional[int] = None
     air_search_time: Optional[str] = None
     air_search_weekdays: Optional[str] = None
+    air_search_interval_minutes: Optional[int] = None
     media_source: Optional[MediaSource] = None
     media_id: Optional[str] = None
     music_type: Optional[str] = None

@@ -5,6 +5,7 @@
 """
 
 from datetime import date, datetime, timedelta, timezone
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,6 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.application.subscription.contract import SubscriptionSnapshot
+from app.application.subscription.query import subscription_search_due
 from app.chain.media import MediaChain
 from app.chain.subscribe.facade import SubscribeChain
 from app.db.adapters.subscription import TransactionalSubscriptionRepository
@@ -344,3 +346,55 @@ def test_air_search_allowed_matrix(monkeypatch, air_time, weekdays, expected) ->
     chain = _chain([subscribe])
 
     assert chain._air_search_allowed(subscribe) is expected
+
+
+DUE_NOW = datetime(2026, 11, 28, 12, tzinfo=timezone.utc)
+
+
+def _searched_ago(**delta) -> str:
+    """
+    构造距 DUE_NOW 指定时长的上次搜索时间。
+    """
+    return (DUE_NOW - timedelta(**delta)).isoformat()
+
+
+def test_due_uses_default_15_minutes_when_air_window_enabled() -> None:
+    """
+    启用播出窗口的订阅按分钟级间隔到期，未配置时默认 15 分钟。
+    """
+    subscribe = _subscribe(air_search_time="11:00")
+
+    assert not subscription_search_due(
+        replace(subscribe, last_search=_searched_ago(minutes=14)), 24, DUE_NOW
+    )
+    assert subscription_search_due(
+        replace(subscribe, last_search=_searched_ago(minutes=15)), 24, DUE_NOW
+    )
+
+
+def test_due_honors_custom_air_retry_minutes() -> None:
+    """
+    自定义分钟间隔覆盖默认 15 分钟。
+    """
+    subscribe = _subscribe(air_search_time="11:00", air_search_interval_minutes=30)
+
+    assert not subscription_search_due(
+        replace(subscribe, last_search=_searched_ago(minutes=29)), 24, DUE_NOW
+    )
+    assert subscription_search_due(
+        replace(subscribe, last_search=_searched_ago(minutes=30)), 24, DUE_NOW
+    )
+
+
+def test_due_keeps_hour_interval_without_air_window() -> None:
+    """
+    未启用播出窗口的订阅仍按小时间隔判定，不受分钟逻辑影响。
+    """
+    subscribe = _subscribe(air_search_time=None, search_interval=2)
+
+    assert not subscription_search_due(
+        replace(subscribe, last_search=_searched_ago(minutes=119)), 24, DUE_NOW
+    )
+    assert subscription_search_due(
+        replace(subscribe, last_search=_searched_ago(minutes=120)), 24, DUE_NOW
+    )
