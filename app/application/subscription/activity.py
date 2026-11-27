@@ -26,7 +26,10 @@ RULE_FIELDS = (
     "best_version", "best_version_full", "start_episode", "total_episode", "custom_words",
     "audio_quality", "audio_format", "min_bitrate", "min_bit_depth", "min_sample_rate",
 )
-EDIT_FIELDS = RULE_FIELDS + ("keyword", "search_interval", "state", "downloader", "save_path", "episode_group")
+EDIT_FIELDS = RULE_FIELDS + (
+    "keyword", "search_interval", "state", "downloader", "save_path", "episode_group",
+    "air_search_time", "air_search_weekdays",
+)
 DETAIL_LIMIT = 100
 DECISION_RANKS = {"related": 0, "rejected": 1, "qualified": 2, "failed": 3, "submitted": 4}
 

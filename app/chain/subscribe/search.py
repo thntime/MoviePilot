@@ -23,6 +23,7 @@ from app.application.subscription.activity import current_activity_run, subscrip
 from app.application.subscription.contract import (
     SubscriptionRepository,
     SubscriptionSnapshot,
+    build_subscribe_meta,
 )
 from app.application.subscription.execution import (
     SearchBatchSnapshot,
@@ -52,6 +53,7 @@ from app.chain.search.execution import MediaSearchPlan
 from app.chain.search.facade import SearchChain
 from app.chain.search.scan import SearchScan, search_targets
 from app.chain.subscribe.contract import _SubscribeOwnerBase
+from app.chain.subscribe.identity import subscribe_recognize_kwargs
 from app.chain.subscribe.metadata import (
     SubscriptionSearchTarget,
     apply_subscription_classification,
@@ -62,6 +64,7 @@ from app.chain.subscribe.searchtask import (
     retry_at_after,
     subscription_search_cancelled,
 )
+from app.domain.air_search import air_search_window_open, season_air_dates
 from app.domain.context import (
     Context,
     MediaInfo,
@@ -1015,7 +1018,42 @@ class SubscribeSearchOwner(_SubscribeSearchQueueOwner):
         if scheduled_interval is None:
             return subscribes
         now = datetime.now(timezone.utc)
-        return [item for item in subscribes if subscription_search_due(item, scheduled_interval, now)]
+        due = [item for item in subscribes if subscription_search_due(item, scheduled_interval, now)]
+        return [item for item in due if self._air_search_allowed(item)]
+
+    def _air_search_allowed(self, subscribe: SubscriptionSnapshot) -> bool:
+        """
+        判断订阅的定时搜索是否已进入播出窗口。
+
+        只有电视剧且配置了播出时刻的订阅参与判定。识别失败或拿不到播出日期时
+        交给纯函数按「没有证据就放行」处理，避免外部数据缺失导致永久不搜。
+
+        :param subscribe: 已按搜索间隔判定到期的订阅快照
+        :return: 本轮是否允许对该订阅执行定时搜索
+        """
+        if subscribe.type != MediaType.TV.value or not subscribe.air_search_time:
+            return True
+        air_dates: tuple[str, ...] = ()
+        try:
+            meta = build_subscribe_meta(subscribe)
+            mediainfo = MediaChain().recognize_media(
+                meta=meta,
+                mtype=meta.type,
+                **subscribe_recognize_kwargs(subscribe),
+                episode_group=subscribe.episode_group,
+            )
+            air_dates = season_air_dates(mediainfo, subscribe.season)
+        except Exception as error:
+            logger.warning(f"订阅《{subscribe.name}》播出日期读取失败，本轮按放行处理：{error}")
+        allowed = air_search_window_open(
+            datetime.now(timezone.utc),
+            air_dates,
+            subscribe.air_search_weekdays,
+            subscribe.air_search_time,
+        )
+        if not allowed:
+            logger.debug(f"订阅《{subscribe.name}》未到播出窗口，本轮定时搜索跳过")
+        return allowed
 
     @staticmethod
     def _recent_subscription_retry_at(

@@ -4028,6 +4028,30 @@
     "Subscribe": {
       "description": "电影、电视剧或音乐订阅输入模型。",
       "properties": {
+        "air_search_time": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "播出日当天的更新时刻 HH:MM；空值不按播出窗口限制定时搜索",
+          "title": "Air Search Time"
+        },
+        "air_search_weekdays": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "播出日期缺失时兜底触发的周几，逗号分隔的 ISO 周号 1-7；空值表示没有兜底",
+          "title": "Air Search Weekdays"
+        },
         "audio_format": {
           "anyOf": [
             {

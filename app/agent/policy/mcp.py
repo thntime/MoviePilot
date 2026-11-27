@@ -465,6 +465,12 @@ FIELD_DESCRIPTIONS = {
     ),
     "scrape": "手动整理后是否生成元数据和图片。",
     "search_interval": "计划搜索间隔，单位为整数小时，范围 1 至 8760；null 使用系统间隔。",
+    "air_search_time": (
+        "播出日当天的更新时刻，格式 HH:MM；null 表示不按播出窗口限制定时搜索。"
+    ),
+    "air_search_weekdays": (
+        "拿不到播出日期时兜底触发的周几，逗号分隔的 ISO 周号 1 至 7（1 为周一）；null 表示没有兜底。"
+    ),
     "last_search": "最近一次订阅搜索尝试的 UTC 时间戳，只读。",
     "search_imdbid": "为 1 时在订阅搜索中使用 IMDb 身份。",
     "season": "媒体、搜索、订阅或整理操作使用的季号。",

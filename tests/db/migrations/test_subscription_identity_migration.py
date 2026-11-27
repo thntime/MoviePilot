@@ -87,7 +87,8 @@ def test_identity_upgrade_chain_preserves_plugin_installation_snapshot(monkeypat
     config = Config()
     config.set_main_option("script_location", "database")
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["4c02986bd95d"]
+    assert script.get_heads() == ["b7e1c4a9d2f3"]
+    assert script.get_revision("b7e1c4a9d2f3").down_revision == "4c02986bd95d"
     assert script.get_revision("4c02986bd95d").down_revision == ("a3d7f1c85b42", "c4e8f1a29b03")
     assert script.get_revision("a3d7f1c85b42").down_revision == "c9e5a1f7b3d2"
     assert script.get_revision("c9e5a1f7b3d2").down_revision == "d8a4c6e29170"

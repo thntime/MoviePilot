@@ -58,6 +58,10 @@ class Subscribe(Base):
     type: Mapped[Optional[str]] = mapped_column(String)
     # 自定义定时搜索间隔（小时）；空值跟随系统
     search_interval: Mapped[Optional[int]] = mapped_column(Integer)
+    # 播出日当天的更新时刻（HH:MM）；空值表示不按播出窗口限制定时搜索
+    air_search_time: Mapped[Optional[str]] = mapped_column(String(5))
+    # 拿不到播出日期时兜底触发的周几，逗号分隔的 ISO 周号 1-7；空值表示没有兜底
+    air_search_weekdays: Mapped[Optional[str]] = mapped_column(String(16))
     # 搜索关键字
     keyword: Mapped[Optional[str]] = mapped_column(String)
     media_source: Mapped[Optional[str]] = mapped_column(String, index=True)

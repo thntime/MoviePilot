@@ -3,6 +3,7 @@
 """
 
 import json
+import re
 from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -11,6 +12,11 @@ from app.schemas.common import JsonData
 from app.schemas.media import OptionalMediaIdentityMixin
 from app.schemas.types import MUSIC_ENTITY_ALBUM as _MUSIC_ENTITY_ALBUM
 from app.schemas.types import MediaSource, MediaType
+
+# 播出时刻按 24 小时制两位数字，前端时间输入框也按同一形态提交
+_AIR_SEARCH_TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+# ISO 周号：1 为周一、7 为周日
+_AIR_SEARCH_WEEKDAY_RANGE = range(1, 8)
 
 
 class SubscriptionActivityEvent(BaseModel):
@@ -192,6 +198,7 @@ class Subscribe(OptionalMediaIdentityMixin, BaseModel):
         "custom_words", "keyword", "save_path", "episode_group", "downloader",
         "min_bitrate", "min_bit_depth", "min_sample_rate",
         "media_category_id", "media_category",
+        "air_search_time", "air_search_weekdays",
     })
 
     PUBLIC_WRITE_EXCLUDED_FIELDS: ClassVar[frozenset[str]] = frozenset({
@@ -207,6 +214,8 @@ class Subscribe(OptionalMediaIdentityMixin, BaseModel):
     year: Optional[str] = Field(default=None, description="媒体发行年份")
     type: Optional[str] = Field(default=None, description="订阅类型 电影/电视剧")
     search_interval: Optional[int] = Field(default=None, ge=1, le=8760, description="定时搜索间隔（小时）；空值跟随系统设置")
+    air_search_time: Optional[str] = Field(default=None, description="播出日当天的更新时刻 HH:MM；空值不按播出窗口限制定时搜索")
+    air_search_weekdays: Optional[str] = Field(default=None, description="播出日期缺失时兜底触发的周几，逗号分隔的 ISO 周号 1-7；空值表示没有兜底")
     last_search: Optional[str] = Field(default=None, description="最近一次主动搜索开始时间，仅供读取")
     keyword: Optional[str] = Field(default=None, description="搜索关键字")
     media_source: Optional[MediaSource] = Field(default=None, description="媒体数据源")
@@ -284,6 +293,61 @@ class Subscribe(OptionalMediaIdentityMixin, BaseModel):
         if isinstance(parsed, list):
             return [item for item in parsed if isinstance(item, int)]
         return None
+
+    @field_validator("air_search_time", mode="before")
+    @classmethod
+    def _validate_air_search_time(cls, value: Any) -> Any:
+        """
+        校验播出时刻为 24 小时制 HH:MM。
+
+        空值表示不按播出窗口限制定时搜索；非法值直接拒绝，避免把无效配置
+        静默存成「不启用」而让用户以为已经生效。
+        """
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("播出时刻必须是 HH:MM 文本")
+        text = value.strip()
+        if not text:
+            return None
+        if not _AIR_SEARCH_TIME_PATTERN.match(text):
+            raise ValueError("播出时刻必须是 HH:MM（00:00-23:59）")
+        return text
+
+    @field_validator("air_search_weekdays", mode="before")
+    @classmethod
+    def _normalize_air_search_weekdays(cls, value: Any) -> Any:
+        """
+        把兜底周几规范化为去重升序的逗号分隔文本。
+
+        接受 6 或 6,7，也接受同内容的列表；非法周号、非数字与超出 1-7 的值
+        直接拒绝，避免兜底触发点算错。
+        """
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            items = list(value)
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            items = text.split(",")
+        else:
+            raise ValueError("兜底周几必须是逗号分隔的 ISO 周号")
+        numbers: set[int] = set()
+        for item in items:
+            raw = str(item).strip()
+            if not raw:
+                continue
+            if not raw.isdecimal():
+                raise ValueError("兜底周几只能包含数字")
+            number = int(raw)
+            if number not in _AIR_SEARCH_WEEKDAY_RANGE:
+                raise ValueError("兜底周几只能是 1-7（1 为周一）")
+            numbers.add(number)
+        if not numbers:
+            return None
+        return ",".join(str(number) for number in sorted(numbers))
 
     @model_validator(mode="before")
     @classmethod
