@@ -1005,8 +1005,8 @@
       "runtime_only": true
     }
   },
-  "edge_count": 11241,
-  "edge_sha256": "a492b3c26c1f520f0913487bab346af03aad92a345f42081874c9a381cf6fe3e",
+  "edge_count": 11243,
+  "edge_sha256": "fb5446a6465eae6c36c37d2df57268fa29565ee58ee33d1dbf3c96518f7b607b",
   "edges": [
     "app -> app.foundation",
     "app -> app.foundation.environment",
@@ -6645,9 +6645,11 @@
     "app.chain.subscribe.search -> app.chain.search.scan",
     "app.chain.subscribe.search -> app.chain.subscribe",
     "app.chain.subscribe.search -> app.chain.subscribe.contract",
+    "app.chain.subscribe.search -> app.chain.subscribe.identity",
     "app.chain.subscribe.search -> app.chain.subscribe.metadata",
     "app.chain.subscribe.search -> app.chain.subscribe.searchtask",
     "app.chain.subscribe.search -> app.domain",
+    "app.chain.subscribe.search -> app.domain.airwindow",
     "app.chain.subscribe.search -> app.domain.context",
     "app.chain.subscribe.search -> app.domain.meta",
     "app.chain.subscribe.search -> app.domain.meta.metabase",
@@ -12250,7 +12252,7 @@
     "app.workflow.actions.transfer_file -> app.workflow",
     "app.workflow.actions.transfer_file -> app.workflow.actions"
   ],
-  "module_count": 1265,
+  "module_count": 1266,
   "modules": [
     "app",
     "app.adapters",
@@ -13007,6 +13009,7 @@
     "app.doctor.runner",
     "app.domain",
     "app.domain.aired",
+    "app.domain.airwindow",
     "app.domain.artwork",
     "app.domain.authorization",
     "app.domain.chat",

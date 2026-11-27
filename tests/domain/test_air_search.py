@@ -8,7 +8,7 @@ from datetime import date, datetime, time, timedelta
 
 import pytest
 
-from app.domain.air_search import (
+from app.domain.airwindow import (
     AIR_SEARCH_WINDOW_HOURS,
     air_search_window_open,
     parse_air_time,

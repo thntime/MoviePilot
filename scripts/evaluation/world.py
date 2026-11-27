@@ -49,7 +49,7 @@ _TORRENT_FIELDS = frozenset({
     "download_type", "netdisk_platform", "share_password", "netdisk_share_token",
 })
 _SUBSCRIPTION_FIELDS = frozenset({
-    "audio_format", "audio_quality", "backdrop", "best_version", "best_version_full", "classification_policy_revision",
+    "air_search_time", "air_search_weekdays", "audio_format", "audio_quality", "backdrop", "best_version", "best_version_full", "classification_policy_revision",
     "classification_rule_id", "classification_source", "completed_episode", "completed_tracks", "current_audio_format", "current_bit_depth",
     "current_bitrate", "current_priority", "current_sample_rate", "custom_words", "date", "description", "downloader",
     "effect", "episode_group", "episode_priority", "exclude", "execution_status", "filter", "filter_groups", "id",

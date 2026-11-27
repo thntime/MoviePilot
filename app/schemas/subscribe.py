@@ -3,7 +3,7 @@
 """
 
 import json
-import re
+from re import compile as _re_compile
 from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -14,7 +14,7 @@ from app.schemas.types import MUSIC_ENTITY_ALBUM as _MUSIC_ENTITY_ALBUM
 from app.schemas.types import MediaSource, MediaType
 
 # 播出时刻按 24 小时制两位数字，前端时间输入框也按同一形态提交
-_AIR_SEARCH_TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_AIR_SEARCH_TIME_PATTERN = _re_compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 # ISO 周号：1 为周一、7 为周日
 _AIR_SEARCH_WEEKDAY_RANGE = range(1, 8)
 

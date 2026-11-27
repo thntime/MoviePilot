@@ -64,7 +64,7 @@ from app.chain.subscribe.searchtask import (
     retry_at_after,
     subscription_search_cancelled,
 )
-from app.domain.air_search import air_search_window_open, season_air_dates
+from app.domain.airwindow import air_search_window_open, season_air_dates
 from app.domain.context import (
     Context,
     MediaInfo,
